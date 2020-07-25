@@ -1,0 +1,2438 @@
+commit a8fabb38525c51a094607768bac3ba46b3f4a9d5
+Author: Juergen Gross <jgross@suse.com>
+Date:   Tue Oct 1 17:03:55 2019 +0200
+
+    xen/xenbus: fix self-deadlock after killing user process
+    
+    In case a user process using xenbus has open transactions and is killed
+    e.g. via ctrl-C the following cleanup of the allocated resources might
+    result in a deadlock due to trying to end a transaction in the xenbus
+    worker thread:
+    
+    [ 2551.474706] INFO: task xenbus:37 blocked for more than 120 seconds.
+    [ 2551.492215]       Tainted: P           OE     5.0.0-29-generic #5
+    [ 2551.510263] "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+    [ 2551.528585] xenbus          D    0    37      2 0x80000080
+    [ 2551.528590] Call Trace:
+    [ 2551.528603]  __schedule+0x2c0/0x870
+    [ 2551.528606]  ? _cond_resched+0x19/0x40
+    [ 2551.528632]  schedule+0x2c/0x70
+    [ 2551.528637]  xs_talkv+0x1ec/0x2b0
+    [ 2551.528642]  ? wait_woken+0x80/0x80
+    [ 2551.528645]  xs_single+0x53/0x80
+    [ 2551.528648]  xenbus_transaction_end+0x3b/0x70
+    [ 2551.528651]  xenbus_file_free+0x5a/0x160
+    [ 2551.528654]  xenbus_dev_queue_reply+0xc4/0x220
+    [ 2551.528657]  xenbus_thread+0x7de/0x880
+    [ 2551.528660]  ? wait_woken+0x80/0x80
+    [ 2551.528665]  kthread+0x121/0x140
+    [ 2551.528667]  ? xb_read+0x1d0/0x1d0
+    [ 2551.528670]  ? kthread_park+0x90/0x90
+    [ 2551.528673]  ret_from_fork+0x35/0x40
+    
+    Fix this by doing the cleanup via a workqueue instead.
+    
+    Reported-by: James Dingwall <james@dingwall.me.uk>
+    Fixes: fd8aa9095a95c ("xen: optimize xenbus driver for multiple concurrent xenstore accesses")
+    Cc: <stable@vger.kernel.org> # 4.11
+    Signed-off-by: Juergen Gross <jgross@suse.com>
+    Reviewed-by: Boris Ostrovsky <boris.ostrovsky@oracle.com>
+    Signed-off-by: Boris Ostrovsky <boris.ostrovsky@oracle.com>
+
+diff --git a/drivers/xen/xenbus/xenbus_dev_frontend.c b/drivers/xen/xenbus/xenbus_dev_frontend.c
+index 08adc590f631..597af455a522 100644
+--- a/drivers/xen/xenbus/xenbus_dev_frontend.c
++++ b/drivers/xen/xenbus/xenbus_dev_frontend.c
+@@ -55,6 +55,7 @@
+ #include <linux/string.h>
+ #include <linux/slab.h>
+ #include <linux/miscdevice.h>
++#include <linux/workqueue.h>
+ 
+ #include <xen/xenbus.h>
+ #include <xen/xen.h>
+@@ -116,6 +117,8 @@ struct xenbus_file_priv {
+ 	wait_queue_head_t read_waitq;
+ 
+ 	struct kref kref;
++
++	struct work_struct wq;
+ };
+ 
+ /* Read out any raw xenbus messages queued up. */
+@@ -300,14 +303,14 @@ static void watch_fired(struct xenbus_watch *watch,
+ 	mutex_unlock(&adap->dev_data->reply_mutex);
+ }
+ 
+-static void xenbus_file_free(struct kref *kref)
++static void xenbus_worker(struct work_struct *wq)
+ {
+ 	struct xenbus_file_priv *u;
+ 	struct xenbus_transaction_holder *trans, *tmp;
+ 	struct watch_adapter *watch, *tmp_watch;
+ 	struct read_buffer *rb, *tmp_rb;
+ 
+-	u = container_of(kref, struct xenbus_file_priv, kref);
++	u = container_of(wq, struct xenbus_file_priv, wq);
+ 
+ 	/*
+ 	 * No need for locking here because there are no other users,
+@@ -333,6 +336,18 @@ static void xenbus_file_free(struct kref *kref)
+ 	kfree(u);
+ }
+ 
++static void xenbus_file_free(struct kref *kref)
++{
++	struct xenbus_file_priv *u;
++
++	/*
++	 * We might be called in xenbus_thread().
++	 * Use workqueue to avoid deadlock.
++	 */
++	u = container_of(kref, struct xenbus_file_priv, kref);
++	schedule_work(&u->wq);
++}
++
+ static struct xenbus_transaction_holder *xenbus_get_transaction(
+ 	struct xenbus_file_priv *u, uint32_t tx_id)
+ {
+@@ -650,6 +665,7 @@ static int xenbus_file_open(struct inode *inode, struct file *filp)
+ 	INIT_LIST_HEAD(&u->watches);
+ 	INIT_LIST_HEAD(&u->read_buffers);
+ 	init_waitqueue_head(&u->read_waitq);
++	INIT_WORK(&u->wq, xenbus_worker);
+ 
+ 	mutex_init(&u->reply_mutex);
+ 	mutex_init(&u->msgbuffer_mutex);
+
+commit d10e0cc113c9e1b64b5c6e3db37b5c839794f3df
+Author: Ross Lagerwall <ross.lagerwall@citrix.com>
+Date:   Mon May 13 14:56:35 2019 +0100
+
+    xenbus: Avoid deadlock during suspend due to open transactions
+    
+    During a suspend/resume, the xenwatch thread waits for all outstanding
+    xenstore requests and transactions to complete. This does not work
+    correctly for transactions started by userspace because it waits for
+    them to complete after freezing userspace threads which means the
+    transactions have no way of completing, resulting in a deadlock. This is
+    trivial to reproduce by running this script and then suspending the VM:
+    
+        import pyxs, time
+        c = pyxs.client.Client(xen_bus_path="/dev/xen/xenbus")
+        c.connect()
+        c.transaction()
+        time.sleep(3600)
+    
+    Even if this deadlock were resolved, misbehaving userspace should not
+    prevent a VM from being migrated. So, instead of waiting for these
+    transactions to complete before suspending, store the current generation
+    id for each transaction when it is started. The global generation id is
+    incremented during resume. If the caller commits the transaction and the
+    generation id does not match the current generation id, return EAGAIN so
+    that they try again. If the transaction was instead discarded, return OK
+    since no changes were made anyway.
+    
+    This only affects users of the xenbus file interface. In-kernel users of
+    xenbus are assumed to be well-behaved and complete all transactions
+    before freezing.
+    
+    Signed-off-by: Ross Lagerwall <ross.lagerwall@citrix.com>
+    Reviewed-by: Juergen Gross <jgross@suse.com>
+    Signed-off-by: Boris Ostrovsky <boris.ostrovsky@oracle.com>
+
+diff --git a/drivers/xen/xenbus/xenbus_dev_frontend.c b/drivers/xen/xenbus/xenbus_dev_frontend.c
+index faf452d0edf0..08adc590f631 100644
+--- a/drivers/xen/xenbus/xenbus_dev_frontend.c
++++ b/drivers/xen/xenbus/xenbus_dev_frontend.c
+@@ -62,6 +62,8 @@
+ 
+ #include "xenbus.h"
+ 
++unsigned int xb_dev_generation_id;
++
+ /*
+  * An element of a list of outstanding transactions, for which we're
+  * still waiting a reply.
+@@ -69,6 +71,7 @@
+ struct xenbus_transaction_holder {
+ 	struct list_head list;
+ 	struct xenbus_transaction handle;
++	unsigned int generation_id;
+ };
+ 
+ /*
+@@ -441,6 +444,7 @@ static int xenbus_write_transaction(unsigned msg_type,
+ 			rc = -ENOMEM;
+ 			goto out;
+ 		}
++		trans->generation_id = xb_dev_generation_id;
+ 		list_add(&trans->list, &u->transactions);
+ 	} else if (msg->hdr.tx_id != 0 &&
+ 		   !xenbus_get_transaction(u, msg->hdr.tx_id))
+@@ -449,6 +453,20 @@ static int xenbus_write_transaction(unsigned msg_type,
+ 		 !(msg->hdr.len == 2 &&
+ 		   (!strcmp(msg->body, "T") || !strcmp(msg->body, "F"))))
+ 		return xenbus_command_reply(u, XS_ERROR, "EINVAL");
++	else if (msg_type == XS_TRANSACTION_END) {
++		trans = xenbus_get_transaction(u, msg->hdr.tx_id);
++		if (trans && trans->generation_id != xb_dev_generation_id) {
++			list_del(&trans->list);
++			kfree(trans);
++			if (!strcmp(msg->body, "T"))
++				return xenbus_command_reply(u, XS_ERROR,
++							    "EAGAIN");
++			else
++				return xenbus_command_reply(u,
++							    XS_TRANSACTION_END,
++							    "OK");
++		}
++	}
+ 
+ 	rc = xenbus_dev_request_and_reply(&msg->hdr, u);
+ 	if (rc && trans) {
+
+commit 51cf07a7b6cd99d9b910932e2af4e7282782e3fe
+Author: Mao Wenan <maowenan@huawei.com>
+Date:   Tue Apr 16 12:06:51 2019 +0800
+
+    xenbus: drop useless LIST_HEAD in xenbus_write_watch() and xenbus_file_write()
+    
+    Drop LIST_HEAD where the variable it declares is never used.
+    
+    The declarations were introduced with the file, but the declared
+    variables were not used.
+    
+    Fixes: 1107ba885e469 ("xen: add xenfs to allow usermode <-> Xen interaction")
+    Signed-off-by: Mao Wenan <maowenan@huawei.com>
+    Reviewed-by: Juergen Gross <jgross@suse.com>
+    Signed-off-by: Boris Ostrovsky <boris.ostrovsky@oracle.com>
+
+diff --git a/drivers/xen/xenbus/xenbus_dev_frontend.c b/drivers/xen/xenbus/xenbus_dev_frontend.c
+index 0782ff3c2273..faf452d0edf0 100644
+--- a/drivers/xen/xenbus/xenbus_dev_frontend.c
++++ b/drivers/xen/xenbus/xenbus_dev_frontend.c
+@@ -465,7 +465,6 @@ static int xenbus_write_watch(unsigned msg_type, struct xenbus_file_priv *u)
+ 	struct watch_adapter *watch;
+ 	char *path, *token;
+ 	int err, rc;
+-	LIST_HEAD(staging_q);
+ 
+ 	path = u->u.buffer + sizeof(u->u.msg);
+ 	token = memchr(path, 0, u->u.msg.len);
+@@ -523,7 +522,6 @@ static ssize_t xenbus_file_write(struct file *filp,
+ 	uint32_t msg_type;
+ 	int rc = len;
+ 	int ret;
+-	LIST_HEAD(staging_q);
+ 
+ 	/*
+ 	 * We're expecting usermode to be writing properly formed
+
+commit 10dce8af34226d90fa56746a934f8da5dcdba3df
+Author: Kirill Smelkov <kirr@nexedi.com>
+Date:   Tue Mar 26 22:20:43 2019 +0000
+
+    fs: stream_open - opener for stream-like files so that read and write can run simultaneously without deadlock
+    
+    Commit 9c225f2655e3 ("vfs: atomic f_pos accesses as per POSIX") added
+    locking for file.f_pos access and in particular made concurrent read and
+    write not possible - now both those functions take f_pos lock for the
+    whole run, and so if e.g. a read is blocked waiting for data, write will
+    deadlock waiting for that read to complete.
+    
+    This caused regression for stream-like files where previously read and
+    write could run simultaneously, but after that patch could not do so
+    anymore. See e.g. commit 581d21a2d02a ("xenbus: fix deadlock on writes
+    to /proc/xen/xenbus") which fixes such regression for particular case of
+    /proc/xen/xenbus.
+    
+    The patch that added f_pos lock in 2014 did so to guarantee POSIX thread
+    safety for read/write/lseek and added the locking to file descriptors of
+    all regular files. In 2014 that thread-safety problem was not new as it
+    was already discussed earlier in 2006.
+    
+    However even though 2006'th version of Linus's patch was adding f_pos
+    locking "only for files that are marked seekable with FMODE_LSEEK (thus
+    avoiding the stream-like objects like pipes and sockets)", the 2014
+    version - the one that actually made it into the tree as 9c225f2655e3 -
+    is doing so irregardless of whether a file is seekable or not.
+    
+    See
+    
+        https://lore.kernel.org/lkml/53022DB1.4070805@gmail.com/
+        https://lwn.net/Articles/180387
+        https://lwn.net/Articles/180396
+    
+    for historic context.
+    
+    The reason that it did so is, probably, that there are many files that
+    are marked non-seekable, but e.g. their read implementation actually
+    depends on knowing current position to correctly handle the read. Some
+    examples:
+    
+            kernel/power/user.c             snapshot_read
+            fs/debugfs/file.c               u32_array_read
+            fs/fuse/control.c               fuse_conn_waiting_read + ...
+            drivers/hwmon/asus_atk0110.c    atk_debugfs_ggrp_read
+            arch/s390/hypfs/inode.c         hypfs_read_iter
+            ...
+    
+    Despite that, many nonseekable_open users implement read and write with
+    pure stream semantics - they don't depend on passed ppos at all. And for
+    those cases where read could wait for something inside, it creates a
+    situation similar to xenbus - the write could be never made to go until
+    read is done, and read is waiting for some, potentially external, event,
+    for potentially unbounded time -> deadlock.
+    
+    Besides xenbus, there are 14 such places in the kernel that I've found
+    with semantic patch (see below):
+    
+            drivers/xen/evtchn.c:667:8-24: ERROR: evtchn_fops: .read() can deadlock .write()
+            drivers/isdn/capi/capi.c:963:8-24: ERROR: capi_fops: .read() can deadlock .write()
+            drivers/input/evdev.c:527:1-17: ERROR: evdev_fops: .read() can deadlock .write()
+            drivers/char/pcmcia/cm4000_cs.c:1685:7-23: ERROR: cm4000_fops: .read() can deadlock .write()
+            net/rfkill/core.c:1146:8-24: ERROR: rfkill_fops: .read() can deadlock .write()
+            drivers/s390/char/fs3270.c:488:1-17: ERROR: fs3270_fops: .read() can deadlock .write()
+            drivers/usb/misc/ldusb.c:310:1-17: ERROR: ld_usb_fops: .read() can deadlock .write()
+            drivers/hid/uhid.c:635:1-17: ERROR: uhid_fops: .read() can deadlock .write()
+            net/batman-adv/icmp_socket.c:80:1-17: ERROR: batadv_fops: .read() can deadlock .write()
+            drivers/media/rc/lirc_dev.c:198:1-17: ERROR: lirc_fops: .read() can deadlock .write()
+            drivers/leds/uleds.c:77:1-17: ERROR: uleds_fops: .read() can deadlock .write()
+            drivers/input/misc/uinput.c:400:1-17: ERROR: uinput_fops: .read() can deadlock .write()
+            drivers/infiniband/core/user_mad.c:985:7-23: ERROR: umad_fops: .read() can deadlock .write()
+            drivers/gnss/core.c:45:1-17: ERROR: gnss_fops: .read() can deadlock .write()
+    
+    In addition to the cases above another regression caused by f_pos
+    locking is that now FUSE filesystems that implement open with
+    FOPEN_NONSEEKABLE flag, can no longer implement bidirectional
+    stream-like files - for the same reason as above e.g. read can deadlock
+    write locking on file.f_pos in the kernel.
+    
+    FUSE's FOPEN_NONSEEKABLE was added in 2008 in a7c1b990f715 ("fuse:
+    implement nonseekable open") to support OSSPD. OSSPD implements /dev/dsp
+    in userspace with FOPEN_NONSEEKABLE flag, with corresponding read and
+    write routines not depending on current position at all, and with both
+    read and write being potentially blocking operations:
+    
+    See
+    
+        https://github.com/libfuse/osspd
+        https://lwn.net/Articles/308445
+    
+        https://github.com/libfuse/osspd/blob/14a9cff0/osspd.c#L1406
+        https://github.com/libfuse/osspd/blob/14a9cff0/osspd.c#L1438-L1477
+        https://github.com/libfuse/osspd/blob/14a9cff0/osspd.c#L1479-L1510
+    
+    Corresponding libfuse example/test also describes FOPEN_NONSEEKABLE as
+    "somewhat pipe-like files ..." with read handler not using offset.
+    However that test implements only read without write and cannot exercise
+    the deadlock scenario:
+    
+        https://github.com/libfuse/libfuse/blob/fuse-3.4.2-3-ga1bff7d/example/poll.c#L124-L131
+        https://github.com/libfuse/libfuse/blob/fuse-3.4.2-3-ga1bff7d/example/poll.c#L146-L163
+        https://github.com/libfuse/libfuse/blob/fuse-3.4.2-3-ga1bff7d/example/poll.c#L209-L216
+    
+    I've actually hit the read vs write deadlock for real while implementing
+    my FUSE filesystem where there is /head/watch file, for which open
+    creates separate bidirectional socket-like stream in between filesystem
+    and its user with both read and write being later performed
+    simultaneously. And there it is semantically not easy to split the
+    stream into two separate read-only and write-only channels:
+    
+        https://lab.nexedi.com/kirr/wendelin.core/blob/f13aa600/wcfs/wcfs.go#L88-169
+    
+    Let's fix this regression. The plan is:
+    
+    1. We can't change nonseekable_open to include &~FMODE_ATOMIC_POS -
+       doing so would break many in-kernel nonseekable_open users which
+       actually use ppos in read/write handlers.
+    
+    2. Add stream_open() to kernel to open stream-like non-seekable file
+       descriptors. Read and write on such file descriptors would never use
+       nor change ppos. And with that property on stream-like files read and
+       write will be running without taking f_pos lock - i.e. read and write
+       could be running simultaneously.
+    
+    3. With semantic patch search and convert to stream_open all in-kernel
+       nonseekable_open users for which read and write actually do not
+       depend on ppos and where there is no other methods in file_operations
+       which assume @offset access.
+    
+    4. Add FOPEN_STREAM to fs/fuse/ and open in-kernel file-descriptors via
+       steam_open if that bit is present in filesystem open reply.
+    
+       It was tempting to change fs/fuse/ open handler to use stream_open
+       instead of nonseekable_open on just FOPEN_NONSEEKABLE flags, but
+       grepping through Debian codesearch shows users of FOPEN_NONSEEKABLE,
+       and in particular GVFS which actually uses offset in its read and
+       write handlers
+    
+            https://codesearch.debian.net/search?q=-%3Enonseekable+%3D
+            https://gitlab.gnome.org/GNOME/gvfs/blob/1.40.0-6-gcbc54396/client/gvfsfusedaemon.c#L1080
+            https://gitlab.gnome.org/GNOME/gvfs/blob/1.40.0-6-gcbc54396/client/gvfsfusedaemon.c#L1247-1346
+            https://gitlab.gnome.org/GNOME/gvfs/blob/1.40.0-6-gcbc54396/client/gvfsfusedaemon.c#L1399-1481
+    
+       so if we would do such a change it will break a real user.
+    
+    5. Add stream_open and FOPEN_STREAM handling to stable kernels starting
+       from v3.14+ (the kernel where 9c225f2655 first appeared).
+    
+       This will allow to patch OSSPD and other FUSE filesystems that
+       provide stream-like files to return FOPEN_STREAM | FOPEN_NONSEEKABLE
+       in their open handler and this way avoid the deadlock on all kernel
+       versions. This should work because fs/fuse/ ignores unknown open
+       flags returned from a filesystem and so passing FOPEN_STREAM to a
+       kernel that is not aware of this flag cannot hurt. In turn the kernel
+       that is not aware of FOPEN_STREAM will be < v3.14 where just
+       FOPEN_NONSEEKABLE is sufficient to implement streams without read vs
+       write deadlock.
+    
+    This patch adds stream_open, converts /proc/xen/xenbus to it and adds
+    semantic patch to automatically locate in-kernel places that are either
+    required to be converted due to read vs write deadlock, or that are just
+    safe to be converted because read and write do not use ppos and there
+    are no other funky methods in file_operations.
+    
+    Regarding semantic patch I've verified each generated change manually -
+    that it is correct to convert - and each other nonseekable_open instance
+    left - that it is either not correct to convert there, or that it is not
+    converted due to current stream_open.cocci limitations.
+    
+    The script also does not convert files that should be valid to convert,
+    but that currently have .llseek = noop_llseek or generic_file_llseek for
+    unknown reason despite file being opened with nonseekable_open (e.g.
+    drivers/input/mousedev.c)
+    
+    Cc: Michael Kerrisk <mtk.manpages@gmail.com>
+    Cc: Yongzhi Pan <panyongzhi@gmail.com>
+    Cc: Jonathan Corbet <corbet@lwn.net>
+    Cc: David Vrabel <david.vrabel@citrix.com>
+    Cc: Juergen Gross <jgross@suse.com>
+    Cc: Miklos Szeredi <miklos@szeredi.hu>
+    Cc: Tejun Heo <tj@kernel.org>
+    Cc: Kirill Tkhai <ktkhai@virtuozzo.com>
+    Cc: Arnd Bergmann <arnd@arndb.de>
+    Cc: Christoph Hellwig <hch@lst.de>
+    Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+    Cc: Julia Lawall <Julia.Lawall@lip6.fr>
+    Cc: Nikolaus Rath <Nikolaus@rath.org>
+    Cc: Han-Wen Nienhuys <hanwen@google.com>
+    Signed-off-by: Kirill Smelkov <kirr@nexedi.com>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/drivers/xen/xenbus/xenbus_dev_frontend.c b/drivers/xen/xenbus/xenbus_dev_frontend.c
+index c3e201025ef0..0782ff3c2273 100644
+--- a/drivers/xen/xenbus/xenbus_dev_frontend.c
++++ b/drivers/xen/xenbus/xenbus_dev_frontend.c
+@@ -622,9 +622,7 @@ static int xenbus_file_open(struct inode *inode, struct file *filp)
+ 	if (xen_store_evtchn == 0)
+ 		return -ENOENT;
+ 
+-	nonseekable_open(inode, filp);
+-
+-	filp->f_mode &= ~FMODE_ATOMIC_POS; /* cdev-style semantics */
++	stream_open(inode, filp);
+ 
+ 	u = kzalloc(sizeof(*u), GFP_KERNEL);
+ 	if (u == NULL)
+
+commit ebf04f331fa15a966262341a7dc6b1a0efd633e4
+Author: Simon Gaiser <simon@invisiblethingslab.com>
+Date:   Thu Mar 15 04:08:03 2018 +0100
+
+    xen: xenbus_dev_frontend: Really return response string
+    
+    xenbus_command_reply() did not actually copy the response string and
+    leaked stack content instead.
+    
+    Fixes: 9a6161fe73bd ("xen: return xenstore command failures via response instead of rc")
+    Signed-off-by: Simon Gaiser <simon@invisiblethingslab.com>
+    Reviewed-by: Juergen Gross <jgross@suse.com>
+    Signed-off-by: Boris Ostrovsky <boris.ostrovsky@oracle.com>
+
+diff --git a/drivers/xen/xenbus/xenbus_dev_frontend.c b/drivers/xen/xenbus/xenbus_dev_frontend.c
+index 0d6d9264d6a9..c3e201025ef0 100644
+--- a/drivers/xen/xenbus/xenbus_dev_frontend.c
++++ b/drivers/xen/xenbus/xenbus_dev_frontend.c
+@@ -403,7 +403,7 @@ static int xenbus_command_reply(struct xenbus_file_priv *u,
+ {
+ 	struct {
+ 		struct xsd_sockmsg hdr;
+-		const char body[16];
++		char body[16];
+ 	} msg;
+ 	int rc;
+ 
+@@ -412,6 +412,7 @@ static int xenbus_command_reply(struct xenbus_file_priv *u,
+ 	msg.hdr.len = strlen(reply) + 1;
+ 	if (msg.hdr.len > sizeof(msg.body))
+ 		return -E2BIG;
++	memcpy(&msg.body, reply, msg.hdr.len);
+ 
+ 	mutex_lock(&u->reply_mutex);
+ 	rc = queue_reply(&u->read_buffers, &msg, sizeof(msg.hdr) + msg.hdr.len);
+
+commit 8fe5ab411209ac6e2c7021131e622fd004506d1a
+Author: Simon Gaiser <simon@invisiblethingslab.com>
+Date:   Thu Mar 15 03:43:22 2018 +0100
+
+    xen: xenbus_dev_frontend: Verify body of XS_TRANSACTION_END
+    
+    By guaranteeing that the argument of XS_TRANSACTION_END is valid we can
+    assume that the transaction has been closed when we get an XS_ERROR
+    response from xenstore (Note that we already verify that it's a valid
+    transaction id).
+    
+    Signed-off-by: Simon Gaiser <simon@invisiblethingslab.com>
+    Reviewed-by: Juergen Gross <jgross@suse.com>
+    Signed-off-by: Boris Ostrovsky <boris.ostrovsky@oracle.com>
+
+diff --git a/drivers/xen/xenbus/xenbus_dev_frontend.c b/drivers/xen/xenbus/xenbus_dev_frontend.c
+index 81a84b3c1c50..0d6d9264d6a9 100644
+--- a/drivers/xen/xenbus/xenbus_dev_frontend.c
++++ b/drivers/xen/xenbus/xenbus_dev_frontend.c
+@@ -429,6 +429,10 @@ static int xenbus_write_transaction(unsigned msg_type,
+ {
+ 	int rc;
+ 	struct xenbus_transaction_holder *trans = NULL;
++	struct {
++		struct xsd_sockmsg hdr;
++		char body[];
++	} *msg = (void *)u->u.buffer;
+ 
+ 	if (msg_type == XS_TRANSACTION_START) {
+ 		trans = kzalloc(sizeof(*trans), GFP_KERNEL);
+@@ -437,11 +441,15 @@ static int xenbus_write_transaction(unsigned msg_type,
+ 			goto out;
+ 		}
+ 		list_add(&trans->list, &u->transactions);
+-	} else if (u->u.msg.tx_id != 0 &&
+-		   !xenbus_get_transaction(u, u->u.msg.tx_id))
++	} else if (msg->hdr.tx_id != 0 &&
++		   !xenbus_get_transaction(u, msg->hdr.tx_id))
+ 		return xenbus_command_reply(u, XS_ERROR, "ENOENT");
++	else if (msg_type == XS_TRANSACTION_END &&
++		 !(msg->hdr.len == 2 &&
++		   (!strcmp(msg->body, "T") || !strcmp(msg->body, "F"))))
++		return xenbus_command_reply(u, XS_ERROR, "EINVAL");
+ 
+-	rc = xenbus_dev_request_and_reply(&u->u.msg, u);
++	rc = xenbus_dev_request_and_reply(&msg->hdr, u);
+ 	if (rc && trans) {
+ 		list_del(&trans->list);
+ 		kfree(trans);
+
+commit 2a22ee6c3ab1d761bc9c04f1e4117edd55b82f09
+Author: Simon Gaiser <simon@invisiblethingslab.com>
+Date:   Thu Mar 15 03:43:20 2018 +0100
+
+    xen: xenbus_dev_frontend: Fix XS_TRANSACTION_END handling
+    
+    Commit fd8aa9095a95 ("xen: optimize xenbus driver for multiple
+    concurrent xenstore accesses") made a subtle change to the semantic of
+    xenbus_dev_request_and_reply() and xenbus_transaction_end().
+    
+    Before on an error response to XS_TRANSACTION_END
+    xenbus_dev_request_and_reply() would not decrement the active
+    transaction counter. But xenbus_transaction_end() has always counted the
+    transaction as finished regardless of the response.
+    
+    The new behavior is that xenbus_dev_request_and_reply() and
+    xenbus_transaction_end() will always count the transaction as finished
+    regardless the response code (handled in xs_request_exit()).
+    
+    But xenbus_dev_frontend tries to end a transaction on closing of the
+    device if the XS_TRANSACTION_END failed before. Trying to close the
+    transaction twice corrupts the reference count. So fix this by also
+    considering a transaction closed if we have sent XS_TRANSACTION_END once
+    regardless of the return code.
+    
+    Cc: <stable@vger.kernel.org> # 4.11
+    Fixes: fd8aa9095a95 ("xen: optimize xenbus driver for multiple concurrent xenstore accesses")
+    Signed-off-by: Simon Gaiser <simon@invisiblethingslab.com>
+    Reviewed-by: Juergen Gross <jgross@suse.com>
+    Signed-off-by: Boris Ostrovsky <boris.ostrovsky@oracle.com>
+
+diff --git a/drivers/xen/xenbus/xenbus_dev_frontend.c b/drivers/xen/xenbus/xenbus_dev_frontend.c
+index a493e99bed21..81a84b3c1c50 100644
+--- a/drivers/xen/xenbus/xenbus_dev_frontend.c
++++ b/drivers/xen/xenbus/xenbus_dev_frontend.c
+@@ -365,7 +365,7 @@ void xenbus_dev_queue_reply(struct xb_req_data *req)
+ 			if (WARN_ON(rc))
+ 				goto out;
+ 		}
+-	} else if (req->msg.type == XS_TRANSACTION_END) {
++	} else if (req->type == XS_TRANSACTION_END) {
+ 		trans = xenbus_get_transaction(u, req->msg.tx_id);
+ 		if (WARN_ON(!trans))
+ 			goto out;
+
+commit a9a08845e9acbd224e4ee466f5c1275ed50054e8
+Author: Linus Torvalds <torvalds@linux-foundation.org>
+Date:   Sun Feb 11 14:34:03 2018 -0800
+
+    vfs: do bulk POLL* -> EPOLL* replacement
+    
+    This is the mindless scripted replacement of kernel use of POLL*
+    variables as described by Al, done by this script:
+    
+        for V in IN OUT PRI ERR RDNORM RDBAND WRNORM WRBAND HUP RDHUP NVAL MSG; do
+            L=`git grep -l -w POLL$V | grep -v '^t' | grep -v /um/ | grep -v '^sa' | grep -v '/poll.h$'|grep -v '^D'`
+            for f in $L; do sed -i "-es/^\([^\"]*\)\(\<POLL$V\>\)/\\1E\\2/" $f; done
+        done
+    
+    with de-mangling cleanups yet to come.
+    
+    NOTE! On almost all architectures, the EPOLL* constants have the same
+    values as the POLL* constants do.  But they keyword here is "almost".
+    For various bad reasons they aren't the same, and epoll() doesn't
+    actually work quite correctly in some cases due to this on Sparc et al.
+    
+    The next patch from Al will sort out the final differences, and we
+    should be all done.
+    
+    Scripted-by: Al Viro <viro@zeniv.linux.org.uk>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/drivers/xen/xenbus/xenbus_dev_frontend.c b/drivers/xen/xenbus/xenbus_dev_frontend.c
+index e17ec3fce590..a493e99bed21 100644
+--- a/drivers/xen/xenbus/xenbus_dev_frontend.c
++++ b/drivers/xen/xenbus/xenbus_dev_frontend.c
+@@ -651,7 +651,7 @@ static __poll_t xenbus_file_poll(struct file *file, poll_table *wait)
+ 
+ 	poll_wait(file, &u->read_waitq, wait);
+ 	if (!list_empty(&u->read_buffers))
+-		return POLLIN | POLLRDNORM;
++		return EPOLLIN | EPOLLRDNORM;
+ 	return 0;
+ }
+ 
+
+commit afc9a42b7464f76e1388cad87d8543c69f6f74ed
+Author: Al Viro <viro@zeniv.linux.org.uk>
+Date:   Mon Jul 3 06:39:46 2017 -0400
+
+    the rest of drivers/*: annotate ->poll() instances
+    
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/drivers/xen/xenbus/xenbus_dev_frontend.c b/drivers/xen/xenbus/xenbus_dev_frontend.c
+index f3b089b7c0b6..e17ec3fce590 100644
+--- a/drivers/xen/xenbus/xenbus_dev_frontend.c
++++ b/drivers/xen/xenbus/xenbus_dev_frontend.c
+@@ -645,7 +645,7 @@ static int xenbus_file_release(struct inode *inode, struct file *filp)
+ 	return 0;
+ }
+ 
+-static unsigned int xenbus_file_poll(struct file *file, poll_table *wait)
++static __poll_t xenbus_file_poll(struct file *file, poll_table *wait)
+ {
+ 	struct xenbus_file_priv *u = file->private_data;
+ 
+
+commit ac4cde398a96c1d28b1c28a0f69b6efd892a1c8a
+Author: Jan Beulich <JBeulich@suse.com>
+Date:   Tue Apr 4 06:27:22 2017 -0600
+
+    xenbus: remove transaction holder from list before freeing
+    
+    After allocation the item is being placed on the list right away.
+    Consequently it needs to be taken off the list before freeing in the
+    case xenbus_dev_request_and_reply() failed, as in that case the
+    callback (xenbus_dev_queue_reply()) is not being called (and if it
+    was called, it should do both).
+    
+    Fixes: 5584ea250ae44f929feb4c7bd3877d1c5edbf813
+    Signed-off-by: Jan Beulich <jbeulich@suse.com>
+    Reviewed-by: Juergen Gross <jgross@suse.com>
+    Signed-off-by: Boris Ostrovsky <boris.ostrovsky@oracle.com>
+
+diff --git a/drivers/xen/xenbus/xenbus_dev_frontend.c b/drivers/xen/xenbus/xenbus_dev_frontend.c
+index 1f4733b80c87..f3b089b7c0b6 100644
+--- a/drivers/xen/xenbus/xenbus_dev_frontend.c
++++ b/drivers/xen/xenbus/xenbus_dev_frontend.c
+@@ -442,8 +442,10 @@ static int xenbus_write_transaction(unsigned msg_type,
+ 		return xenbus_command_reply(u, XS_ERROR, "ENOENT");
+ 
+ 	rc = xenbus_dev_request_and_reply(&u->u.msg, u);
+-	if (rc)
++	if (rc && trans) {
++		list_del(&trans->list);
+ 		kfree(trans);
++	}
+ 
+ out:
+ 	return rc;
+
+commit d825adb48cf9bf9e3f5cb1d927e2827f8c2abee4
+Author: Masanari Iida <standby24x7@gmail.com>
+Date:   Sun Feb 26 16:15:21 2017 +0900
+
+    xenbus: Remove duplicate inclusion of linux/init.h
+    
+    This patch remove duplicate inclusion of linux/init.h in
+    xenbus_dev_frontend.c.
+    Confirm successfully compile after remove the line.
+    
+    Signed-off-by: Masanari Iida <standby24x7@gmail.com>
+    Reviewed-by: Juergen Gross <jgross@suse.com>
+
+diff --git a/drivers/xen/xenbus/xenbus_dev_frontend.c b/drivers/xen/xenbus/xenbus_dev_frontend.c
+index 4d343eed08f5..1f4733b80c87 100644
+--- a/drivers/xen/xenbus/xenbus_dev_frontend.c
++++ b/drivers/xen/xenbus/xenbus_dev_frontend.c
+@@ -55,7 +55,6 @@
+ #include <linux/string.h>
+ #include <linux/slab.h>
+ #include <linux/miscdevice.h>
+-#include <linux/init.h>
+ 
+ #include <xen/xenbus.h>
+ #include <xen/xen.h>
+
+commit fd8aa9095a95c02dcc35540a263267c29b8fda9d
+Author: Juergen Gross <jgross@suse.com>
+Date:   Thu Feb 9 14:39:58 2017 +0100
+
+    xen: optimize xenbus driver for multiple concurrent xenstore accesses
+    
+    Handling of multiple concurrent Xenstore accesses through xenbus driver
+    either from the kernel or user land is rather lame today: xenbus is
+    capable to have one access active only at one point of time.
+    
+    Rewrite xenbus to handle multiple requests concurrently by making use
+    of the request id of the Xenstore protocol. This requires to:
+    
+    - Instead of blocking inside xb_read() when trying to read data from
+      the xenstore ring buffer do so only in the main loop of
+      xenbus_thread().
+    
+    - Instead of doing writes to the xenstore ring buffer in the context of
+      the caller just queue the request and do the write in the dedicated
+      xenbus thread.
+    
+    - Instead of just forwarding the request id specified by the caller of
+      xenbus to xenstore use a xenbus internal unique request id. This will
+      allow multiple outstanding requests.
+    
+    - Modify the locking scheme in order to allow multiple requests being
+      active in parallel.
+    
+    - Instead of waiting for the reply of a user's xenstore request after
+      writing the request to the xenstore ring buffer return directly to
+      the caller and do the waiting in the read path.
+    
+    Additionally signal handling was optimized by avoiding waking up the
+    xenbus thread or sending an event to Xenstore in case the addressed
+    entity is known to be running already.
+    
+    As a result communication with Xenstore is sped up by a factor of up
+    to 5: depending on the request type (read or write) and the amount of
+    data transferred the gain was at least 20% (small reads) and went up to
+    a factor of 5 for large writes.
+    
+    In the end some more rough edges of xenbus have been smoothed:
+    
+    - Handling of memory shortage when reading from xenstore ring buffer in
+      the xenbus driver was not optimal: it was busy looping and issuing a
+      warning in each loop.
+    
+    - In case of xenstore not running in dom0 but in a stubdom we end up
+      with two xenbus threads running as the initialization of xenbus in
+      dom0 expecting a local xenstored will be redone later when connecting
+      to the xenstore domain. Up to now this was no problem as locking
+      would prevent the two xenbus threads interfering with each other, but
+      this was just a waste of kernel resources.
+    
+    - An out of memory situation while writing to or reading from the
+      xenstore ring buffer no longer will lead to a possible loss of
+      synchronization with xenstore.
+    
+    - The user read and write part are now interruptible by signals.
+    
+    Signed-off-by: Juergen Gross <jgross@suse.com>
+    Signed-off-by: Boris Ostrovsky <boris.ostrovsky@oracle.com>
+
+diff --git a/drivers/xen/xenbus/xenbus_dev_frontend.c b/drivers/xen/xenbus/xenbus_dev_frontend.c
+index e4b984777507..4d343eed08f5 100644
+--- a/drivers/xen/xenbus/xenbus_dev_frontend.c
++++ b/drivers/xen/xenbus/xenbus_dev_frontend.c
+@@ -113,6 +113,7 @@ struct xenbus_file_priv {
+ 	struct list_head read_buffers;
+ 	wait_queue_head_t read_waitq;
+ 
++	struct kref kref;
+ };
+ 
+ /* Read out any raw xenbus messages queued up. */
+@@ -297,6 +298,107 @@ static void watch_fired(struct xenbus_watch *watch,
+ 	mutex_unlock(&adap->dev_data->reply_mutex);
+ }
+ 
++static void xenbus_file_free(struct kref *kref)
++{
++	struct xenbus_file_priv *u;
++	struct xenbus_transaction_holder *trans, *tmp;
++	struct watch_adapter *watch, *tmp_watch;
++	struct read_buffer *rb, *tmp_rb;
++
++	u = container_of(kref, struct xenbus_file_priv, kref);
++
++	/*
++	 * No need for locking here because there are no other users,
++	 * by definition.
++	 */
++
++	list_for_each_entry_safe(trans, tmp, &u->transactions, list) {
++		xenbus_transaction_end(trans->handle, 1);
++		list_del(&trans->list);
++		kfree(trans);
++	}
++
++	list_for_each_entry_safe(watch, tmp_watch, &u->watches, list) {
++		unregister_xenbus_watch(&watch->watch);
++		list_del(&watch->list);
++		free_watch_adapter(watch);
++	}
++
++	list_for_each_entry_safe(rb, tmp_rb, &u->read_buffers, list) {
++		list_del(&rb->list);
++		kfree(rb);
++	}
++	kfree(u);
++}
++
++static struct xenbus_transaction_holder *xenbus_get_transaction(
++	struct xenbus_file_priv *u, uint32_t tx_id)
++{
++	struct xenbus_transaction_holder *trans;
++
++	list_for_each_entry(trans, &u->transactions, list)
++		if (trans->handle.id == tx_id)
++			return trans;
++
++	return NULL;
++}
++
++void xenbus_dev_queue_reply(struct xb_req_data *req)
++{
++	struct xenbus_file_priv *u = req->par;
++	struct xenbus_transaction_holder *trans = NULL;
++	int rc;
++	LIST_HEAD(staging_q);
++
++	xs_request_exit(req);
++
++	mutex_lock(&u->msgbuffer_mutex);
++
++	if (req->type == XS_TRANSACTION_START) {
++		trans = xenbus_get_transaction(u, 0);
++		if (WARN_ON(!trans))
++			goto out;
++		if (req->msg.type == XS_ERROR) {
++			list_del(&trans->list);
++			kfree(trans);
++		} else {
++			rc = kstrtou32(req->body, 10, &trans->handle.id);
++			if (WARN_ON(rc))
++				goto out;
++		}
++	} else if (req->msg.type == XS_TRANSACTION_END) {
++		trans = xenbus_get_transaction(u, req->msg.tx_id);
++		if (WARN_ON(!trans))
++			goto out;
++		list_del(&trans->list);
++		kfree(trans);
++	}
++
++	mutex_unlock(&u->msgbuffer_mutex);
++
++	mutex_lock(&u->reply_mutex);
++	rc = queue_reply(&staging_q, &req->msg, sizeof(req->msg));
++	if (!rc)
++		rc = queue_reply(&staging_q, req->body, req->msg.len);
++	if (!rc) {
++		list_splice_tail(&staging_q, &u->read_buffers);
++		wake_up(&u->read_waitq);
++	} else {
++		queue_cleanup(&staging_q);
++	}
++	mutex_unlock(&u->reply_mutex);
++
++	kfree(req->body);
++	kfree(req);
++
++	kref_put(&u->kref, xenbus_file_free);
++
++	return;
++
++ out:
++	mutex_unlock(&u->msgbuffer_mutex);
++}
++
+ static int xenbus_command_reply(struct xenbus_file_priv *u,
+ 				unsigned int msg_type, const char *reply)
+ {
+@@ -317,6 +419,9 @@ static int xenbus_command_reply(struct xenbus_file_priv *u,
+ 	wake_up(&u->read_waitq);
+ 	mutex_unlock(&u->reply_mutex);
+ 
++	if (!rc)
++		kref_put(&u->kref, xenbus_file_free);
++
+ 	return rc;
+ }
+ 
+@@ -324,57 +429,22 @@ static int xenbus_write_transaction(unsigned msg_type,
+ 				    struct xenbus_file_priv *u)
+ {
+ 	int rc;
+-	void *reply;
+ 	struct xenbus_transaction_holder *trans = NULL;
+-	LIST_HEAD(staging_q);
+ 
+ 	if (msg_type == XS_TRANSACTION_START) {
+-		trans = kmalloc(sizeof(*trans), GFP_KERNEL);
++		trans = kzalloc(sizeof(*trans), GFP_KERNEL);
+ 		if (!trans) {
+ 			rc = -ENOMEM;
+ 			goto out;
+ 		}
+-	} else if (u->u.msg.tx_id != 0) {
+-		list_for_each_entry(trans, &u->transactions, list)
+-			if (trans->handle.id == u->u.msg.tx_id)
+-				break;
+-		if (&trans->list == &u->transactions)
+-			return xenbus_command_reply(u, XS_ERROR, "ENOENT");
+-	}
+-
+-	reply = xenbus_dev_request_and_reply(&u->u.msg);
+-	if (IS_ERR(reply)) {
+-		if (msg_type == XS_TRANSACTION_START)
+-			kfree(trans);
+-		rc = PTR_ERR(reply);
+-		goto out;
+-	}
++		list_add(&trans->list, &u->transactions);
++	} else if (u->u.msg.tx_id != 0 &&
++		   !xenbus_get_transaction(u, u->u.msg.tx_id))
++		return xenbus_command_reply(u, XS_ERROR, "ENOENT");
+ 
+-	if (msg_type == XS_TRANSACTION_START) {
+-		if (u->u.msg.type == XS_ERROR)
+-			kfree(trans);
+-		else {
+-			trans->handle.id = simple_strtoul(reply, NULL, 0);
+-			list_add(&trans->list, &u->transactions);
+-		}
+-	} else if (u->u.msg.type == XS_TRANSACTION_END) {
+-		list_del(&trans->list);
++	rc = xenbus_dev_request_and_reply(&u->u.msg, u);
++	if (rc)
+ 		kfree(trans);
+-	}
+-
+-	mutex_lock(&u->reply_mutex);
+-	rc = queue_reply(&staging_q, &u->u.msg, sizeof(u->u.msg));
+-	if (!rc)
+-		rc = queue_reply(&staging_q, reply, u->u.msg.len);
+-	if (!rc) {
+-		list_splice_tail(&staging_q, &u->read_buffers);
+-		wake_up(&u->read_waitq);
+-	} else {
+-		queue_cleanup(&staging_q);
+-	}
+-	mutex_unlock(&u->reply_mutex);
+-
+-	kfree(reply);
+ 
+ out:
+ 	return rc;
+@@ -506,6 +576,8 @@ static ssize_t xenbus_file_write(struct file *filp,
+ 	 * OK, now we have a complete message.  Do something with it.
+ 	 */
+ 
++	kref_get(&u->kref);
++
+ 	msg_type = u->u.msg.type;
+ 
+ 	switch (msg_type) {
+@@ -520,8 +592,10 @@ static ssize_t xenbus_file_write(struct file *filp,
+ 		ret = xenbus_write_transaction(msg_type, u);
+ 		break;
+ 	}
+-	if (ret != 0)
++	if (ret != 0) {
+ 		rc = ret;
++		kref_put(&u->kref, xenbus_file_free);
++	}
+ 
+ 	/* Buffered message consumed */
+ 	u->len = 0;
+@@ -546,6 +620,8 @@ static int xenbus_file_open(struct inode *inode, struct file *filp)
+ 	if (u == NULL)
+ 		return -ENOMEM;
+ 
++	kref_init(&u->kref);
++
+ 	INIT_LIST_HEAD(&u->transactions);
+ 	INIT_LIST_HEAD(&u->watches);
+ 	INIT_LIST_HEAD(&u->read_buffers);
+@@ -562,32 +638,8 @@ static int xenbus_file_open(struct inode *inode, struct file *filp)
+ static int xenbus_file_release(struct inode *inode, struct file *filp)
+ {
+ 	struct xenbus_file_priv *u = filp->private_data;
+-	struct xenbus_transaction_holder *trans, *tmp;
+-	struct watch_adapter *watch, *tmp_watch;
+-	struct read_buffer *rb, *tmp_rb;
+-
+-	/*
+-	 * No need for locking here because there are no other users,
+-	 * by definition.
+-	 */
+ 
+-	list_for_each_entry_safe(trans, tmp, &u->transactions, list) {
+-		xenbus_transaction_end(trans->handle, 1);
+-		list_del(&trans->list);
+-		kfree(trans);
+-	}
+-
+-	list_for_each_entry_safe(watch, tmp_watch, &u->watches, list) {
+-		unregister_xenbus_watch(&watch->watch);
+-		list_del(&watch->list);
+-		free_watch_adapter(watch);
+-	}
+-
+-	list_for_each_entry_safe(rb, tmp_rb, &u->read_buffers, list) {
+-		list_del(&rb->list);
+-		kfree(rb);
+-	}
+-	kfree(u);
++	kref_put(&u->kref, xenbus_file_free);
+ 
+ 	return 0;
+ }
+
+commit 5584ea250ae44f929feb4c7bd3877d1c5edbf813
+Author: Juergen Gross <jgross@suse.com>
+Date:   Thu Feb 9 14:39:57 2017 +0100
+
+    xen: modify xenstore watch event interface
+    
+    Today a Xenstore watch event is delivered via a callback function
+    declared as:
+    
+    void (*callback)(struct xenbus_watch *,
+                     const char **vec, unsigned int len);
+    
+    As all watch events only ever come with two parameters (path and token)
+    changing the prototype to:
+    
+    void (*callback)(struct xenbus_watch *,
+                     const char *path, const char *token);
+    
+    is the natural thing to do.
+    
+    Apply this change and adapt all users.
+    
+    Cc: konrad.wilk@oracle.com
+    Cc: roger.pau@citrix.com
+    Cc: wei.liu2@citrix.com
+    Cc: paul.durrant@citrix.com
+    Cc: netdev@vger.kernel.org
+    
+    Signed-off-by: Juergen Gross <jgross@suse.com>
+    Reviewed-by: Paul Durrant <paul.durrant@citrix.com>
+    Reviewed-by: Wei Liu <wei.liu2@citrix.com>
+    Reviewed-by: Roger Pau Monné <roger.pau@citrix.com>
+    Reviewed-by: Boris Ostrovsky <boris.ostrovsky@oracle.com>
+    Signed-off-by: Boris Ostrovsky <boris.ostrovsky@oracle.com>
+
+diff --git a/drivers/xen/xenbus/xenbus_dev_frontend.c b/drivers/xen/xenbus/xenbus_dev_frontend.c
+index e2bc9b301494..e4b984777507 100644
+--- a/drivers/xen/xenbus/xenbus_dev_frontend.c
++++ b/drivers/xen/xenbus/xenbus_dev_frontend.c
+@@ -258,26 +258,23 @@ static struct watch_adapter *alloc_watch_adapter(const char *path,
+ }
+ 
+ static void watch_fired(struct xenbus_watch *watch,
+-			const char **vec,
+-			unsigned int len)
++			const char *path,
++			const char *token)
+ {
+ 	struct watch_adapter *adap;
+ 	struct xsd_sockmsg hdr;
+-	const char *path, *token;
+-	int path_len, tok_len, body_len, data_len = 0;
++	const char *token_caller;
++	int path_len, tok_len, body_len;
+ 	int ret;
+ 	LIST_HEAD(staging_q);
+ 
+ 	adap = container_of(watch, struct watch_adapter, watch);
+ 
+-	path = vec[XS_WATCH_PATH];
+-	token = adap->token;
++	token_caller = adap->token;
+ 
+ 	path_len = strlen(path) + 1;
+-	tok_len = strlen(token) + 1;
+-	if (len > 2)
+-		data_len = vec[len] - vec[2] + 1;
+-	body_len = path_len + tok_len + data_len;
++	tok_len = strlen(token_caller) + 1;
++	body_len = path_len + tok_len;
+ 
+ 	hdr.type = XS_WATCH_EVENT;
+ 	hdr.len = body_len;
+@@ -288,9 +285,7 @@ static void watch_fired(struct xenbus_watch *watch,
+ 	if (!ret)
+ 		ret = queue_reply(&staging_q, path, path_len);
+ 	if (!ret)
+-		ret = queue_reply(&staging_q, token, tok_len);
+-	if (!ret && len > 2)
+-		ret = queue_reply(&staging_q, vec[2], data_len);
++		ret = queue_reply(&staging_q, token_caller, tok_len);
+ 
+ 	if (!ret) {
+ 		/* success: pass reply list onto watcher */
+
+commit 332f791dc98d98116f4473b726f67c9321b0f31e
+Author: Juergen Gross <jgross@suse.com>
+Date:   Thu Feb 9 14:39:56 2017 +0100
+
+    xen: clean up xenbus internal headers
+    
+    The xenbus driver has an awful mixture of internally and globally
+    visible headers: some of the internally used only stuff is defined in
+    the global header include/xen/xenbus.h while some stuff defined in
+    internal headers is used by other drivers, too.
+    
+    Clean this up by moving the externally used symbols to
+    include/xen/xenbus.h and the symbols used internally only to a new
+    header drivers/xen/xenbus/xenbus.h replacing xenbus_comms.h and
+    xenbus_probe.h
+    
+    Signed-off-by: Juergen Gross <jgross@suse.com>
+    Reviewed-by: Boris Ostrovsky <boris.ostrovsky@oracle.com>
+    Signed-off-by: Boris Ostrovsky <boris.ostrovsky@oracle.com>
+
+diff --git a/drivers/xen/xenbus/xenbus_dev_frontend.c b/drivers/xen/xenbus/xenbus_dev_frontend.c
+index 79130b310247..e2bc9b301494 100644
+--- a/drivers/xen/xenbus/xenbus_dev_frontend.c
++++ b/drivers/xen/xenbus/xenbus_dev_frontend.c
+@@ -57,12 +57,12 @@
+ #include <linux/miscdevice.h>
+ #include <linux/init.h>
+ 
+-#include "xenbus_comms.h"
+-
+ #include <xen/xenbus.h>
+ #include <xen/xen.h>
+ #include <asm/xen/hypervisor.h>
+ 
++#include "xenbus.h"
++
+ /*
+  * An element of a list of outstanding transactions, for which we're
+  * still waiting a reply.
+
+commit 9a6161fe73bdd3ae4a1e18421b0b20cb7141f680
+Author: Juergen Gross <jgross@suse.com>
+Date:   Thu Dec 22 08:19:47 2016 +0100
+
+    xen: return xenstore command failures via response instead of rc
+    
+    When the xenbus driver does some special handling for a Xenstore
+    command any error condition related to the command should be returned
+    via an error response instead of letting the related write operation
+    fail. Otherwise the user land handler might take wrong decisions
+    assuming the connection to Xenstore is broken.
+    
+    While at it try to return the same error values xenstored would
+    return for those cases.
+    
+    Signed-off-by: Juergen Gross <jgross@suse.com>
+    Reviewed-by: Boris Ostrovsky <boris.ostrovsky@oracle.com>
+    Signed-off-by: Juergen Gross <jgross@suse.com>
+
+diff --git a/drivers/xen/xenbus/xenbus_dev_frontend.c b/drivers/xen/xenbus/xenbus_dev_frontend.c
+index a06828124b70..79130b310247 100644
+--- a/drivers/xen/xenbus/xenbus_dev_frontend.c
++++ b/drivers/xen/xenbus/xenbus_dev_frontend.c
+@@ -302,6 +302,29 @@ static void watch_fired(struct xenbus_watch *watch,
+ 	mutex_unlock(&adap->dev_data->reply_mutex);
+ }
+ 
++static int xenbus_command_reply(struct xenbus_file_priv *u,
++				unsigned int msg_type, const char *reply)
++{
++	struct {
++		struct xsd_sockmsg hdr;
++		const char body[16];
++	} msg;
++	int rc;
++
++	msg.hdr = u->u.msg;
++	msg.hdr.type = msg_type;
++	msg.hdr.len = strlen(reply) + 1;
++	if (msg.hdr.len > sizeof(msg.body))
++		return -E2BIG;
++
++	mutex_lock(&u->reply_mutex);
++	rc = queue_reply(&u->read_buffers, &msg, sizeof(msg.hdr) + msg.hdr.len);
++	wake_up(&u->read_waitq);
++	mutex_unlock(&u->reply_mutex);
++
++	return rc;
++}
++
+ static int xenbus_write_transaction(unsigned msg_type,
+ 				    struct xenbus_file_priv *u)
+ {
+@@ -321,7 +344,7 @@ static int xenbus_write_transaction(unsigned msg_type,
+ 			if (trans->handle.id == u->u.msg.tx_id)
+ 				break;
+ 		if (&trans->list == &u->transactions)
+-			return -ESRCH;
++			return xenbus_command_reply(u, XS_ERROR, "ENOENT");
+ 	}
+ 
+ 	reply = xenbus_dev_request_and_reply(&u->u.msg);
+@@ -372,12 +395,12 @@ static int xenbus_write_watch(unsigned msg_type, struct xenbus_file_priv *u)
+ 	path = u->u.buffer + sizeof(u->u.msg);
+ 	token = memchr(path, 0, u->u.msg.len);
+ 	if (token == NULL) {
+-		rc = -EILSEQ;
++		rc = xenbus_command_reply(u, XS_ERROR, "EINVAL");
+ 		goto out;
+ 	}
+ 	token++;
+ 	if (memchr(token, 0, u->u.msg.len - (token - path)) == NULL) {
+-		rc = -EILSEQ;
++		rc = xenbus_command_reply(u, XS_ERROR, "EINVAL");
+ 		goto out;
+ 	}
+ 
+@@ -411,23 +434,7 @@ static int xenbus_write_watch(unsigned msg_type, struct xenbus_file_priv *u)
+ 	}
+ 
+ 	/* Success.  Synthesize a reply to say all is OK. */
+-	{
+-		struct {
+-			struct xsd_sockmsg hdr;
+-			char body[3];
+-		} __packed reply = {
+-			{
+-				.type = msg_type,
+-				.len = sizeof(reply.body)
+-			},
+-			"OK"
+-		};
+-
+-		mutex_lock(&u->reply_mutex);
+-		rc = queue_reply(&u->read_buffers, &reply, sizeof(reply));
+-		wake_up(&u->read_waitq);
+-		mutex_unlock(&u->reply_mutex);
+-	}
++	rc = xenbus_command_reply(u, msg_type, "OK");
+ 
+ out:
+ 	return rc;
+
+commit 639b08810d6ad74ded2c5f6e233c4fcb9d147168
+Author: Juergen Gross <jgross@suse.com>
+Date:   Thu Dec 22 08:19:46 2016 +0100
+
+    xen: xenbus driver must not accept invalid transaction ids
+    
+    When accessing Xenstore in a transaction the user is specifying a
+    transaction id which he normally obtained from Xenstore when starting
+    the transaction. Xenstore is validating a transaction id against all
+    known transaction ids of the connection the request came in. As all
+    requests of a domain not being the one where Xenstore lives share
+    one connection, validation of transaction ids of different users of
+    Xenstore in that domain should be done by the kernel of that domain
+    being the multiplexer between the Xenstore users in that domain and
+    Xenstore.
+    
+    In order to prohibit one Xenstore user "hijacking" a transaction from
+    another user the xenbus driver has to verify a given transaction id
+    against all known transaction ids of the user before forwarding it to
+    Xenstore.
+    
+    Signed-off-by: Juergen Gross <jgross@suse.com>
+    Reviewed-by: Boris Ostrovsky <boris.ostrovsky@oracle.com>
+    Signed-off-by: Juergen Gross <jgross@suse.com>
+
+diff --git a/drivers/xen/xenbus/xenbus_dev_frontend.c b/drivers/xen/xenbus/xenbus_dev_frontend.c
+index 6c0ead4be784..a06828124b70 100644
+--- a/drivers/xen/xenbus/xenbus_dev_frontend.c
++++ b/drivers/xen/xenbus/xenbus_dev_frontend.c
+@@ -316,7 +316,7 @@ static int xenbus_write_transaction(unsigned msg_type,
+ 			rc = -ENOMEM;
+ 			goto out;
+ 		}
+-	} else if (msg_type == XS_TRANSACTION_END) {
++	} else if (u->u.msg.tx_id != 0) {
+ 		list_for_each_entry(trans, &u->transactions, list)
+ 			if (trans->handle.id == u->u.msg.tx_id)
+ 				break;
+
+commit 581d21a2d02a798ee34e56dbfa13f891b3a90c30
+Author: David Vrabel <david.vrabel@citrix.com>
+Date:   Fri Dec 9 14:41:13 2016 +0000
+
+    xenbus: fix deadlock on writes to /proc/xen/xenbus
+    
+    /proc/xen/xenbus does not work correctly.  A read blocked waiting for
+    a xenstore message holds the mutex needed for atomic file position
+    updates.  This blocks any writes on the same file handle, which can
+    deadlock if the write is needed to unblock the read.
+    
+    Clear FMODE_ATOMIC_POS when opening this device to always get
+    character device like sematics.
+    
+    Signed-off-by: David Vrabel <david.vrabel@citrix.com>
+    Reviewed-by: Juergen Gross <jgross@suse.com>
+    Signed-off-by: Juergen Gross <jgross@suse.com>
+
+diff --git a/drivers/xen/xenbus/xenbus_dev_frontend.c b/drivers/xen/xenbus/xenbus_dev_frontend.c
+index 1e8be12ebb55..6c0ead4be784 100644
+--- a/drivers/xen/xenbus/xenbus_dev_frontend.c
++++ b/drivers/xen/xenbus/xenbus_dev_frontend.c
+@@ -538,6 +538,8 @@ static int xenbus_file_open(struct inode *inode, struct file *filp)
+ 
+ 	nonseekable_open(inode, filp);
+ 
++	filp->f_mode &= ~FMODE_ATOMIC_POS; /* cdev-style semantics */
++
+ 	u = kzalloc(sizeof(*u), GFP_KERNEL);
+ 	if (u == NULL)
+ 		return -ENOMEM;
+
+commit aa34e07e457ed13b44d680b5b605e3e5a585f611
+Merge: 0d7317598214 c251f15c7dbf
+Author: Linus Torvalds <torvalds@linux-foundation.org>
+Date:   Mon Oct 24 19:52:24 2016 -0700
+
+    Merge tag 'for-linus-4.9-rc2-tag' of git://git.kernel.org/pub/scm/linux/kernel/git/xen/tip
+    
+    Pull xen fixes from David Vrabel:
+    
+     - advertise control feature flags in xenstore
+    
+     - fix x86 build when XEN_PVHVM is disabled
+    
+    * tag 'for-linus-4.9-rc2-tag' of git://git.kernel.org/pub/scm/linux/kernel/git/xen/tip:
+      xenbus: check return value of xenbus_scanf()
+      xenbus: prefer list_for_each()
+      x86: xen: move cpu_up functions out of ifdef
+      xenbus: advertise control feature flags
+
+commit e1e5b3ff41983f506c3cbcf123fe7d682f61a8f1
+Author: Jan Beulich <JBeulich@suse.com>
+Date:   Mon Oct 24 09:03:49 2016 -0600
+
+    xenbus: prefer list_for_each()
+    
+    This is more efficient than list_for_each_safe() when list modification
+    is accompanied by breaking out of the loop.
+    
+    Signed-off-by: Jan Beulich <jbeulich@suse.com>
+    Reviewed-by: Juergen Gross <jgross@suse.com>
+    Signed-off-by: David Vrabel <david.vrabel@citrix.com>
+
+diff --git a/drivers/xen/xenbus/xenbus_dev_frontend.c b/drivers/xen/xenbus/xenbus_dev_frontend.c
+index 7487971f9f78..fe60b12de920 100644
+--- a/drivers/xen/xenbus/xenbus_dev_frontend.c
++++ b/drivers/xen/xenbus/xenbus_dev_frontend.c
+@@ -364,7 +364,7 @@ static int xenbus_write_transaction(unsigned msg_type,
+ 
+ static int xenbus_write_watch(unsigned msg_type, struct xenbus_file_priv *u)
+ {
+-	struct watch_adapter *watch, *tmp_watch;
++	struct watch_adapter *watch;
+ 	char *path, *token;
+ 	int err, rc;
+ 	LIST_HEAD(staging_q);
+@@ -399,7 +399,7 @@ static int xenbus_write_watch(unsigned msg_type, struct xenbus_file_priv *u)
+ 		}
+ 		list_add(&watch->list, &u->watches);
+ 	} else {
+-		list_for_each_entry_safe(watch, tmp_watch, &u->watches, list) {
++		list_for_each_entry(watch, &u->watches, list) {
+ 			if (!strcmp(watch->token, token) &&
+ 			    !strcmp(watch->watch.node, path)) {
+ 				unregister_xenbus_watch(&watch->watch);
+
+commit 9a035a40f7f3f6708b79224b86c5777a3334f7ea
+Author: Jan Beulich <JBeulich@suse.com>
+Date:   Mon Aug 15 09:02:38 2016 -0600
+
+    xenbus: don't look up transaction IDs for ordinary writes
+    
+    This should really only be done for XS_TRANSACTION_END messages, or
+    else at least some of the xenstore-* tools don't work anymore.
+    
+    Fixes: 0beef634b8 ("xenbus: don't BUG() on user mode induced condition")
+    Reported-by: Richard Schütz <rschuetz@uni-koblenz.de>
+    Cc: <stable@vger.kernel.org>
+    Signed-off-by: Jan Beulich <jbeulich@suse.com>
+    Tested-by: Richard Schütz <rschuetz@uni-koblenz.de>
+    Signed-off-by: David Vrabel <david.vrabel@citrix.com>
+
+diff --git a/drivers/xen/xenbus/xenbus_dev_frontend.c b/drivers/xen/xenbus/xenbus_dev_frontend.c
+index 7487971f9f78..c1010f018bd8 100644
+--- a/drivers/xen/xenbus/xenbus_dev_frontend.c
++++ b/drivers/xen/xenbus/xenbus_dev_frontend.c
+@@ -316,7 +316,7 @@ static int xenbus_write_transaction(unsigned msg_type,
+ 			rc = -ENOMEM;
+ 			goto out;
+ 		}
+-	} else {
++	} else if (msg_type == XS_TRANSACTION_END) {
+ 		list_for_each_entry(trans, &u->transactions, list)
+ 			if (trans->handle.id == u->u.msg.tx_id)
+ 				break;
+
+commit 0beef634b86a1350c31da5fcc2992f0d7c8a622b
+Author: Jan Beulich <JBeulich@suse.com>
+Date:   Thu Jul 7 01:23:57 2016 -0600
+
+    xenbus: don't BUG() on user mode induced condition
+    
+    Inability to locate a user mode specified transaction ID should not
+    lead to a kernel crash. For other than XS_TRANSACTION_START also
+    don't issue anything to xenbus if the specified ID doesn't match that
+    of any active transaction.
+    
+    Signed-off-by: Jan Beulich <jbeulich@suse.com>
+    Cc: <stable@vger.kernel.org>
+    Signed-off-by: David Vrabel <david.vrabel@citrix.com>
+
+diff --git a/drivers/xen/xenbus/xenbus_dev_frontend.c b/drivers/xen/xenbus/xenbus_dev_frontend.c
+index cacf30d14747..7487971f9f78 100644
+--- a/drivers/xen/xenbus/xenbus_dev_frontend.c
++++ b/drivers/xen/xenbus/xenbus_dev_frontend.c
+@@ -316,11 +316,18 @@ static int xenbus_write_transaction(unsigned msg_type,
+ 			rc = -ENOMEM;
+ 			goto out;
+ 		}
++	} else {
++		list_for_each_entry(trans, &u->transactions, list)
++			if (trans->handle.id == u->u.msg.tx_id)
++				break;
++		if (&trans->list == &u->transactions)
++			return -ESRCH;
+ 	}
+ 
+ 	reply = xenbus_dev_request_and_reply(&u->u.msg);
+ 	if (IS_ERR(reply)) {
+-		kfree(trans);
++		if (msg_type == XS_TRANSACTION_START)
++			kfree(trans);
+ 		rc = PTR_ERR(reply);
+ 		goto out;
+ 	}
+@@ -333,12 +340,7 @@ static int xenbus_write_transaction(unsigned msg_type,
+ 			list_add(&trans->list, &u->transactions);
+ 		}
+ 	} else if (u->u.msg.type == XS_TRANSACTION_END) {
+-		list_for_each_entry(trans, &u->transactions, list)
+-			if (trans->handle.id == u->u.msg.tx_id)
+-				break;
+-		BUG_ON(&trans->list == &u->transactions);
+ 		list_del(&trans->list);
+-
+ 		kfree(trans);
+ 	}
+ 
+
+commit 55fc733c7e1de05a03237d857f4fe6dcec52d8d9
+Merge: b852495908cd e01dc539df3a
+Author: Linus Torvalds <torvalds@linux-foundation.org>
+Date:   Tue Mar 22 12:55:17 2016 -0700
+
+    Merge tag 'for-linus-4.6-rc0-tag' of git://git.kernel.org/pub/scm/linux/kernel/git/xen/tip
+    
+    Pull xen updates from David Vrabel:
+     "Features and fixes for 4.6:
+    
+      - Make earlyprintk=xen work for HVM guests
+    
+      - Remove module support for things never built as modules"
+    
+    * tag 'for-linus-4.6-rc0-tag' of git://git.kernel.org/pub/scm/linux/kernel/git/xen/tip:
+      drivers/xen: make platform-pci.c explicitly non-modular
+      drivers/xen: make sys-hypervisor.c explicitly non-modular
+      drivers/xen: make xenbus_dev_[front/back]end explicitly non-modular
+      drivers/xen: make [xen-]ballon explicitly non-modular
+      xen: audit usages of module.h ; remove unnecessary instances
+      xen/x86: Drop mode-selecting ifdefs in startup_xen()
+      xen/x86: Zero out .bss for PV guests
+      hvc_xen: make early_printk work with HVM guests
+      hvc_xen: fix xenboot for DomUs
+      hvc_xen: add earlycon support
+
+commit ab1241a1fc4351be16a5fd5c34001de08c696169
+Author: Paul Gortmaker <paul.gortmaker@windriver.com>
+Date:   Sun Feb 21 19:06:06 2016 -0500
+
+    drivers/xen: make xenbus_dev_[front/back]end explicitly non-modular
+    
+    The Makefile / Kconfig currently controlling compilation here is:
+    
+    obj-y   += xenbus_dev_frontend.o
+    [...]
+    obj-$(CONFIG_XEN_BACKEND) += xenbus_dev_backend.o
+    
+    ...with:
+    
+    drivers/xen/Kconfig:config XEN_BACKEND
+    drivers/xen/Kconfig:    bool "Backend driver support"
+    
+    ...meaning that they currently are not being built as modules by anyone.
+    
+    Lets remove the modular code that is essentially orphaned, so that
+    when reading the driver there is no doubt it is builtin-only.
+    
+    Since module_init translates to device_initcall in the non-modular
+    case, the init ordering remains unchanged with this commit.
+    
+    We also delete the MODULE_LICENSE tag since all that information
+    is already contained at the top of the file in the comments.
+    
+    Signed-off-by: Paul Gortmaker <paul.gortmaker@windriver.com>
+    Reviewed-by: Stefano Stabellini <stefano.stabellini@eu.citrix.com>
+    Signed-off-by: David Vrabel <david.vrabel@citrix.com>
+
+diff --git a/drivers/xen/xenbus/xenbus_dev_frontend.c b/drivers/xen/xenbus/xenbus_dev_frontend.c
+index 9433e46518c8..8c0a359ab4a8 100644
+--- a/drivers/xen/xenbus/xenbus_dev_frontend.c
++++ b/drivers/xen/xenbus/xenbus_dev_frontend.c
+@@ -55,7 +55,7 @@
+ #include <linux/string.h>
+ #include <linux/slab.h>
+ #include <linux/miscdevice.h>
+-#include <linux/module.h>
++#include <linux/init.h>
+ 
+ #include "xenbus_comms.h"
+ 
+@@ -63,8 +63,6 @@
+ #include <xen/xen.h>
+ #include <asm/xen/hypervisor.h>
+ 
+-MODULE_LICENSE("GPL");
+-
+ /*
+  * An element of a list of outstanding transactions, for which we're
+  * still waiting a reply.
+@@ -624,11 +622,4 @@ static int __init xenbus_init(void)
+ 		pr_err("Could not register xenbus frontend device\n");
+ 	return err;
+ }
+-
+-static void __exit xenbus_exit(void)
+-{
+-	misc_deregister(&xenbus_dev);
+-}
+-
+-module_init(xenbus_init);
+-module_exit(xenbus_exit);
++device_initcall(xenbus_init);
+
+commit 85c0a87cd117e83361932b2b160c9af178fdb21a
+Author: Insu Yun <wuninsu@gmail.com>
+Date:   Mon Jan 18 11:54:43 2016 -0500
+
+    xen: fix potential integer overflow in queue_reply
+    
+    When len is greater than UINT_MAX - sizeof(*rb), in next allocation,
+    it can overflow integer range and allocates small size of heap.
+    After that, memcpy will overflow the allocated heap.
+    Therefore, it needs to check the size of given length.
+    
+    Signed-off-by: Insu Yun <wuninsu@gmail.com>
+    Signed-off-by: David Vrabel <david.vrabel@citrix.com>
+
+diff --git a/drivers/xen/xenbus/xenbus_dev_frontend.c b/drivers/xen/xenbus/xenbus_dev_frontend.c
+index 9433e46518c8..912b64edb42b 100644
+--- a/drivers/xen/xenbus/xenbus_dev_frontend.c
++++ b/drivers/xen/xenbus/xenbus_dev_frontend.c
+@@ -188,6 +188,8 @@ static int queue_reply(struct list_head *queue, const void *data, size_t len)
+ 
+ 	if (len == 0)
+ 		return 0;
++	if (len > XENSTORE_PAYLOAD_MAX)
++		return -EINVAL;
+ 
+ 	rb = kmalloc(sizeof(*rb) + len, GFP_KERNEL);
+ 	if (rb == NULL)
+
+commit a2e75bc2ee207351e6806e77a5379c6c1dd4598a
+Author: Jennifer Herbert <Jennifer.Herbert@citrix.com>
+Date:   Thu Feb 5 14:45:40 2015 +0000
+
+    xenbus: Add proper handling of XS_ERROR from Xenbus for transactions.
+    
+    If Xenstore sends back a XS_ERROR for TRANSACTION_END, the driver BUGs
+    because it cannot find the matching transaction in the list.  For
+    TRANSACTION_START, it leaks memory.
+    
+    Check the message as returned from xenbus_dev_request_and_reply(), and
+    clean up for TRANSACTION_START or discard the error for
+    TRANSACTION_END.
+    
+    Signed-off-by: Jennifer Herbert <Jennifer.Herbert@citrix.com>
+    Signed-off-by: David Vrabel <david.vrabel@citrix.com>
+
+diff --git a/drivers/xen/xenbus/xenbus_dev_frontend.c b/drivers/xen/xenbus/xenbus_dev_frontend.c
+index 85534ea63555..9433e46518c8 100644
+--- a/drivers/xen/xenbus/xenbus_dev_frontend.c
++++ b/drivers/xen/xenbus/xenbus_dev_frontend.c
+@@ -326,10 +326,13 @@ static int xenbus_write_transaction(unsigned msg_type,
+ 	}
+ 
+ 	if (msg_type == XS_TRANSACTION_START) {
+-		trans->handle.id = simple_strtoul(reply, NULL, 0);
+-
+-		list_add(&trans->list, &u->transactions);
+-	} else if (msg_type == XS_TRANSACTION_END) {
++		if (u->u.msg.type == XS_ERROR)
++			kfree(trans);
++		else {
++			trans->handle.id = simple_strtoul(reply, NULL, 0);
++			list_add(&trans->list, &u->transactions);
++		}
++	} else if (u->u.msg.type == XS_TRANSACTION_END) {
+ 		list_for_each_entry(trans, &u->transactions, list)
+ 			if (trans->handle.id == u->u.msg.tx_id)
+ 				break;
+
+commit 283c0972d53769ee44750cad4c27e3f5fa26ec1f
+Author: Joe Perches <joe@perches.com>
+Date:   Fri Jun 28 03:21:41 2013 -0700
+
+    xen: Convert printks to pr_<level>
+    
+    Convert printks to pr_<level> (excludes printk(KERN_DEBUG...)
+    to be more consistent throughout the xen subsystem.
+    
+    Add pr_fmt with KBUILD_MODNAME or "xen:" KBUILD_MODNAME
+    Coalesce formats and add missing word spaces
+    Add missing newlines
+    Align arguments and reflow to 80 columns
+    Remove DRV_NAME from formats as pr_fmt adds the same content
+    
+    This does change some of the prefixes of these messages
+    but it also does make them more consistent.
+    
+    Signed-off-by: Joe Perches <joe@perches.com>
+    Signed-off-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+
+diff --git a/drivers/xen/xenbus/xenbus_dev_frontend.c b/drivers/xen/xenbus/xenbus_dev_frontend.c
+index ac727028e658..85534ea63555 100644
+--- a/drivers/xen/xenbus/xenbus_dev_frontend.c
++++ b/drivers/xen/xenbus/xenbus_dev_frontend.c
+@@ -35,6 +35,8 @@
+  *                              Turned xenfs into a loadable module.
+  */
+ 
++#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++
+ #include <linux/kernel.h>
+ #include <linux/errno.h>
+ #include <linux/uio.h>
+@@ -616,7 +618,7 @@ static int __init xenbus_init(void)
+ 
+ 	err = misc_register(&xenbus_dev);
+ 	if (err)
+-		printk(KERN_ERR "Could not register xenbus frontend device\n");
++		pr_err("Could not register xenbus frontend device\n");
+ 	return err;
+ }
+ 
+
+commit 1bcaba51eba549748917f7d6eb41900ff9ee3d5f
+Author: Jan Beulich <JBeulich@suse.com>
+Date:   Wed Oct 17 13:14:09 2012 -0400
+
+    xen/xenbus: fix overflow check in xenbus_file_write()
+    
+    Acked-by: Ian Campbell <ian.campbell@citrix.com>
+    Reported-by: Dan Carpenter <dan.carpenter@oracle.com>
+    Signed-off-by: Jan Beulich <jbeulich@suse.com>
+    [v1: Rebased on upstream]
+    Signed-off-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+
+diff --git a/drivers/xen/xenbus/xenbus_dev_frontend.c b/drivers/xen/xenbus/xenbus_dev_frontend.c
+index 89f76252a16f..ac727028e658 100644
+--- a/drivers/xen/xenbus/xenbus_dev_frontend.c
++++ b/drivers/xen/xenbus/xenbus_dev_frontend.c
+@@ -458,7 +458,7 @@ static ssize_t xenbus_file_write(struct file *filp,
+ 		goto out;
+ 
+ 	/* Can't write a xenbus message larger we can buffer */
+-	if ((len + u->len) > sizeof(u->u.buffer)) {
++	if (len > sizeof(u->u.buffer) - u->len) {
+ 		/* On error, dump existing buffer */
+ 		u->len = 0;
+ 		rc = -EINVAL;
+
+commit a43a5ccdfa5bd5b2f00aa9b2321df268c2e5d6e2
+Author: Jan Beulich <JBeulich@suse.com>
+Date:   Tue Jan 24 13:52:42 2012 +0000
+
+    xenbus_dev: add missing error check to watch handling
+    
+    So far only the watch path was checked to be zero terminated, while
+    the watch token was merely assumed to be.
+    
+    Signed-off-by: Jan Beulich <jbeulich@suse.com>
+    Signed-off-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+
+diff --git a/drivers/xen/xenbus/xenbus_dev_frontend.c b/drivers/xen/xenbus/xenbus_dev_frontend.c
+index 527dc2a3b89f..89f76252a16f 100644
+--- a/drivers/xen/xenbus/xenbus_dev_frontend.c
++++ b/drivers/xen/xenbus/xenbus_dev_frontend.c
+@@ -369,6 +369,10 @@ static int xenbus_write_watch(unsigned msg_type, struct xenbus_file_priv *u)
+ 		goto out;
+ 	}
+ 	token++;
++	if (memchr(token, 0, u->u.msg.len - (token - path)) == NULL) {
++		rc = -EILSEQ;
++		goto out;
++	}
+ 
+ 	if (msg_type == XS_WATCH) {
+ 		watch = alloc_watch_adapter(path, token);
+
+commit 50bf73796e85ed6a061df6d8474f7cef7870df6a
+Author: Ian Campbell <ian.campbell@citrix.com>
+Date:   Wed Jan 4 11:39:51 2012 +0000
+
+    xenbus: maximum buffer size is XENSTORE_PAYLOAD_MAX
+    
+    Use this now that it is defined even though it happens to be == PAGE_SIZE.
+    
+    The code which takes requests from userspace already validates against the size
+    of this buffer so no further checks are required to ensure that userspace
+    requests comply with the protocol in this respect.
+    
+    Signed-off-by: Ian Campbell <ian.campbell@citrix.com>
+    Cc: Haogang Chen <haogangchen@gmail.com>
+    Signed-off-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+
+diff --git a/drivers/xen/xenbus/xenbus_dev_frontend.c b/drivers/xen/xenbus/xenbus_dev_frontend.c
+index aec01420d979..527dc2a3b89f 100644
+--- a/drivers/xen/xenbus/xenbus_dev_frontend.c
++++ b/drivers/xen/xenbus/xenbus_dev_frontend.c
+@@ -105,7 +105,7 @@ struct xenbus_file_priv {
+ 	unsigned int len;
+ 	union {
+ 		struct xsd_sockmsg msg;
+-		char buffer[PAGE_SIZE];
++		char buffer[XENSTORE_PAYLOAD_MAX];
+ 	} u;
+ 
+ 	/* Response queue. */
+
+commit b79d2ff98caee60c07a7598aba3b26acd1655a99
+Author: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+Date:   Mon Dec 19 15:08:15 2011 -0500
+
+    xen/xenbus-frontend: Fix compile error with randconfig
+    
+    drivers/xen/xenbus/xenbus_dev_frontend.c: In function 'xenbus_init':
+    drivers/xen/xenbus/xenbus_dev_frontend.c:609:2: error: implicit declaration of function 'xen_domain'
+    
+    Reported-by: Randy Dunlap <rdunlap@xenotime.net>
+    Signed-off-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+
+diff --git a/drivers/xen/xenbus/xenbus_dev_frontend.c b/drivers/xen/xenbus/xenbus_dev_frontend.c
+index 9f6be7d59a68..aec01420d979 100644
+--- a/drivers/xen/xenbus/xenbus_dev_frontend.c
++++ b/drivers/xen/xenbus/xenbus_dev_frontend.c
+@@ -58,6 +58,7 @@
+ #include "xenbus_comms.h"
+ 
+ #include <xen/xenbus.h>
++#include <xen/xen.h>
+ #include <asm/xen/hypervisor.h>
+ 
+ MODULE_LICENSE("GPL");
+
+commit fe7acdbec195339e2fbcee518229e85fb9c329b1
+Author: Bastian Blank <waldi@debian.org>
+Date:   Sat Dec 10 19:29:50 2011 +0100
+
+    xen/xenbus-frontend: Make error message more clear
+    
+    Add the work frontend to the error message because we now also have a
+    backend device.
+    
+    Signed-off-by: Bastian Blank <waldi@debian.org>
+    Acked-by: Ian Campbell <ian.campbell@citrix.com>
+    Signed-off-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+
+diff --git a/drivers/xen/xenbus/xenbus_dev_frontend.c b/drivers/xen/xenbus/xenbus_dev_frontend.c
+index fb30cffe0338..9f6be7d59a68 100644
+--- a/drivers/xen/xenbus/xenbus_dev_frontend.c
++++ b/drivers/xen/xenbus/xenbus_dev_frontend.c
+@@ -611,7 +611,7 @@ static int __init xenbus_init(void)
+ 
+ 	err = misc_register(&xenbus_dev);
+ 	if (err)
+-		printk(KERN_ERR "Could not register xenbus device\n");
++		printk(KERN_ERR "Could not register xenbus frontend device\n");
+ 	return err;
+ }
+ 
+
+commit 2fb3683e7b164ee2b324039f7c9d90fe5b1a259b
+Author: Bastian Blank <waldi@debian.org>
+Date:   Sat Dec 10 19:29:47 2011 +0100
+
+    xen: Add xenbus device driver
+    
+    Access to xenbus is currently handled via xenfs. This adds a device
+    driver for xenbus and makes xenfs use this code.
+    
+    Signed-off-by: Bastian Blank <waldi@debian.org>
+    Acked-by: Ian Campbell <ian.campbell@citrix.com>
+    Signed-off-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+
+diff --git a/drivers/xen/xenbus/xenbus_dev_frontend.c b/drivers/xen/xenbus/xenbus_dev_frontend.c
+new file mode 100644
+index 000000000000..fb30cffe0338
+--- /dev/null
++++ b/drivers/xen/xenbus/xenbus_dev_frontend.c
+@@ -0,0 +1,624 @@
++/*
++ * Driver giving user-space access to the kernel's xenbus connection
++ * to xenstore.
++ *
++ * Copyright (c) 2005, Christian Limpach
++ * Copyright (c) 2005, Rusty Russell, IBM Corporation
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License version 2
++ * as published by the Free Software Foundation; or, when distributed
++ * separately from the Linux kernel or incorporated into other
++ * software packages, subject to the following license:
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this source file (the "Software"), to deal in the Software without
++ * restriction, including without limitation the rights to use, copy, modify,
++ * merge, publish, distribute, sublicense, and/or sell copies of the Software,
++ * and to permit persons to whom the Software is furnished to do so, subject to
++ * the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
++ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
++ * IN THE SOFTWARE.
++ *
++ * Changes:
++ * 2008-10-07  Alex Zeffertt    Replaced /proc/xen/xenbus with xenfs filesystem
++ *                              and /proc/xen compatibility mount point.
++ *                              Turned xenfs into a loadable module.
++ */
++
++#include <linux/kernel.h>
++#include <linux/errno.h>
++#include <linux/uio.h>
++#include <linux/notifier.h>
++#include <linux/wait.h>
++#include <linux/fs.h>
++#include <linux/poll.h>
++#include <linux/mutex.h>
++#include <linux/sched.h>
++#include <linux/spinlock.h>
++#include <linux/mount.h>
++#include <linux/pagemap.h>
++#include <linux/uaccess.h>
++#include <linux/init.h>
++#include <linux/namei.h>
++#include <linux/string.h>
++#include <linux/slab.h>
++#include <linux/miscdevice.h>
++#include <linux/module.h>
++
++#include "xenbus_comms.h"
++
++#include <xen/xenbus.h>
++#include <asm/xen/hypervisor.h>
++
++MODULE_LICENSE("GPL");
++
++/*
++ * An element of a list of outstanding transactions, for which we're
++ * still waiting a reply.
++ */
++struct xenbus_transaction_holder {
++	struct list_head list;
++	struct xenbus_transaction handle;
++};
++
++/*
++ * A buffer of data on the queue.
++ */
++struct read_buffer {
++	struct list_head list;
++	unsigned int cons;
++	unsigned int len;
++	char msg[];
++};
++
++struct xenbus_file_priv {
++	/*
++	 * msgbuffer_mutex is held while partial requests are built up
++	 * and complete requests are acted on.  It therefore protects
++	 * the "transactions" and "watches" lists, and the partial
++	 * request length and buffer.
++	 *
++	 * reply_mutex protects the reply being built up to return to
++	 * usermode.  It nests inside msgbuffer_mutex but may be held
++	 * alone during a watch callback.
++	 */
++	struct mutex msgbuffer_mutex;
++
++	/* In-progress transactions */
++	struct list_head transactions;
++
++	/* Active watches. */
++	struct list_head watches;
++
++	/* Partial request. */
++	unsigned int len;
++	union {
++		struct xsd_sockmsg msg;
++		char buffer[PAGE_SIZE];
++	} u;
++
++	/* Response queue. */
++	struct mutex reply_mutex;
++	struct list_head read_buffers;
++	wait_queue_head_t read_waitq;
++
++};
++
++/* Read out any raw xenbus messages queued up. */
++static ssize_t xenbus_file_read(struct file *filp,
++			       char __user *ubuf,
++			       size_t len, loff_t *ppos)
++{
++	struct xenbus_file_priv *u = filp->private_data;
++	struct read_buffer *rb;
++	unsigned i;
++	int ret;
++
++	mutex_lock(&u->reply_mutex);
++again:
++	while (list_empty(&u->read_buffers)) {
++		mutex_unlock(&u->reply_mutex);
++		if (filp->f_flags & O_NONBLOCK)
++			return -EAGAIN;
++
++		ret = wait_event_interruptible(u->read_waitq,
++					       !list_empty(&u->read_buffers));
++		if (ret)
++			return ret;
++		mutex_lock(&u->reply_mutex);
++	}
++
++	rb = list_entry(u->read_buffers.next, struct read_buffer, list);
++	i = 0;
++	while (i < len) {
++		unsigned sz = min((unsigned)len - i, rb->len - rb->cons);
++
++		ret = copy_to_user(ubuf + i, &rb->msg[rb->cons], sz);
++
++		i += sz - ret;
++		rb->cons += sz - ret;
++
++		if (ret != 0) {
++			if (i == 0)
++				i = -EFAULT;
++			goto out;
++		}
++
++		/* Clear out buffer if it has been consumed */
++		if (rb->cons == rb->len) {
++			list_del(&rb->list);
++			kfree(rb);
++			if (list_empty(&u->read_buffers))
++				break;
++			rb = list_entry(u->read_buffers.next,
++					struct read_buffer, list);
++		}
++	}
++	if (i == 0)
++		goto again;
++
++out:
++	mutex_unlock(&u->reply_mutex);
++	return i;
++}
++
++/*
++ * Add a buffer to the queue.  Caller must hold the appropriate lock
++ * if the queue is not local.  (Commonly the caller will build up
++ * multiple queued buffers on a temporary local list, and then add it
++ * to the appropriate list under lock once all the buffers have een
++ * successfully allocated.)
++ */
++static int queue_reply(struct list_head *queue, const void *data, size_t len)
++{
++	struct read_buffer *rb;
++
++	if (len == 0)
++		return 0;
++
++	rb = kmalloc(sizeof(*rb) + len, GFP_KERNEL);
++	if (rb == NULL)
++		return -ENOMEM;
++
++	rb->cons = 0;
++	rb->len = len;
++
++	memcpy(rb->msg, data, len);
++
++	list_add_tail(&rb->list, queue);
++	return 0;
++}
++
++/*
++ * Free all the read_buffer s on a list.
++ * Caller must have sole reference to list.
++ */
++static void queue_cleanup(struct list_head *list)
++{
++	struct read_buffer *rb;
++
++	while (!list_empty(list)) {
++		rb = list_entry(list->next, struct read_buffer, list);
++		list_del(list->next);
++		kfree(rb);
++	}
++}
++
++struct watch_adapter {
++	struct list_head list;
++	struct xenbus_watch watch;
++	struct xenbus_file_priv *dev_data;
++	char *token;
++};
++
++static void free_watch_adapter(struct watch_adapter *watch)
++{
++	kfree(watch->watch.node);
++	kfree(watch->token);
++	kfree(watch);
++}
++
++static struct watch_adapter *alloc_watch_adapter(const char *path,
++						 const char *token)
++{
++	struct watch_adapter *watch;
++
++	watch = kzalloc(sizeof(*watch), GFP_KERNEL);
++	if (watch == NULL)
++		goto out_fail;
++
++	watch->watch.node = kstrdup(path, GFP_KERNEL);
++	if (watch->watch.node == NULL)
++		goto out_free;
++
++	watch->token = kstrdup(token, GFP_KERNEL);
++	if (watch->token == NULL)
++		goto out_free;
++
++	return watch;
++
++out_free:
++	free_watch_adapter(watch);
++
++out_fail:
++	return NULL;
++}
++
++static void watch_fired(struct xenbus_watch *watch,
++			const char **vec,
++			unsigned int len)
++{
++	struct watch_adapter *adap;
++	struct xsd_sockmsg hdr;
++	const char *path, *token;
++	int path_len, tok_len, body_len, data_len = 0;
++	int ret;
++	LIST_HEAD(staging_q);
++
++	adap = container_of(watch, struct watch_adapter, watch);
++
++	path = vec[XS_WATCH_PATH];
++	token = adap->token;
++
++	path_len = strlen(path) + 1;
++	tok_len = strlen(token) + 1;
++	if (len > 2)
++		data_len = vec[len] - vec[2] + 1;
++	body_len = path_len + tok_len + data_len;
++
++	hdr.type = XS_WATCH_EVENT;
++	hdr.len = body_len;
++
++	mutex_lock(&adap->dev_data->reply_mutex);
++
++	ret = queue_reply(&staging_q, &hdr, sizeof(hdr));
++	if (!ret)
++		ret = queue_reply(&staging_q, path, path_len);
++	if (!ret)
++		ret = queue_reply(&staging_q, token, tok_len);
++	if (!ret && len > 2)
++		ret = queue_reply(&staging_q, vec[2], data_len);
++
++	if (!ret) {
++		/* success: pass reply list onto watcher */
++		list_splice_tail(&staging_q, &adap->dev_data->read_buffers);
++		wake_up(&adap->dev_data->read_waitq);
++	} else
++		queue_cleanup(&staging_q);
++
++	mutex_unlock(&adap->dev_data->reply_mutex);
++}
++
++static int xenbus_write_transaction(unsigned msg_type,
++				    struct xenbus_file_priv *u)
++{
++	int rc;
++	void *reply;
++	struct xenbus_transaction_holder *trans = NULL;
++	LIST_HEAD(staging_q);
++
++	if (msg_type == XS_TRANSACTION_START) {
++		trans = kmalloc(sizeof(*trans), GFP_KERNEL);
++		if (!trans) {
++			rc = -ENOMEM;
++			goto out;
++		}
++	}
++
++	reply = xenbus_dev_request_and_reply(&u->u.msg);
++	if (IS_ERR(reply)) {
++		kfree(trans);
++		rc = PTR_ERR(reply);
++		goto out;
++	}
++
++	if (msg_type == XS_TRANSACTION_START) {
++		trans->handle.id = simple_strtoul(reply, NULL, 0);
++
++		list_add(&trans->list, &u->transactions);
++	} else if (msg_type == XS_TRANSACTION_END) {
++		list_for_each_entry(trans, &u->transactions, list)
++			if (trans->handle.id == u->u.msg.tx_id)
++				break;
++		BUG_ON(&trans->list == &u->transactions);
++		list_del(&trans->list);
++
++		kfree(trans);
++	}
++
++	mutex_lock(&u->reply_mutex);
++	rc = queue_reply(&staging_q, &u->u.msg, sizeof(u->u.msg));
++	if (!rc)
++		rc = queue_reply(&staging_q, reply, u->u.msg.len);
++	if (!rc) {
++		list_splice_tail(&staging_q, &u->read_buffers);
++		wake_up(&u->read_waitq);
++	} else {
++		queue_cleanup(&staging_q);
++	}
++	mutex_unlock(&u->reply_mutex);
++
++	kfree(reply);
++
++out:
++	return rc;
++}
++
++static int xenbus_write_watch(unsigned msg_type, struct xenbus_file_priv *u)
++{
++	struct watch_adapter *watch, *tmp_watch;
++	char *path, *token;
++	int err, rc;
++	LIST_HEAD(staging_q);
++
++	path = u->u.buffer + sizeof(u->u.msg);
++	token = memchr(path, 0, u->u.msg.len);
++	if (token == NULL) {
++		rc = -EILSEQ;
++		goto out;
++	}
++	token++;
++
++	if (msg_type == XS_WATCH) {
++		watch = alloc_watch_adapter(path, token);
++		if (watch == NULL) {
++			rc = -ENOMEM;
++			goto out;
++		}
++
++		watch->watch.callback = watch_fired;
++		watch->dev_data = u;
++
++		err = register_xenbus_watch(&watch->watch);
++		if (err) {
++			free_watch_adapter(watch);
++			rc = err;
++			goto out;
++		}
++		list_add(&watch->list, &u->watches);
++	} else {
++		list_for_each_entry_safe(watch, tmp_watch, &u->watches, list) {
++			if (!strcmp(watch->token, token) &&
++			    !strcmp(watch->watch.node, path)) {
++				unregister_xenbus_watch(&watch->watch);
++				list_del(&watch->list);
++				free_watch_adapter(watch);
++				break;
++			}
++		}
++	}
++
++	/* Success.  Synthesize a reply to say all is OK. */
++	{
++		struct {
++			struct xsd_sockmsg hdr;
++			char body[3];
++		} __packed reply = {
++			{
++				.type = msg_type,
++				.len = sizeof(reply.body)
++			},
++			"OK"
++		};
++
++		mutex_lock(&u->reply_mutex);
++		rc = queue_reply(&u->read_buffers, &reply, sizeof(reply));
++		wake_up(&u->read_waitq);
++		mutex_unlock(&u->reply_mutex);
++	}
++
++out:
++	return rc;
++}
++
++static ssize_t xenbus_file_write(struct file *filp,
++				const char __user *ubuf,
++				size_t len, loff_t *ppos)
++{
++	struct xenbus_file_priv *u = filp->private_data;
++	uint32_t msg_type;
++	int rc = len;
++	int ret;
++	LIST_HEAD(staging_q);
++
++	/*
++	 * We're expecting usermode to be writing properly formed
++	 * xenbus messages.  If they write an incomplete message we
++	 * buffer it up.  Once it is complete, we act on it.
++	 */
++
++	/*
++	 * Make sure concurrent writers can't stomp all over each
++	 * other's messages and make a mess of our partial message
++	 * buffer.  We don't make any attemppt to stop multiple
++	 * writers from making a mess of each other's incomplete
++	 * messages; we're just trying to guarantee our own internal
++	 * consistency and make sure that single writes are handled
++	 * atomically.
++	 */
++	mutex_lock(&u->msgbuffer_mutex);
++
++	/* Get this out of the way early to avoid confusion */
++	if (len == 0)
++		goto out;
++
++	/* Can't write a xenbus message larger we can buffer */
++	if ((len + u->len) > sizeof(u->u.buffer)) {
++		/* On error, dump existing buffer */
++		u->len = 0;
++		rc = -EINVAL;
++		goto out;
++	}
++
++	ret = copy_from_user(u->u.buffer + u->len, ubuf, len);
++
++	if (ret != 0) {
++		rc = -EFAULT;
++		goto out;
++	}
++
++	/* Deal with a partial copy. */
++	len -= ret;
++	rc = len;
++
++	u->len += len;
++
++	/* Return if we haven't got a full message yet */
++	if (u->len < sizeof(u->u.msg))
++		goto out;	/* not even the header yet */
++
++	/* If we're expecting a message that's larger than we can
++	   possibly send, dump what we have and return an error. */
++	if ((sizeof(u->u.msg) + u->u.msg.len) > sizeof(u->u.buffer)) {
++		rc = -E2BIG;
++		u->len = 0;
++		goto out;
++	}
++
++	if (u->len < (sizeof(u->u.msg) + u->u.msg.len))
++		goto out;	/* incomplete data portion */
++
++	/*
++	 * OK, now we have a complete message.  Do something with it.
++	 */
++
++	msg_type = u->u.msg.type;
++
++	switch (msg_type) {
++	case XS_WATCH:
++	case XS_UNWATCH:
++		/* (Un)Ask for some path to be watched for changes */
++		ret = xenbus_write_watch(msg_type, u);
++		break;
++
++	default:
++		/* Send out a transaction */
++		ret = xenbus_write_transaction(msg_type, u);
++		break;
++	}
++	if (ret != 0)
++		rc = ret;
++
++	/* Buffered message consumed */
++	u->len = 0;
++
++ out:
++	mutex_unlock(&u->msgbuffer_mutex);
++	return rc;
++}
++
++static int xenbus_file_open(struct inode *inode, struct file *filp)
++{
++	struct xenbus_file_priv *u;
++
++	if (xen_store_evtchn == 0)
++		return -ENOENT;
++
++	nonseekable_open(inode, filp);
++
++	u = kzalloc(sizeof(*u), GFP_KERNEL);
++	if (u == NULL)
++		return -ENOMEM;
++
++	INIT_LIST_HEAD(&u->transactions);
++	INIT_LIST_HEAD(&u->watches);
++	INIT_LIST_HEAD(&u->read_buffers);
++	init_waitqueue_head(&u->read_waitq);
++
++	mutex_init(&u->reply_mutex);
++	mutex_init(&u->msgbuffer_mutex);
++
++	filp->private_data = u;
++
++	return 0;
++}
++
++static int xenbus_file_release(struct inode *inode, struct file *filp)
++{
++	struct xenbus_file_priv *u = filp->private_data;
++	struct xenbus_transaction_holder *trans, *tmp;
++	struct watch_adapter *watch, *tmp_watch;
++	struct read_buffer *rb, *tmp_rb;
++
++	/*
++	 * No need for locking here because there are no other users,
++	 * by definition.
++	 */
++
++	list_for_each_entry_safe(trans, tmp, &u->transactions, list) {
++		xenbus_transaction_end(trans->handle, 1);
++		list_del(&trans->list);
++		kfree(trans);
++	}
++
++	list_for_each_entry_safe(watch, tmp_watch, &u->watches, list) {
++		unregister_xenbus_watch(&watch->watch);
++		list_del(&watch->list);
++		free_watch_adapter(watch);
++	}
++
++	list_for_each_entry_safe(rb, tmp_rb, &u->read_buffers, list) {
++		list_del(&rb->list);
++		kfree(rb);
++	}
++	kfree(u);
++
++	return 0;
++}
++
++static unsigned int xenbus_file_poll(struct file *file, poll_table *wait)
++{
++	struct xenbus_file_priv *u = file->private_data;
++
++	poll_wait(file, &u->read_waitq, wait);
++	if (!list_empty(&u->read_buffers))
++		return POLLIN | POLLRDNORM;
++	return 0;
++}
++
++const struct file_operations xen_xenbus_fops = {
++	.read = xenbus_file_read,
++	.write = xenbus_file_write,
++	.open = xenbus_file_open,
++	.release = xenbus_file_release,
++	.poll = xenbus_file_poll,
++	.llseek = no_llseek,
++};
++EXPORT_SYMBOL_GPL(xen_xenbus_fops);
++
++static struct miscdevice xenbus_dev = {
++	.minor = MISC_DYNAMIC_MINOR,
++	.name = "xen/xenbus",
++	.fops = &xen_xenbus_fops,
++};
++
++static int __init xenbus_init(void)
++{
++	int err;
++
++	if (!xen_domain())
++		return -ENODEV;
++
++	err = misc_register(&xenbus_dev);
++	if (err)
++		printk(KERN_ERR "Could not register xenbus device\n");
++	return err;
++}
++
++static void __exit xenbus_exit(void)
++{
++	misc_deregister(&xenbus_dev);
++}
++
++module_init(xenbus_init);
++module_exit(xenbus_exit);

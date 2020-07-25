@@ -1,0 +1,813 @@
+commit 01f624f01845a1685b6070bfa6be9a13ed03b712
+Author: Chris Wilson <chris@chris-wilson.co.uk>
+Date:   Wed Dec 18 09:40:57 2019 +0000
+
+    drm/i915: Ratelimit i915_globals_park
+    
+    When doing our global park, we like to be a good citizen and shrink our
+    slab caches (of which we have quite a few now), but each
+    kmem_cache_shrink() incurs a stop_machine() and so ends up being quite
+    expensive, causing machine-wide stalls. While ideally we would like to
+    throw away unused pages in our slab caches whenever it appears that we
+    are idling, doing so will require a much cheaper mechanism. In the
+    meantime use a delayed worked to impose a rate-limit that means we have
+    to have been idle for more than 2 seconds before we start shrinking.
+    
+    References: https://gitlab.freedesktop.org/drm/intel/issues/848
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+    Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20191218094057.3510459-1-chris@chris-wilson.co.uk
+
+diff --git a/drivers/gpu/drm/i915/i915_globals.c b/drivers/gpu/drm/i915/i915_globals.c
+index be127cd28931..3aa213684293 100644
+--- a/drivers/gpu/drm/i915/i915_globals.c
++++ b/drivers/gpu/drm/i915/i915_globals.c
+@@ -20,7 +20,10 @@ static LIST_HEAD(globals);
+ static atomic_t active;
+ static atomic_t epoch;
+ static struct park_work {
+-	struct rcu_work work;
++	struct delayed_work work;
++	struct rcu_head rcu;
++	unsigned long flags;
++#define PENDING 0
+ 	int epoch;
+ } park;
+ 
+@@ -37,11 +40,33 @@ static void i915_globals_shrink(void)
+ 		global->shrink();
+ }
+ 
++static void __i915_globals_grace(struct rcu_head *rcu)
++{
++	/* Ratelimit parking as shrinking is quite slow */
++	schedule_delayed_work(&park.work, round_jiffies_up_relative(2 * HZ));
++}
++
++static void __i915_globals_queue_rcu(void)
++{
++	park.epoch = atomic_inc_return(&epoch);
++	if (!atomic_read(&active)) {
++		init_rcu_head(&park.rcu);
++		call_rcu(&park.rcu, __i915_globals_grace);
++	}
++}
++
+ static void __i915_globals_park(struct work_struct *work)
+ {
++	destroy_rcu_head(&park.rcu);
++
+ 	/* Confirm nothing woke up in the last grace period */
+-	if (park.epoch == atomic_read(&epoch))
+-		i915_globals_shrink();
++	if (park.epoch != atomic_read(&epoch)) {
++		__i915_globals_queue_rcu();
++		return;
++	}
++
++	clear_bit(PENDING, &park.flags);
++	i915_globals_shrink();
+ }
+ 
+ void __init i915_global_register(struct i915_global *global)
+@@ -85,7 +110,7 @@ int __init i915_globals_init(void)
+ 		}
+ 	}
+ 
+-	INIT_RCU_WORK(&park.work, __i915_globals_park);
++	INIT_DELAYED_WORK(&park.work, __i915_globals_park);
+ 	return 0;
+ }
+ 
+@@ -103,8 +128,9 @@ void i915_globals_park(void)
+ 	if (!atomic_dec_and_test(&active))
+ 		return;
+ 
+-	park.epoch = atomic_inc_return(&epoch);
+-	queue_rcu_work(system_wq, &park.work);
++	/* Queue cleanup after the next RCU grace period has freed slabs */
++	if (!test_and_set_bit(PENDING, &park.flags))
++		__i915_globals_queue_rcu();
+ }
+ 
+ void i915_globals_unpark(void)
+@@ -113,12 +139,21 @@ void i915_globals_unpark(void)
+ 	atomic_inc(&active);
+ }
+ 
++static void __exit __i915_globals_flush(void)
++{
++	atomic_inc(&active); /* skip shrinking */
++
++	rcu_barrier(); /* wait for the work to be queued */
++	flush_delayed_work(&park.work);
++
++	atomic_dec(&active);
++}
++
+ void __exit i915_globals_exit(void)
+ {
+-	/* Flush any residual park_work */
+-	atomic_inc(&epoch);
+-	flush_rcu_work(&park.work);
++	GEM_BUG_ON(atomic_read(&active));
+ 
++	__i915_globals_flush();
+ 	__i915_globals_cleanup();
+ 
+ 	/* And ensure that our DESTROY_BY_RCU slabs are truly destroyed */
+
+commit 14d1b9a6247c4548015d940ca92dbea05c0245bb
+Author: Matthew Auld <matthew.auld@intel.com>
+Date:   Fri Aug 9 21:29:24 2019 +0100
+
+    drm/i915: buddy allocator
+    
+    Simple buddy allocator. We want to allocate properly aligned
+    power-of-two blocks to promote usage of huge-pages for the GTT, so 64K,
+    2M and possibly even 1G. While we do support allocating stuff at a
+    specific offset, it is more intended for preallocating portions of the
+    address space, say for an initial framebuffer, for other uses drm_mm is
+    probably a much better fit. Anyway, hopefully this can all be thrown
+    away if we eventually move to having the core MM manage device memory.
+    
+    Signed-off-by: Matthew Auld <matthew.auld@intel.com>
+    Cc: Chris Wilson <chris@chris-wilson.co.uk>
+    Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20190809202926.14545-2-matthew.auld@intel.com
+
+diff --git a/drivers/gpu/drm/i915/i915_globals.c b/drivers/gpu/drm/i915/i915_globals.c
+index 2d5fcba98841..be127cd28931 100644
+--- a/drivers/gpu/drm/i915/i915_globals.c
++++ b/drivers/gpu/drm/i915/i915_globals.c
+@@ -62,6 +62,7 @@ static void __i915_globals_cleanup(void)
+ 
+ static __initconst int (* const initfn[])(void) = {
+ 	i915_global_active_init,
++	i915_global_buddy_init,
+ 	i915_global_context_init,
+ 	i915_global_gem_context_init,
+ 	i915_global_objects_init,
+
+commit 10be98a77c558f8cfb823cd2777171fbb35040f6
+Author: Chris Wilson <chris@chris-wilson.co.uk>
+Date:   Tue May 28 10:29:49 2019 +0100
+
+    drm/i915: Move more GEM objects under gem/
+    
+    Continuing the theme of separating out the GEM clutter.
+    
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Reviewed-by: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20190528092956.14910-8-chris@chris-wilson.co.uk
+
+diff --git a/drivers/gpu/drm/i915/i915_globals.c b/drivers/gpu/drm/i915/i915_globals.c
+index db52a58eadcc..2d5fcba98841 100644
+--- a/drivers/gpu/drm/i915/i915_globals.c
++++ b/drivers/gpu/drm/i915/i915_globals.c
+@@ -8,7 +8,7 @@
+ #include <linux/workqueue.h>
+ 
+ #include "i915_active.h"
+-#include "i915_gem_context.h"
++#include "gem/i915_gem_context.h"
+ #include "gem/i915_gem_object.h"
+ #include "i915_globals.h"
+ #include "i915_request.h"
+
+commit 98932149aeb992398a58f6361a86a91f9bfc0b04
+Author: Chris Wilson <chris@chris-wilson.co.uk>
+Date:   Tue May 28 10:29:44 2019 +0100
+
+    drm/i915: Move object->pages API to i915_gem_object.[ch]
+    
+    Currently the code for manipulating the pages on an object is still
+    residing in i915_gem.c, move it to i915_gem_object.c
+    
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Cc: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+    Reviewed-by: Matthew Auld <matthew.auld@intel.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20190528092956.14910-3-chris@chris-wilson.co.uk
+
+diff --git a/drivers/gpu/drm/i915/i915_globals.c b/drivers/gpu/drm/i915/i915_globals.c
+index 81e5c2ce336b..db52a58eadcc 100644
+--- a/drivers/gpu/drm/i915/i915_globals.c
++++ b/drivers/gpu/drm/i915/i915_globals.c
+@@ -9,7 +9,7 @@
+ 
+ #include "i915_active.h"
+ #include "i915_gem_context.h"
+-#include "i915_gem_object.h"
++#include "gem/i915_gem_object.h"
+ #include "i915_globals.h"
+ #include "i915_request.h"
+ #include "i915_scheduler.h"
+
+commit da23379f1508dba4a02feb1ed4f53122fb4ecf64
+Author: Chris Wilson <chris@chris-wilson.co.uk>
+Date:   Mon Apr 8 10:17:02 2019 +0100
+
+    drm/i915: Use static allocation for i915_globals_park()
+    
+    In order to avoid the malloc inside i915_globals_park() occurring
+    underneath a lock connected to the shrinker (thus causing circular
+    lockdeps warnings), move the rcu_worker to a global.
+    
+    <4> [39.085073] ======================================================
+    <4> [39.085273] WARNING: possible circular locking dependency detected
+    <4> [39.085552] 5.1.0-rc3-CI-Trybot_4088+ #1 Tainted: G     U
+    <4> [39.085752] ------------------------------------------------------
+    <4> [39.085949] kswapd0/32 is trying to acquire lock:
+    <4> [39.086121] 00000000004b5f91 (wakeref#3){+.+.}, at: intel_engine_pm_put+0x1b/0x40 [i915]
+    <4> [39.086493]
+    but task is already holding lock:
+    <4> [39.086682] 00000000dd009a9a (fs_reclaim){+.+.}, at: __fs_reclaim_acquire+0x0/0x30
+    <4> [39.086910]
+    which lock already depends on the new lock.
+    
+    <4> [39.087139]
+    the existing dependency chain (in reverse order) is:
+    <4> [39.087356]
+    -> #2 (fs_reclaim){+.+.}:
+    <4> [39.087604]        fs_reclaim_acquire.part.24+0x24/0x30
+    <4> [39.087785]        kmem_cache_alloc_trace+0x2a/0x290
+    <4> [39.087998]        i915_globals_park+0x22/0xa0 [i915]
+    <4> [39.088478]        idle_work_handler+0x1df/0x220 [i915]
+    <4> [39.089016]        process_one_work+0x245/0x610
+    <4> [39.089447]        worker_thread+0x37/0x380
+    <4> [39.089956]        kthread+0x119/0x130
+    <4> [39.090374]        ret_from_fork+0x3a/0x50
+    <4> [39.090868]
+    -> #1 (wakeref#4){+.+.}:
+    <4> [39.091569]        __mutex_lock+0x8c/0x960
+    <4> [39.092054]        atomic_dec_and_mutex_lock+0x33/0x50
+    <4> [39.092521]        intel_gt_pm_put+0x1b/0x40 [i915]
+    <4> [39.093047]        intel_engine_park+0xeb/0x1d0 [i915]
+    <4> [39.093514]        __intel_wakeref_put_once+0x10/0x30 [i915]
+    <4> [39.094062]        i915_request_retire+0x477/0xaf0 [i915]
+    <4> [39.094547]        ring_retire_requests+0x86/0x160 [i915]
+    <4> [39.095110]        i915_retire_requests+0x58/0xc0 [i915]
+    <4> [39.095587]        i915_gem_wait_for_idle.part.22+0xb2/0xf0 [i915]
+    <4> [39.096142]        switch_to_kernel_context_sync+0x2a/0x70 [i915]
+    <4> [39.096633]        i915_gem_init+0x59c/0x9c0 [i915]
+    <4> [39.097174]        i915_driver_load+0xd96/0x1880 [i915]
+    <4> [39.097640]        i915_pci_probe+0x29/0xa0 [i915]
+    <4> [39.098145]        pci_device_probe+0xa1/0x120
+    <4> [39.098607]        really_probe+0xf3/0x3e0
+    <4> [39.099031]        driver_probe_device+0x10a/0x120
+    <4> [39.099599]        device_driver_attach+0x4b/0x50
+    <4> [39.100033]        __driver_attach+0x97/0x130
+    <4> [39.100525]        bus_for_each_dev+0x74/0xc0
+    <4> [39.100954]        bus_add_driver+0x13f/0x210
+    <4> [39.101441]        driver_register+0x56/0xe0
+    <4> [39.101891]        do_one_initcall+0x58/0x2e0
+    <4> [39.102319]        do_init_module+0x56/0x1ea
+    <4> [39.102805]        load_module+0x2701/0x29e0
+    <4> [39.103231]        __se_sys_finit_module+0xd3/0xf0
+    <4> [39.103727]        do_syscall_64+0x55/0x190
+    <4> [39.104153]        entry_SYSCALL_64_after_hwframe+0x49/0xbe
+    <4> [39.104736]
+    -> #0 (wakeref#3){+.+.}:
+    <4> [39.105437]        lock_acquire+0xa6/0x1c0
+    <4> [39.105923]        __mutex_lock+0x8c/0x960
+    <4> [39.106345]        atomic_dec_and_mutex_lock+0x33/0x50
+    <4> [39.106897]        intel_engine_pm_put+0x1b/0x40 [i915]
+    <4> [39.107375]        i915_request_retire+0x477/0xaf0 [i915]
+    <4> [39.107930]        ring_retire_requests+0x86/0x160 [i915]
+    <4> [39.108412]        i915_retire_requests+0x58/0xc0 [i915]
+    <4> [39.108934]        i915_gem_shrink+0xd8/0x5b0 [i915]
+    <4> [39.109431]        i915_gem_shrinker_scan+0x59/0x130 [i915]
+    <4> [39.109884]        do_shrink_slab+0x131/0x3e0
+    <4> [39.110380]        shrink_slab+0x228/0x2c0
+    <4> [39.110810]        shrink_node+0x177/0x460
+    <4> [39.111317]        balance_pgdat+0x239/0x580
+    <4> [39.111743]        kswapd+0x186/0x570
+    <4> [39.112221]        kthread+0x119/0x130
+    <4> [39.112641]        ret_from_fork+0x3a/0x50
+    
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20190408091728.20207-3-chris@chris-wilson.co.uk
+
+diff --git a/drivers/gpu/drm/i915/i915_globals.c b/drivers/gpu/drm/i915/i915_globals.c
+index 2f5c72e2a9d1..81e5c2ce336b 100644
+--- a/drivers/gpu/drm/i915/i915_globals.c
++++ b/drivers/gpu/drm/i915/i915_globals.c
+@@ -17,6 +17,33 @@
+ 
+ static LIST_HEAD(globals);
+ 
++static atomic_t active;
++static atomic_t epoch;
++static struct park_work {
++	struct rcu_work work;
++	int epoch;
++} park;
++
++static void i915_globals_shrink(void)
++{
++	struct i915_global *global;
++
++	/*
++	 * kmem_cache_shrink() discards empty slabs and reorders partially
++	 * filled slabs to prioritise allocating from the mostly full slabs,
++	 * with the aim of reducing fragmentation.
++	 */
++	list_for_each_entry(global, &globals, link)
++		global->shrink();
++}
++
++static void __i915_globals_park(struct work_struct *work)
++{
++	/* Confirm nothing woke up in the last grace period */
++	if (park.epoch == atomic_read(&epoch))
++		i915_globals_shrink();
++}
++
+ void __init i915_global_register(struct i915_global *global)
+ {
+ 	GEM_BUG_ON(!global->shrink);
+@@ -57,44 +84,12 @@ int __init i915_globals_init(void)
+ 		}
+ 	}
+ 
++	INIT_RCU_WORK(&park.work, __i915_globals_park);
+ 	return 0;
+ }
+ 
+-static void i915_globals_shrink(void)
+-{
+-	struct i915_global *global;
+-
+-	/*
+-	 * kmem_cache_shrink() discards empty slabs and reorders partially
+-	 * filled slabs to prioritise allocating from the mostly full slabs,
+-	 * with the aim of reducing fragmentation.
+-	 */
+-	list_for_each_entry(global, &globals, link)
+-		global->shrink();
+-}
+-
+-static atomic_t active;
+-static atomic_t epoch;
+-struct park_work {
+-	struct rcu_work work;
+-	int epoch;
+-};
+-
+-static void __i915_globals_park(struct work_struct *work)
+-{
+-	struct park_work *wrk = container_of(work, typeof(*wrk), work.work);
+-
+-	/* Confirm nothing woke up in the last grace period */
+-	if (wrk->epoch == atomic_read(&epoch))
+-		i915_globals_shrink();
+-
+-	kfree(wrk);
+-}
+-
+ void i915_globals_park(void)
+ {
+-	struct park_work *wrk;
+-
+ 	/*
+ 	 * Defer shrinking the global slab caches (and other work) until
+ 	 * after a RCU grace period has completed with no activity. This
+@@ -107,13 +102,8 @@ void i915_globals_park(void)
+ 	if (!atomic_dec_and_test(&active))
+ 		return;
+ 
+-	wrk = kmalloc(sizeof(*wrk), GFP_KERNEL);
+-	if (!wrk)
+-		return;
+-
+-	wrk->epoch = atomic_inc_return(&epoch);
+-	INIT_RCU_WORK(&wrk->work, __i915_globals_park);
+-	queue_rcu_work(system_wq, &wrk->work);
++	park.epoch = atomic_inc_return(&epoch);
++	queue_rcu_work(system_wq, &park.work);
+ }
+ 
+ void i915_globals_unpark(void)
+@@ -125,8 +115,8 @@ void i915_globals_unpark(void)
+ void __exit i915_globals_exit(void)
+ {
+ 	/* Flush any residual park_work */
+-	rcu_barrier();
+-	flush_scheduled_work();
++	atomic_inc(&epoch);
++	flush_rcu_work(&park.work);
+ 
+ 	__i915_globals_cleanup();
+ 
+
+commit c4d52feb2c46ddcdde4058cf03f8b9eb996bb09b
+Author: Chris Wilson <chris@chris-wilson.co.uk>
+Date:   Fri Mar 8 13:25:19 2019 +0000
+
+    drm/i915: Move over to intel_context_lookup()
+    
+    In preparation for an ever growing number of engines and so ever
+    increasing static array of HW contexts within the GEM context, move the
+    array over to an rbtree, allocated upon first use.
+    
+    Unfortunately, this imposes an rbtree lookup at a few frequent callsites,
+    but we should be able to mitigate those by moving over to using the HW
+    context as our primary type and so only incur the lookup on the boundary
+    with the user GEM context and engines.
+    
+    v2: Check for no HW context in guc_stage_desc_init
+    
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+    Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20190308132522.21573-4-chris@chris-wilson.co.uk
+
+diff --git a/drivers/gpu/drm/i915/i915_globals.c b/drivers/gpu/drm/i915/i915_globals.c
+index 1cf4e8bc8ec6..2f5c72e2a9d1 100644
+--- a/drivers/gpu/drm/i915/i915_globals.c
++++ b/drivers/gpu/drm/i915/i915_globals.c
+@@ -36,6 +36,7 @@ static void __i915_globals_cleanup(void)
+ static __initconst int (* const initfn[])(void) = {
+ 	i915_global_active_init,
+ 	i915_global_context_init,
++	i915_global_gem_context_init,
+ 	i915_global_objects_init,
+ 	i915_global_request_init,
+ 	i915_global_scheduler_init,
+
+commit 103b76eeff2e86cad489a54e6003d0173df76bde
+Author: Chris Wilson <chris@chris-wilson.co.uk>
+Date:   Tue Mar 5 21:38:30 2019 +0000
+
+    drm/i915: Use i915_global_register()
+    
+    Rather than manually add every new global into each hook, use
+    i915_global_register() function and keep a list of registered globals to
+    invoke instead.
+    
+    However, I haven't found a way for random drivers to add an .init table
+    to avoid having to manually add ourselves to i915_globals_init() each
+    time.
+    
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20190305213830.18094-1-chris@chris-wilson.co.uk
+    Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+
+diff --git a/drivers/gpu/drm/i915/i915_globals.c b/drivers/gpu/drm/i915/i915_globals.c
+index cfd0bc462f58..1cf4e8bc8ec6 100644
+--- a/drivers/gpu/drm/i915/i915_globals.c
++++ b/drivers/gpu/drm/i915/i915_globals.c
+@@ -15,62 +15,61 @@
+ #include "i915_scheduler.h"
+ #include "i915_vma.h"
+ 
+-int __init i915_globals_init(void)
++static LIST_HEAD(globals);
++
++void __init i915_global_register(struct i915_global *global)
+ {
+-	int err;
++	GEM_BUG_ON(!global->shrink);
++	GEM_BUG_ON(!global->exit);
+ 
+-	err = i915_global_active_init();
+-	if (err)
+-		return err;
++	list_add_tail(&global->link, &globals);
++}
+ 
+-	err = i915_global_context_init();
+-	if (err)
+-		goto err_active;
++static void __i915_globals_cleanup(void)
++{
++	struct i915_global *global, *next;
+ 
+-	err = i915_global_objects_init();
+-	if (err)
+-		goto err_context;
++	list_for_each_entry_safe_reverse(global, next, &globals, link)
++		global->exit();
++}
+ 
+-	err = i915_global_request_init();
+-	if (err)
+-		goto err_objects;
++static __initconst int (* const initfn[])(void) = {
++	i915_global_active_init,
++	i915_global_context_init,
++	i915_global_objects_init,
++	i915_global_request_init,
++	i915_global_scheduler_init,
++	i915_global_vma_init,
++};
+ 
+-	err = i915_global_scheduler_init();
+-	if (err)
+-		goto err_request;
++int __init i915_globals_init(void)
++{
++	int i;
+ 
+-	err = i915_global_vma_init();
+-	if (err)
+-		goto err_scheduler;
++	for (i = 0; i < ARRAY_SIZE(initfn); i++) {
++		int err;
+ 
+-	return 0;
++		err = initfn[i]();
++		if (err) {
++			__i915_globals_cleanup();
++			return err;
++		}
++	}
+ 
+-err_scheduler:
+-	i915_global_scheduler_exit();
+-err_request:
+-	i915_global_request_exit();
+-err_objects:
+-	i915_global_objects_exit();
+-err_context:
+-	i915_global_context_exit();
+-err_active:
+-	i915_global_active_exit();
+-	return err;
++	return 0;
+ }
+ 
+ static void i915_globals_shrink(void)
+ {
++	struct i915_global *global;
++
+ 	/*
+ 	 * kmem_cache_shrink() discards empty slabs and reorders partially
+ 	 * filled slabs to prioritise allocating from the mostly full slabs,
+ 	 * with the aim of reducing fragmentation.
+ 	 */
+-	i915_global_active_shrink();
+-	i915_global_context_shrink();
+-	i915_global_objects_shrink();
+-	i915_global_request_shrink();
+-	i915_global_scheduler_shrink();
+-	i915_global_vma_shrink();
++	list_for_each_entry(global, &globals, link)
++		global->shrink();
+ }
+ 
+ static atomic_t active;
+@@ -128,12 +127,7 @@ void __exit i915_globals_exit(void)
+ 	rcu_barrier();
+ 	flush_scheduled_work();
+ 
+-	i915_global_vma_exit();
+-	i915_global_scheduler_exit();
+-	i915_global_request_exit();
+-	i915_global_objects_exit();
+-	i915_global_context_exit();
+-	i915_global_active_exit();
++	__i915_globals_cleanup();
+ 
+ 	/* And ensure that our DESTROY_BY_RCU slabs are truly destroyed */
+ 	rcu_barrier();
+
+commit 13f1bfd3b3329b19950f95964580a84795ce7be9
+Author: Chris Wilson <chris@chris-wilson.co.uk>
+Date:   Thu Feb 28 10:20:34 2019 +0000
+
+    drm/i915: Make object/vma allocation caches global
+    
+    As our allocations are not device specific, we can move our slab caches
+    to a global scope.
+    
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20190228102035.5857-2-chris@chris-wilson.co.uk
+
+diff --git a/drivers/gpu/drm/i915/i915_globals.c b/drivers/gpu/drm/i915/i915_globals.c
+index 7fd1b3945a04..cfd0bc462f58 100644
+--- a/drivers/gpu/drm/i915/i915_globals.c
++++ b/drivers/gpu/drm/i915/i915_globals.c
+@@ -8,9 +8,12 @@
+ #include <linux/workqueue.h>
+ 
+ #include "i915_active.h"
++#include "i915_gem_context.h"
++#include "i915_gem_object.h"
+ #include "i915_globals.h"
+ #include "i915_request.h"
+ #include "i915_scheduler.h"
++#include "i915_vma.h"
+ 
+ int __init i915_globals_init(void)
+ {
+@@ -20,18 +23,36 @@ int __init i915_globals_init(void)
+ 	if (err)
+ 		return err;
+ 
+-	err = i915_global_request_init();
++	err = i915_global_context_init();
+ 	if (err)
+ 		goto err_active;
+ 
++	err = i915_global_objects_init();
++	if (err)
++		goto err_context;
++
++	err = i915_global_request_init();
++	if (err)
++		goto err_objects;
++
+ 	err = i915_global_scheduler_init();
+ 	if (err)
+ 		goto err_request;
+ 
++	err = i915_global_vma_init();
++	if (err)
++		goto err_scheduler;
++
+ 	return 0;
+ 
++err_scheduler:
++	i915_global_scheduler_exit();
+ err_request:
+ 	i915_global_request_exit();
++err_objects:
++	i915_global_objects_exit();
++err_context:
++	i915_global_context_exit();
+ err_active:
+ 	i915_global_active_exit();
+ 	return err;
+@@ -45,8 +66,11 @@ static void i915_globals_shrink(void)
+ 	 * with the aim of reducing fragmentation.
+ 	 */
+ 	i915_global_active_shrink();
++	i915_global_context_shrink();
++	i915_global_objects_shrink();
+ 	i915_global_request_shrink();
+ 	i915_global_scheduler_shrink();
++	i915_global_vma_shrink();
+ }
+ 
+ static atomic_t active;
+@@ -104,8 +128,11 @@ void __exit i915_globals_exit(void)
+ 	rcu_barrier();
+ 	flush_scheduled_work();
+ 
++	i915_global_vma_exit();
+ 	i915_global_scheduler_exit();
+ 	i915_global_request_exit();
++	i915_global_objects_exit();
++	i915_global_context_exit();
+ 	i915_global_active_exit();
+ 
+ 	/* And ensure that our DESTROY_BY_RCU slabs are truly destroyed */
+
+commit 32eb6bcfdda9dad240cf6a22fda2b3418b1a1b8e
+Author: Chris Wilson <chris@chris-wilson.co.uk>
+Date:   Thu Feb 28 10:20:33 2019 +0000
+
+    drm/i915: Make request allocation caches global
+    
+    As kmem_caches share the same properties (size, allocation/free behaviour)
+    for all potential devices, we can use global caches. While this
+    potential has worse fragmentation behaviour (one can argue that
+    different devices would have different activity lifetimes, but you can
+    also argue that activity is temporal across the system) it is the
+    default behaviour of the system at large to amalgamate matching caches.
+    
+    The benefit for us is much reduced pointer dancing along the frequent
+    allocation paths.
+    
+    v2: Defer shrinking until after a global grace period for futureproofing
+    multiple consumers of the slab caches, similar to the current strategy
+    for avoiding shrinking too early.
+    
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20190228102035.5857-1-chris@chris-wilson.co.uk
+
+diff --git a/drivers/gpu/drm/i915/i915_globals.c b/drivers/gpu/drm/i915/i915_globals.c
+new file mode 100644
+index 000000000000..7fd1b3945a04
+--- /dev/null
++++ b/drivers/gpu/drm/i915/i915_globals.c
+@@ -0,0 +1,113 @@
++/*
++ * SPDX-License-Identifier: MIT
++ *
++ * Copyright © 2019 Intel Corporation
++ */
++
++#include <linux/slab.h>
++#include <linux/workqueue.h>
++
++#include "i915_active.h"
++#include "i915_globals.h"
++#include "i915_request.h"
++#include "i915_scheduler.h"
++
++int __init i915_globals_init(void)
++{
++	int err;
++
++	err = i915_global_active_init();
++	if (err)
++		return err;
++
++	err = i915_global_request_init();
++	if (err)
++		goto err_active;
++
++	err = i915_global_scheduler_init();
++	if (err)
++		goto err_request;
++
++	return 0;
++
++err_request:
++	i915_global_request_exit();
++err_active:
++	i915_global_active_exit();
++	return err;
++}
++
++static void i915_globals_shrink(void)
++{
++	/*
++	 * kmem_cache_shrink() discards empty slabs and reorders partially
++	 * filled slabs to prioritise allocating from the mostly full slabs,
++	 * with the aim of reducing fragmentation.
++	 */
++	i915_global_active_shrink();
++	i915_global_request_shrink();
++	i915_global_scheduler_shrink();
++}
++
++static atomic_t active;
++static atomic_t epoch;
++struct park_work {
++	struct rcu_work work;
++	int epoch;
++};
++
++static void __i915_globals_park(struct work_struct *work)
++{
++	struct park_work *wrk = container_of(work, typeof(*wrk), work.work);
++
++	/* Confirm nothing woke up in the last grace period */
++	if (wrk->epoch == atomic_read(&epoch))
++		i915_globals_shrink();
++
++	kfree(wrk);
++}
++
++void i915_globals_park(void)
++{
++	struct park_work *wrk;
++
++	/*
++	 * Defer shrinking the global slab caches (and other work) until
++	 * after a RCU grace period has completed with no activity. This
++	 * is to try and reduce the latency impact on the consumers caused
++	 * by us shrinking the caches the same time as they are trying to
++	 * allocate, with the assumption being that if we idle long enough
++	 * for an RCU grace period to elapse since the last use, it is likely
++	 * to be longer until we need the caches again.
++	 */
++	if (!atomic_dec_and_test(&active))
++		return;
++
++	wrk = kmalloc(sizeof(*wrk), GFP_KERNEL);
++	if (!wrk)
++		return;
++
++	wrk->epoch = atomic_inc_return(&epoch);
++	INIT_RCU_WORK(&wrk->work, __i915_globals_park);
++	queue_rcu_work(system_wq, &wrk->work);
++}
++
++void i915_globals_unpark(void)
++{
++	atomic_inc(&epoch);
++	atomic_inc(&active);
++}
++
++void __exit i915_globals_exit(void)
++{
++	/* Flush any residual park_work */
++	rcu_barrier();
++	flush_scheduled_work();
++
++	i915_global_scheduler_exit();
++	i915_global_request_exit();
++	i915_global_active_exit();
++
++	/* And ensure that our DESTROY_BY_RCU slabs are truly destroyed */
++	rcu_barrier();
++}

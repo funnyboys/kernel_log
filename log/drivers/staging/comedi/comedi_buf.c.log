@@ -1,0 +1,4657 @@
+commit e36472145aa706c186a6bb4f6419c613b0b1305c
+Author: Ian Abbott <abbotti@mev.co.uk>
+Date:   Tue Jun 25 12:26:59 2019 +0100
+
+    staging: comedi: use dma_mmap_coherent for DMA-able buffer mmap
+    
+    Comedi's acquisition buffer allocation code can allocate the buffer from
+    normal kernel memory or from DMA coherent memory depending on the
+    `dma_async_dir` value in the comedi subdevice.  (A value of `DMA_NONE`
+    causes the buffer to be allocated from normal kernel memory.  Other
+    values cause the buffer to be allocated from DMA coherent memory.)   The
+    buffer currently consists of a bunch of page-sized blocks that are
+    vmap'ed into a contiguous range of virtual addresses. The pages are also
+    mmap'able into user address space.  For DMA'able buffers, these
+    page-sized blocks are allocated by `dma_alloc_coherent()`.
+    
+    For DMA-able buffers, the DMA API is currently abused in various ways,
+    the most serious abuse being the calling of `virt_to_page()` on the
+    blocks allocated by `dma_alloc_coherent()` and passing those pages to
+    `vmap()` (for mapping to the kernels vmalloc address space) and via
+    `page_to_pfn()` to `remap_pfn_range()` (for mmap'ing to user space).  it
+    also uses the `__GFP_COMP` flag when allocating the blocks, and marks
+    the allocated pages as reserved (which is unnecessary for DMA coherent
+    allocations).
+    
+    The code can be changed to get rid of the vmap'ed address altogether if
+    necessary, since there are only a few places in the comedi code that use
+    the vmap'ed address directly and we also keep a list of the kernel
+    addresses for the individual pages prior to the vmap operation. This
+    would add some run-time overhead to buffer accesses.  The real killer is
+    the mmap operation.
+    
+    For mmap, the address range specified in the VMA needs to be mmap'ed to
+    the individually allocated page-sized blocks.  That is not a problem
+    when the pages are allocated from normal kernel memory as the individual
+    pages can be remapped by `remap_pfn_range()`, but it is a problem when
+    the page-sized blocks are allocated by `dma_alloc_coherent()` because
+    the DMA API currently has no support for splitting a VMA across multiple
+    blocks of DMA coherent memory (or rather, no support for mapping part of
+    a VMA range to a single block of DMA coherent memory).
+    
+    In order to comply with the DMA API and allow the buffer to be mmap'ed,
+    the buffer needs to be allocated as a single block by a single call to
+    `dma_alloc_coherent()`, freed by a single call to `dma_free_coherent()`,
+    and mmap'ed to user space by a single call to `dma_mmap_coherent()`.
+    This patch changes the buffer allocation, freeing, and mmap'ing code to
+    do that, with the unfortunate consequence that buffer allocation is more
+    likely to fail.  It also no longer uses the `__GFP_COMP` flag when
+    allocating DMA coherent memory, no longer marks the
+    allocated pages of DMA coherent memory as reserved, and no longer vmap's
+    the DMA coherent memory pages (since they are contiguous anyway).
+    
+    Signed-off-by: Ian Abbott <abbotti@mev.co.uk>
+    Reviewed-by: Christoph Hellwig <hch@lst.de>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index d2c8cc72a99d..3ef3ddabf139 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -27,18 +27,19 @@ static void comedi_buf_map_kref_release(struct kref *kref)
+ 	unsigned int i;
+ 
+ 	if (bm->page_list) {
+-		for (i = 0; i < bm->n_pages; i++) {
+-			buf = &bm->page_list[i];
+-			clear_bit(PG_reserved,
+-				  &(virt_to_page(buf->virt_addr)->flags));
+-			if (bm->dma_dir != DMA_NONE) {
+-#ifdef CONFIG_HAS_DMA
+-				dma_free_coherent(bm->dma_hw_dev,
+-						  PAGE_SIZE,
+-						  buf->virt_addr,
+-						  buf->dma_addr);
+-#endif
+-			} else {
++		if (bm->dma_dir != DMA_NONE) {
++			/*
++			 * DMA buffer was allocated as a single block.
++			 * Address is in page_list[0].
++			 */
++			buf = &bm->page_list[0];
++			dma_free_coherent(bm->dma_hw_dev,
++					  PAGE_SIZE * bm->n_pages,
++					  buf->virt_addr, buf->dma_addr);
++		} else {
++			for (i = 0; i < bm->n_pages; i++) {
++				buf = &bm->page_list[i];
++				ClearPageReserved(virt_to_page(buf->virt_addr));
+ 				free_page((unsigned long)buf->virt_addr);
+ 			}
+ 		}
+@@ -57,7 +58,8 @@ static void __comedi_buf_free(struct comedi_device *dev,
+ 	unsigned long flags;
+ 
+ 	if (async->prealloc_buf) {
+-		vunmap(async->prealloc_buf);
++		if (s->async_dma_dir == DMA_NONE)
++			vunmap(async->prealloc_buf);
+ 		async->prealloc_buf = NULL;
+ 		async->prealloc_bufsz = 0;
+ 	}
+@@ -69,6 +71,72 @@ static void __comedi_buf_free(struct comedi_device *dev,
+ 	comedi_buf_map_put(bm);
+ }
+ 
++static struct comedi_buf_map *
++comedi_buf_map_alloc(struct comedi_device *dev, enum dma_data_direction dma_dir,
++		     unsigned int n_pages)
++{
++	struct comedi_buf_map *bm;
++	struct comedi_buf_page *buf;
++	unsigned int i;
++
++	bm = kzalloc(sizeof(*bm), GFP_KERNEL);
++	if (!bm)
++		return NULL;
++
++	kref_init(&bm->refcount);
++	bm->dma_dir = dma_dir;
++	if (bm->dma_dir != DMA_NONE) {
++		/* Need ref to hardware device to free buffer later. */
++		bm->dma_hw_dev = get_device(dev->hw_dev);
++	}
++
++	bm->page_list = vzalloc(sizeof(*buf) * n_pages);
++	if (!bm->page_list)
++		goto err;
++
++	if (bm->dma_dir != DMA_NONE) {
++		void *virt_addr;
++		dma_addr_t dma_addr;
++
++		/*
++		 * Currently, the DMA buffer needs to be allocated as a
++		 * single block so that it can be mmap()'ed.
++		 */
++		virt_addr = dma_alloc_coherent(bm->dma_hw_dev,
++					       PAGE_SIZE * n_pages, &dma_addr,
++					       GFP_KERNEL);
++		if (!virt_addr)
++			goto err;
++
++		for (i = 0; i < n_pages; i++) {
++			buf = &bm->page_list[i];
++			buf->virt_addr = virt_addr + (i << PAGE_SHIFT);
++			buf->dma_addr = dma_addr + (i << PAGE_SHIFT);
++		}
++
++		bm->n_pages = i;
++	} else {
++		for (i = 0; i < n_pages; i++) {
++			buf = &bm->page_list[i];
++			buf->virt_addr = (void *)get_zeroed_page(GFP_KERNEL);
++			if (!buf->virt_addr)
++				break;
++
++			SetPageReserved(virt_to_page(buf->virt_addr));
++		}
++
++		bm->n_pages = i;
++		if (i < n_pages)
++			goto err;
++	}
++
++	return bm;
++
++err:
++	comedi_buf_map_put(bm);
++	return NULL;
++}
++
+ static void __comedi_buf_alloc(struct comedi_device *dev,
+ 			       struct comedi_subdevice *s,
+ 			       unsigned int n_pages)
+@@ -86,57 +154,37 @@ static void __comedi_buf_alloc(struct comedi_device *dev,
+ 		return;
+ 	}
+ 
+-	bm = kzalloc(sizeof(*async->buf_map), GFP_KERNEL);
++	bm = comedi_buf_map_alloc(dev, s->async_dma_dir, n_pages);
+ 	if (!bm)
+ 		return;
+ 
+-	kref_init(&bm->refcount);
+ 	spin_lock_irqsave(&s->spin_lock, flags);
+ 	async->buf_map = bm;
+ 	spin_unlock_irqrestore(&s->spin_lock, flags);
+-	bm->dma_dir = s->async_dma_dir;
+-	if (bm->dma_dir != DMA_NONE)
+-		/* Need ref to hardware device to free buffer later. */
+-		bm->dma_hw_dev = get_device(dev->hw_dev);
+ 
+-	bm->page_list = vzalloc(sizeof(*buf) * n_pages);
+-	if (bm->page_list)
++	if (bm->dma_dir != DMA_NONE) {
++		/*
++		 * DMA buffer was allocated as a single block.
++		 * Address is in page_list[0].
++		 */
++		buf = &bm->page_list[0];
++		async->prealloc_buf = buf->virt_addr;
++	} else {
+ 		pages = vmalloc(sizeof(struct page *) * n_pages);
++		if (!pages)
++			return;
+ 
+-	if (!pages)
+-		return;
+-
+-	for (i = 0; i < n_pages; i++) {
+-		buf = &bm->page_list[i];
+-		if (bm->dma_dir != DMA_NONE)
+-#ifdef CONFIG_HAS_DMA
+-			buf->virt_addr = dma_alloc_coherent(bm->dma_hw_dev,
+-							    PAGE_SIZE,
+-							    &buf->dma_addr,
+-							    GFP_KERNEL |
+-							    __GFP_COMP);
+-#else
+-			break;
+-#endif
+-		else
+-			buf->virt_addr = (void *)get_zeroed_page(GFP_KERNEL);
+-		if (!buf->virt_addr)
+-			break;
+-
+-		set_bit(PG_reserved, &(virt_to_page(buf->virt_addr)->flags));
+-
+-		pages[i] = virt_to_page(buf->virt_addr);
+-	}
+-	spin_lock_irqsave(&s->spin_lock, flags);
+-	bm->n_pages = i;
+-	spin_unlock_irqrestore(&s->spin_lock, flags);
++		for (i = 0; i < n_pages; i++) {
++			buf = &bm->page_list[i];
++			pages[i] = virt_to_page(buf->virt_addr);
++		}
+ 
+-	/* vmap the prealloc_buf if all the pages were allocated */
+-	if (i == n_pages)
++		/* vmap the pages to prealloc_buf */
+ 		async->prealloc_buf = vmap(pages, n_pages, VM_MAP,
+ 					   COMEDI_PAGE_PROTECTION);
+ 
+-	vfree(pages);
++		vfree(pages);
++	}
+ }
+ 
+ void comedi_buf_map_get(struct comedi_buf_map *bm)
+
+commit 77c21b626be5b6b30ca6f76ccd5ba1d14a8278a9
+Author: Ian Abbott <abbotti@mev.co.uk>
+Date:   Wed Apr 17 15:39:29 2019 +0100
+
+    staging: comedi: Add lockdep_assert_held() calls for dev->mutex
+    
+    Lots of functions in the core comedi module expect the mutex in `struct
+    comedi_device` to be held, so add calls to `lockdep_assert_held()` to
+    check and document that.  An unusual case is the calls to
+    `lockdep_assert_held()` after successful return from
+    `comedi_alloc_board_minor()` which allocates a `struct comedi_device`
+    and returns with its mutex locked.
+    
+    Signed-off-by: Ian Abbott <abbotti@mev.co.uk>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index f693c2c0bec3..d2c8cc72a99d 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -211,6 +211,8 @@ int comedi_buf_alloc(struct comedi_device *dev, struct comedi_subdevice *s,
+ {
+ 	struct comedi_async *async = s->async;
+ 
++	lockdep_assert_held(&dev->mutex);
++
+ 	/* Round up new_size to multiple of PAGE_SIZE */
+ 	new_size = (new_size + PAGE_SIZE - 1) & PAGE_MASK;
+ 
+
+commit f814e74c9b5f37f22fe28acc1989566b99adb170
+Author: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Date:   Tue Nov 7 14:58:45 2017 +0100
+
+    staging: comedi: Remove redundant license text
+    
+    Now that the SPDX tag is in all comedi files, that identifies the
+    license in a specific and legally-defined manner.  So the extra GPL text
+    wording can be removed as it is no longer needed at all.
+    
+    This is done on a quest to remove the 700+ different ways that files in
+    the kernel describe the GPL license text.  And there's unneeded stuff
+    like the address (sometimes incorrect) for the FSF which is never
+    needed.
+    
+    No copyright headers or other non-license-description text was removed.
+    
+    Cc: Ian Abbott <abbotti@mev.co.uk>
+    Cc: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index e75d41ac2a19..f693c2c0bec3 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -5,16 +5,6 @@
+  * COMEDI - Linux Control and Measurement Device Interface
+  * Copyright (C) 1997-2000 David A. Schleef <ds@schleef.org>
+  * Copyright (C) 2002 Frank Mori Hess <fmhess@users.sourceforge.net>
+- *
+- * This program is free software; you can redistribute it and/or modify
+- * it under the terms of the GNU General Public License as published by
+- * the Free Software Foundation; either version 2 of the License, or
+- * (at your option) any later version.
+- *
+- * This program is distributed in the hope that it will be useful,
+- * but WITHOUT ANY WARRANTY; without even the implied warranty of
+- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+- * GNU General Public License for more details.
+  */
+ 
+ #include <linux/vmalloc.h>
+
+commit e184e2bed8fc895ce930624524d319289c1f1082
+Author: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Date:   Tue Nov 7 14:58:43 2017 +0100
+
+    staging: comedi: add SPDX identifiers to all greybus driver files
+    
+    It's good to have SPDX identifiers in all files to make it easier to
+    audit the kernel tree for correct licenses.
+    
+    Update the drivers/staging/comedi files files with the correct SPDX
+    license identifier based on the license text in the file itself.  The
+    SPDX identifier is a legally binding shorthand, which can be used
+    instead of the full boiler plate text.
+    
+    This work is based on a script and data from Thomas Gleixner, Philippe
+    Ombredanne, and Kate Stewart.
+    
+    Cc: Ian Abbott <abbotti@mev.co.uk>
+    Cc: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Kate Stewart <kstewart@linuxfoundation.org>
+    Cc: Philippe Ombredanne <pombredanne@nexb.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index b455ff6714eb..e75d41ac2a19 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -1,3 +1,4 @@
++// SPDX-License-Identifier: GPL-2.0+
+ /*
+  * comedi_buf.c
+  *
+
+commit f47d8b11eeaf32fa124cf006ef9f4ef6d63c9d50
+Author: Amitoj Kaur Chawla <amitoj1606@gmail.com>
+Date:   Mon Jul 3 19:13:34 2017 -0400
+
+    staging: comedi: Use offset_in_page macro
+    
+    Use offset_in_page macro instead of (var & ~PAGE_MASK)
+    
+    The Coccinelle semantic patch used to make this change is as follows:
+    // <smpl>
+    @@
+    unsigned long p;
+    @@
+    - p & ~PAGE_MASK
+    + offset_in_page(p)
+    // </smpl>
+    
+    Signed-off-by: Amitoj Kaur Chawla <amitoj1606@gmail.com>
+    Signed-off-by: Ian Abbott <abbotti@mev.co.uk>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index 8e9b30b26810..b455ff6714eb 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -165,7 +165,7 @@ int comedi_buf_map_put(struct comedi_buf_map *bm)
+ int comedi_buf_map_access(struct comedi_buf_map *bm, unsigned long offset,
+ 			  void *buf, int len, int write)
+ {
+-	unsigned int pgoff = offset & ~PAGE_MASK;
++	unsigned int pgoff = offset_in_page(offset);
+ 	unsigned long pg = offset >> PAGE_SHIFT;
+ 	int done = 0;
+ 
+
+commit 255364f7b8a0fee3fb642b3e1521e943dd67bfb3
+Author: Ian Abbott <abbotti@mev.co.uk>
+Date:   Thu Apr 20 19:05:14 2017 +0100
+
+    staging: comedi: support vm_access_process for mmap'd buffer
+    
+    If a process that has mmap'd a COMEDI buffer is being run under a
+    debugger such as GDB, the buffer contents are inaccessible from the
+    debugger.  Support the `access()` VM operation to allow the buffer
+    contents to be accessed by another process.
+    
+    Signed-off-by: Ian Abbott <abbotti@mev.co.uk>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index 1e1df89b5018..8e9b30b26810 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -161,6 +161,30 @@ int comedi_buf_map_put(struct comedi_buf_map *bm)
+ 	return 1;
+ }
+ 
++/* helper for "access" vm operation */
++int comedi_buf_map_access(struct comedi_buf_map *bm, unsigned long offset,
++			  void *buf, int len, int write)
++{
++	unsigned int pgoff = offset & ~PAGE_MASK;
++	unsigned long pg = offset >> PAGE_SHIFT;
++	int done = 0;
++
++	while (done < len && pg < bm->n_pages) {
++		int l = min_t(int, len - done, PAGE_SIZE - pgoff);
++		void *b = bm->page_list[pg].virt_addr + pgoff;
++
++		if (write)
++			memcpy(b, buf, l);
++		else
++			memcpy(buf, b, l);
++		buf += l;
++		done += l;
++		pg++;
++		pgoff = 0;
++	}
++	return done;
++}
++
+ /* returns s->async->buf_map and increments its kref refcount */
+ struct comedi_buf_map *
+ comedi_buf_map_from_subdev_get(struct comedi_subdevice *s)
+
+commit 2c935bc57221cc2edc787c72ea0e2d30cdcd3d5e
+Author: Peter Zijlstra <peterz@infradead.org>
+Date:   Mon Nov 14 17:29:48 2016 +0100
+
+    locking/atomic, kref: Add kref_read()
+    
+    Since we need to change the implementation, stop exposing internals.
+    
+    Provide kref_read() to read the current reference count; typically
+    used for debug messages.
+    
+    Kills two anti-patterns:
+    
+            atomic_read(&kref->refcount)
+            kref->refcount.counter
+    
+    Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+    Cc: Andrew Morton <akpm@linux-foundation.org>
+    Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: linux-kernel@vger.kernel.org
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index c7d7682b1412..1e1df89b5018 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -188,7 +188,7 @@ bool comedi_buf_is_mmapped(struct comedi_subdevice *s)
+ {
+ 	struct comedi_buf_map *bm = s->async->buf_map;
+ 
+-	return bm && (atomic_read(&bm->refcount.refcount) > 1);
++	return bm && (kref_read(&bm->refcount) > 1);
+ }
+ 
+ int comedi_buf_alloc(struct comedi_device *dev, struct comedi_subdevice *s,
+
+commit 938cae7ab3b046af9669aa7454fab0546231ba48
+Author: Leslie Klein <lesliebklein@gmail.com>
+Date:   Sun Mar 20 20:26:12 2016 -0400
+
+    Staging: comedi: comedi_buf: Replace 'unsigned' with 'unsigned int'
+    
+    Fix checkpatch warning:
+    Prefer 'unsigned int' to bare use of 'unsigned'
+    in file comedi_buf.c
+    
+    Signed-off-by: Leslie Klein <lesliebklein@gmail.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index 90c28016c6c1..c7d7682b1412 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -80,14 +80,14 @@ static void __comedi_buf_free(struct comedi_device *dev,
+ 
+ static void __comedi_buf_alloc(struct comedi_device *dev,
+ 			       struct comedi_subdevice *s,
+-			       unsigned n_pages)
++			       unsigned int n_pages)
+ {
+ 	struct comedi_async *async = s->async;
+ 	struct page **pages = NULL;
+ 	struct comedi_buf_map *bm;
+ 	struct comedi_buf_page *buf;
+ 	unsigned long flags;
+-	unsigned i;
++	unsigned int i;
+ 
+ 	if (!IS_ENABLED(CONFIG_HAS_DMA) && s->async_dma_dir != DMA_NONE) {
+ 		dev_err(dev->class_dev,
+@@ -208,7 +208,7 @@ int comedi_buf_alloc(struct comedi_device *dev, struct comedi_subdevice *s,
+ 
+ 	/* allocate new buffer */
+ 	if (new_size) {
+-		unsigned n_pages = new_size >> PAGE_SHIFT;
++		unsigned int n_pages = new_size >> PAGE_SHIFT;
+ 
+ 		__comedi_buf_alloc(dev, s, n_pages);
+ 
+@@ -302,7 +302,7 @@ static unsigned int comedi_buf_munge(struct comedi_subdevice *s,
+ {
+ 	struct comedi_async *async = s->async;
+ 	unsigned int count = 0;
+-	const unsigned num_sample_bytes = comedi_bytes_per_sample(s);
++	const unsigned int num_sample_bytes = comedi_bytes_per_sample(s);
+ 
+ 	if (!s->munge || (async->cmd.flags & CMDF_RAWDATA)) {
+ 		async->munge_count += num_bytes;
+@@ -395,7 +395,7 @@ EXPORT_SYMBOL_GPL(comedi_buf_write_free);
+ unsigned int comedi_buf_read_n_available(struct comedi_subdevice *s)
+ {
+ 	struct comedi_async *async = s->async;
+-	unsigned num_bytes;
++	unsigned int num_bytes;
+ 
+ 	if (!async)
+ 		return 0;
+
+commit 432fbde739583140c7ee937910786a9d740804c9
+Author: Ian Abbott <abbotti@mev.co.uk>
+Date:   Fri Oct 9 12:26:49 2015 +0100
+
+    staging: comedi: add new comedi_buf_write_n_available()
+    
+    Add a new function `comedi_buf_write_n_available()` to return the amount
+    of buffer space available for writing, including space already allocated
+    by `comedi_buf_write_alloc()` plus any unallocated space available.
+    This is currently just for internal use by the comedi core, so is not
+    exported.
+    
+    Signed-off-by: Ian Abbott <abbotti@mev.co.uk>
+    Reviewed-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index 4837559ac6b8..90c28016c6c1 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -253,6 +253,14 @@ static unsigned int comedi_buf_write_n_unalloc(struct comedi_subdevice *s)
+ 	return free_end - async->buf_write_alloc_count;
+ }
+ 
++unsigned int comedi_buf_write_n_available(struct comedi_subdevice *s)
++{
++	struct comedi_async *async = s->async;
++	unsigned int free_end = async->buf_read_count + async->prealloc_bufsz;
++
++	return free_end - async->buf_write_count;
++}
++
+ /**
+  * comedi_buf_write_alloc() - Reserve buffer space for writing
+  * @s: COMEDI subdevice.
+
+commit 274ec5ee5478f1757ba083e366d9490dfaa6bd2f
+Author: Ian Abbott <abbotti@mev.co.uk>
+Date:   Fri Oct 9 12:26:48 2015 +0100
+
+    staging: comedi: rename comedi_buf_write_n_available
+    
+    Rename the local function `comedi_buf_write_n_available()` to
+    `comedi_buf_write_n_unalloc()`.  It is the amount of unallocated space
+    available in the buffer that is available to be allocated for writing
+    and does not include the space that has already been allocated for
+    writing.  This is unlike the exported function
+    `comedi_buf_read_n_available()` which includes the space available to be
+    allocated for reading plus the space already allocated for reading.  The
+    new name breaks the unintentional naming symmetry (and also clears the
+    way for the old name to be reused for a new function).
+    
+    Signed-off-by: Ian Abbott <abbotti@mev.co.uk>
+    Reviewed-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index d45a4b65e8d3..4837559ac6b8 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -245,7 +245,7 @@ void comedi_buf_reset(struct comedi_subdevice *s)
+ 	async->events = 0;
+ }
+ 
+-static unsigned int comedi_buf_write_n_available(struct comedi_subdevice *s)
++static unsigned int comedi_buf_write_n_unalloc(struct comedi_subdevice *s)
+ {
+ 	struct comedi_async *async = s->async;
+ 	unsigned int free_end = async->buf_read_count + async->prealloc_bufsz;
+@@ -268,10 +268,10 @@ unsigned int comedi_buf_write_alloc(struct comedi_subdevice *s,
+ 				    unsigned int nbytes)
+ {
+ 	struct comedi_async *async = s->async;
+-	unsigned int available = comedi_buf_write_n_available(s);
++	unsigned int unalloc = comedi_buf_write_n_unalloc(s);
+ 
+-	if (nbytes > available)
+-		nbytes = available;
++	if (nbytes > unalloc)
++		nbytes = unalloc;
+ 
+ 	async->buf_write_alloc_count += nbytes;
+ 
+@@ -557,8 +557,7 @@ unsigned int comedi_buf_write_samples(struct comedi_subdevice *s,
+ 	 * If not, clamp the nsamples to the number that will fit, flag the
+ 	 * buffer overrun and add the samples that fit.
+ 	 */
+-	max_samples = comedi_bytes_to_samples(s,
+-					      comedi_buf_write_n_available(s));
++	max_samples = comedi_bytes_to_samples(s, comedi_buf_write_n_unalloc(s));
+ 	if (nsamples > max_samples) {
+ 		dev_warn(s->device->class_dev, "buffer overrun\n");
+ 		s->async->events |= COMEDI_CB_OVERFLOW;
+
+commit c240e20c73b2d3d4f27b9155bf4897db40af9b1e
+Author: Ian Abbott <abbotti@mev.co.uk>
+Date:   Tue Sep 22 18:02:39 2015 +0100
+
+    staging: comedi: comedi_buf.c: document remaining exported functions
+    
+    Add kernel-doc headers to the remaining functions marked for export.
+    
+    Signed-off-by: Ian Abbott <abbotti@mev.co.uk>
+    Reviewed-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index 63553d9dc051..d45a4b65e8d3 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -253,7 +253,17 @@ static unsigned int comedi_buf_write_n_available(struct comedi_subdevice *s)
+ 	return free_end - async->buf_write_alloc_count;
+ }
+ 
+-/* allocates chunk for the writer from free buffer space */
++/**
++ * comedi_buf_write_alloc() - Reserve buffer space for writing
++ * @s: COMEDI subdevice.
++ * @nbytes: Maximum space to reserve in bytes.
++ *
++ * Reserve up to @nbytes bytes of space to be written in the COMEDI acquisition
++ * data buffer associated with the subdevice.  The amount reserved is limited
++ * by the space available.
++ *
++ * Return: The amount of space reserved in bytes.
++ */
+ unsigned int comedi_buf_write_alloc(struct comedi_subdevice *s,
+ 				    unsigned int nbytes)
+ {
+@@ -329,7 +339,21 @@ unsigned int comedi_buf_write_n_allocated(struct comedi_subdevice *s)
+ 	return async->buf_write_alloc_count - async->buf_write_count;
+ }
+ 
+-/* transfers a chunk from writer to filled buffer space */
++/**
++ * comedi_buf_write_free() - Free buffer space after it is written
++ * @s: COMEDI subdevice.
++ * @nbytes: Maximum space to free in bytes.
++ *
++ * Free up to @nbytes bytes of space previously reserved for writing in the
++ * COMEDI acquisition data buffer associated with the subdevice.  The amount of
++ * space freed is limited to the amount that was reserved.  The freed space is
++ * assumed to have been filled with sample data by the writer.
++ *
++ * If the samples in the freed space need to be "munged", do so here.  The
++ * freed space becomes available for allocation by the reader.
++ *
++ * Return: The amount of space freed in bytes.
++ */
+ unsigned int comedi_buf_write_free(struct comedi_subdevice *s,
+ 				   unsigned int nbytes)
+ {
+@@ -349,6 +373,17 @@ unsigned int comedi_buf_write_free(struct comedi_subdevice *s,
+ }
+ EXPORT_SYMBOL_GPL(comedi_buf_write_free);
+ 
++/**
++ * comedi_buf_read_n_available() - Determine amount of readable buffer space
++ * @s: COMEDI subdevice.
++ *
++ * Determine the amount of readable buffer space in the COMEDI acquisition data
++ * buffer associated with the subdevice.  The readable buffer space is that
++ * which has been freed by the writer and "munged" to the sample data format
++ * expected by COMEDI if necessary.
++ *
++ * Return: The amount of readable buffer space.
++ */
+ unsigned int comedi_buf_read_n_available(struct comedi_subdevice *s)
+ {
+ 	struct comedi_async *async = s->async;
+@@ -369,7 +404,21 @@ unsigned int comedi_buf_read_n_available(struct comedi_subdevice *s)
+ }
+ EXPORT_SYMBOL_GPL(comedi_buf_read_n_available);
+ 
+-/* allocates a chunk for the reader from filled (and munged) buffer space */
++/**
++ * comedi_buf_read_alloc() - Reserve buffer space for reading
++ * @s: COMEDI subdevice.
++ * @nbytes: Maximum space to reserve in bytes.
++ *
++ * Reserve up to @nbytes bytes of previously written and "munged" buffer space
++ * for reading in the COMEDI acquisition data buffer associated with the
++ * subdevice.  The amount reserved is limited to the space available.  The
++ * reader can read from the reserved space and then free it.  A reader is also
++ * allowed to read from the space before reserving it as long as it determines
++ * the amount of readable data available, but the space needs to be marked as
++ * reserved before it can be freed.
++ *
++ * Return: The amount of space reserved in bytes.
++ */
+ unsigned int comedi_buf_read_alloc(struct comedi_subdevice *s,
+ 				   unsigned int nbytes)
+ {
+@@ -397,7 +446,19 @@ static unsigned int comedi_buf_read_n_allocated(struct comedi_async *async)
+ 	return async->buf_read_alloc_count - async->buf_read_count;
+ }
+ 
+-/* transfers control of a chunk from reader to free buffer space */
++/**
++ * comedi_buf_read_free() - Free buffer space after it has been read
++ * @s: COMEDI subdevice.
++ * @nbytes: Maximum space to free in bytes.
++ *
++ * Free up to @nbytes bytes of buffer space previously reserved for reading in
++ * the COMEDI acquisition data buffer associated with the subdevice.  The
++ * amount of space freed is limited to the amount that was reserved.
++ *
++ * The freed space becomes available for allocation by the writer.
++ *
++ * Return: The amount of space freed in bytes.
++ */
+ unsigned int comedi_buf_read_free(struct comedi_subdevice *s,
+ 				  unsigned int nbytes)
+ {
+
+commit 67ecc3ddd3acb9095b171211b5516478c8b57764
+Author: Ian Abbott <abbotti@mev.co.uk>
+Date:   Tue Sep 22 18:02:38 2015 +0100
+
+    staging: comedi: comedi_buf.c: tweak existing kernel-doc
+    
+    Expand the kernel-doc descriptions of those exported functions that
+    already have kernel-doc comments.
+    
+    Signed-off-by: Ian Abbott <abbotti@mev.co.uk>
+    Reviewed-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index 19e7b229d15e..63553d9dc051 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -469,15 +469,21 @@ static void comedi_buf_memcpy_from(struct comedi_subdevice *s,
+ }
+ 
+ /**
+- * comedi_buf_write_samples - write sample data to comedi buffer
+- * @s: comedi_subdevice struct
+- * @data: samples
+- * @nsamples: number of samples
++ * comedi_buf_write_samples() - Write sample data to COMEDI buffer
++ * @s: COMEDI subdevice.
++ * @data: Pointer to source samples.
++ * @nsamples: Number of samples to write.
+  *
+- * Writes nsamples to the comedi buffer associated with the subdevice, marks
+- * it as written and updates the acquisition scan progress.
++ * Write up to @nsamples samples to the COMEDI acquisition data buffer
++ * associated with the subdevice, mark it as written and update the
++ * acquisition scan progress.  If there is not enough room for the specified
++ * number of samples, the number of samples written is limited to the number
++ * that will fit and the %COMEDI_CB_OVERFLOW event flag is set to cause the
++ * acquisition to terminate with an overrun error.  Set the %COMEDI_CB_BLOCK
++ * event flag if any samples are written to cause waiting tasks to be woken
++ * when the event flags are processed.
+  *
+- * Returns the amount of data written in bytes.
++ * Return: The amount of data written in bytes.
+  */
+ unsigned int comedi_buf_write_samples(struct comedi_subdevice *s,
+ 				      const void *data, unsigned int nsamples)
+@@ -513,15 +519,18 @@ unsigned int comedi_buf_write_samples(struct comedi_subdevice *s,
+ EXPORT_SYMBOL_GPL(comedi_buf_write_samples);
+ 
+ /**
+- * comedi_buf_read_samples - read sample data from comedi buffer
+- * @s: comedi_subdevice struct
+- * @data: destination
+- * @nsamples: maximum number of samples to read
++ * comedi_buf_read_samples() - Read sample data from COMEDI buffer
++ * @s: COMEDI subdevice.
++ * @data: Pointer to destination.
++ * @nsamples: Maximum number of samples to read.
+  *
+- * Reads up to nsamples from the comedi buffer associated with the subdevice,
+- * marks it as read and updates the acquisition scan progress.
++ * Read up to @nsamples samples from the COMEDI acquisition data buffer
++ * associated with the subdevice, mark it as read and update the acquisition
++ * scan progress.  Limit the number of samples read to the number available.
++ * Set the %COMEDI_CB_BLOCK event flag if any samples are read to cause waiting
++ * tasks to be woken when the event flags are processed.
+  *
+- * Returns the amount of data read in bytes.
++ * Return: The amount of data read in bytes.
+  */
+ unsigned int comedi_buf_read_samples(struct comedi_subdevice *s,
+ 				     void *data, unsigned int nsamples)
+
+commit 1dacbe5b26268fd3eaa6dad41271d296b072f3df
+Author: H Hartley Sweeten <hsweeten@visionengravers.com>
+Date:   Wed Nov 5 10:20:52 2014 -0700
+
+    staging: comedi: comedidev.h: add 'scans_done' member to comedi_async
+    
+    Introduce a new member to comedi_async to count the number of scans completed.
+    This member is cleared by comedi_buf_reset() along with the other comedi_async
+    members. It is incremented in comedi_inc_scan_progress() when the end of scan
+    is detected.
+    
+    This member will be used to clean up the scan counting in the comedi drivers.
+    
+    Signed-off-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Reviewed-by: Ian Abbott <abbotti@mev.co.uk>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index eb3fecf85b6d..19e7b229d15e 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -236,6 +236,7 @@ void comedi_buf_reset(struct comedi_subdevice *s)
+ 	async->buf_read_ptr = 0;
+ 
+ 	async->cur_chan = 0;
++	async->scans_done = 0;
+ 	async->scan_progress = 0;
+ 	async->munge_chan = 0;
+ 	async->munge_count = 0;
+
+commit c39e050d21d107d26183be0f22b89eccccdbe61c
+Author: H Hartley Sweeten <hsweeten@visionengravers.com>
+Date:   Fri Oct 31 12:04:28 2014 -0700
+
+    staging: comedi: remove use of 'bytes_per_sample()'
+    
+    This inline helper function has been replaced with comedi_bytes_per_sample().
+    The same commit (bf33eb4b4f57) introduced a couple other related helper
+    functions a manipulate the sample size.
+    
+    Use the new helper functions to remove the use of 'bytes_per_sample()' and
+    remove it.
+    
+    Signed-off-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Reviewed-by: Ian Abbott <abbotti@mev.co.uk>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index b43424d611ad..eb3fecf85b6d 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -283,7 +283,7 @@ static unsigned int comedi_buf_munge(struct comedi_subdevice *s,
+ {
+ 	struct comedi_async *async = s->async;
+ 	unsigned int count = 0;
+-	const unsigned num_sample_bytes = bytes_per_sample(s);
++	const unsigned num_sample_bytes = comedi_bytes_per_sample(s);
+ 
+ 	if (!s->munge || (async->cmd.flags & CMDF_RAWDATA)) {
+ 		async->munge_count += num_bytes;
+@@ -489,7 +489,8 @@ unsigned int comedi_buf_write_samples(struct comedi_subdevice *s,
+ 	 * If not, clamp the nsamples to the number that will fit, flag the
+ 	 * buffer overrun and add the samples that fit.
+ 	 */
+-	max_samples = comedi_buf_write_n_available(s) / bytes_per_sample(s);
++	max_samples = comedi_bytes_to_samples(s,
++					      comedi_buf_write_n_available(s));
+ 	if (nsamples > max_samples) {
+ 		dev_warn(s->device->class_dev, "buffer overrun\n");
+ 		s->async->events |= COMEDI_CB_OVERFLOW;
+@@ -499,7 +500,8 @@ unsigned int comedi_buf_write_samples(struct comedi_subdevice *s,
+ 	if (nsamples == 0)
+ 		return 0;
+ 
+-	nbytes = comedi_buf_write_alloc(s, nsamples * bytes_per_sample(s));
++	nbytes = comedi_buf_write_alloc(s,
++					comedi_samples_to_bytes(s, nsamples));
+ 	comedi_buf_memcpy_to(s, data, nbytes);
+ 	comedi_buf_write_free(s, nbytes);
+ 	comedi_inc_scan_progress(s, nbytes);
+@@ -527,14 +529,16 @@ unsigned int comedi_buf_read_samples(struct comedi_subdevice *s,
+ 	unsigned int nbytes;
+ 
+ 	/* clamp nsamples to the number of full samples available */
+-	max_samples = comedi_buf_read_n_available(s) / bytes_per_sample(s);
++	max_samples = comedi_bytes_to_samples(s,
++					      comedi_buf_read_n_available(s));
+ 	if (nsamples > max_samples)
+ 		nsamples = max_samples;
+ 
+ 	if (nsamples == 0)
+ 		return 0;
+ 
+-	nbytes = comedi_buf_read_alloc(s, nsamples * bytes_per_sample(s));
++	nbytes = comedi_buf_read_alloc(s,
++				       comedi_samples_to_bytes(s, nsamples));
+ 	comedi_buf_memcpy_from(s, data, nbytes);
+ 	comedi_buf_read_free(s, nbytes);
+ 	comedi_inc_scan_progress(s, nbytes);
+
+commit eb3a13230b78c3dc580b509e370862c632c90dae
+Author: H Hartley Sweeten <hsweeten@visionengravers.com>
+Date:   Thu Oct 30 11:10:50 2014 -0700
+
+    staging: comedi: comedi_buf: make comedi_buf_write_samples() add samples that fit
+    
+    This function currently fails if the number of samples to add would
+    overflow the async buffer. Modify it to add the samples that fit so
+    at least some of the sample data is returned to the user.
+    
+    Signed-off-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Reviewed-by: Ian Abbott <abbotti@mev.co.uk>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index 6dd87cb2a8af..b43424d611ad 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -484,12 +484,16 @@ unsigned int comedi_buf_write_samples(struct comedi_subdevice *s,
+ 	unsigned int max_samples;
+ 	unsigned int nbytes;
+ 
+-	/* make sure there is enought room in the buffer for all the samples */
++	/*
++	 * Make sure there is enough room in the buffer for all the samples.
++	 * If not, clamp the nsamples to the number that will fit, flag the
++	 * buffer overrun and add the samples that fit.
++	 */
+ 	max_samples = comedi_buf_write_n_available(s) / bytes_per_sample(s);
+ 	if (nsamples > max_samples) {
+ 		dev_warn(s->device->class_dev, "buffer overrun\n");
+ 		s->async->events |= COMEDI_CB_OVERFLOW;
+-		return 0;
++		nsamples = max_samples;
+ 	}
+ 
+ 	if (nsamples == 0)
+
+commit 0cf5efaa4bca230c7b733694932a4355d94dc5e0
+Author: H Hartley Sweeten <hsweeten@visionengravers.com>
+Date:   Wed Oct 22 15:37:18 2014 -0700
+
+    staging: comedi: comedi_buf: absorb __comedi_buf_write_alloc()
+    
+    This function is only called by comedi_buf_write_alloc(). Absorb it and remove
+    the unused 'strict' parameter.
+    
+    Signed-off-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Reviewed-by: Ian Abbott <abbotti@mev.co.uk>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index 23e3bd175caa..6dd87cb2a8af 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -252,15 +252,15 @@ static unsigned int comedi_buf_write_n_available(struct comedi_subdevice *s)
+ 	return free_end - async->buf_write_alloc_count;
+ }
+ 
+-static unsigned int __comedi_buf_write_alloc(struct comedi_subdevice *s,
+-					     unsigned int nbytes,
+-					     int strict)
++/* allocates chunk for the writer from free buffer space */
++unsigned int comedi_buf_write_alloc(struct comedi_subdevice *s,
++				    unsigned int nbytes)
+ {
+ 	struct comedi_async *async = s->async;
+ 	unsigned int available = comedi_buf_write_n_available(s);
+ 
+ 	if (nbytes > available)
+-		nbytes = strict ? 0 : available;
++		nbytes = available;
+ 
+ 	async->buf_write_alloc_count += nbytes;
+ 
+@@ -272,13 +272,6 @@ static unsigned int __comedi_buf_write_alloc(struct comedi_subdevice *s,
+ 
+ 	return nbytes;
+ }
+-
+-/* allocates chunk for the writer from free buffer space */
+-unsigned int comedi_buf_write_alloc(struct comedi_subdevice *s,
+-				    unsigned int nbytes)
+-{
+-	return __comedi_buf_write_alloc(s, nbytes, 0);
+-}
+ EXPORT_SYMBOL_GPL(comedi_buf_write_alloc);
+ 
+ /*
+
+commit e19a3c97242825d7426758bad9e293068adf16ec
+Author: H Hartley Sweeten <hsweeten@visionengravers.com>
+Date:   Wed Oct 22 15:37:17 2014 -0700
+
+    staging: comedi: comedi_buf: absorb comedi_write_array_to_buffer()
+    
+    This function is only called by comedi_buf_write_samples(). Absorb it.
+    
+    The buffer overflow was already checked so the overflow check of
+    comedi_buf_write_alloc() can be removed.
+    
+    Signed-off-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Reviewed-by: Ian Abbott <abbotti@mev.co.uk>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index c3152d89e608..23e3bd175caa 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -474,31 +474,6 @@ static void comedi_buf_memcpy_from(struct comedi_subdevice *s,
+ 	}
+ }
+ 
+-static unsigned int comedi_write_array_to_buffer(struct comedi_subdevice *s,
+-						 const void *data,
+-						 unsigned int num_bytes)
+-{
+-	struct comedi_async *async = s->async;
+-	unsigned int retval;
+-
+-	if (num_bytes == 0)
+-		return 0;
+-
+-	retval = comedi_buf_write_alloc(s, num_bytes);
+-	if (retval != num_bytes) {
+-		dev_warn(s->device->class_dev, "buffer overrun\n");
+-		async->events |= COMEDI_CB_OVERFLOW;
+-		return 0;
+-	}
+-
+-	comedi_buf_memcpy_to(s, data, num_bytes);
+-	comedi_buf_write_free(s, num_bytes);
+-	comedi_inc_scan_progress(s, num_bytes);
+-	async->events |= COMEDI_CB_BLOCK;
+-
+-	return num_bytes;
+-}
+-
+ /**
+  * comedi_buf_write_samples - write sample data to comedi buffer
+  * @s: comedi_subdevice struct
+@@ -524,9 +499,16 @@ unsigned int comedi_buf_write_samples(struct comedi_subdevice *s,
+ 		return 0;
+ 	}
+ 
+-	nbytes = nsamples * bytes_per_sample(s);
++	if (nsamples == 0)
++		return 0;
+ 
+-	return comedi_write_array_to_buffer(s, data, nbytes);
++	nbytes = comedi_buf_write_alloc(s, nsamples * bytes_per_sample(s));
++	comedi_buf_memcpy_to(s, data, nbytes);
++	comedi_buf_write_free(s, nbytes);
++	comedi_inc_scan_progress(s, nbytes);
++	s->async->events |= COMEDI_CB_BLOCK;
++
++	return nbytes;
+ }
+ EXPORT_SYMBOL_GPL(comedi_buf_write_samples);
+ 
+
+commit 8f90726196b60e94e744b58e004064b84ac2d63d
+Author: H Hartley Sweeten <hsweeten@visionengravers.com>
+Date:   Wed Oct 22 15:37:16 2014 -0700
+
+    staging: comedi: comedi_buf: don't export comedi_write_array_to_buffer()
+    
+    All the comedi drivers have been converted to use comedi_buf_write_samples().
+    This function is now only used internally by comedi_buf. Remvoe the export.
+    
+    Signed-off-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Reviewed-by: Ian Abbott <abbotti@mev.co.uk>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index f4b75d177d7f..c3152d89e608 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -474,21 +474,9 @@ static void comedi_buf_memcpy_from(struct comedi_subdevice *s,
+ 	}
+ }
+ 
+-/**
+- * comedi_write_array_to_buffer - write data to comedi buffer
+- * @s: comedi_subdevice struct
+- * @data: destination
+- * @num_bytes: number of bytes to write
+- *
+- * Writes up to num_bytes bytes of data to the comedi buffer associated with
+- * the subdevice, marks it as written and updates the acquisition scan
+- * progress.
+- *
+- * Returns the amount of data written in bytes.
+- */
+-unsigned int comedi_write_array_to_buffer(struct comedi_subdevice *s,
+-					  const void *data,
+-					  unsigned int num_bytes)
++static unsigned int comedi_write_array_to_buffer(struct comedi_subdevice *s,
++						 const void *data,
++						 unsigned int num_bytes)
+ {
+ 	struct comedi_async *async = s->async;
+ 	unsigned int retval;
+@@ -510,7 +498,6 @@ unsigned int comedi_write_array_to_buffer(struct comedi_subdevice *s,
+ 
+ 	return num_bytes;
+ }
+-EXPORT_SYMBOL_GPL(comedi_write_array_to_buffer);
+ 
+ /**
+  * comedi_buf_write_samples - write sample data to comedi buffer
+
+commit 0ce64e65177e9ddf22e375f0ccbcbfb59cfd6841
+Author: H Hartley Sweeten <hsweeten@visionengravers.com>
+Date:   Wed Oct 22 15:37:15 2014 -0700
+
+    staging: comedi: comedi_buf: remove comedi_buf_put()
+    
+    All comedi drivers now use comedi_buf_write_samples() to add the samples to
+    the async buffer. Remove this unused function.
+    
+    Signed-off-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Reviewed-by: Ian Abbott <abbotti@mev.co.uk>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index a41a414bef74..f4b75d177d7f 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -427,21 +427,6 @@ unsigned int comedi_buf_read_free(struct comedi_subdevice *s,
+ }
+ EXPORT_SYMBOL_GPL(comedi_buf_read_free);
+ 
+-int comedi_buf_put(struct comedi_subdevice *s, unsigned short x)
+-{
+-	struct comedi_async *async = s->async;
+-	unsigned int n = __comedi_buf_write_alloc(s, sizeof(short), 1);
+-
+-	if (n < sizeof(short)) {
+-		async->events |= COMEDI_CB_ERROR;
+-		return 0;
+-	}
+-	*(unsigned short *)(async->prealloc_buf + async->buf_write_ptr) = x;
+-	comedi_buf_write_free(s, sizeof(short));
+-	return 1;
+-}
+-EXPORT_SYMBOL_GPL(comedi_buf_put);
+-
+ static void comedi_buf_memcpy_to(struct comedi_subdevice *s,
+ 				 const void *data, unsigned int num_bytes)
+ {
+
+commit 5438da85fc482c63f7a6f93e5b07d7c55fc77135
+Author: H Hartley Sweeten <hsweeten@visionengravers.com>
+Date:   Wed Oct 22 15:36:24 2014 -0700
+
+    staging: comedi: comedi_buf: introduce comedi_buf_write_samples()
+    
+    Introduce a generic method to write samples to the async buffer.
+    
+    The number of samples is first checked against the number of samples that
+    would fill the async buffer. The size of each sample is determined using
+    the bytes_per_sample() helper. If all the samples will fit in the async
+    buffer they are written to the buffer using comedi_write_array_to_buffer().
+    
+    This will allow converting all the comedi drivers to use a common method to
+    write data to the async buffer.
+    
+    Since comedi_write_array_to_buffer() sets the COMEDI_CB_BLOCK event after
+    writing the data, those events can be removed from the drivers.
+    
+    In addition, comedi_inc_scan_progress() will automatically detect the end of
+    scan and set the COMEDI_CB_EOS event. Those events can also be removed from
+    the drivers.
+    
+    Signed-off-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Reviewed-by: Ian Abbott <abbotti@mev.co.uk>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index 1f916072cd93..a41a414bef74 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -527,6 +527,37 @@ unsigned int comedi_write_array_to_buffer(struct comedi_subdevice *s,
+ }
+ EXPORT_SYMBOL_GPL(comedi_write_array_to_buffer);
+ 
++/**
++ * comedi_buf_write_samples - write sample data to comedi buffer
++ * @s: comedi_subdevice struct
++ * @data: samples
++ * @nsamples: number of samples
++ *
++ * Writes nsamples to the comedi buffer associated with the subdevice, marks
++ * it as written and updates the acquisition scan progress.
++ *
++ * Returns the amount of data written in bytes.
++ */
++unsigned int comedi_buf_write_samples(struct comedi_subdevice *s,
++				      const void *data, unsigned int nsamples)
++{
++	unsigned int max_samples;
++	unsigned int nbytes;
++
++	/* make sure there is enought room in the buffer for all the samples */
++	max_samples = comedi_buf_write_n_available(s) / bytes_per_sample(s);
++	if (nsamples > max_samples) {
++		dev_warn(s->device->class_dev, "buffer overrun\n");
++		s->async->events |= COMEDI_CB_OVERFLOW;
++		return 0;
++	}
++
++	nbytes = nsamples * bytes_per_sample(s);
++
++	return comedi_write_array_to_buffer(s, data, nbytes);
++}
++EXPORT_SYMBOL_GPL(comedi_buf_write_samples);
++
+ /**
+  * comedi_buf_read_samples - read sample data from comedi buffer
+  * @s: comedi_subdevice struct
+
+commit 0ca7f61cd67f7cd581bc6ba968072b4f7b0a2ef8
+Author: H Hartley Sweeten <hsweeten@visionengravers.com>
+Date:   Wed Oct 22 14:36:51 2014 -0700
+
+    staging: comedi: comedi_buf: comedi_buf_memcpy_from() remove 'offset' param
+    
+    This parameter is always passed as '0'. Remove the unnecessary parameter.
+    
+    This allows removing the unnecessary check of the read_ptr overflow.
+    
+    Signed-off-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Reviewed-by: Ian Abbott <abbotti@mev.co.uk>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index c60fa1aa2048..1f916072cd93 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -466,15 +466,11 @@ static void comedi_buf_memcpy_to(struct comedi_subdevice *s,
+ }
+ 
+ static void comedi_buf_memcpy_from(struct comedi_subdevice *s,
+-				   unsigned int offset,
+ 				   void *dest, unsigned int nbytes)
+ {
+ 	void *src;
+ 	struct comedi_async *async = s->async;
+-	unsigned int read_ptr = async->buf_read_ptr + offset;
+-
+-	if (read_ptr >= async->prealloc_bufsz)
+-		read_ptr %= async->prealloc_bufsz;
++	unsigned int read_ptr = async->buf_read_ptr;
+ 
+ 	while (nbytes) {
+ 		unsigned int block_size;
+@@ -557,7 +553,7 @@ unsigned int comedi_buf_read_samples(struct comedi_subdevice *s,
+ 		return 0;
+ 
+ 	nbytes = comedi_buf_read_alloc(s, nsamples * bytes_per_sample(s));
+-	comedi_buf_memcpy_from(s, 0, data, nbytes);
++	comedi_buf_memcpy_from(s, data, nbytes);
+ 	comedi_buf_read_free(s, nbytes);
+ 	comedi_inc_scan_progress(s, nbytes);
+ 	s->async->events |= COMEDI_CB_BLOCK;
+
+commit 319ad742bddace99d6576e4b6fba1f074f29ed2a
+Author: H Hartley Sweeten <hsweeten@visionengravers.com>
+Date:   Wed Oct 22 14:36:50 2014 -0700
+
+    staging: comedi: comedi_buf: comedi_buf_memcpy_to() remove 'offset' param
+    
+    This parameter is always passed as '0'. Remove the unnecessary parameter.
+    
+    This allows removing the unnecessary check of the write_ptr overflow.
+    
+    Signed-off-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Reviewed-by: Ian Abbott <abbotti@mev.co.uk>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index 0e4727dee030..c60fa1aa2048 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -443,14 +443,10 @@ int comedi_buf_put(struct comedi_subdevice *s, unsigned short x)
+ EXPORT_SYMBOL_GPL(comedi_buf_put);
+ 
+ static void comedi_buf_memcpy_to(struct comedi_subdevice *s,
+-				 unsigned int offset,
+ 				 const void *data, unsigned int num_bytes)
+ {
+ 	struct comedi_async *async = s->async;
+-	unsigned int write_ptr = async->buf_write_ptr + offset;
+-
+-	if (write_ptr >= async->prealloc_bufsz)
+-		write_ptr %= async->prealloc_bufsz;
++	unsigned int write_ptr = async->buf_write_ptr;
+ 
+ 	while (num_bytes) {
+ 		unsigned int block_size;
+@@ -526,7 +522,7 @@ unsigned int comedi_write_array_to_buffer(struct comedi_subdevice *s,
+ 		return 0;
+ 	}
+ 
+-	comedi_buf_memcpy_to(s, 0, data, num_bytes);
++	comedi_buf_memcpy_to(s, data, num_bytes);
+ 	comedi_buf_write_free(s, num_bytes);
+ 	comedi_inc_scan_progress(s, num_bytes);
+ 	async->events |= COMEDI_CB_BLOCK;
+
+commit aa26e46b0f1d2c0093ec59a68aec715df3f06715
+Author: H Hartley Sweeten <hsweeten@visionengravers.com>
+Date:   Wed Oct 22 14:36:49 2014 -0700
+
+    staging: comedi: comedi_buf: don't export comedi_buf_memcpy_to()
+    
+    This function is only used internally. Remove the export.
+    
+    Signed-off-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Reviewed-by: Ian Abbott <abbotti@mev.co.uk>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index a87b8e66fde0..0e4727dee030 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -442,8 +442,9 @@ int comedi_buf_put(struct comedi_subdevice *s, unsigned short x)
+ }
+ EXPORT_SYMBOL_GPL(comedi_buf_put);
+ 
+-void comedi_buf_memcpy_to(struct comedi_subdevice *s, unsigned int offset,
+-			  const void *data, unsigned int num_bytes)
++static void comedi_buf_memcpy_to(struct comedi_subdevice *s,
++				 unsigned int offset,
++				 const void *data, unsigned int num_bytes)
+ {
+ 	struct comedi_async *async = s->async;
+ 	unsigned int write_ptr = async->buf_write_ptr + offset;
+@@ -467,7 +468,6 @@ void comedi_buf_memcpy_to(struct comedi_subdevice *s, unsigned int offset,
+ 		write_ptr = 0;
+ 	}
+ }
+-EXPORT_SYMBOL_GPL(comedi_buf_memcpy_to);
+ 
+ static void comedi_buf_memcpy_from(struct comedi_subdevice *s,
+ 				   unsigned int offset,
+
+commit 9e2093d2399a771f3896292b95ca44a147f5ac6e
+Author: H Hartley Sweeten <hsweeten@visionengravers.com>
+Date:   Wed Oct 22 14:36:48 2014 -0700
+
+    staging: comedi: comedi_buf: dont't export comedi_buf_memcpy_from()
+    
+    This function is only used internally. Remove the export.
+    
+    Signed-off-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Reviewed-by: Ian Abbott <abbotti@mev.co.uk>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index f7ff420ed612..a87b8e66fde0 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -469,8 +469,9 @@ void comedi_buf_memcpy_to(struct comedi_subdevice *s, unsigned int offset,
+ }
+ EXPORT_SYMBOL_GPL(comedi_buf_memcpy_to);
+ 
+-void comedi_buf_memcpy_from(struct comedi_subdevice *s, unsigned int offset,
+-			    void *dest, unsigned int nbytes)
++static void comedi_buf_memcpy_from(struct comedi_subdevice *s,
++				   unsigned int offset,
++				   void *dest, unsigned int nbytes)
+ {
+ 	void *src;
+ 	struct comedi_async *async = s->async;
+@@ -495,7 +496,6 @@ void comedi_buf_memcpy_from(struct comedi_subdevice *s, unsigned int offset,
+ 		read_ptr = 0;
+ 	}
+ }
+-EXPORT_SYMBOL_GPL(comedi_buf_memcpy_from);
+ 
+ /**
+  * comedi_write_array_to_buffer - write data to comedi buffer
+
+commit 04c4166a22717241c3d5fdf8740c7e4c9a0bdf25
+Author: H Hartley Sweeten <hsweeten@visionengravers.com>
+Date:   Wed Oct 22 14:36:47 2014 -0700
+
+    staging: comedi: comedi_buf: remove comedi_buf_get()
+    
+    This function is no longer used. Remove it.
+    
+    Signed-off-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Reviewed-by: Ian Abbott <abbotti@mev.co.uk>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index fb2e91a0e724..f7ff420ed612 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -442,20 +442,6 @@ int comedi_buf_put(struct comedi_subdevice *s, unsigned short x)
+ }
+ EXPORT_SYMBOL_GPL(comedi_buf_put);
+ 
+-int comedi_buf_get(struct comedi_subdevice *s, unsigned short *x)
+-{
+-	struct comedi_async *async = s->async;
+-	unsigned int n = comedi_buf_read_n_available(s);
+-
+-	if (n < sizeof(short))
+-		return 0;
+-	comedi_buf_read_alloc(s, sizeof(short));
+-	*x = *(unsigned short *)(async->prealloc_buf + async->buf_read_ptr);
+-	comedi_buf_read_free(s, sizeof(short));
+-	return 1;
+-}
+-EXPORT_SYMBOL_GPL(comedi_buf_get);
+-
+ void comedi_buf_memcpy_to(struct comedi_subdevice *s, unsigned int offset,
+ 			  const void *data, unsigned int num_bytes)
+ {
+
+commit 8de27e7010cbd8c75a4e04a9807adacc7a8d70b2
+Author: H Hartley Sweeten <hsweeten@visionengravers.com>
+Date:   Wed Oct 22 14:36:42 2014 -0700
+
+    staging: comedi: comedi_buf: make comedi_buf_read_samples() always return full samples
+    
+    A number of drivers currently use comedi_buf_get() to read single samples
+    from the the async buffer. This works but the drivers have to handle the
+    COMEDI_CB_BLOCK and COMEDI_CB_EOS events. Converting those drivers to use
+    comedi_buf_read_samples() moves the handling of those events into the core.
+    
+    Modify comedi_buf_read_samples() so that the async buffer is checked for
+    the number of full samples available. Use that to clamp the number of
+    samples that will be read. This makes sure that only full samples are
+    read from the async buffer making comedi_buf_read_samples() mimic the
+    action of comedi_buf_get() with the added benifit of handling the events.
+    
+    Signed-off-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Reviewed-by: Ian Abbott <abbotti@mev.co.uk>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index 9074da2cbe0a..fb2e91a0e724 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -566,15 +566,15 @@ unsigned int comedi_buf_read_samples(struct comedi_subdevice *s,
+ 	unsigned int max_samples;
+ 	unsigned int nbytes;
+ 
+-	max_samples = s->async->prealloc_bufsz / bytes_per_sample(s);
++	/* clamp nsamples to the number of full samples available */
++	max_samples = comedi_buf_read_n_available(s) / bytes_per_sample(s);
+ 	if (nsamples > max_samples)
+ 		nsamples = max_samples;
+ 
+-	nbytes = nsamples * bytes_per_sample(s);
+-	if (nbytes == 0)
++	if (nsamples == 0)
+ 		return 0;
+ 
+-	nbytes = comedi_buf_read_alloc(s, nbytes);
++	nbytes = comedi_buf_read_alloc(s, nsamples * bytes_per_sample(s));
+ 	comedi_buf_memcpy_from(s, 0, data, nbytes);
+ 	comedi_buf_read_free(s, nbytes);
+ 	comedi_inc_scan_progress(s, nbytes);
+
+commit 109bf06e2a88a04607c93d8223e4be0af09ebc8c
+Author: H Hartley Sweeten <hsweeten@visionengravers.com>
+Date:   Wed Oct 22 14:36:41 2014 -0700
+
+    staging: comedi: comedi_buf: absorb comedi_read_array_from_buffer()
+    
+    This function is only called by comedi_buf_read_samples(). Absorb it.
+    
+    Signed-off-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Reviewed-by: Ian Abbott <abbotti@mev.co.uk>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index d1303a831462..9074da2cbe0a 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -549,22 +549,6 @@ unsigned int comedi_write_array_to_buffer(struct comedi_subdevice *s,
+ }
+ EXPORT_SYMBOL_GPL(comedi_write_array_to_buffer);
+ 
+-static unsigned int comedi_read_array_from_buffer(struct comedi_subdevice *s,
+-						  void *data,
+-						  unsigned int num_bytes)
+-{
+-	if (num_bytes == 0)
+-		return 0;
+-
+-	num_bytes = comedi_buf_read_alloc(s, num_bytes);
+-	comedi_buf_memcpy_from(s, 0, data, num_bytes);
+-	comedi_buf_read_free(s, num_bytes);
+-	comedi_inc_scan_progress(s, num_bytes);
+-	s->async->events |= COMEDI_CB_BLOCK;
+-
+-	return num_bytes;
+-}
+-
+ /**
+  * comedi_buf_read_samples - read sample data from comedi buffer
+  * @s: comedi_subdevice struct
+@@ -587,7 +571,15 @@ unsigned int comedi_buf_read_samples(struct comedi_subdevice *s,
+ 		nsamples = max_samples;
+ 
+ 	nbytes = nsamples * bytes_per_sample(s);
++	if (nbytes == 0)
++		return 0;
+ 
+-	return comedi_read_array_from_buffer(s, data, nbytes);
++	nbytes = comedi_buf_read_alloc(s, nbytes);
++	comedi_buf_memcpy_from(s, 0, data, nbytes);
++	comedi_buf_read_free(s, nbytes);
++	comedi_inc_scan_progress(s, nbytes);
++	s->async->events |= COMEDI_CB_BLOCK;
++
++	return nbytes;
+ }
+ EXPORT_SYMBOL_GPL(comedi_buf_read_samples);
+
+commit 2b3e13b8605ee0915804ce73d6e5e4e72fc51ba2
+Author: H Hartley Sweeten <hsweeten@visionengravers.com>
+Date:   Wed Oct 22 14:36:40 2014 -0700
+
+    staging: comedi: comedi_buf: remove export of comedi_read_array_from_buffer()
+    
+    This function is only used internally. Remove the export.
+    
+    Signed-off-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Reviewed-by: Ian Abbott <abbotti@mev.co.uk>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index 88a7cae97811..d1303a831462 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -549,19 +549,9 @@ unsigned int comedi_write_array_to_buffer(struct comedi_subdevice *s,
+ }
+ EXPORT_SYMBOL_GPL(comedi_write_array_to_buffer);
+ 
+-/**
+- * comedi_read_array_from_buffer - read data from comedi buffer
+- * @s: comedi_subdevice struct
+- * @data: destination
+- * @num_bytes: number of bytes to read
+- *
+- * Reads up to num_bytes bytes of data from the comedi buffer associated with
+- * the subdevice, marks it as read and updates the acquisition scan progress.
+- *
+- * Returns the amount of data read in bytes.
+- */
+-unsigned int comedi_read_array_from_buffer(struct comedi_subdevice *s,
+-					   void *data, unsigned int num_bytes)
++static unsigned int comedi_read_array_from_buffer(struct comedi_subdevice *s,
++						  void *data,
++						  unsigned int num_bytes)
+ {
+ 	if (num_bytes == 0)
+ 		return 0;
+@@ -574,7 +564,6 @@ unsigned int comedi_read_array_from_buffer(struct comedi_subdevice *s,
+ 
+ 	return num_bytes;
+ }
+-EXPORT_SYMBOL_GPL(comedi_read_array_from_buffer);
+ 
+ /**
+  * comedi_buf_read_samples - read sample data from comedi buffer
+
+commit 4455d7c351dada63ec031a82760fa00d7806139a
+Author: H Hartley Sweeten <hsweeten@visionengravers.com>
+Date:   Wed Oct 22 14:36:34 2014 -0700
+
+    staging: comedi: comedi_buf: introduce comedi_buf_read_samples()
+    
+    Introduce a generic method to read samples from the async buffer.
+    
+    The number of requested samples is clampled to the number of samples that
+    would fill the async buffer. The size of each sample is determined using
+    the bytes_per_sample() helper. The number of bytes need are then read
+    from the async buffer using comedi_read_array_from_buffer().
+    
+    This will allow converting all the comedi drivers to use a common method
+    to read data from the async buffer.
+    
+    Since comedi_read_array_from_buffer() sets the COMEDI_CB_BLOCK event after
+    reading the data, those events can be removed from the drivers.
+    
+    In addition, comedi_inc_scan_progress() will automatically detect the end of
+    scan and set the COMEDI_CB_EOS event. Those events can also be removed from
+    the drivers.
+    
+    Signed-off-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Reviewed-by: Ian Abbott <abbotti@mev.co.uk>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index c60a45ad12b9..88a7cae97811 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -575,3 +575,30 @@ unsigned int comedi_read_array_from_buffer(struct comedi_subdevice *s,
+ 	return num_bytes;
+ }
+ EXPORT_SYMBOL_GPL(comedi_read_array_from_buffer);
++
++/**
++ * comedi_buf_read_samples - read sample data from comedi buffer
++ * @s: comedi_subdevice struct
++ * @data: destination
++ * @nsamples: maximum number of samples to read
++ *
++ * Reads up to nsamples from the comedi buffer associated with the subdevice,
++ * marks it as read and updates the acquisition scan progress.
++ *
++ * Returns the amount of data read in bytes.
++ */
++unsigned int comedi_buf_read_samples(struct comedi_subdevice *s,
++				     void *data, unsigned int nsamples)
++{
++	unsigned int max_samples;
++	unsigned int nbytes;
++
++	max_samples = s->async->prealloc_bufsz / bytes_per_sample(s);
++	if (nsamples > max_samples)
++		nsamples = max_samples;
++
++	nbytes = nsamples * bytes_per_sample(s);
++
++	return comedi_read_array_from_buffer(s, data, nbytes);
++}
++EXPORT_SYMBOL_GPL(comedi_buf_read_samples);
+
+commit b8d57655fdedd40c8ef234b13b4da05dd607dbb5
+Author: Ian Abbott <abbotti@mev.co.uk>
+Date:   Mon Sep 15 13:46:06 2014 +0100
+
+    staging: comedi: migrate copyrights from "comedi_fc.c"
+    
+    The "comedi_fc" module was originally written and copyrighted by Frank
+    Mori Hess, but the functionality has been migrated into the core
+    "comedi" module.  Move the copyright notices over to the affected .c
+    files in the core comedi module.
+    
+    Signed-off-by: Ian Abbott <abbotti@mev.co.uk>
+    Reviewed-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index c3f5751086a0..c60a45ad12b9 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -3,6 +3,7 @@
+  *
+  * COMEDI - Linux Control and Measurement Device Interface
+  * Copyright (C) 1997-2000 David A. Schleef <ds@schleef.org>
++ * Copyright (C) 2002 Frank Mori Hess <fmhess@users.sourceforge.net>
+  *
+  * This program is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License as published by
+
+commit bfa9facdb13fb7bc47677bc8f590fc816ccd0c9a
+Author: Ian Abbott <abbotti@mev.co.uk>
+Date:   Mon Sep 15 13:46:05 2014 +0100
+
+    staging: comedi: add comedi_read_array_from_buffer()
+    
+    The "comedi_fc" module contains a few functions useful to Comedi
+    drivers.  Their functionality is being migrated to the core "comedi"
+    module and renamed to start with the prefix `comedi_`.  As part of this
+    migration, move `cfc_read_array_from_buffer()` into the core comedi
+    module and rename it to `comedi_read_array_from_buffer()`.  Change the
+    external declaration of `cfc_read_array_from_buffer()` into an inline
+    function that calls `comedi_read_array_from_buffer()`.
+    
+    Signed-off-by: Ian Abbott <abbotti@mev.co.uk>
+    Reviewed-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index 52a75d2238dc..c3f5751086a0 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -547,3 +547,30 @@ unsigned int comedi_write_array_to_buffer(struct comedi_subdevice *s,
+ 	return num_bytes;
+ }
+ EXPORT_SYMBOL_GPL(comedi_write_array_to_buffer);
++
++/**
++ * comedi_read_array_from_buffer - read data from comedi buffer
++ * @s: comedi_subdevice struct
++ * @data: destination
++ * @num_bytes: number of bytes to read
++ *
++ * Reads up to num_bytes bytes of data from the comedi buffer associated with
++ * the subdevice, marks it as read and updates the acquisition scan progress.
++ *
++ * Returns the amount of data read in bytes.
++ */
++unsigned int comedi_read_array_from_buffer(struct comedi_subdevice *s,
++					   void *data, unsigned int num_bytes)
++{
++	if (num_bytes == 0)
++		return 0;
++
++	num_bytes = comedi_buf_read_alloc(s, num_bytes);
++	comedi_buf_memcpy_from(s, 0, data, num_bytes);
++	comedi_buf_read_free(s, num_bytes);
++	comedi_inc_scan_progress(s, num_bytes);
++	s->async->events |= COMEDI_CB_BLOCK;
++
++	return num_bytes;
++}
++EXPORT_SYMBOL_GPL(comedi_read_array_from_buffer);
+
+commit af2c6a8a2429dd40555a9efd4f286eca2ab9add0
+Author: Ian Abbott <abbotti@mev.co.uk>
+Date:   Mon Sep 15 13:46:04 2014 +0100
+
+    staging: comedi: comedi_fc.h: use comedi_write_array_to_buffer()
+    
+    Since `cfc_write_array_to_buffer()` is just an inline function that
+    calls `comedi_write_array_to_buffer()`, replace calls to the former to
+    the latter in the "comedi_fc.h" header.  This is part of the migration
+    of functionality from the "comedi_fc" module to the core "comedi"
+    module.
+    
+    Signed-off-by: Ian Abbott <abbotti@mev.co.uk>
+    Reviewed-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index 5aa86842fcce..52a75d2238dc 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -510,7 +510,18 @@ void comedi_buf_memcpy_from(struct comedi_subdevice *s, unsigned int offset,
+ }
+ EXPORT_SYMBOL_GPL(comedi_buf_memcpy_from);
+ 
+-/* Writes an array of data points to comedi's buffer */
++/**
++ * comedi_write_array_to_buffer - write data to comedi buffer
++ * @s: comedi_subdevice struct
++ * @data: destination
++ * @num_bytes: number of bytes to write
++ *
++ * Writes up to num_bytes bytes of data to the comedi buffer associated with
++ * the subdevice, marks it as written and updates the acquisition scan
++ * progress.
++ *
++ * Returns the amount of data written in bytes.
++ */
+ unsigned int comedi_write_array_to_buffer(struct comedi_subdevice *s,
+ 					  const void *data,
+ 					  unsigned int num_bytes)
+
+commit ea29c1d563a4d57db1c2955c22468a0947f110b0
+Author: Ian Abbott <abbotti@mev.co.uk>
+Date:   Mon Sep 15 13:46:03 2014 +0100
+
+    staging: comedi: add comedi_write_array_to_buffer()
+    
+    The "comedi_fc" module contains a few functions useful to Comedi
+    drivers.  Their functionality is being migrated to the core "comedi"
+    module and renamed to start with the prefix `comedi_`.  As part of this
+    migration, move `cfc_write_array_to_buffer()` into the core comedi
+    module and rename it to `comedi_write_array_to_buffer()`.  Change the
+    external declaration of `cfc_write_array_to_buffer()` into an inline
+    function that calls `comedi_write_array_to_buffer()`.
+    
+    Signed-off-by: Ian Abbott <abbotti@mev.co.uk>
+    Reviewed-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index df4a9c4bca35..5aa86842fcce 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -509,3 +509,30 @@ void comedi_buf_memcpy_from(struct comedi_subdevice *s, unsigned int offset,
+ 	}
+ }
+ EXPORT_SYMBOL_GPL(comedi_buf_memcpy_from);
++
++/* Writes an array of data points to comedi's buffer */
++unsigned int comedi_write_array_to_buffer(struct comedi_subdevice *s,
++					  const void *data,
++					  unsigned int num_bytes)
++{
++	struct comedi_async *async = s->async;
++	unsigned int retval;
++
++	if (num_bytes == 0)
++		return 0;
++
++	retval = comedi_buf_write_alloc(s, num_bytes);
++	if (retval != num_bytes) {
++		dev_warn(s->device->class_dev, "buffer overrun\n");
++		async->events |= COMEDI_CB_OVERFLOW;
++		return 0;
++	}
++
++	comedi_buf_memcpy_to(s, 0, data, num_bytes);
++	comedi_buf_write_free(s, num_bytes);
++	comedi_inc_scan_progress(s, num_bytes);
++	async->events |= COMEDI_CB_BLOCK;
++
++	return num_bytes;
++}
++EXPORT_SYMBOL_GPL(comedi_write_array_to_buffer);
+
+commit a1c0e5fe68b437ba43b3125fbe5d8c72dca242a2
+Author: Ian Abbott <abbotti@mev.co.uk>
+Date:   Tue May 6 13:12:14 2014 +0100
+
+    staging: comedi: pass subdevice to comedi_buf_write_n_available()
+    
+    Local function `comedi_buf_write_n_available()` currently takes a
+    pointer to a `struct comedi_async`.  Change it to take a pointer to a
+    `struct comedi_subdevice` and use the `async` member for consistency
+    with the other comedi buffer handling functions.
+    
+    Signed-off-by: Ian Abbott <abbotti@mev.co.uk>
+    Reviewed-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index 5be91cd88cc3..df4a9c4bca35 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -243,8 +243,9 @@ void comedi_buf_reset(struct comedi_subdevice *s)
+ 	async->events = 0;
+ }
+ 
+-static unsigned int comedi_buf_write_n_available(struct comedi_async *async)
++static unsigned int comedi_buf_write_n_available(struct comedi_subdevice *s)
+ {
++	struct comedi_async *async = s->async;
+ 	unsigned int free_end = async->buf_read_count + async->prealloc_bufsz;
+ 
+ 	return free_end - async->buf_write_alloc_count;
+@@ -255,7 +256,7 @@ static unsigned int __comedi_buf_write_alloc(struct comedi_subdevice *s,
+ 					     int strict)
+ {
+ 	struct comedi_async *async = s->async;
+-	unsigned int available = comedi_buf_write_n_available(async);
++	unsigned int available = comedi_buf_write_n_available(s);
+ 
+ 	if (nbytes > available)
+ 		nbytes = strict ? 0 : available;
+
+commit 8ab4fe7e13989ef5b11bd96f1ed6763eabb1d17d
+Author: Ian Abbott <abbotti@mev.co.uk>
+Date:   Tue May 6 13:12:13 2014 +0100
+
+    staging: comedi: pass subdevice to __comedi_buf_write_alloc()
+    
+    Local function `__comedi_buf_write_alloc()` is called by
+    `comedi_buf_write_alloc()` and `comedi_buf_put()`.  It currently takes a
+    pointer to a `struct comedi_async`.  Change it to take a pointer to a
+    `struct comedi_subdevice` and use the `async` member for consistency
+    with other comedi buffer handling functions.
+    
+    Signed-off-by: Ian Abbott <abbotti@mev.co.uk>
+    Reviewed-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index b5e329e1f623..5be91cd88cc3 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -250,10 +250,11 @@ static unsigned int comedi_buf_write_n_available(struct comedi_async *async)
+ 	return free_end - async->buf_write_alloc_count;
+ }
+ 
+-static unsigned int __comedi_buf_write_alloc(struct comedi_async *async,
++static unsigned int __comedi_buf_write_alloc(struct comedi_subdevice *s,
+ 					     unsigned int nbytes,
+ 					     int strict)
+ {
++	struct comedi_async *async = s->async;
+ 	unsigned int available = comedi_buf_write_n_available(async);
+ 
+ 	if (nbytes > available)
+@@ -274,7 +275,7 @@ static unsigned int __comedi_buf_write_alloc(struct comedi_async *async,
+ unsigned int comedi_buf_write_alloc(struct comedi_subdevice *s,
+ 				    unsigned int nbytes)
+ {
+-	return __comedi_buf_write_alloc(s->async, nbytes, 0);
++	return __comedi_buf_write_alloc(s, nbytes, 0);
+ }
+ EXPORT_SYMBOL_GPL(comedi_buf_write_alloc);
+ 
+@@ -427,7 +428,7 @@ EXPORT_SYMBOL_GPL(comedi_buf_read_free);
+ int comedi_buf_put(struct comedi_subdevice *s, unsigned short x)
+ {
+ 	struct comedi_async *async = s->async;
+-	unsigned int n = __comedi_buf_write_alloc(async, sizeof(short), 1);
++	unsigned int n = __comedi_buf_write_alloc(s, sizeof(short), 1);
+ 
+ 	if (n < sizeof(short)) {
+ 		async->events |= COMEDI_CB_ERROR;
+
+commit 5b108588ba1ff6c18502dc9fe711b0229a18b9f8
+Author: Ian Abbott <abbotti@mev.co.uk>
+Date:   Tue May 6 13:12:12 2014 +0100
+
+    staging: comedi: pass subdevice to comedi_buf_munge()
+    
+    Local function `comedi_buf_munge()` is called by
+    `comedi_buf_write_free()` to modify (or "munge") the data copied from
+    a device into the buffer.
+    
+    Currently, the function takes a pointer to a `struct comedi_async` and
+    gets a pointer to the comedi subdevice from the `subdevice` member.
+    Change it to take a pointer to a `struct comedi_subdevice` and get a
+    pointer to the "async" structure from the `async` member.
+    
+    The main motivation for this is to elimate the `subdevice` member of
+    `struct comedi_async`.
+    
+    Signed-off-by: Ian Abbott <abbotti@mev.co.uk>
+    Reviewed-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index 46de9338bada..b5e329e1f623 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -282,10 +282,10 @@ EXPORT_SYMBOL_GPL(comedi_buf_write_alloc);
+  * munging is applied to data by core as it passes between user
+  * and kernel space
+  */
+-static unsigned int comedi_buf_munge(struct comedi_async *async,
++static unsigned int comedi_buf_munge(struct comedi_subdevice *s,
+ 				     unsigned int num_bytes)
+ {
+-	struct comedi_subdevice *s = async->subdevice;
++	struct comedi_async *async = s->async;
+ 	unsigned int count = 0;
+ 	const unsigned num_sample_bytes = bytes_per_sample(s);
+ 
+@@ -344,7 +344,7 @@ unsigned int comedi_buf_write_free(struct comedi_subdevice *s,
+ 
+ 	async->buf_write_count += nbytes;
+ 	async->buf_write_ptr += nbytes;
+-	comedi_buf_munge(async, async->buf_write_count - async->munge_count);
++	comedi_buf_munge(s, async->buf_write_count - async->munge_count);
+ 	if (async->buf_write_ptr >= async->prealloc_bufsz)
+ 		async->buf_write_ptr %= async->prealloc_bufsz;
+ 
+
+commit d4526ab4e03bb16beee03547bfcbc1d8e09707f1
+Author: Ian Abbott <abbotti@mev.co.uk>
+Date:   Tue May 6 13:12:11 2014 +0100
+
+    staging: comedi: pass subdevice to comedi_buf_is_mmapped()
+    
+    Change the parameters of `comedi_buf_is_mmapped()` to pass a pointer to
+    the comedi subdevice instead of a pointer to the "async" structure
+    belonging to the subdevice.
+    
+    The main aim at the moment is to replace all the `struct comedi_async *`
+    parameters with `struct comedi_subdevice *` parameters in the comedi
+    driver API.
+    
+    Signed-off-by: Ian Abbott <abbotti@mev.co.uk>
+    Reviewed-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index fa5d6d4d0351..46de9338bada 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -183,9 +183,9 @@ comedi_buf_map_from_subdev_get(struct comedi_subdevice *s)
+ 	return bm;
+ }
+ 
+-bool comedi_buf_is_mmapped(struct comedi_async *async)
++bool comedi_buf_is_mmapped(struct comedi_subdevice *s)
+ {
+-	struct comedi_buf_map *bm = async->buf_map;
++	struct comedi_buf_map *bm = s->async->buf_map;
+ 
+ 	return bm && (atomic_read(&bm->refcount.refcount) > 1);
+ }
+
+commit fcc18a9aa2c43765ba37012879936fbf142ba91c
+Author: Ian Abbott <abbotti@mev.co.uk>
+Date:   Tue May 6 13:12:10 2014 +0100
+
+    staging: comedi: pass subdevice to comedi_buf_reset()
+    
+    Change the parameters of `comedi_buf_reset()` to pass a pointer to the
+    comedi subdevice instead of a pointer to the "async" structure belonging
+    to the subdevice.
+    
+    The main aim at the moment is to replace all the `struct comedi_async *`
+    parameters with `struct comedi_subdevice *` parameters in the comedi
+    driver API.
+    
+    Signed-off-by: Ian Abbott <abbotti@mev.co.uk>
+    Reviewed-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index f295285d2aa6..fa5d6d4d0351 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -222,8 +222,10 @@ int comedi_buf_alloc(struct comedi_device *dev, struct comedi_subdevice *s,
+ 	return 0;
+ }
+ 
+-void comedi_buf_reset(struct comedi_async *async)
++void comedi_buf_reset(struct comedi_subdevice *s)
+ {
++	struct comedi_async *async = s->async;
++
+ 	async->buf_write_alloc_count = 0;
+ 	async->buf_write_count = 0;
+ 	async->buf_read_alloc_count = 0;
+
+commit e9edef3a5454a19fd0d0c342cc88b6310b871a48
+Author: Ian Abbott <abbotti@mev.co.uk>
+Date:   Tue May 6 13:12:09 2014 +0100
+
+    staging: comedi: pass subdevice to comedi_buf_read_n_available()
+    
+    Change the parameters of `comedi_buf_read_n_available()` to pass a
+    pointer to the comedi subdevice instead of a pointer to the "async"
+    structure belonging to the subdevice.
+    
+    The main aim at the moment is to replace all the `struct comedi_async *`
+    parameters with `struct comedi_subdevice *` parameters in the comedi
+    driver API.
+    
+    Signed-off-by: Ian Abbott <abbotti@mev.co.uk>
+    Reviewed-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index a3c3f21e77f9..f295285d2aa6 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -350,8 +350,9 @@ unsigned int comedi_buf_write_free(struct comedi_subdevice *s,
+ }
+ EXPORT_SYMBOL_GPL(comedi_buf_write_free);
+ 
+-unsigned int comedi_buf_read_n_available(struct comedi_async *async)
++unsigned int comedi_buf_read_n_available(struct comedi_subdevice *s)
+ {
++	struct comedi_async *async = s->async;
+ 	unsigned num_bytes;
+ 
+ 	if (!async)
+@@ -439,7 +440,7 @@ EXPORT_SYMBOL_GPL(comedi_buf_put);
+ int comedi_buf_get(struct comedi_subdevice *s, unsigned short *x)
+ {
+ 	struct comedi_async *async = s->async;
+-	unsigned int n = comedi_buf_read_n_available(async);
++	unsigned int n = comedi_buf_read_n_available(s);
+ 
+ 	if (n < sizeof(short))
+ 		return 0;
+
+commit f1df8662859e7edee134d3d77f241a32c9cfb8ef
+Author: Ian Abbott <abbotti@mev.co.uk>
+Date:   Tue May 6 13:12:08 2014 +0100
+
+    staging: comedi: pass subdevice to comedi_buf_read_free()
+    
+    Change the parameters of `comedi_buf_read_free()` to pass a pointer to
+    the comedi subdevice instead of a pointer to the "async" structure
+    belonging to the subdevice.
+    
+    The main aim at the moment is to replace all the `struct comedi_async *`
+    parameters with `struct comedi_subdevice *` parameters in the comedi
+    driver API.
+    
+    Signed-off-by: Ian Abbott <abbotti@mev.co.uk>
+    Reviewed-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index 07e0b3a51828..a3c3f21e77f9 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -398,9 +398,10 @@ static unsigned int comedi_buf_read_n_allocated(struct comedi_async *async)
+ }
+ 
+ /* transfers control of a chunk from reader to free buffer space */
+-unsigned int comedi_buf_read_free(struct comedi_async *async,
++unsigned int comedi_buf_read_free(struct comedi_subdevice *s,
+ 				  unsigned int nbytes)
+ {
++	struct comedi_async *async = s->async;
+ 	unsigned int allocated;
+ 
+ 	/*
+@@ -444,7 +445,7 @@ int comedi_buf_get(struct comedi_subdevice *s, unsigned short *x)
+ 		return 0;
+ 	comedi_buf_read_alloc(s, sizeof(short));
+ 	*x = *(unsigned short *)(async->prealloc_buf + async->buf_read_ptr);
+-	comedi_buf_read_free(async, sizeof(short));
++	comedi_buf_read_free(s, sizeof(short));
+ 	return 1;
+ }
+ EXPORT_SYMBOL_GPL(comedi_buf_get);
+
+commit d13be55a37a136ee4274680308b7d0d7e3818bf3
+Author: Ian Abbott <abbotti@mev.co.uk>
+Date:   Tue May 6 13:12:07 2014 +0100
+
+    staging: comedi: pass subdevice to comedi_buf_read_alloc()
+    
+    Change the parameters of `comedi_buf_read_alloc()` to pass a pointer to
+    the comedi subdevice instead of a pointer to the "async" structure
+    belonging to the subdevice.
+    
+    The main aim at the moment is to replace all the `struct comedi_async *`
+    parameters with `struct comedi_subdevice *` parameters in the comedi
+    driver API.
+    
+    Signed-off-by: Ian Abbott <abbotti@mev.co.uk>
+    Reviewed-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index ac498e0b4865..07e0b3a51828 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -370,9 +370,10 @@ unsigned int comedi_buf_read_n_available(struct comedi_async *async)
+ EXPORT_SYMBOL_GPL(comedi_buf_read_n_available);
+ 
+ /* allocates a chunk for the reader from filled (and munged) buffer space */
+-unsigned int comedi_buf_read_alloc(struct comedi_async *async,
++unsigned int comedi_buf_read_alloc(struct comedi_subdevice *s,
+ 				   unsigned int nbytes)
+ {
++	struct comedi_async *async = s->async;
+ 	unsigned int available;
+ 
+ 	available = async->munge_count - async->buf_read_alloc_count;
+@@ -441,7 +442,7 @@ int comedi_buf_get(struct comedi_subdevice *s, unsigned short *x)
+ 
+ 	if (n < sizeof(short))
+ 		return 0;
+-	comedi_buf_read_alloc(async, sizeof(short));
++	comedi_buf_read_alloc(s, sizeof(short));
+ 	*x = *(unsigned short *)(async->prealloc_buf + async->buf_read_ptr);
+ 	comedi_buf_read_free(async, sizeof(short));
+ 	return 1;
+
+commit 0f1f34e844a24187270315ffb539d4bd1900c333
+Author: Ian Abbott <abbotti@mev.co.uk>
+Date:   Tue May 6 13:12:06 2014 +0100
+
+    staging: comedi: pass subdevice to comedi_buf_write_n_allocated()
+    
+    Change the parameters of `comedi_buf_write_n_allocated()` to pass a
+    pointer to the comedi subdevice instead of a pointer to the "async"
+    structure belonging to the subdevice.
+    
+    The main aim at the moment is to replace all the `struct comedi_async *`
+    parameters with `struct comedi_subdevice *` parameters in the comedi
+    driver API.
+    
+    Signed-off-by: Ian Abbott <abbotti@mev.co.uk>
+    Reviewed-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index 220816857128..ac498e0b4865 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -323,8 +323,10 @@ static unsigned int comedi_buf_munge(struct comedi_async *async,
+ 	return count;
+ }
+ 
+-unsigned int comedi_buf_write_n_allocated(struct comedi_async *async)
++unsigned int comedi_buf_write_n_allocated(struct comedi_subdevice *s)
+ {
++	struct comedi_async *async = s->async;
++
+ 	return async->buf_write_alloc_count - async->buf_write_count;
+ }
+ 
+@@ -333,7 +335,7 @@ unsigned int comedi_buf_write_free(struct comedi_subdevice *s,
+ 				   unsigned int nbytes)
+ {
+ 	struct comedi_async *async = s->async;
+-	unsigned int allocated = comedi_buf_write_n_allocated(async);
++	unsigned int allocated = comedi_buf_write_n_allocated(s);
+ 
+ 	if (nbytes > allocated)
+ 		nbytes = allocated;
+
+commit 940dd35d5812ead0b93f3f2a1f44732ac069000b
+Author: Ian Abbott <abbotti@mev.co.uk>
+Date:   Tue May 6 13:12:05 2014 +0100
+
+    staging: comedi: pass subdevice to comedi_buf_write_free()
+    
+    Change the parameters of `comedi_buf_write_free()` to pass a pointer to
+    the comedi subdevice instead of a pointer to the "async" structure
+    belonging to the subdevice.
+    
+    The main aim at the moment is to replace all the `struct comedi_async *`
+    parameters with `struct comedi_subdevice *` parameters in the comedi
+    driver API.
+    
+    Signed-off-by: Ian Abbott <abbotti@mev.co.uk>
+    Reviewed-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index 6a655008655f..220816857128 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -329,9 +329,10 @@ unsigned int comedi_buf_write_n_allocated(struct comedi_async *async)
+ }
+ 
+ /* transfers a chunk from writer to filled buffer space */
+-unsigned int comedi_buf_write_free(struct comedi_async *async,
++unsigned int comedi_buf_write_free(struct comedi_subdevice *s,
+ 				   unsigned int nbytes)
+ {
++	struct comedi_async *async = s->async;
+ 	unsigned int allocated = comedi_buf_write_n_allocated(async);
+ 
+ 	if (nbytes > allocated)
+@@ -426,7 +427,7 @@ int comedi_buf_put(struct comedi_subdevice *s, unsigned short x)
+ 		return 0;
+ 	}
+ 	*(unsigned short *)(async->prealloc_buf + async->buf_write_ptr) = x;
+-	comedi_buf_write_free(async, sizeof(short));
++	comedi_buf_write_free(s, sizeof(short));
+ 	return 1;
+ }
+ EXPORT_SYMBOL_GPL(comedi_buf_put);
+
+commit 24e894bbf247ecdeed3ed2f77f658da756760f60
+Author: Ian Abbott <abbotti@mev.co.uk>
+Date:   Tue May 6 13:12:04 2014 +0100
+
+    staging: comedi: pass subdevice to comedi_buf_write_alloc()
+    
+    Change the parameters of `comedi_buf_write_alloc()` to pass a pointer to
+    the comedi subdevice instead of a pointer to the "async" structure
+    belonging to the subdevice.
+    
+    The main aim at the moment is to replace all the `struct comedi_async *`
+    parameters with `struct comedi_subdevice *` parameters in the comedi
+    driver API.
+    
+    Signed-off-by: Ian Abbott <abbotti@mev.co.uk>
+    Reviewed-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index 199ebb48974c..6a655008655f 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -269,10 +269,10 @@ static unsigned int __comedi_buf_write_alloc(struct comedi_async *async,
+ }
+ 
+ /* allocates chunk for the writer from free buffer space */
+-unsigned int comedi_buf_write_alloc(struct comedi_async *async,
++unsigned int comedi_buf_write_alloc(struct comedi_subdevice *s,
+ 				    unsigned int nbytes)
+ {
+-	return __comedi_buf_write_alloc(async, nbytes, 0);
++	return __comedi_buf_write_alloc(s->async, nbytes, 0);
+ }
+ EXPORT_SYMBOL_GPL(comedi_buf_write_alloc);
+ 
+
+commit 2fadffc0bb2e0b33ebee72be172073f84624bc3d
+Author: Ian Abbott <abbotti@mev.co.uk>
+Date:   Tue May 6 13:12:02 2014 +0100
+
+    staging: comedi: pass subdevice to comedi_buf_memcpy_from()
+    
+    Change the parameters of `comedi_buf_memcpy_from()` to pass a pointer to
+    the comedi subdevice instead of a pointer to the "async" structure
+    belonging to the subdevice.
+    
+    The main aim at the moment is to replace all the `struct comedi_async *`
+    parameters with `struct comedi_subdevice *` parameters in the comedi
+    driver API.
+    
+    Signed-off-by: Ian Abbott <abbotti@mev.co.uk>
+    Reviewed-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index de850f3fd49d..199ebb48974c 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -472,10 +472,11 @@ void comedi_buf_memcpy_to(struct comedi_subdevice *s, unsigned int offset,
+ }
+ EXPORT_SYMBOL_GPL(comedi_buf_memcpy_to);
+ 
+-void comedi_buf_memcpy_from(struct comedi_async *async, unsigned int offset,
++void comedi_buf_memcpy_from(struct comedi_subdevice *s, unsigned int offset,
+ 			    void *dest, unsigned int nbytes)
+ {
+ 	void *src;
++	struct comedi_async *async = s->async;
+ 	unsigned int read_ptr = async->buf_read_ptr + offset;
+ 
+ 	if (read_ptr >= async->prealloc_bufsz)
+
+commit 00603a9c321e186bba000e01042529bf5cfe68a3
+Author: Ian Abbott <abbotti@mev.co.uk>
+Date:   Tue May 6 13:12:01 2014 +0100
+
+    staging: comedi: pass subdevice to comedi_buf_memcpy_to()
+    
+    Change the parameters of `comedi_buf_memcpy_to()` to pass a pointer to
+    the comedi subdevice instead of a pointer to the "async" structure
+    belonging to the subdevice.
+    
+    The main aim at the moment is to replace all the `struct comedi_async *`
+    parameters with `struct comedi_subdevice *` parameters in the comedi
+    driver API.
+    
+    Signed-off-by: Ian Abbott <abbotti@mev.co.uk>
+    Reviewed-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index acb042c3e034..de850f3fd49d 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -445,9 +445,10 @@ int comedi_buf_get(struct comedi_subdevice *s, unsigned short *x)
+ }
+ EXPORT_SYMBOL_GPL(comedi_buf_get);
+ 
+-void comedi_buf_memcpy_to(struct comedi_async *async, unsigned int offset,
++void comedi_buf_memcpy_to(struct comedi_subdevice *s, unsigned int offset,
+ 			  const void *data, unsigned int num_bytes)
+ {
++	struct comedi_async *async = s->async;
+ 	unsigned int write_ptr = async->buf_write_ptr + offset;
+ 
+ 	if (write_ptr >= async->prealloc_bufsz)
+
+commit 458c13e935d9f33fffb099e49ecb53c67ddd1a21
+Author: Ian Abbott <abbotti@mev.co.uk>
+Date:   Tue May 6 13:12:00 2014 +0100
+
+    staging: comedi: pass subdevice to comedi_buf_get()
+    
+    Change the parameters of `comedi_buf_get()` to pass a pointer to the
+    comedi subdevice instead of a pointer to the "async" structure belonging
+    to the subdevice.
+    
+    The function gets a sample value from the comedi buffer, but currently
+    only deals with 16-bit sample types.  A future version could deal with
+    16 or 32-bit sample types depending on the value of the SDF_LSAMPL
+    subdevice flag.
+    
+    The main aim at the moment is to replace all the `struct comedi_async *`
+    parameters with `struct comedi_subdevice *` parameters in the comedi
+    driver API.
+    
+    Signed-off-by: Ian Abbott <abbotti@mev.co.uk>
+    Reviewed-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index f127bf9bd421..acb042c3e034 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -431,8 +431,9 @@ int comedi_buf_put(struct comedi_subdevice *s, unsigned short x)
+ }
+ EXPORT_SYMBOL_GPL(comedi_buf_put);
+ 
+-int comedi_buf_get(struct comedi_async *async, unsigned short *x)
++int comedi_buf_get(struct comedi_subdevice *s, unsigned short *x)
+ {
++	struct comedi_async *async = s->async;
+ 	unsigned int n = comedi_buf_read_n_available(async);
+ 
+ 	if (n < sizeof(short))
+
+commit 3672effdeae5395d661a2103f69082146ef949fc
+Author: Ian Abbott <abbotti@mev.co.uk>
+Date:   Tue May 6 13:11:59 2014 +0100
+
+    staging: comedi: pass subdevice to comedi_buf_put()
+    
+    Change the parameters of `comedi_buf_put()` to pass a pointer to the
+    comedi subdevice instead of a pointer to the "async" structure belonging
+    to the subdevice.
+    
+    The function puts a sample value in the comedi buffer, but currently
+    only deals with 16-bit sample types.  A future version could deal with
+    16 or 32-bit sample types depending on the value of the SDF_LSAMPL
+    subdevice flag.
+    
+    The main aim at the moment is to replace all the `struct comedi_async *`
+    parameters with `struct comedi_subdevice *` parameters in the comedi
+    driver API.
+    
+    Signed-off-by: Ian Abbott <abbotti@mev.co.uk>
+    Reviewed-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index 257595016161..f127bf9bd421 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -416,8 +416,9 @@ unsigned int comedi_buf_read_free(struct comedi_async *async,
+ }
+ EXPORT_SYMBOL_GPL(comedi_buf_read_free);
+ 
+-int comedi_buf_put(struct comedi_async *async, unsigned short x)
++int comedi_buf_put(struct comedi_subdevice *s, unsigned short x)
+ {
++	struct comedi_async *async = s->async;
+ 	unsigned int n = __comedi_buf_write_alloc(async, sizeof(short), 1);
+ 
+ 	if (n < sizeof(short)) {
+
+commit b34aa86f12e8848ba453215602c8c50fa63c4cb3
+Author: Ian Abbott <abbotti@mev.co.uk>
+Date:   Thu Apr 10 19:41:57 2014 +0100
+
+    staging: comedi: fix circular locking dependency in comedi_mmap()
+    
+    Mmapping a comedi data buffer with lockdep checking enabled produced the
+    following kernel debug messages:
+    
+    ======================================================
+    [ INFO: possible circular locking dependency detected ]
+    3.5.0-rc3-ija1+ #9 Tainted: G         C
+    -------------------------------------------------------
+    comedi_test/4160 is trying to acquire lock:
+     (&dev->mutex#2){+.+.+.}, at: [<ffffffffa00313f4>] comedi_mmap+0x57/0x1d9 [comedi]
+    
+    but task is already holding lock:
+     (&mm->mmap_sem){++++++}, at: [<ffffffff810c96fe>] vm_mmap_pgoff+0x41/0x76
+    
+    which lock already depends on the new lock.
+    
+    the existing dependency chain (in reverse order) is:
+    
+    -> #1 (&mm->mmap_sem){++++++}:
+           [<ffffffff8106d0e8>] lock_acquire+0x97/0x105
+           [<ffffffff810ce3bc>] might_fault+0x6d/0x90
+           [<ffffffffa0031ffb>] do_devinfo_ioctl.isra.7+0x11e/0x14c [comedi]
+           [<ffffffffa003227f>] comedi_unlocked_ioctl+0x256/0xe48 [comedi]
+           [<ffffffff810f7fcd>] vfs_ioctl+0x18/0x34
+           [<ffffffff810f87fd>] do_vfs_ioctl+0x382/0x43c
+           [<ffffffff810f88f9>] sys_ioctl+0x42/0x65
+           [<ffffffff81415c62>] system_call_fastpath+0x16/0x1b
+    
+    -> #0 (&dev->mutex#2){+.+.+.}:
+           [<ffffffff8106c528>] __lock_acquire+0x101d/0x1591
+           [<ffffffff8106d0e8>] lock_acquire+0x97/0x105
+           [<ffffffff8140c894>] mutex_lock_nested+0x46/0x2a4
+           [<ffffffffa00313f4>] comedi_mmap+0x57/0x1d9 [comedi]
+           [<ffffffff810d5816>] mmap_region+0x281/0x492
+           [<ffffffff810d5c92>] do_mmap_pgoff+0x26b/0x2a7
+           [<ffffffff810c971a>] vm_mmap_pgoff+0x5d/0x76
+           [<ffffffff810d493f>] sys_mmap_pgoff+0xc7/0x10d
+           [<ffffffff81004d36>] sys_mmap+0x16/0x20
+           [<ffffffff81415c62>] system_call_fastpath+0x16/0x1b
+    
+    other info that might help us debug this:
+    
+     Possible unsafe locking scenario:
+    
+           CPU0                    CPU1
+           ----                    ----
+      lock(&mm->mmap_sem);
+                                   lock(&dev->mutex#2);
+                                   lock(&mm->mmap_sem);
+      lock(&dev->mutex#2);
+    
+     *** DEADLOCK ***
+    
+    To avoid the circular dependency, just try to get the lock in
+    `comedi_mmap()` instead of blocking.  Since the comedi device's main mutex
+    is heavily used, do a down-read of its `attach_lock` rwsemaphore
+    instead.  Trying to down-read `attach_lock` should only fail if
+    some task has down-write locked it, and that is only done while the
+    comedi device is being attached to or detached from a low-level hardware
+    device.
+    
+    Unfortunately, acquiring the `attach_lock` doesn't prevent another
+    task replacing the comedi data buffer we are trying to mmap.  The
+    details of the buffer are held in a `struct comedi_buf_map` and pointed
+    to by `s->async->buf_map` where `s` is the comedi subdevice whose buffer
+    we are trying to map.  The `struct comedi_buf_map` is already reference
+    counted with a `struct kref`, so we can stop it being freed prematurely.
+    
+    Modify `comedi_mmap()` to call new function
+    `comedi_buf_map_from_subdev_get()` to read the subdevice's current
+    buffer map pointer and increment its reference instead of accessing
+    `async->buf_map` directly.  Call `comedi_buf_map_put()` to decrement the
+    reference once the buffer map structure has been dealt with.  (Note that
+    `comedi_buf_map_put()` does nothing if passed a NULL pointer.)
+    
+    `comedi_buf_map_from_subdev_get()` checks the subdevice's buffer map
+    pointer has been set and the buffer map has been initialized enough for
+    `comedi_mmap()` to deal with it (specifically, check the `n_pages`
+    member has been set to a non-zero value).  If all is well, the buffer
+    map's reference is incremented and a pointer to it is returned.  The
+    comedi subdevice's spin-lock is used to protect the checks.  Also use
+    the spin-lock in `__comedi_buf_alloc()` and `__comedi_buf_free()` to
+    protect changes to the subdevice's buffer map structure pointer and the
+    buffer map structure's `n_pages` member.  (This checking of `n_pages` is
+    a bit clunky and I [Ian Abbott] plan to deal with it in the future.)
+    
+    Signed-off-by: Ian Abbott <abbotti@mev.co.uk>
+    Cc: <stable@vger.kernel.org> # 3.14.x, 3.15.x
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index 924fce977985..257595016161 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -61,6 +61,8 @@ static void __comedi_buf_free(struct comedi_device *dev,
+ 			      struct comedi_subdevice *s)
+ {
+ 	struct comedi_async *async = s->async;
++	struct comedi_buf_map *bm;
++	unsigned long flags;
+ 
+ 	if (async->prealloc_buf) {
+ 		vunmap(async->prealloc_buf);
+@@ -68,8 +70,11 @@ static void __comedi_buf_free(struct comedi_device *dev,
+ 		async->prealloc_bufsz = 0;
+ 	}
+ 
+-	comedi_buf_map_put(async->buf_map);
++	spin_lock_irqsave(&s->spin_lock, flags);
++	bm = async->buf_map;
+ 	async->buf_map = NULL;
++	spin_unlock_irqrestore(&s->spin_lock, flags);
++	comedi_buf_map_put(bm);
+ }
+ 
+ static void __comedi_buf_alloc(struct comedi_device *dev,
+@@ -80,6 +85,7 @@ static void __comedi_buf_alloc(struct comedi_device *dev,
+ 	struct page **pages = NULL;
+ 	struct comedi_buf_map *bm;
+ 	struct comedi_buf_page *buf;
++	unsigned long flags;
+ 	unsigned i;
+ 
+ 	if (!IS_ENABLED(CONFIG_HAS_DMA) && s->async_dma_dir != DMA_NONE) {
+@@ -92,8 +98,10 @@ static void __comedi_buf_alloc(struct comedi_device *dev,
+ 	if (!bm)
+ 		return;
+ 
+-	async->buf_map = bm;
+ 	kref_init(&bm->refcount);
++	spin_lock_irqsave(&s->spin_lock, flags);
++	async->buf_map = bm;
++	spin_unlock_irqrestore(&s->spin_lock, flags);
+ 	bm->dma_dir = s->async_dma_dir;
+ 	if (bm->dma_dir != DMA_NONE)
+ 		/* Need ref to hardware device to free buffer later. */
+@@ -127,7 +135,9 @@ static void __comedi_buf_alloc(struct comedi_device *dev,
+ 
+ 		pages[i] = virt_to_page(buf->virt_addr);
+ 	}
++	spin_lock_irqsave(&s->spin_lock, flags);
+ 	bm->n_pages = i;
++	spin_unlock_irqrestore(&s->spin_lock, flags);
+ 
+ 	/* vmap the prealloc_buf if all the pages were allocated */
+ 	if (i == n_pages)
+@@ -150,6 +160,29 @@ int comedi_buf_map_put(struct comedi_buf_map *bm)
+ 	return 1;
+ }
+ 
++/* returns s->async->buf_map and increments its kref refcount */
++struct comedi_buf_map *
++comedi_buf_map_from_subdev_get(struct comedi_subdevice *s)
++{
++	struct comedi_async *async = s->async;
++	struct comedi_buf_map *bm = NULL;
++	unsigned long flags;
++
++	if (!async)
++		return NULL;
++
++	spin_lock_irqsave(&s->spin_lock, flags);
++	bm = async->buf_map;
++	/* only want it if buffer pages allocated */
++	if (bm && bm->n_pages)
++		comedi_buf_map_get(bm);
++	else
++		bm = NULL;
++	spin_unlock_irqrestore(&s->spin_lock, flags);
++
++	return bm;
++}
++
+ bool comedi_buf_is_mmapped(struct comedi_async *async)
+ {
+ 	struct comedi_buf_map *bm = async->buf_map;
+
+commit af93da31634d6d55c9d313b5c49af8b272f7cb79
+Author: Ian Abbott <abbotti@mev.co.uk>
+Date:   Fri Nov 8 15:03:43 2013 +0000
+
+    staging: comedi: protect buffer from being freed while mmapped
+    
+    If a comedi device is automatically detached by `comedi_auto_unconfig()`
+    any data buffers associated with subdevices that support asynchronous
+    commands will be freed.  If the buffer is mmapped at the time, bad
+    things are likely to happen!  Prevent this by moving some of the buffer
+    details from `struct comedi_async` into a new, dynamically allocated,
+    and kref-counted `struct comedi_buf_map`.  This holds a list of pages, a
+    reference count, and enough information to free the pages.  The new
+    member `buf_map` of `struct comedi_async` points to a `struct
+    comedi_buf_map` when the buffer size is non-zero.
+    
+    Provide a new helper function `comedi_buf_is_mapped()` to check whether
+    an a buffer is mmapped.  If it is mmapped, the buffer is not allowed to
+    be resized and the device is not allowed to be manually detached by the
+    `COMEDI_DEVCONFIG` ioctl.  Provide helper functions
+    `comedi_buf_map_get()` and `comedi_buf_map_put()` to manipulate the
+    reference count of the `struct comedi_buf_map`, which will be freed
+    along with its contents via the 'release' callback of the `kref_put()`
+    call.  The reference count is manipulated by the vma operations and the
+    mmap file operation.
+    
+    Now, when the comedi device is automatically detached, the buffer will
+    be effectively freed by calling `comedi_buf_alloc()` with a new buffer
+    size of 0.  That calls local function `__comedi_buf_free()` which calls
+    `comedi_buf_map_put()` on the `buf_map` member to free it.  It won't
+    actually be freed until the final 'put'.
+    
+    Signed-off-by: Ian Abbott <abbotti@mev.co.uk>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index 4e26bd7fc84f..924fce977985 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -16,6 +16,7 @@
+  */
+ 
+ #include <linux/vmalloc.h>
++#include <linux/slab.h>
+ 
+ #include "comedidev.h"
+ #include "comedi_internal.h"
+@@ -26,31 +27,21 @@
+ #define COMEDI_PAGE_PROTECTION		PAGE_KERNEL
+ #endif
+ 
+-static void __comedi_buf_free(struct comedi_device *dev,
+-			      struct comedi_subdevice *s,
+-			      unsigned n_pages)
++static void comedi_buf_map_kref_release(struct kref *kref)
+ {
+-	struct comedi_async *async = s->async;
++	struct comedi_buf_map *bm =
++		container_of(kref, struct comedi_buf_map, refcount);
+ 	struct comedi_buf_page *buf;
+-	unsigned i;
+-
+-	if (async->prealloc_buf) {
+-		vunmap(async->prealloc_buf);
+-		async->prealloc_buf = NULL;
+-		async->prealloc_bufsz = 0;
+-	}
++	unsigned int i;
+ 
+-	if (!async->buf_page_list)
+-		return;
+-
+-	for (i = 0; i < n_pages; ++i) {
+-		buf = &async->buf_page_list[i];
+-		if (buf->virt_addr) {
++	if (bm->page_list) {
++		for (i = 0; i < bm->n_pages; i++) {
++			buf = &bm->page_list[i];
+ 			clear_bit(PG_reserved,
+ 				  &(virt_to_page(buf->virt_addr)->flags));
+-			if (s->async_dma_dir != DMA_NONE) {
++			if (bm->dma_dir != DMA_NONE) {
+ #ifdef CONFIG_HAS_DMA
+-				dma_free_coherent(dev->hw_dev,
++				dma_free_coherent(bm->dma_hw_dev,
+ 						  PAGE_SIZE,
+ 						  buf->virt_addr,
+ 						  buf->dma_addr);
+@@ -59,10 +50,26 @@ static void __comedi_buf_free(struct comedi_device *dev,
+ 				free_page((unsigned long)buf->virt_addr);
+ 			}
+ 		}
++		vfree(bm->page_list);
+ 	}
+-	vfree(async->buf_page_list);
+-	async->buf_page_list = NULL;
+-	async->n_buf_pages = 0;
++	if (bm->dma_dir != DMA_NONE)
++		put_device(bm->dma_hw_dev);
++	kfree(bm);
++}
++
++static void __comedi_buf_free(struct comedi_device *dev,
++			      struct comedi_subdevice *s)
++{
++	struct comedi_async *async = s->async;
++
++	if (async->prealloc_buf) {
++		vunmap(async->prealloc_buf);
++		async->prealloc_buf = NULL;
++		async->prealloc_bufsz = 0;
++	}
++
++	comedi_buf_map_put(async->buf_map);
++	async->buf_map = NULL;
+ }
+ 
+ static void __comedi_buf_alloc(struct comedi_device *dev,
+@@ -71,6 +78,7 @@ static void __comedi_buf_alloc(struct comedi_device *dev,
+ {
+ 	struct comedi_async *async = s->async;
+ 	struct page **pages = NULL;
++	struct comedi_buf_map *bm;
+ 	struct comedi_buf_page *buf;
+ 	unsigned i;
+ 
+@@ -80,18 +88,29 @@ static void __comedi_buf_alloc(struct comedi_device *dev,
+ 		return;
+ 	}
+ 
+-	async->buf_page_list = vzalloc(sizeof(*buf) * n_pages);
+-	if (async->buf_page_list)
++	bm = kzalloc(sizeof(*async->buf_map), GFP_KERNEL);
++	if (!bm)
++		return;
++
++	async->buf_map = bm;
++	kref_init(&bm->refcount);
++	bm->dma_dir = s->async_dma_dir;
++	if (bm->dma_dir != DMA_NONE)
++		/* Need ref to hardware device to free buffer later. */
++		bm->dma_hw_dev = get_device(dev->hw_dev);
++
++	bm->page_list = vzalloc(sizeof(*buf) * n_pages);
++	if (bm->page_list)
+ 		pages = vmalloc(sizeof(struct page *) * n_pages);
+ 
+ 	if (!pages)
+ 		return;
+ 
+ 	for (i = 0; i < n_pages; i++) {
+-		buf = &async->buf_page_list[i];
+-		if (s->async_dma_dir != DMA_NONE)
++		buf = &bm->page_list[i];
++		if (bm->dma_dir != DMA_NONE)
+ #ifdef CONFIG_HAS_DMA
+-			buf->virt_addr = dma_alloc_coherent(dev->hw_dev,
++			buf->virt_addr = dma_alloc_coherent(bm->dma_hw_dev,
+ 							    PAGE_SIZE,
+ 							    &buf->dma_addr,
+ 							    GFP_KERNEL |
+@@ -108,6 +127,7 @@ static void __comedi_buf_alloc(struct comedi_device *dev,
+ 
+ 		pages[i] = virt_to_page(buf->virt_addr);
+ 	}
++	bm->n_pages = i;
+ 
+ 	/* vmap the prealloc_buf if all the pages were allocated */
+ 	if (i == n_pages)
+@@ -117,6 +137,26 @@ static void __comedi_buf_alloc(struct comedi_device *dev,
+ 	vfree(pages);
+ }
+ 
++void comedi_buf_map_get(struct comedi_buf_map *bm)
++{
++	if (bm)
++		kref_get(&bm->refcount);
++}
++
++int comedi_buf_map_put(struct comedi_buf_map *bm)
++{
++	if (bm)
++		return kref_put(&bm->refcount, comedi_buf_map_kref_release);
++	return 1;
++}
++
++bool comedi_buf_is_mmapped(struct comedi_async *async)
++{
++	struct comedi_buf_map *bm = async->buf_map;
++
++	return bm && (atomic_read(&bm->refcount.refcount) > 1);
++}
++
+ int comedi_buf_alloc(struct comedi_device *dev, struct comedi_subdevice *s,
+ 		     unsigned long new_size)
+ {
+@@ -130,7 +170,7 @@ int comedi_buf_alloc(struct comedi_device *dev, struct comedi_subdevice *s,
+ 		return 0;
+ 
+ 	/* deallocate old buffer */
+-	__comedi_buf_free(dev, s, async->n_buf_pages);
++	__comedi_buf_free(dev, s);
+ 
+ 	/* allocate new buffer */
+ 	if (new_size) {
+@@ -140,10 +180,9 @@ int comedi_buf_alloc(struct comedi_device *dev, struct comedi_subdevice *s,
+ 
+ 		if (!async->prealloc_buf) {
+ 			/* allocation failed */
+-			__comedi_buf_free(dev, s, n_pages);
++			__comedi_buf_free(dev, s);
+ 			return -ENOMEM;
+ 		}
+-		async->n_buf_pages = n_pages;
+ 	}
+ 	async->prealloc_bufsz = new_size;
+ 
+
+commit 0a6fd02c1c0fe4ae872dc24260d569583363f52c
+Author: Ian Abbott <abbotti@mev.co.uk>
+Date:   Wed Oct 16 14:40:04 2013 +0100
+
+    staging: comedi: use unsigned samples for comedi_buf_put()/get()
+    
+    Sample values in comedi are generally represented as unsigned values.
+    `comedi_buf_put()` and `comedi_buf_get()` use a `short` to hold the
+    16-bit data value being transferred to or from the comedi buffer.
+    Change them to use `unsigned short` for consistency.
+    
+    Signed-off-by: Ian Abbott <abbotti@mev.co.uk>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index 94b2385fb0af..4e26bd7fc84f 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -344,7 +344,7 @@ unsigned int comedi_buf_read_free(struct comedi_async *async,
+ }
+ EXPORT_SYMBOL_GPL(comedi_buf_read_free);
+ 
+-int comedi_buf_put(struct comedi_async *async, short x)
++int comedi_buf_put(struct comedi_async *async, unsigned short x)
+ {
+ 	unsigned int n = __comedi_buf_write_alloc(async, sizeof(short), 1);
+ 
+@@ -352,20 +352,20 @@ int comedi_buf_put(struct comedi_async *async, short x)
+ 		async->events |= COMEDI_CB_ERROR;
+ 		return 0;
+ 	}
+-	*(short *)(async->prealloc_buf + async->buf_write_ptr) = x;
++	*(unsigned short *)(async->prealloc_buf + async->buf_write_ptr) = x;
+ 	comedi_buf_write_free(async, sizeof(short));
+ 	return 1;
+ }
+ EXPORT_SYMBOL_GPL(comedi_buf_put);
+ 
+-int comedi_buf_get(struct comedi_async *async, short *x)
++int comedi_buf_get(struct comedi_async *async, unsigned short *x)
+ {
+ 	unsigned int n = comedi_buf_read_n_available(async);
+ 
+ 	if (n < sizeof(short))
+ 		return 0;
+ 	comedi_buf_read_alloc(async, sizeof(short));
+-	*x = *(short *)(async->prealloc_buf + async->buf_read_ptr);
++	*x = *(unsigned short *)(async->prealloc_buf + async->buf_read_ptr);
+ 	comedi_buf_read_free(async, sizeof(short));
+ 	return 1;
+ }
+
+commit 76a1de328462f353950ba1e614da1cef1e95bdc1
+Author: H Hartley Sweeten <hsweeten@visionengravers.com>
+Date:   Wed Jul 24 09:55:39 2013 -0700
+
+    staging: comedi: comedi_buf: needs <linux/vmalloc.h>
+    
+    As reported by the kbuild test robot:
+    
+    Commit: ce157f8032bbd46d9427034c335b0afd751da25d
+    staging: comedi: con't rely on comedidev.h to include headers
+    
+    Removed most the includes from comedidev.h and pushed only the needed
+    ones to all the comedi drivers.
+    
+    This one was missed.
+    
+    Signed-off-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Reported-by: kbuild test robot <fengguang.wu@intel.com>
+    Cc: Ian Abbott <abbotti@mev.co.uk>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index b4c001b6f88f..94b2385fb0af 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -15,6 +15,8 @@
+  * GNU General Public License for more details.
+  */
+ 
++#include <linux/vmalloc.h>
++
+ #include "comedidev.h"
+ #include "comedi_internal.h"
+ 
+
+commit 829455bb0e994373519e3c58d403fc1148f44630
+Merge: 42b4212baa28 e4aa937ec75d
+Author: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Date:   Mon May 27 10:54:33 2013 +0900
+
+    Merge 3.10-rc3 into staging-next
+    
+    We want the changes here, and we resolve the merge conflict that was
+    happening in the nvec_kbd.c file.
+    
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit e9166139f6f829c2e7bf6695f13e08d09303d6ca
+Author: Ian Abbott <abbotti@mev.co.uk>
+Date:   Fri May 10 14:07:16 2013 +0100
+
+    staging: comedi: complain if dma buffer allocation not supported
+    
+    When allocating a buffer to support asynchronous comedi commands, if a
+    DMA coherent buffer was requested but `CONFIG_HAS_DMA` is undefined,
+    bail out of local helper function `__comedi_buf_alloc()` with an error
+    message.
+    
+    Signed-off-by: Ian Abbott <abbotti@mev.co.uk>
+    Reviewed-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index b6cd67ad55d1..d4be0e68509b 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -76,6 +76,12 @@ static void __comedi_buf_alloc(struct comedi_device *dev,
+ 	struct comedi_buf_page *buf;
+ 	unsigned i;
+ 
++	if (!IS_ENABLED(CONFIG_HAS_DMA) && s->async_dma_dir != DMA_NONE) {
++		dev_err(dev->class_dev,
++			"dma buffer allocation not supported\n");
++		return;
++	}
++
+ 	async->buf_page_list = vzalloc(sizeof(*buf) * n_pages);
+ 	if (async->buf_page_list)
+ 		pages = vmalloc(sizeof(struct page *) * n_pages);
+
+commit 4efc4bbdc1602d887d784be629a7a4efbf6b6e19
+Author: Ian Abbott <abbotti@mev.co.uk>
+Date:   Fri May 10 14:07:15 2013 +0100
+
+    staging: comedi: work without HAS_DMA
+    
+    The core "comedi" module and the "mite" helper module for NI PCI devices
+    both have calls to `dma_alloc_coherent()` and `dma_free_coherent()`.
+    Those functions are only available if `CONFIG_HAS_DMA` is defined.
+    
+    Apart from the "mite" module, the functions are only called for comedi
+    drivers that set `s->async_dma_dir` (where `s` is a pointer to a `struct
+    comedi_subdevice`) to anything other than `DMA_NONE`.
+    
+    Change local helper functions `__comedi_buf_alloc()` and
+    `__comedi_buf_free()` to only call `dma_alloc_coherent()` and
+    `dma_free_coherent()` if `CONFIG_HAS_DMA` is defined.
+    
+    Change the "Kconfig" to make the following configuration options depend
+    on `HAS_DMA`:
+    
+    `COMEDI_MITE` - builds the "mite" module.
+    `COMEDI_NI_6527` - selects `COMEDI_MITE`.
+    `COMEDI_NI_65XX` - selects `COMEDI_MITE`.
+    `COMEDI_NI_670X` - selects `COMEDI_MITE`.
+    `COMEDI_NI_LABPC_PCI` - selects `COMEDI_MITE`.
+    `COMEDI_NI_PCIDIO` - selects `COMEDI_MITE`.
+    `COMEDI_NI_TIOCMD` - selects `COMEDI_MITE`.
+    `COMEDI_NI_660X` - selects `COMEDI_NI_TIOCMD`,
+                       sets `s->async_dma_dir`.
+    `COMEDI_NI_PCIMIO` - selects `COMEDI_NI_TIOCMD`,
+                         sets `s->async_dma_dir`.
+    
+    Signed-off-by: Ian Abbott <abbotti@mev.co.uk>
+    Reviewed-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index ca709901fb3e..b6cd67ad55d1 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -51,10 +51,12 @@ static void __comedi_buf_free(struct comedi_device *dev,
+ 			clear_bit(PG_reserved,
+ 				  &(virt_to_page(buf->virt_addr)->flags));
+ 			if (s->async_dma_dir != DMA_NONE) {
++#ifdef CONFIG_HAS_DMA
+ 				dma_free_coherent(dev->hw_dev,
+ 						  PAGE_SIZE,
+ 						  buf->virt_addr,
+ 						  buf->dma_addr);
++#endif
+ 			} else {
+ 				free_page((unsigned long)buf->virt_addr);
+ 			}
+@@ -84,11 +86,15 @@ static void __comedi_buf_alloc(struct comedi_device *dev,
+ 	for (i = 0; i < n_pages; i++) {
+ 		buf = &async->buf_page_list[i];
+ 		if (s->async_dma_dir != DMA_NONE)
++#ifdef CONFIG_HAS_DMA
+ 			buf->virt_addr = dma_alloc_coherent(dev->hw_dev,
+ 							    PAGE_SIZE,
+ 							    &buf->dma_addr,
+ 							    GFP_KERNEL |
+ 							    __GFP_COMP);
++#else
++			break;
++#endif
+ 		else
+ 			buf->virt_addr = (void *)get_zeroed_page(GFP_KERNEL);
+ 		if (!buf->virt_addr)
+
+commit 641f064e5df6fb3aaeb6256031a153a5efb16ca6
+Author: H Hartley Sweeten <hsweeten@visionengravers.com>
+Date:   Wed Apr 24 18:13:24 2013 -0700
+
+    staging: comedi: remove FSF address from boilerplate text
+    
+    Addresses change...
+    
+    Remove the paragraph with the FSF address from all the comedi source
+    files.
+    
+    Also, remove the paragraph about the finding the complete GPL in the
+    COPYING file since it's unnecessary.
+    
+    Signed-off-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Cc: Ian Abbott <abbotti@mev.co.uk>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index ca709901fb3e..ce17c55afc77 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -13,10 +13,6 @@
+  * but WITHOUT ANY WARRANTY; without even the implied warranty of
+  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  * GNU General Public License for more details.
+- *
+- * You should have received a copy of the GNU General Public License
+- * along with this program; if not, write to the Free Software
+- * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+  */
+ 
+ #include "comedidev.h"
+
+commit 5660e7427113eff85ae712af9cf98c8c5bd368e3
+Author: H Hartley Sweeten <hsweeten@visionengravers.com>
+Date:   Fri Apr 12 10:11:54 2013 -0700
+
+    staging: comedi: use EXPORT_SYMBOL_GPL() for all exported symbols
+    
+    Comedi is licensed under GPL. Some if its exports are currently
+    EXPORT_SYMBOL() and others are EXPORT_SYMBOL_GPL(). Change them all
+    to EXPORT_SYMBOL_GPL() and see if anyone reports any fall out.
+    
+    If any of the symbols "need" to be EXPORT_SYMBOL() they will be
+    addressed as needed.
+    
+    Signed-off-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Cc: Ian Abbott <abbotti@mev.co.uk>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index 9b997ae67796..ca709901fb3e 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -192,7 +192,7 @@ unsigned int comedi_buf_write_alloc(struct comedi_async *async,
+ {
+ 	return __comedi_buf_write_alloc(async, nbytes, 0);
+ }
+-EXPORT_SYMBOL(comedi_buf_write_alloc);
++EXPORT_SYMBOL_GPL(comedi_buf_write_alloc);
+ 
+ /*
+  * munging is applied to data by core as it passes between user
+@@ -263,7 +263,7 @@ unsigned int comedi_buf_write_free(struct comedi_async *async,
+ 
+ 	return nbytes;
+ }
+-EXPORT_SYMBOL(comedi_buf_write_free);
++EXPORT_SYMBOL_GPL(comedi_buf_write_free);
+ 
+ unsigned int comedi_buf_read_n_available(struct comedi_async *async)
+ {
+@@ -282,7 +282,7 @@ unsigned int comedi_buf_read_n_available(struct comedi_async *async)
+ 
+ 	return num_bytes;
+ }
+-EXPORT_SYMBOL(comedi_buf_read_n_available);
++EXPORT_SYMBOL_GPL(comedi_buf_read_n_available);
+ 
+ /* allocates a chunk for the reader from filled (and munged) buffer space */
+ unsigned int comedi_buf_read_alloc(struct comedi_async *async,
+@@ -304,7 +304,7 @@ unsigned int comedi_buf_read_alloc(struct comedi_async *async,
+ 
+ 	return nbytes;
+ }
+-EXPORT_SYMBOL(comedi_buf_read_alloc);
++EXPORT_SYMBOL_GPL(comedi_buf_read_alloc);
+ 
+ static unsigned int comedi_buf_read_n_allocated(struct comedi_async *async)
+ {
+@@ -332,7 +332,7 @@ unsigned int comedi_buf_read_free(struct comedi_async *async,
+ 	async->buf_read_ptr %= async->prealloc_bufsz;
+ 	return nbytes;
+ }
+-EXPORT_SYMBOL(comedi_buf_read_free);
++EXPORT_SYMBOL_GPL(comedi_buf_read_free);
+ 
+ int comedi_buf_put(struct comedi_async *async, short x)
+ {
+@@ -346,7 +346,7 @@ int comedi_buf_put(struct comedi_async *async, short x)
+ 	comedi_buf_write_free(async, sizeof(short));
+ 	return 1;
+ }
+-EXPORT_SYMBOL(comedi_buf_put);
++EXPORT_SYMBOL_GPL(comedi_buf_put);
+ 
+ int comedi_buf_get(struct comedi_async *async, short *x)
+ {
+@@ -359,7 +359,7 @@ int comedi_buf_get(struct comedi_async *async, short *x)
+ 	comedi_buf_read_free(async, sizeof(short));
+ 	return 1;
+ }
+-EXPORT_SYMBOL(comedi_buf_get);
++EXPORT_SYMBOL_GPL(comedi_buf_get);
+ 
+ void comedi_buf_memcpy_to(struct comedi_async *async, unsigned int offset,
+ 			  const void *data, unsigned int num_bytes)
+@@ -385,7 +385,7 @@ void comedi_buf_memcpy_to(struct comedi_async *async, unsigned int offset,
+ 		write_ptr = 0;
+ 	}
+ }
+-EXPORT_SYMBOL(comedi_buf_memcpy_to);
++EXPORT_SYMBOL_GPL(comedi_buf_memcpy_to);
+ 
+ void comedi_buf_memcpy_from(struct comedi_async *async, unsigned int offset,
+ 			    void *dest, unsigned int nbytes)
+@@ -412,4 +412,4 @@ void comedi_buf_memcpy_from(struct comedi_async *async, unsigned int offset,
+ 		read_ptr = 0;
+ 	}
+ }
+-EXPORT_SYMBOL(comedi_buf_memcpy_from);
++EXPORT_SYMBOL_GPL(comedi_buf_memcpy_from);
+
+commit 215040e1238fa18caf5edf9bcd68126ecd8a6b2d
+Author: H Hartley Sweeten <hsweeten@visionengravers.com>
+Date:   Thu Jan 10 10:38:20 2013 -0700
+
+    staging: comedi: comedi_buf: remove noise in comedi_buf_read_free()
+    
+    If an attempt is made to free more bytes than have been allocated
+    a dev_info message is output and the number of bytes to free is
+    adjusted to the allocated size.
+    
+    Telling the user this happened is just noise. Remove the message.
+    
+    Signed-off-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Cc: Ian Abbott <abbobbi@mev.co.uk>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index 17162d94273b..9b997ae67796 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -324,11 +324,9 @@ unsigned int comedi_buf_read_free(struct comedi_async *async,
+ 	smp_mb();
+ 
+ 	allocated = comedi_buf_read_n_allocated(async);
+-	if (nbytes > allocated) {
+-		dev_info(async->subdevice->device->class_dev,
+-			 "attempted to read-free more bytes than have been read-allocated.\n");
++	if (nbytes > allocated)
+ 		nbytes = allocated;
+-	}
++
+ 	async->buf_read_count += nbytes;
+ 	async->buf_read_ptr += nbytes;
+ 	async->buf_read_ptr %= async->prealloc_bufsz;
+
+commit 6166ce878771edfe2d0fb9e719d5c4d4d4b82157
+Author: H Hartley Sweeten <hsweeten@visionengravers.com>
+Date:   Thu Jan 10 10:37:56 2013 -0700
+
+    staging: comedi: comedi_buf: remove noise in comedi_buf_write_free()
+    
+    If an attempt is made to free more bytes than have been allocated
+    a dev_info message is output and the number of bytes to free is
+    adjusted to the allocated size.
+    
+    Telling the user this happened is just noise. Remove the message.
+    
+    Signed-off-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Cc: Ian Abbott <abbobbi@mev.co.uk>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index 9d11f4163984..17162d94273b 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -252,11 +252,9 @@ unsigned int comedi_buf_write_free(struct comedi_async *async,
+ {
+ 	unsigned int allocated = comedi_buf_write_n_allocated(async);
+ 
+-	if (nbytes > allocated) {
+-		dev_info(async->subdevice->device->class_dev,
+-			 "attempted to write-free more bytes than have been write-allocated.\n");
++	if (nbytes > allocated)
+ 		nbytes = allocated;
+-	}
++
+ 	async->buf_write_count += nbytes;
+ 	async->buf_write_ptr += nbytes;
+ 	comedi_buf_munge(async, async->buf_write_count - async->munge_count);
+
+commit a8f40f463fda58b90206173be73dc199beb7395f
+Author: H Hartley Sweeten <hsweeten@visionengravers.com>
+Date:   Thu Jan 10 10:37:27 2013 -0700
+
+    staging: comedi: comedi_buf: remove unreachable dev_warn in comedi_buf_munge()
+    
+    Due to the 'while(count < num_bytes)' the computed 'block_size' will
+    always be a value greater than 0.
+    
+    Remove the unreachable dev_warn and the (block_size < 0) test.
+    
+    Signed-off-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Cc: Ian Abbott <abbobbi@mev.co.uk>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index 7d516a07474b..9d11f4163984 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -215,13 +215,6 @@ static unsigned int comedi_buf_munge(struct comedi_async *async,
+ 			int block_size = num_bytes - count;
+ 			unsigned int buf_end;
+ 
+-			if (block_size < 0) {
+-				dev_warn(s->device->class_dev,
+-					"%s: %s: bug! block_size is negative\n",
+-					__FILE__, __func__);
+-				break;
+-			}
+-
+ 			buf_end = async->prealloc_bufsz - async->munge_ptr;
+ 			if (block_size > buf_end)
+ 				block_size = buf_end;
+
+commit 305a6f3896350bbfa59c0021f59600bbbb2e9590
+Author: H Hartley Sweeten <hsweeten@visionengravers.com>
+Date:   Thu Jan 10 10:36:58 2013 -0700
+
+    staging: comedi: comedi_buf: remove BUG_ON in comedi_buf_munge()
+    
+    The condition that would trigger this BUG_ON can never occur.
+    
+    The 'munge_count' will be equal to 'buf_write_count' if all the data
+    in the buffer has been munged.
+    
+    Or, the 'munge_count' will be less than the 'buf_write_count' if any
+    partial samples in the buffer were not munged.
+    
+    The 'munge_count' will never be greater than the 'buf_write_count'.
+    
+    Remove the unnecessary BUG_ON.
+    
+    Signed-off-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Cc: Ian Abbott <abbobbi@mev.co.uk>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index ac5f0a91e93b..7d516a07474b 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -245,7 +245,6 @@ static unsigned int comedi_buf_munge(struct comedi_async *async,
+ 		}
+ 	}
+ 
+-	BUG_ON((int)(async->munge_count - async->buf_write_count) > 0);
+ 	return count;
+ }
+ 
+
+commit 8ae560a14abaf2b76fb486ad08fea9c6c5be640f
+Author: H Hartley Sweeten <hsweeten@visionengravers.com>
+Date:   Wed Jan 9 13:32:56 2013 -0700
+
+    staging: comedi: comedi_buf: reorder exported function prototypes
+    
+    For aesthetic reasons, reorder the prototypes for the exported
+    comedi_buf_* functions in comedidev.h to follow the function
+    declarations in comedi_buf.c.
+    
+    Also, change a couple of the return values from 'unsigned' to
+    'unsigned int' to match the value actually returned.
+    
+    Signed-off-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Signed-off-by: Ian Abbott <abbotti@mev.co.uk>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index c562346e4429..ac5f0a91e93b 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -255,7 +255,8 @@ unsigned int comedi_buf_write_n_allocated(struct comedi_async *async)
+ }
+ 
+ /* transfers a chunk from writer to filled buffer space */
+-unsigned comedi_buf_write_free(struct comedi_async *async, unsigned int nbytes)
++unsigned int comedi_buf_write_free(struct comedi_async *async,
++				   unsigned int nbytes)
+ {
+ 	unsigned int allocated = comedi_buf_write_n_allocated(async);
+ 
+@@ -294,7 +295,8 @@ unsigned int comedi_buf_read_n_available(struct comedi_async *async)
+ EXPORT_SYMBOL(comedi_buf_read_n_available);
+ 
+ /* allocates a chunk for the reader from filled (and munged) buffer space */
+-unsigned comedi_buf_read_alloc(struct comedi_async *async, unsigned nbytes)
++unsigned int comedi_buf_read_alloc(struct comedi_async *async,
++				   unsigned int nbytes)
+ {
+ 	unsigned int available;
+ 
+@@ -320,7 +322,8 @@ static unsigned int comedi_buf_read_n_allocated(struct comedi_async *async)
+ }
+ 
+ /* transfers control of a chunk from reader to free buffer space */
+-unsigned comedi_buf_read_free(struct comedi_async *async, unsigned int nbytes)
++unsigned int comedi_buf_read_free(struct comedi_async *async,
++				  unsigned int nbytes)
+ {
+ 	unsigned int allocated;
+ 
+
+commit 8bd650f91be07fb84adc2e47fb1379b7223b95a4
+Author: H Hartley Sweeten <hsweeten@visionengravers.com>
+Date:   Wed Jan 9 13:32:18 2013 -0700
+
+    staging: comedi: comedi_buf: don't expose comedi_buf_write_n_allocated()
+    
+    This helper function is only called by the comedi core in comedi_buf.c
+    and comedi_fops.c. For aesthetic reasons, move it to comedi_buf.c and
+    remove the inline. Move the prototype from comedidev.h to comedi_internal.h
+    so it's not exposed outside the comedi core.
+    
+    Signed-off-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Signed-off-by: Ian Abbott <abbotti@mev.co.uk>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index 891cf89efa91..c562346e4429 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -249,6 +249,11 @@ static unsigned int comedi_buf_munge(struct comedi_async *async,
+ 	return count;
+ }
+ 
++unsigned int comedi_buf_write_n_allocated(struct comedi_async *async)
++{
++	return async->buf_write_alloc_count - async->buf_write_count;
++}
++
+ /* transfers a chunk from writer to filled buffer space */
+ unsigned comedi_buf_write_free(struct comedi_async *async, unsigned int nbytes)
+ {
+
+commit 5b2b64b7510292f4b1e6363edb6f53c39828672e
+Author: H Hartley Sweeten <hsweeten@visionengravers.com>
+Date:   Wed Jan 9 13:31:46 2013 -0700
+
+    staging: comedi: comedi_buf: don't expose comedi_buf_read_n_allocated()
+    
+    This helper function is only called in comedi_buf.c. Move it there and
+    make it static so it's not exposed globally.
+    
+    Signed-off-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Signed-off-by: Ian Abbott <abbotti@mev.co.uk>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index 70d29016f8c0..891cf89efa91 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -309,6 +309,11 @@ unsigned comedi_buf_read_alloc(struct comedi_async *async, unsigned nbytes)
+ }
+ EXPORT_SYMBOL(comedi_buf_read_alloc);
+ 
++static unsigned int comedi_buf_read_n_allocated(struct comedi_async *async)
++{
++	return async->buf_read_alloc_count - async->buf_read_count;
++}
++
+ /* transfers control of a chunk from reader to free buffer space */
+ unsigned comedi_buf_read_free(struct comedi_async *async, unsigned int nbytes)
+ {
+
+commit 3abfa1066b9e98df434868eda9ba91d7012d45c6
+Author: H Hartley Sweeten <hsweeten@visionengravers.com>
+Date:   Wed Jan 9 13:31:16 2013 -0700
+
+    staging: comedi: comedi_buf: clarify comedi_buf_read_free()
+    
+    Reword the comment about the need for the smp_mb().
+    
+    Clarify the check to make sure the number of bytes to free is not
+    more than the number of bytes allocated.
+    
+    Signed-off-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Signed-off-by: Ian Abbott <abbotti@mev.co.uk>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index 971f7394a1f0..70d29016f8c0 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -312,14 +312,19 @@ EXPORT_SYMBOL(comedi_buf_read_alloc);
+ /* transfers control of a chunk from reader to free buffer space */
+ unsigned comedi_buf_read_free(struct comedi_async *async, unsigned int nbytes)
+ {
+-	/* barrier insures data has been read out of
+-	 * buffer before read count is incremented */
++	unsigned int allocated;
++
++	/*
++	 * ensure data has been read out of buffer before
++	 * the async read count is incremented
++	 */
+ 	smp_mb();
+-	if ((int)(async->buf_read_count + nbytes -
+-		  async->buf_read_alloc_count) > 0) {
++
++	allocated = comedi_buf_read_n_allocated(async);
++	if (nbytes > allocated) {
+ 		dev_info(async->subdevice->device->class_dev,
+ 			 "attempted to read-free more bytes than have been read-allocated.\n");
+-		nbytes = async->buf_read_alloc_count - async->buf_read_count;
++		nbytes = allocated;
+ 	}
+ 	async->buf_read_count += nbytes;
+ 	async->buf_read_ptr += nbytes;
+
+commit 034cbd17922a8b6c64b227360314167c15c1f031
+Author: H Hartley Sweeten <hsweeten@visionengravers.com>
+Date:   Wed Jan 9 13:30:49 2013 -0700
+
+    staging: comedi: comedi_buf: clarify comedi_buf_read_alloc()
+    
+    Clarify the check to make sure the number of bytes to allocate is
+    available.
+    
+    Reword the comment about the need for the smp_rmb().
+    
+    Signed-off-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Signed-off-by: Ian Abbott <abbotti@mev.co.uk>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index 06dd544ec2c5..971f7394a1f0 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -291,14 +291,20 @@ EXPORT_SYMBOL(comedi_buf_read_n_available);
+ /* allocates a chunk for the reader from filled (and munged) buffer space */
+ unsigned comedi_buf_read_alloc(struct comedi_async *async, unsigned nbytes)
+ {
+-	if ((int)(async->buf_read_alloc_count + nbytes - async->munge_count) >
+-	    0) {
+-		nbytes = async->munge_count - async->buf_read_alloc_count;
+-	}
++	unsigned int available;
++
++	available = async->munge_count - async->buf_read_alloc_count;
++	if (nbytes > available)
++		nbytes = available;
++
+ 	async->buf_read_alloc_count += nbytes;
+-	/* barrier insures read of munge_count occurs before we actually read
+-	   data out of buffer */
++
++	/*
++	 * ensure the async buffer 'counts' are read before we
++	 * attempt to read data from the read-alloc'ed buffer space
++	 */
+ 	smp_rmb();
++
+ 	return nbytes;
+ }
+ EXPORT_SYMBOL(comedi_buf_read_alloc);
+
+commit 43f9137df461f6365f76b46f404fd6775eab7d51
+Author: H Hartley Sweeten <hsweeten@visionengravers.com>
+Date:   Wed Jan 9 13:30:22 2013 -0700
+
+    staging: comedi: comedi_buf: cleanup comedi_buf_read_n_available()
+    
+    For aesthetic reasons, cleanup this function a bit.
+    
+    Change the (async == NULL) test to simply (!async).
+    
+    Reword the comment about the need for the smp_rmb()..
+    
+    Signed-off-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Signed-off-by: Ian Abbott <abbotti@mev.co.uk>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index fd2a92e29fb0..06dd544ec2c5 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -273,14 +273,17 @@ unsigned int comedi_buf_read_n_available(struct comedi_async *async)
+ {
+ 	unsigned num_bytes;
+ 
+-	if (async == NULL)
++	if (!async)
+ 		return 0;
++
+ 	num_bytes = async->munge_count - async->buf_read_count;
+-	/* barrier insures the read of munge_count in this
+-	   query occurs before any following reads of the buffer which
+-	   might be based on the return value from this query.
++
++	/*
++	 * ensure the async buffer 'counts' are read before we
++	 * attempt to read data from the buffer
+ 	 */
+ 	smp_rmb();
++
+ 	return num_bytes;
+ }
+ EXPORT_SYMBOL(comedi_buf_read_n_available);
+
+commit d21af4cbfb7fccbccedc1d9e143a14aee6b1c9ad
+Author: H Hartley Sweeten <hsweeten@visionengravers.com>
+Date:   Wed Jan 9 13:29:53 2013 -0700
+
+    staging: comedi: comedi_buf: clarify comedi_buf_write_free()
+    
+    Use the helper comedi_buf_write_n_allocated() to clarify the check
+    to make sure the number of bytes to free is not more than the number
+    of bytes allocated.
+    
+    Signed-off-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Signed-off-by: Ian Abbott <abbotti@mev.co.uk>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index 95cbe365ded2..fd2a92e29fb0 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -252,11 +252,12 @@ static unsigned int comedi_buf_munge(struct comedi_async *async,
+ /* transfers a chunk from writer to filled buffer space */
+ unsigned comedi_buf_write_free(struct comedi_async *async, unsigned int nbytes)
+ {
+-	if ((int)(async->buf_write_count + nbytes -
+-		  async->buf_write_alloc_count) > 0) {
++	unsigned int allocated = comedi_buf_write_n_allocated(async);
++
++	if (nbytes > allocated) {
+ 		dev_info(async->subdevice->device->class_dev,
+ 			 "attempted to write-free more bytes than have been write-allocated.\n");
+-		nbytes = async->buf_write_alloc_count - async->buf_write_count;
++		nbytes = allocated;
+ 	}
+ 	async->buf_write_count += nbytes;
+ 	async->buf_write_ptr += nbytes;
+
+commit 8d4be669479d95a0c6eb4b6a538460f0ab35c4f7
+Author: H Hartley Sweeten <hsweeten@visionengravers.com>
+Date:   Wed Jan 9 13:29:19 2013 -0700
+
+    staging: comedi: comedi_buf: cleanup comedi_buf_munge()
+    
+    Refactor this function so there is a single return point and only
+    one BUG_ON check. The BUG_ON needs to be looked at to see if it
+    can be safely removed.
+    
+    Clarify the test in the munge loop that checks for a block copy
+    that would extend pass the end of the prealloc_buf.
+    
+    Reword the comment about the need for the smp_wmb().
+    
+    Signed-off-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Signed-off-by: Ian Abbott <abbotti@mev.co.uk>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index 1b269a7a07ac..95cbe365ded2 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -194,8 +194,10 @@ unsigned int comedi_buf_write_alloc(struct comedi_async *async,
+ }
+ EXPORT_SYMBOL(comedi_buf_write_alloc);
+ 
+-/* munging is applied to data by core as it passes between user
+- * and kernel space */
++/*
++ * munging is applied to data by core as it passes between user
++ * and kernel space
++ */
+ static unsigned int comedi_buf_munge(struct comedi_async *async,
+ 				     unsigned int num_bytes)
+ {
+@@ -203,40 +205,46 @@ static unsigned int comedi_buf_munge(struct comedi_async *async,
+ 	unsigned int count = 0;
+ 	const unsigned num_sample_bytes = bytes_per_sample(s);
+ 
+-	if (s->munge == NULL || (async->cmd.flags & CMDF_RAWDATA)) {
++	if (!s->munge || (async->cmd.flags & CMDF_RAWDATA)) {
+ 		async->munge_count += num_bytes;
+-		BUG_ON((int)(async->munge_count - async->buf_write_count) > 0);
+-		return num_bytes;
+-	}
+-	/* don't munge partial samples */
+-	num_bytes -= num_bytes % num_sample_bytes;
+-	while (count < num_bytes) {
+-		int block_size;
+-
+-		block_size = num_bytes - count;
+-		if (block_size < 0) {
+-			dev_warn(s->device->class_dev,
+-				 "%s: %s: bug! block_size is negative\n",
+-				 __FILE__, __func__);
+-			break;
++		count = num_bytes;
++	} else {
++		/* don't munge partial samples */
++		num_bytes -= num_bytes % num_sample_bytes;
++		while (count < num_bytes) {
++			int block_size = num_bytes - count;
++			unsigned int buf_end;
++
++			if (block_size < 0) {
++				dev_warn(s->device->class_dev,
++					"%s: %s: bug! block_size is negative\n",
++					__FILE__, __func__);
++				break;
++			}
++
++			buf_end = async->prealloc_bufsz - async->munge_ptr;
++			if (block_size > buf_end)
++				block_size = buf_end;
++
++			s->munge(s->device, s,
++				 async->prealloc_buf + async->munge_ptr,
++				 block_size, async->munge_chan);
++
++			/*
++			 * ensure data is munged in buffer before the
++			 * async buffer munge_count is incremented
++			 */
++			smp_wmb();
++
++			async->munge_chan += block_size / num_sample_bytes;
++			async->munge_chan %= async->cmd.chanlist_len;
++			async->munge_count += block_size;
++			async->munge_ptr += block_size;
++			async->munge_ptr %= async->prealloc_bufsz;
++			count += block_size;
+ 		}
+-		if ((int)(async->munge_ptr + block_size -
+-			  async->prealloc_bufsz) > 0)
+-			block_size = async->prealloc_bufsz - async->munge_ptr;
+-
+-		s->munge(s->device, s, async->prealloc_buf + async->munge_ptr,
+-			 block_size, async->munge_chan);
+-
+-		smp_wmb();	/* barrier insures data is munged in buffer
+-				 * before munge_count is incremented */
+-
+-		async->munge_chan += block_size / num_sample_bytes;
+-		async->munge_chan %= async->cmd.chanlist_len;
+-		async->munge_count += block_size;
+-		async->munge_ptr += block_size;
+-		async->munge_ptr %= async->prealloc_bufsz;
+-		count += block_size;
+ 	}
++
+ 	BUG_ON((int)(async->munge_count - async->buf_write_count) > 0);
+ 	return count;
+ }
+
+commit 47181eab71a81a919bf74eee570d6db59c6cf298
+Author: H Hartley Sweeten <hsweeten@visionengravers.com>
+Date:   Wed Jan 9 13:28:20 2013 -0700
+
+    staging: comedi: comedi_buf: remove comedi_buf_write_alloc_strict
+    
+    This function is only called by comedi_buf_put(). Remove it and just
+    call __comedi_buf_write_alloc() directly with the strict flag set.
+    
+    Signed-off-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Signed-off-by: Ian Abbott <abbotti@mev.co.uk>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index 2f38a87fbcf0..1b269a7a07ac 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -194,13 +194,6 @@ unsigned int comedi_buf_write_alloc(struct comedi_async *async,
+ }
+ EXPORT_SYMBOL(comedi_buf_write_alloc);
+ 
+-/* allocates nothing unless it can completely fulfill the request */
+-unsigned int comedi_buf_write_alloc_strict(struct comedi_async *async,
+-					   unsigned int nbytes)
+-{
+-	return __comedi_buf_write_alloc(async, nbytes, 1);
+-}
+-
+ /* munging is applied to data by core as it passes between user
+  * and kernel space */
+ static unsigned int comedi_buf_munge(struct comedi_async *async,
+@@ -319,7 +312,7 @@ EXPORT_SYMBOL(comedi_buf_read_free);
+ 
+ int comedi_buf_put(struct comedi_async *async, short x)
+ {
+-	unsigned int n = comedi_buf_write_alloc_strict(async, sizeof(short));
++	unsigned int n = __comedi_buf_write_alloc(async, sizeof(short), 1);
+ 
+ 	if (n < sizeof(short)) {
+ 		async->events |= COMEDI_CB_ERROR;
+
+commit f8f76e909b8cc6696071e69cf4be07714c95bcb4
+Author: H Hartley Sweeten <hsweeten@visionengravers.com>
+Date:   Wed Jan 9 13:27:48 2013 -0700
+
+    staging: comedi: comedi_buf: factor out common comedi_buf_write_alloc_* code
+    
+    The only difference between comedi_buf_write_alloc() and the *_strict()
+    version is that the *_strict() one will only allocate the chunk if it
+    can completely fulfill the request.
+    
+    Factor out the common code and add a flag parameter to indicate the 'strict'
+    usage. Change the exported functions so they are just wrappers around the
+    common function.
+    
+    Cleanup the common function a bit and use the comedi_buf_write_n_available()
+    helper to determine the number of bytes available.
+    
+    comedi_buf_write_n_available() is not used outside this module so make it
+    static. Since the only caller is __comedi_buf_write_alloc(), which will
+    always have a valid async pointer and already has a memory barrier, we
+    can remove the unnecessary (async == NULL) test as well as the smp_mb().
+    Also, the rounding of the sample size can be removed since the caller
+    does not need it.
+    
+    Signed-off-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Signed-off-by: Ian Abbott <abbotti@mev.co.uk>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index 9392453918ea..2f38a87fbcf0 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -159,22 +159,30 @@ void comedi_buf_reset(struct comedi_async *async)
+ 	async->events = 0;
+ }
+ 
+-unsigned int comedi_buf_write_n_available(struct comedi_async *async)
++static unsigned int comedi_buf_write_n_available(struct comedi_async *async)
+ {
+-	unsigned int free_end;
+-	unsigned int nbytes;
++	unsigned int free_end = async->buf_read_count + async->prealloc_bufsz;
+ 
+-	if (async == NULL)
+-		return 0;
++	return free_end - async->buf_write_alloc_count;
++}
+ 
+-	free_end = async->buf_read_count + async->prealloc_bufsz;
+-	nbytes = free_end - async->buf_write_alloc_count;
+-	nbytes -= nbytes % bytes_per_sample(async->subdevice);
+-	/* barrier insures the read of buf_read_count in this
+-	   query occurs before any following writes to the buffer which
+-	   might be based on the return value from this query.
++static unsigned int __comedi_buf_write_alloc(struct comedi_async *async,
++					     unsigned int nbytes,
++					     int strict)
++{
++	unsigned int available = comedi_buf_write_n_available(async);
++
++	if (nbytes > available)
++		nbytes = strict ? 0 : available;
++
++	async->buf_write_alloc_count += nbytes;
++
++	/*
++	 * ensure the async buffer 'counts' are read and updated
++	 * before we write data to the write-alloc'ed buffer space
+ 	 */
+ 	smp_mb();
++
+ 	return nbytes;
+ }
+ 
+@@ -182,16 +190,7 @@ unsigned int comedi_buf_write_n_available(struct comedi_async *async)
+ unsigned int comedi_buf_write_alloc(struct comedi_async *async,
+ 				    unsigned int nbytes)
+ {
+-	unsigned int free_end = async->buf_read_count + async->prealloc_bufsz;
+-
+-	if ((int)(async->buf_write_alloc_count + nbytes - free_end) > 0)
+-		nbytes = free_end - async->buf_write_alloc_count;
+-
+-	async->buf_write_alloc_count += nbytes;
+-	/* barrier insures the read of buf_read_count above occurs before
+-	   we write data to the write-alloc'ed buffer space */
+-	smp_mb();
+-	return nbytes;
++	return __comedi_buf_write_alloc(async, nbytes, 0);
+ }
+ EXPORT_SYMBOL(comedi_buf_write_alloc);
+ 
+@@ -199,16 +198,7 @@ EXPORT_SYMBOL(comedi_buf_write_alloc);
+ unsigned int comedi_buf_write_alloc_strict(struct comedi_async *async,
+ 					   unsigned int nbytes)
+ {
+-	unsigned int free_end = async->buf_read_count + async->prealloc_bufsz;
+-
+-	if ((int)(async->buf_write_alloc_count + nbytes - free_end) > 0)
+-		nbytes = 0;
+-
+-	async->buf_write_alloc_count += nbytes;
+-	/* barrier insures the read of buf_read_count above occurs before
+-	   we write data to the write-alloc'ed buffer space */
+-	smp_mb();
+-	return nbytes;
++	return __comedi_buf_write_alloc(async, nbytes, 1);
+ }
+ 
+ /* munging is applied to data by core as it passes between user
+
+commit 61c9fb0eb08bc9b7164a6181b0062d9959406a34
+Author: H Hartley Sweeten <hsweeten@visionengravers.com>
+Date:   Wed Jan 9 13:27:07 2013 -0700
+
+    staging: comedi: comedi_buf: rename comedi_reset_async_buf()
+    
+    For aesthetic reasons, rename this function to comedi_buf_reset(). This
+    makes all the asynchronous buffer functions have the same namespace.
+    
+    Signed-off-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Signed-off-by: Ian Abbott <abbotti@mev.co.uk>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index 2fc89816f10d..9392453918ea 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -140,7 +140,7 @@ int comedi_buf_alloc(struct comedi_device *dev, struct comedi_subdevice *s,
+ 	return 0;
+ }
+ 
+-void comedi_reset_async_buf(struct comedi_async *async)
++void comedi_buf_reset(struct comedi_async *async)
+ {
+ 	async->buf_write_alloc_count = 0;
+ 	async->buf_write_count = 0;
+
+commit 6bd764573179f3f7c165b1ee093aff2d7ad3c59e
+Author: H Hartley Sweeten <hsweeten@visionengravers.com>
+Date:   Wed Jan 9 13:26:26 2013 -0700
+
+    staging: comedi: comedi_buf: factor out new buffer allocation code
+    
+    The function comedi_buf_alloc() first frees any allocated buffer then,
+    optionally, allocates a new buffer.
+    
+    Factor out the new buffer allocation code to a new function. This
+    allows reducing the indent level and makes the code a bit cleaner.
+    
+    Also, cleanup to factored out code to make it a bit more concise.
+    Use a local variable for the current comedi_buf_page being allocated.
+    This cleans up the ugly line breaks used to keep the lines < 80 chars.
+    
+    Move the #ifdef'ery for the page protection determination out of the
+    vmap() call.
+    
+    Signed-off-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Signed-off-by: Ian Abbott <abbotti@mev.co.uk>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index 3f01b0badd0b..2fc89816f10d 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -22,6 +22,12 @@
+ #include "comedidev.h"
+ #include "comedi_internal.h"
+ 
++#ifdef PAGE_KERNEL_NOCACHE
++#define COMEDI_PAGE_PROTECTION		PAGE_KERNEL_NOCACHE
++#else
++#define COMEDI_PAGE_PROTECTION		PAGE_KERNEL
++#endif
++
+ static void __comedi_buf_free(struct comedi_device *dev,
+ 			      struct comedi_subdevice *s,
+ 			      unsigned n_pages)
+@@ -59,6 +65,48 @@ static void __comedi_buf_free(struct comedi_device *dev,
+ 	async->n_buf_pages = 0;
+ }
+ 
++static void __comedi_buf_alloc(struct comedi_device *dev,
++			       struct comedi_subdevice *s,
++			       unsigned n_pages)
++{
++	struct comedi_async *async = s->async;
++	struct page **pages = NULL;
++	struct comedi_buf_page *buf;
++	unsigned i;
++
++	async->buf_page_list = vzalloc(sizeof(*buf) * n_pages);
++	if (async->buf_page_list)
++		pages = vmalloc(sizeof(struct page *) * n_pages);
++
++	if (!pages)
++		return;
++
++	for (i = 0; i < n_pages; i++) {
++		buf = &async->buf_page_list[i];
++		if (s->async_dma_dir != DMA_NONE)
++			buf->virt_addr = dma_alloc_coherent(dev->hw_dev,
++							    PAGE_SIZE,
++							    &buf->dma_addr,
++							    GFP_KERNEL |
++							    __GFP_COMP);
++		else
++			buf->virt_addr = (void *)get_zeroed_page(GFP_KERNEL);
++		if (!buf->virt_addr)
++			break;
++
++		set_bit(PG_reserved, &(virt_to_page(buf->virt_addr)->flags));
++
++		pages[i] = virt_to_page(buf->virt_addr);
++	}
++
++	/* vmap the prealloc_buf if all the pages were allocated */
++	if (i == n_pages)
++		async->prealloc_buf = vmap(pages, n_pages, VM_MAP,
++					   COMEDI_PAGE_PROTECTION);
++
++	vfree(pages);
++}
++
+ int comedi_buf_alloc(struct comedi_device *dev, struct comedi_subdevice *s,
+ 		     unsigned long new_size)
+ {
+@@ -74,55 +122,14 @@ int comedi_buf_alloc(struct comedi_device *dev, struct comedi_subdevice *s,
+ 	/* deallocate old buffer */
+ 	__comedi_buf_free(dev, s, async->n_buf_pages);
+ 
+-	/*  allocate new buffer */
++	/* allocate new buffer */
+ 	if (new_size) {
+-		unsigned i = 0;
+ 		unsigned n_pages = new_size >> PAGE_SHIFT;
+-		struct page **pages = NULL;
+-
+-		async->buf_page_list =
+-		    vzalloc(sizeof(struct comedi_buf_page) * n_pages);
+-		if (async->buf_page_list)
+-			pages = vmalloc(sizeof(struct page *) * n_pages);
+-
+-		if (pages) {
+-			for (i = 0; i < n_pages; i++) {
+-				if (s->async_dma_dir != DMA_NONE) {
+-					async->buf_page_list[i].virt_addr =
+-					    dma_alloc_coherent(dev->hw_dev,
+-							       PAGE_SIZE,
+-							       &async->
+-							       buf_page_list
+-							       [i].dma_addr,
+-							       GFP_KERNEL |
+-							       __GFP_COMP);
+-				} else {
+-					async->buf_page_list[i].virt_addr =
+-					    (void *)
+-					    get_zeroed_page(GFP_KERNEL);
+-				}
+-				if (async->buf_page_list[i].virt_addr == NULL)
+-					break;
+-
+-				set_bit(PG_reserved,
+-					&(virt_to_page(async->buf_page_list[i].
+-							virt_addr)->flags));
+-				pages[i] = virt_to_page(async->buf_page_list[i].
+-								virt_addr);
+-			}
+-		}
+-		if (i == n_pages) {
+-			async->prealloc_buf =
+-#ifdef PAGE_KERNEL_NOCACHE
+-			    vmap(pages, n_pages, VM_MAP, PAGE_KERNEL_NOCACHE);
+-#else
+-			    vmap(pages, n_pages, VM_MAP, PAGE_KERNEL);
+-#endif
+-		}
+-		vfree(pages);
++
++		__comedi_buf_alloc(dev, s, n_pages);
+ 
+ 		if (!async->prealloc_buf) {
+-			/* Some allocation failed above */
++			/* allocation failed */
+ 			__comedi_buf_free(dev, s, n_pages);
+ 			return -ENOMEM;
+ 		}
+
+commit 718c4d68d9491e8bc16a614d193b257efc41723e
+Author: H Hartley Sweeten <hsweeten@visionengravers.com>
+Date:   Wed Jan 9 13:25:54 2013 -0700
+
+    staging: comedi: comedi_buf: factor out common code to free the async buffer
+    
+    The function comedi_buf_alloc() uses two loops to free the async buffer's
+    buf_page_list. The first one is used at the beginning to deallocate the
+    current buffer. The second is used to cleanup if the new buffer allocation
+    fails.
+    
+    Factor out the common code to a new function.
+    
+    Signed-off-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Signed-off-by: Ian Abbott <abbotti@mev.co.uk>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+index fe2dcae805b4..3f01b0badd0b 100644
+--- a/drivers/staging/comedi/comedi_buf.c
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -22,6 +22,43 @@
+ #include "comedidev.h"
+ #include "comedi_internal.h"
+ 
++static void __comedi_buf_free(struct comedi_device *dev,
++			      struct comedi_subdevice *s,
++			      unsigned n_pages)
++{
++	struct comedi_async *async = s->async;
++	struct comedi_buf_page *buf;
++	unsigned i;
++
++	if (async->prealloc_buf) {
++		vunmap(async->prealloc_buf);
++		async->prealloc_buf = NULL;
++		async->prealloc_bufsz = 0;
++	}
++
++	if (!async->buf_page_list)
++		return;
++
++	for (i = 0; i < n_pages; ++i) {
++		buf = &async->buf_page_list[i];
++		if (buf->virt_addr) {
++			clear_bit(PG_reserved,
++				  &(virt_to_page(buf->virt_addr)->flags));
++			if (s->async_dma_dir != DMA_NONE) {
++				dma_free_coherent(dev->hw_dev,
++						  PAGE_SIZE,
++						  buf->virt_addr,
++						  buf->dma_addr);
++			} else {
++				free_page((unsigned long)buf->virt_addr);
++			}
++		}
++	}
++	vfree(async->buf_page_list);
++	async->buf_page_list = NULL;
++	async->n_buf_pages = 0;
++}
++
+ int comedi_buf_alloc(struct comedi_device *dev, struct comedi_subdevice *s,
+ 		     unsigned long new_size)
+ {
+@@ -34,39 +71,9 @@ int comedi_buf_alloc(struct comedi_device *dev, struct comedi_subdevice *s,
+ 	if (async->prealloc_buf && async->prealloc_bufsz == new_size)
+ 		return 0;
+ 
+-	/*  deallocate old buffer */
+-	if (async->prealloc_buf) {
+-		vunmap(async->prealloc_buf);
+-		async->prealloc_buf = NULL;
+-		async->prealloc_bufsz = 0;
+-	}
+-	if (async->buf_page_list) {
+-		unsigned i;
+-		for (i = 0; i < async->n_buf_pages; ++i) {
+-			if (async->buf_page_list[i].virt_addr) {
+-				clear_bit(PG_reserved,
+-					&(virt_to_page(async->buf_page_list[i].
+-							virt_addr)->flags));
+-				if (s->async_dma_dir != DMA_NONE) {
+-					dma_free_coherent(dev->hw_dev,
+-							  PAGE_SIZE,
+-							  async->
+-							  buf_page_list
+-							  [i].virt_addr,
+-							  async->
+-							  buf_page_list
+-							  [i].dma_addr);
+-				} else {
+-					free_page((unsigned long)
+-						  async->buf_page_list[i].
+-						  virt_addr);
+-				}
+-			}
+-		}
+-		vfree(async->buf_page_list);
+-		async->buf_page_list = NULL;
+-		async->n_buf_pages = 0;
+-	}
++	/* deallocate old buffer */
++	__comedi_buf_free(dev, s, async->n_buf_pages);
++
+ 	/*  allocate new buffer */
+ 	if (new_size) {
+ 		unsigned i = 0;
+@@ -114,36 +121,9 @@ int comedi_buf_alloc(struct comedi_device *dev, struct comedi_subdevice *s,
+ 		}
+ 		vfree(pages);
+ 
+-		if (async->prealloc_buf == NULL) {
+-			/* Some allocation failed above. */
+-			if (async->buf_page_list) {
+-				for (i = 0; i < n_pages; i++) {
+-					if (async->buf_page_list[i].virt_addr ==
+-					    NULL) {
+-						break;
+-					}
+-					clear_bit(PG_reserved,
+-						&(virt_to_page(async->
+-							buf_page_list[i].
+-							virt_addr)->flags));
+-					if (s->async_dma_dir != DMA_NONE) {
+-						dma_free_coherent(dev->hw_dev,
+-								  PAGE_SIZE,
+-								  async->
+-								  buf_page_list
+-								  [i].virt_addr,
+-								  async->
+-								  buf_page_list
+-								  [i].dma_addr);
+-					} else {
+-						free_page((unsigned long)
+-							  async->buf_page_list
+-							  [i].virt_addr);
+-					}
+-				}
+-				vfree(async->buf_page_list);
+-				async->buf_page_list = NULL;
+-			}
++		if (!async->prealloc_buf) {
++			/* Some allocation failed above */
++			__comedi_buf_free(dev, s, n_pages);
+ 			return -ENOMEM;
+ 		}
+ 		async->n_buf_pages = n_pages;
+
+commit ea082fb1b0ee42b6430c83a6dc9d795381a87264
+Author: H Hartley Sweeten <hsweeten@visionengravers.com>
+Date:   Wed Jan 9 13:25:06 2013 -0700
+
+    staging: comedi: separate out comedi_buf_* functions
+    
+    Create a new file, comedi_buf.c, to hold all the comedi_async buffer
+    functions. Currently they are all in drivers.c and really don't have
+    any association with that source file.
+    
+    Signed-off-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Signed-off-by: Ian Abbott <abbotti@mev.co.uk>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/staging/comedi/comedi_buf.c b/drivers/staging/comedi/comedi_buf.c
+new file mode 100644
+index 000000000000..fe2dcae805b4
+--- /dev/null
++++ b/drivers/staging/comedi/comedi_buf.c
+@@ -0,0 +1,421 @@
++/*
++ * comedi_buf.c
++ *
++ * COMEDI - Linux Control and Measurement Device Interface
++ * Copyright (C) 1997-2000 David A. Schleef <ds@schleef.org>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
++ */
++
++#include "comedidev.h"
++#include "comedi_internal.h"
++
++int comedi_buf_alloc(struct comedi_device *dev, struct comedi_subdevice *s,
++		     unsigned long new_size)
++{
++	struct comedi_async *async = s->async;
++
++	/* Round up new_size to multiple of PAGE_SIZE */
++	new_size = (new_size + PAGE_SIZE - 1) & PAGE_MASK;
++
++	/* if no change is required, do nothing */
++	if (async->prealloc_buf && async->prealloc_bufsz == new_size)
++		return 0;
++
++	/*  deallocate old buffer */
++	if (async->prealloc_buf) {
++		vunmap(async->prealloc_buf);
++		async->prealloc_buf = NULL;
++		async->prealloc_bufsz = 0;
++	}
++	if (async->buf_page_list) {
++		unsigned i;
++		for (i = 0; i < async->n_buf_pages; ++i) {
++			if (async->buf_page_list[i].virt_addr) {
++				clear_bit(PG_reserved,
++					&(virt_to_page(async->buf_page_list[i].
++							virt_addr)->flags));
++				if (s->async_dma_dir != DMA_NONE) {
++					dma_free_coherent(dev->hw_dev,
++							  PAGE_SIZE,
++							  async->
++							  buf_page_list
++							  [i].virt_addr,
++							  async->
++							  buf_page_list
++							  [i].dma_addr);
++				} else {
++					free_page((unsigned long)
++						  async->buf_page_list[i].
++						  virt_addr);
++				}
++			}
++		}
++		vfree(async->buf_page_list);
++		async->buf_page_list = NULL;
++		async->n_buf_pages = 0;
++	}
++	/*  allocate new buffer */
++	if (new_size) {
++		unsigned i = 0;
++		unsigned n_pages = new_size >> PAGE_SHIFT;
++		struct page **pages = NULL;
++
++		async->buf_page_list =
++		    vzalloc(sizeof(struct comedi_buf_page) * n_pages);
++		if (async->buf_page_list)
++			pages = vmalloc(sizeof(struct page *) * n_pages);
++
++		if (pages) {
++			for (i = 0; i < n_pages; i++) {
++				if (s->async_dma_dir != DMA_NONE) {
++					async->buf_page_list[i].virt_addr =
++					    dma_alloc_coherent(dev->hw_dev,
++							       PAGE_SIZE,
++							       &async->
++							       buf_page_list
++							       [i].dma_addr,
++							       GFP_KERNEL |
++							       __GFP_COMP);
++				} else {
++					async->buf_page_list[i].virt_addr =
++					    (void *)
++					    get_zeroed_page(GFP_KERNEL);
++				}
++				if (async->buf_page_list[i].virt_addr == NULL)
++					break;
++
++				set_bit(PG_reserved,
++					&(virt_to_page(async->buf_page_list[i].
++							virt_addr)->flags));
++				pages[i] = virt_to_page(async->buf_page_list[i].
++								virt_addr);
++			}
++		}
++		if (i == n_pages) {
++			async->prealloc_buf =
++#ifdef PAGE_KERNEL_NOCACHE
++			    vmap(pages, n_pages, VM_MAP, PAGE_KERNEL_NOCACHE);
++#else
++			    vmap(pages, n_pages, VM_MAP, PAGE_KERNEL);
++#endif
++		}
++		vfree(pages);
++
++		if (async->prealloc_buf == NULL) {
++			/* Some allocation failed above. */
++			if (async->buf_page_list) {
++				for (i = 0; i < n_pages; i++) {
++					if (async->buf_page_list[i].virt_addr ==
++					    NULL) {
++						break;
++					}
++					clear_bit(PG_reserved,
++						&(virt_to_page(async->
++							buf_page_list[i].
++							virt_addr)->flags));
++					if (s->async_dma_dir != DMA_NONE) {
++						dma_free_coherent(dev->hw_dev,
++								  PAGE_SIZE,
++								  async->
++								  buf_page_list
++								  [i].virt_addr,
++								  async->
++								  buf_page_list
++								  [i].dma_addr);
++					} else {
++						free_page((unsigned long)
++							  async->buf_page_list
++							  [i].virt_addr);
++					}
++				}
++				vfree(async->buf_page_list);
++				async->buf_page_list = NULL;
++			}
++			return -ENOMEM;
++		}
++		async->n_buf_pages = n_pages;
++	}
++	async->prealloc_bufsz = new_size;
++
++	return 0;
++}
++
++void comedi_reset_async_buf(struct comedi_async *async)
++{
++	async->buf_write_alloc_count = 0;
++	async->buf_write_count = 0;
++	async->buf_read_alloc_count = 0;
++	async->buf_read_count = 0;
++
++	async->buf_write_ptr = 0;
++	async->buf_read_ptr = 0;
++
++	async->cur_chan = 0;
++	async->scan_progress = 0;
++	async->munge_chan = 0;
++	async->munge_count = 0;
++	async->munge_ptr = 0;
++
++	async->events = 0;
++}
++
++unsigned int comedi_buf_write_n_available(struct comedi_async *async)
++{
++	unsigned int free_end;
++	unsigned int nbytes;
++
++	if (async == NULL)
++		return 0;
++
++	free_end = async->buf_read_count + async->prealloc_bufsz;
++	nbytes = free_end - async->buf_write_alloc_count;
++	nbytes -= nbytes % bytes_per_sample(async->subdevice);
++	/* barrier insures the read of buf_read_count in this
++	   query occurs before any following writes to the buffer which
++	   might be based on the return value from this query.
++	 */
++	smp_mb();
++	return nbytes;
++}
++
++/* allocates chunk for the writer from free buffer space */
++unsigned int comedi_buf_write_alloc(struct comedi_async *async,
++				    unsigned int nbytes)
++{
++	unsigned int free_end = async->buf_read_count + async->prealloc_bufsz;
++
++	if ((int)(async->buf_write_alloc_count + nbytes - free_end) > 0)
++		nbytes = free_end - async->buf_write_alloc_count;
++
++	async->buf_write_alloc_count += nbytes;
++	/* barrier insures the read of buf_read_count above occurs before
++	   we write data to the write-alloc'ed buffer space */
++	smp_mb();
++	return nbytes;
++}
++EXPORT_SYMBOL(comedi_buf_write_alloc);
++
++/* allocates nothing unless it can completely fulfill the request */
++unsigned int comedi_buf_write_alloc_strict(struct comedi_async *async,
++					   unsigned int nbytes)
++{
++	unsigned int free_end = async->buf_read_count + async->prealloc_bufsz;
++
++	if ((int)(async->buf_write_alloc_count + nbytes - free_end) > 0)
++		nbytes = 0;
++
++	async->buf_write_alloc_count += nbytes;
++	/* barrier insures the read of buf_read_count above occurs before
++	   we write data to the write-alloc'ed buffer space */
++	smp_mb();
++	return nbytes;
++}
++
++/* munging is applied to data by core as it passes between user
++ * and kernel space */
++static unsigned int comedi_buf_munge(struct comedi_async *async,
++				     unsigned int num_bytes)
++{
++	struct comedi_subdevice *s = async->subdevice;
++	unsigned int count = 0;
++	const unsigned num_sample_bytes = bytes_per_sample(s);
++
++	if (s->munge == NULL || (async->cmd.flags & CMDF_RAWDATA)) {
++		async->munge_count += num_bytes;
++		BUG_ON((int)(async->munge_count - async->buf_write_count) > 0);
++		return num_bytes;
++	}
++	/* don't munge partial samples */
++	num_bytes -= num_bytes % num_sample_bytes;
++	while (count < num_bytes) {
++		int block_size;
++
++		block_size = num_bytes - count;
++		if (block_size < 0) {
++			dev_warn(s->device->class_dev,
++				 "%s: %s: bug! block_size is negative\n",
++				 __FILE__, __func__);
++			break;
++		}
++		if ((int)(async->munge_ptr + block_size -
++			  async->prealloc_bufsz) > 0)
++			block_size = async->prealloc_bufsz - async->munge_ptr;
++
++		s->munge(s->device, s, async->prealloc_buf + async->munge_ptr,
++			 block_size, async->munge_chan);
++
++		smp_wmb();	/* barrier insures data is munged in buffer
++				 * before munge_count is incremented */
++
++		async->munge_chan += block_size / num_sample_bytes;
++		async->munge_chan %= async->cmd.chanlist_len;
++		async->munge_count += block_size;
++		async->munge_ptr += block_size;
++		async->munge_ptr %= async->prealloc_bufsz;
++		count += block_size;
++	}
++	BUG_ON((int)(async->munge_count - async->buf_write_count) > 0);
++	return count;
++}
++
++/* transfers a chunk from writer to filled buffer space */
++unsigned comedi_buf_write_free(struct comedi_async *async, unsigned int nbytes)
++{
++	if ((int)(async->buf_write_count + nbytes -
++		  async->buf_write_alloc_count) > 0) {
++		dev_info(async->subdevice->device->class_dev,
++			 "attempted to write-free more bytes than have been write-allocated.\n");
++		nbytes = async->buf_write_alloc_count - async->buf_write_count;
++	}
++	async->buf_write_count += nbytes;
++	async->buf_write_ptr += nbytes;
++	comedi_buf_munge(async, async->buf_write_count - async->munge_count);
++	if (async->buf_write_ptr >= async->prealloc_bufsz)
++		async->buf_write_ptr %= async->prealloc_bufsz;
++
++	return nbytes;
++}
++EXPORT_SYMBOL(comedi_buf_write_free);
++
++unsigned int comedi_buf_read_n_available(struct comedi_async *async)
++{
++	unsigned num_bytes;
++
++	if (async == NULL)
++		return 0;
++	num_bytes = async->munge_count - async->buf_read_count;
++	/* barrier insures the read of munge_count in this
++	   query occurs before any following reads of the buffer which
++	   might be based on the return value from this query.
++	 */
++	smp_rmb();
++	return num_bytes;
++}
++EXPORT_SYMBOL(comedi_buf_read_n_available);
++
++/* allocates a chunk for the reader from filled (and munged) buffer space */
++unsigned comedi_buf_read_alloc(struct comedi_async *async, unsigned nbytes)
++{
++	if ((int)(async->buf_read_alloc_count + nbytes - async->munge_count) >
++	    0) {
++		nbytes = async->munge_count - async->buf_read_alloc_count;
++	}
++	async->buf_read_alloc_count += nbytes;
++	/* barrier insures read of munge_count occurs before we actually read
++	   data out of buffer */
++	smp_rmb();
++	return nbytes;
++}
++EXPORT_SYMBOL(comedi_buf_read_alloc);
++
++/* transfers control of a chunk from reader to free buffer space */
++unsigned comedi_buf_read_free(struct comedi_async *async, unsigned int nbytes)
++{
++	/* barrier insures data has been read out of
++	 * buffer before read count is incremented */
++	smp_mb();
++	if ((int)(async->buf_read_count + nbytes -
++		  async->buf_read_alloc_count) > 0) {
++		dev_info(async->subdevice->device->class_dev,
++			 "attempted to read-free more bytes than have been read-allocated.\n");
++		nbytes = async->buf_read_alloc_count - async->buf_read_count;
++	}
++	async->buf_read_count += nbytes;
++	async->buf_read_ptr += nbytes;
++	async->buf_read_ptr %= async->prealloc_bufsz;
++	return nbytes;
++}
++EXPORT_SYMBOL(comedi_buf_read_free);
++
++int comedi_buf_put(struct comedi_async *async, short x)
++{
++	unsigned int n = comedi_buf_write_alloc_strict(async, sizeof(short));
++
++	if (n < sizeof(short)) {
++		async->events |= COMEDI_CB_ERROR;
++		return 0;
++	}
++	*(short *)(async->prealloc_buf + async->buf_write_ptr) = x;
++	comedi_buf_write_free(async, sizeof(short));
++	return 1;
++}
++EXPORT_SYMBOL(comedi_buf_put);
++
++int comedi_buf_get(struct comedi_async *async, short *x)
++{
++	unsigned int n = comedi_buf_read_n_available(async);
++
++	if (n < sizeof(short))
++		return 0;
++	comedi_buf_read_alloc(async, sizeof(short));
++	*x = *(short *)(async->prealloc_buf + async->buf_read_ptr);
++	comedi_buf_read_free(async, sizeof(short));
++	return 1;
++}
++EXPORT_SYMBOL(comedi_buf_get);
++
++void comedi_buf_memcpy_to(struct comedi_async *async, unsigned int offset,
++			  const void *data, unsigned int num_bytes)
++{
++	unsigned int write_ptr = async->buf_write_ptr + offset;
++
++	if (write_ptr >= async->prealloc_bufsz)
++		write_ptr %= async->prealloc_bufsz;
++
++	while (num_bytes) {
++		unsigned int block_size;
++
++		if (write_ptr + num_bytes > async->prealloc_bufsz)
++			block_size = async->prealloc_bufsz - write_ptr;
++		else
++			block_size = num_bytes;
++
++		memcpy(async->prealloc_buf + write_ptr, data, block_size);
++
++		data += block_size;
++		num_bytes -= block_size;
++
++		write_ptr = 0;
++	}
++}
++EXPORT_SYMBOL(comedi_buf_memcpy_to);
++
++void comedi_buf_memcpy_from(struct comedi_async *async, unsigned int offset,
++			    void *dest, unsigned int nbytes)
++{
++	void *src;
++	unsigned int read_ptr = async->buf_read_ptr + offset;
++
++	if (read_ptr >= async->prealloc_bufsz)
++		read_ptr %= async->prealloc_bufsz;
++
++	while (nbytes) {
++		unsigned int block_size;
++
++		src = async->prealloc_buf + read_ptr;
++
++		if (nbytes >= async->prealloc_bufsz - read_ptr)
++			block_size = async->prealloc_bufsz - read_ptr;
++		else
++			block_size = nbytes;
++
++		memcpy(dest, src, block_size);
++		nbytes -= block_size;
++		dest += block_size;
++		read_ptr = 0;
++	}
++}
++EXPORT_SYMBOL(comedi_buf_memcpy_from);

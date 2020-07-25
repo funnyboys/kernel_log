@@ -1,0 +1,620 @@
+commit 3b71f6b59508b1c9befcb43de434866aafc76520
+Author: Andrea Merello <andrea.merello@gmail.com>
+Date:   Mon Dec 2 15:13:36 2019 +0100
+
+    iio: ad7949: fix channels mixups
+    
+    Each time we need to read a sample (from the sysfs interface, since the
+    driver supports only it) the driver writes the configuration register
+    with the proper settings needed to perform the said read, then it runs
+    another xfer to actually read the resulting value. Most notably the
+    configuration register is updated to set the ADC internal MUX depending by
+    which channel the read targets.
+    
+    Unfortunately this seems not enough to ensure correct operation because
+    the ADC works in a pipelined-like fashion and the new configuration isn't
+    applied in time.
+    
+    The ADC alternates two phases: acquisition and conversion. During the
+    acquisition phase the ADC samples the analog signal in an internal
+    capacitor; in the conversion phase the ADC performs the actual analog to
+    digital conversion of the stored voltage. Note that of course the MUX
+    needs to be set to the proper channel when the acquisition phase is
+    performed.
+    
+    Once the conversion phase has been completed, the device automatically
+    switches back to a new acquisition; on the other hand the device switches
+    from acquisition to conversion on the rising edge of SPI cs signal (that
+    is when the xfer finishes).
+    
+    Only after both two phases have been completed (with the proper settings
+    already written in the configuration register since the beginning) it is
+    possible to read the outcome from SPI bus.
+    
+    With the current driver implementation, we end up in the following
+    situation:
+    
+            _______  1st xfer ____________  2nd xfer ___________________
+    SPI cs..       \_________/            \_________/
+    SPI rd.. idle  |(val N-2)+    idle    | val N-1 +   idle ...
+    SPI wr.. idle  |  cfg N  +    idle    |   (X)   +   idle ...
+    ------------------------ + -------------------- + ------------------
+      AD  ..   acq  N-1      + cnv N-1 |  acq N     +  cnv N  | acq N+1
+    
+    As shown in the diagram above, the value we read in the Nth read belongs
+    to configuration setting N-1.
+    
+    In case the configuration is not changed (config[N] == config[N-1]), then
+    we still get correct data, but in case the configuration changes (i.e.
+    switching the MUX on another channel), we get wrong data (data from the
+    previously selected channel).
+    
+    This patch fixes this by performing one more "dummy" transfer in order to
+    ending up in reading the data when it's really ready, as per the following
+    timing diagram.
+    
+            _______  1st xfer ____________  2nd xfer ___________  3rd xfer ___
+    SPI cs..       \_________/            \_________/           \_________/
+    SPI rd.. idle  |(val N-2)+    idle    |(val N-1)+    idle   |  val N  + ..
+    SPI wr.. idle  |  cfg N  +    idle    |   (X)   +    idle   |   (X)   + ..
+    ------------------------ + -------------------- + ------------------- + --
+      AD  ..   acq  N-1      + cnv N-1 |  acq N     +  cnv N  | acq N+1   | ..
+    
+    NOTE: in the latter case (cfg changes), the acquisition phase for the
+    value to be read begins after the 1st xfer, that is after the read request
+    has been issued on sysfs. On the other hand, if the cfg doesn't change,
+    then we can refer to the fist diagram assuming N == (N - 1); the
+    acquisition phase _begins_ before the 1st xfer (potentially a lot of time
+    before the read has been issued via sysfs, but it _ends_ after the 1st
+    xfer, that is _after_ the read has started. This should guarantee a
+    reasonably fresh data, which value represents the voltage that the sampled
+    signal has after the read start or maybe just around it.
+    
+    Signed-off-by: Andrea Merello <andrea.merello@gmail.com>
+    Reviewed-by: Charles-Antoine Couret <charles-antoine.couret@essensium.com>
+    Cc: <Stable@vger.kernel.org>
+    Signed-off-by: Jonathan Cameron <Jonathan.Cameron@huawei.com>
+
+diff --git a/drivers/iio/adc/ad7949.c b/drivers/iio/adc/ad7949.c
+index 5c2b3446fa4a..2c6f60edb7ce 100644
+--- a/drivers/iio/adc/ad7949.c
++++ b/drivers/iio/adc/ad7949.c
+@@ -89,6 +89,7 @@ static int ad7949_spi_read_channel(struct ad7949_adc_chip *ad7949_adc, int *val,
+ 				   unsigned int channel)
+ {
+ 	int ret;
++	int i;
+ 	int bits_per_word = ad7949_adc->resolution;
+ 	int mask = GENMASK(ad7949_adc->resolution, 0);
+ 	struct spi_message msg;
+@@ -100,12 +101,23 @@ static int ad7949_spi_read_channel(struct ad7949_adc_chip *ad7949_adc, int *val,
+ 		},
+ 	};
+ 
+-	ret = ad7949_spi_write_cfg(ad7949_adc,
+-				   channel << AD7949_OFFSET_CHANNEL_SEL,
+-				   AD7949_MASK_CHANNEL_SEL);
+-	if (ret)
+-		return ret;
++	/*
++	 * 1: write CFG for sample N and read old data (sample N-2)
++	 * 2: if CFG was not changed since sample N-1 then we'll get good data
++	 *    at the next xfer, so we bail out now, otherwise we write something
++	 *    and we read garbage (sample N-1 configuration).
++	 */
++	for (i = 0; i < 2; i++) {
++		ret = ad7949_spi_write_cfg(ad7949_adc,
++					   channel << AD7949_OFFSET_CHANNEL_SEL,
++					   AD7949_MASK_CHANNEL_SEL);
++		if (ret)
++			return ret;
++		if (channel == ad7949_adc->current_channel)
++			break;
++	}
+ 
++	/* 3: write something and read actual data */
+ 	ad7949_adc->buffer = 0;
+ 	spi_message_init_with_transfers(&msg, tx, 1);
+ 	ret = spi_sync(ad7949_adc->spi, &msg);
+
+commit 348eb0b2c4f0f912d626fa789dfeb084b083e1f0
+Author: Andrea Merello <andrea.merello@gmail.com>
+Date:   Thu Sep 12 16:43:08 2019 +0200
+
+    iio: ad7949: fix incorrect SPI xfer len
+    
+    This driver supports 14-bits and 16-bits devices. All of them have a 14-bit
+    configuration registers. All SPI trasfers, for reading AD conversion
+    results and for writing the configuration register, fit in two bytes.
+    
+    The driver always uses 4-bytes xfers which seems at least pointless (maybe
+    even harmful). This patch trims the SPI xfer len and the buffer size to
+    two bytes.
+    
+    Signed-off-by: Andrea Merello <andrea.merello@gmail.com>
+    Reviewed-by: Alexandru Ardelean <alexandru.ardelean@analog.com>
+    Signed-off-by: Jonathan Cameron <Jonathan.Cameron@huawei.com>
+
+diff --git a/drivers/iio/adc/ad7949.c b/drivers/iio/adc/ad7949.c
+index 518044c31a73..5c2b3446fa4a 100644
+--- a/drivers/iio/adc/ad7949.c
++++ b/drivers/iio/adc/ad7949.c
+@@ -54,7 +54,7 @@ struct ad7949_adc_chip {
+ 	u8 resolution;
+ 	u16 cfg;
+ 	unsigned int current_channel;
+-	u32 buffer ____cacheline_aligned;
++	u16 buffer ____cacheline_aligned;
+ };
+ 
+ static int ad7949_spi_write_cfg(struct ad7949_adc_chip *ad7949_adc, u16 val,
+@@ -67,7 +67,7 @@ static int ad7949_spi_write_cfg(struct ad7949_adc_chip *ad7949_adc, u16 val,
+ 	struct spi_transfer tx[] = {
+ 		{
+ 			.tx_buf = &ad7949_adc->buffer,
+-			.len = 4,
++			.len = 2,
+ 			.bits_per_word = bits_per_word,
+ 		},
+ 	};
+@@ -95,7 +95,7 @@ static int ad7949_spi_read_channel(struct ad7949_adc_chip *ad7949_adc, int *val,
+ 	struct spi_transfer tx[] = {
+ 		{
+ 			.rx_buf = &ad7949_adc->buffer,
+-			.len = 4,
++			.len = 2,
+ 			.bits_per_word = bits_per_word,
+ 		},
+ 	};
+
+commit c270bbf7bb9ddc4e2a51b3c56557c377c9ac79bc
+Author: Andrea Merello <andrea.merello@gmail.com>
+Date:   Thu Sep 12 16:43:07 2019 +0200
+
+    iio: ad7949: kill pointless "readback"-handling code
+    
+    The device could be configured to spit out also the configuration word
+    while reading the AD result value (in the same SPI xfer) - this is called
+    "readback" in the device datasheet.
+    
+    The driver checks if readback is enabled and it eventually adjusts the SPI
+    xfer length and it applies proper shifts to still get the data, discarding
+    the configuration word.
+    
+    The readback option is actually never enabled (the driver disables it), so
+    the said checks do not serve for any purpose.
+    
+    Since enabling the readback option seems not to provide any advantage (the
+    driver entirely sets the configuration word without relying on any default
+    value), just kill the said, unused, code.
+    
+    Signed-off-by: Andrea Merello <andrea.merello@gmail.com>
+    Reviewed-by: Alexandru Ardelean <alexandru.ardelean@analog.com>
+    Signed-off-by: Jonathan Cameron <Jonathan.Cameron@huawei.com>
+
+diff --git a/drivers/iio/adc/ad7949.c b/drivers/iio/adc/ad7949.c
+index ac0ffff6c5ae..518044c31a73 100644
+--- a/drivers/iio/adc/ad7949.c
++++ b/drivers/iio/adc/ad7949.c
+@@ -57,29 +57,11 @@ struct ad7949_adc_chip {
+ 	u32 buffer ____cacheline_aligned;
+ };
+ 
+-static bool ad7949_spi_cfg_is_read_back(struct ad7949_adc_chip *ad7949_adc)
+-{
+-	if (!(ad7949_adc->cfg & AD7949_CFG_READ_BACK))
+-		return true;
+-
+-	return false;
+-}
+-
+-static int ad7949_spi_bits_per_word(struct ad7949_adc_chip *ad7949_adc)
+-{
+-	int ret = ad7949_adc->resolution;
+-
+-	if (ad7949_spi_cfg_is_read_back(ad7949_adc))
+-		ret += AD7949_CFG_REG_SIZE_BITS;
+-
+-	return ret;
+-}
+-
+ static int ad7949_spi_write_cfg(struct ad7949_adc_chip *ad7949_adc, u16 val,
+ 				u16 mask)
+ {
+ 	int ret;
+-	int bits_per_word = ad7949_spi_bits_per_word(ad7949_adc);
++	int bits_per_word = ad7949_adc->resolution;
+ 	int shift = bits_per_word - AD7949_CFG_REG_SIZE_BITS;
+ 	struct spi_message msg;
+ 	struct spi_transfer tx[] = {
+@@ -107,7 +89,7 @@ static int ad7949_spi_read_channel(struct ad7949_adc_chip *ad7949_adc, int *val,
+ 				   unsigned int channel)
+ {
+ 	int ret;
+-	int bits_per_word = ad7949_spi_bits_per_word(ad7949_adc);
++	int bits_per_word = ad7949_adc->resolution;
+ 	int mask = GENMASK(ad7949_adc->resolution, 0);
+ 	struct spi_message msg;
+ 	struct spi_transfer tx[] = {
+@@ -138,10 +120,7 @@ static int ad7949_spi_read_channel(struct ad7949_adc_chip *ad7949_adc, int *val,
+ 
+ 	ad7949_adc->current_channel = channel;
+ 
+-	if (ad7949_spi_cfg_is_read_back(ad7949_adc))
+-		*val = (ad7949_adc->buffer >> AD7949_CFG_REG_SIZE_BITS) & mask;
+-	else
+-		*val = ad7949_adc->buffer & mask;
++	*val = ad7949_adc->buffer & mask;
+ 
+ 	return 0;
+ }
+
+commit 7f40e0614317f20ac07b5aa5cec2eb43737e28d6
+Author: Charles-Antoine Couret <charles-antoine.couret@essensium.com>
+Date:   Mon Oct 22 23:02:42 2018 +0200
+
+    iio:adc:ad7949: Add AD7949 ADC driver family
+    
+    Compatible with AD7682 and AD7689 chips.
+    It is a Analog Devices ADC driver 14/16 bits 4/8 channels
+    with SPI protocol
+    
+    Datasheet of the device:
+    http://www.analog.com/media/en/technical-documentation/data-sheets/AD7949.pdf
+    
+    Signed-off-by: Charles-Antoine Couret <charles-antoine.couret@essensium.com>
+    Signed-off-by: Jonathan Cameron <Jonathan.Cameron@huawei.com>
+
+diff --git a/drivers/iio/adc/ad7949.c b/drivers/iio/adc/ad7949.c
+new file mode 100644
+index 000000000000..ac0ffff6c5ae
+--- /dev/null
++++ b/drivers/iio/adc/ad7949.c
+@@ -0,0 +1,347 @@
++// SPDX-License-Identifier: GPL-2.0
++/* ad7949.c - Analog Devices ADC driver 14/16 bits 4/8 channels
++ *
++ * Copyright (C) 2018 CMC NV
++ *
++ * http://www.analog.com/media/en/technical-documentation/data-sheets/AD7949.pdf
++ */
++
++#include <linux/delay.h>
++#include <linux/iio/iio.h>
++#include <linux/module.h>
++#include <linux/regulator/consumer.h>
++#include <linux/spi/spi.h>
++
++#define AD7949_MASK_CHANNEL_SEL		GENMASK(9, 7)
++#define AD7949_MASK_TOTAL		GENMASK(13, 0)
++#define AD7949_OFFSET_CHANNEL_SEL	7
++#define AD7949_CFG_READ_BACK		0x1
++#define AD7949_CFG_REG_SIZE_BITS	14
++
++enum {
++	ID_AD7949 = 0,
++	ID_AD7682,
++	ID_AD7689,
++};
++
++struct ad7949_adc_spec {
++	u8 num_channels;
++	u8 resolution;
++};
++
++static const struct ad7949_adc_spec ad7949_adc_spec[] = {
++	[ID_AD7949] = { .num_channels = 8, .resolution = 14 },
++	[ID_AD7682] = { .num_channels = 4, .resolution = 16 },
++	[ID_AD7689] = { .num_channels = 8, .resolution = 16 },
++};
++
++/**
++ * struct ad7949_adc_chip - AD ADC chip
++ * @lock: protects write sequences
++ * @vref: regulator generating Vref
++ * @iio_dev: reference to iio structure
++ * @spi: reference to spi structure
++ * @resolution: resolution of the chip
++ * @cfg: copy of the configuration register
++ * @current_channel: current channel in use
++ * @buffer: buffer to send / receive data to / from device
++ */
++struct ad7949_adc_chip {
++	struct mutex lock;
++	struct regulator *vref;
++	struct iio_dev *indio_dev;
++	struct spi_device *spi;
++	u8 resolution;
++	u16 cfg;
++	unsigned int current_channel;
++	u32 buffer ____cacheline_aligned;
++};
++
++static bool ad7949_spi_cfg_is_read_back(struct ad7949_adc_chip *ad7949_adc)
++{
++	if (!(ad7949_adc->cfg & AD7949_CFG_READ_BACK))
++		return true;
++
++	return false;
++}
++
++static int ad7949_spi_bits_per_word(struct ad7949_adc_chip *ad7949_adc)
++{
++	int ret = ad7949_adc->resolution;
++
++	if (ad7949_spi_cfg_is_read_back(ad7949_adc))
++		ret += AD7949_CFG_REG_SIZE_BITS;
++
++	return ret;
++}
++
++static int ad7949_spi_write_cfg(struct ad7949_adc_chip *ad7949_adc, u16 val,
++				u16 mask)
++{
++	int ret;
++	int bits_per_word = ad7949_spi_bits_per_word(ad7949_adc);
++	int shift = bits_per_word - AD7949_CFG_REG_SIZE_BITS;
++	struct spi_message msg;
++	struct spi_transfer tx[] = {
++		{
++			.tx_buf = &ad7949_adc->buffer,
++			.len = 4,
++			.bits_per_word = bits_per_word,
++		},
++	};
++
++	ad7949_adc->cfg = (val & mask) | (ad7949_adc->cfg & ~mask);
++	ad7949_adc->buffer = ad7949_adc->cfg << shift;
++	spi_message_init_with_transfers(&msg, tx, 1);
++	ret = spi_sync(ad7949_adc->spi, &msg);
++
++	/*
++	 * This delay is to avoid a new request before the required time to
++	 * send a new command to the device
++	 */
++	udelay(2);
++	return ret;
++}
++
++static int ad7949_spi_read_channel(struct ad7949_adc_chip *ad7949_adc, int *val,
++				   unsigned int channel)
++{
++	int ret;
++	int bits_per_word = ad7949_spi_bits_per_word(ad7949_adc);
++	int mask = GENMASK(ad7949_adc->resolution, 0);
++	struct spi_message msg;
++	struct spi_transfer tx[] = {
++		{
++			.rx_buf = &ad7949_adc->buffer,
++			.len = 4,
++			.bits_per_word = bits_per_word,
++		},
++	};
++
++	ret = ad7949_spi_write_cfg(ad7949_adc,
++				   channel << AD7949_OFFSET_CHANNEL_SEL,
++				   AD7949_MASK_CHANNEL_SEL);
++	if (ret)
++		return ret;
++
++	ad7949_adc->buffer = 0;
++	spi_message_init_with_transfers(&msg, tx, 1);
++	ret = spi_sync(ad7949_adc->spi, &msg);
++	if (ret)
++		return ret;
++
++	/*
++	 * This delay is to avoid a new request before the required time to
++	 * send a new command to the device
++	 */
++	udelay(2);
++
++	ad7949_adc->current_channel = channel;
++
++	if (ad7949_spi_cfg_is_read_back(ad7949_adc))
++		*val = (ad7949_adc->buffer >> AD7949_CFG_REG_SIZE_BITS) & mask;
++	else
++		*val = ad7949_adc->buffer & mask;
++
++	return 0;
++}
++
++#define AD7949_ADC_CHANNEL(chan) {				\
++	.type = IIO_VOLTAGE,					\
++	.indexed = 1,						\
++	.channel = (chan),					\
++	.info_mask_separate = BIT(IIO_CHAN_INFO_RAW),		\
++	.info_mask_shared_by_type = BIT(IIO_CHAN_INFO_SCALE),	\
++}
++
++static const struct iio_chan_spec ad7949_adc_channels[] = {
++	AD7949_ADC_CHANNEL(0),
++	AD7949_ADC_CHANNEL(1),
++	AD7949_ADC_CHANNEL(2),
++	AD7949_ADC_CHANNEL(3),
++	AD7949_ADC_CHANNEL(4),
++	AD7949_ADC_CHANNEL(5),
++	AD7949_ADC_CHANNEL(6),
++	AD7949_ADC_CHANNEL(7),
++};
++
++static int ad7949_spi_read_raw(struct iio_dev *indio_dev,
++			   struct iio_chan_spec const *chan,
++			   int *val, int *val2, long mask)
++{
++	struct ad7949_adc_chip *ad7949_adc = iio_priv(indio_dev);
++	int ret;
++
++	if (!val)
++		return -EINVAL;
++
++	switch (mask) {
++	case IIO_CHAN_INFO_RAW:
++		mutex_lock(&ad7949_adc->lock);
++		ret = ad7949_spi_read_channel(ad7949_adc, val, chan->channel);
++		mutex_unlock(&ad7949_adc->lock);
++
++		if (ret < 0)
++			return ret;
++
++		return IIO_VAL_INT;
++
++	case IIO_CHAN_INFO_SCALE:
++		ret = regulator_get_voltage(ad7949_adc->vref);
++		if (ret < 0)
++			return ret;
++
++		*val = ret / 5000;
++		return IIO_VAL_INT;
++	}
++
++	return -EINVAL;
++}
++
++static int ad7949_spi_reg_access(struct iio_dev *indio_dev,
++			unsigned int reg, unsigned int writeval,
++			unsigned int *readval)
++{
++	struct ad7949_adc_chip *ad7949_adc = iio_priv(indio_dev);
++	int ret = 0;
++
++	if (readval)
++		*readval = ad7949_adc->cfg;
++	else
++		ret = ad7949_spi_write_cfg(ad7949_adc,
++			writeval & AD7949_MASK_TOTAL, AD7949_MASK_TOTAL);
++
++	return ret;
++}
++
++static const struct iio_info ad7949_spi_info = {
++	.read_raw = ad7949_spi_read_raw,
++	.debugfs_reg_access = ad7949_spi_reg_access,
++};
++
++static int ad7949_spi_init(struct ad7949_adc_chip *ad7949_adc)
++{
++	int ret;
++	int val;
++
++	/* Sequencer disabled, CFG readback disabled, IN0 as default channel */
++	ad7949_adc->current_channel = 0;
++	ret = ad7949_spi_write_cfg(ad7949_adc, 0x3C79, AD7949_MASK_TOTAL);
++
++	/*
++	 * Do two dummy conversions to apply the first configuration setting.
++	 * Required only after the start up of the device.
++	 */
++	ad7949_spi_read_channel(ad7949_adc, &val, ad7949_adc->current_channel);
++	ad7949_spi_read_channel(ad7949_adc, &val, ad7949_adc->current_channel);
++
++	return ret;
++}
++
++static int ad7949_spi_probe(struct spi_device *spi)
++{
++	struct device *dev = &spi->dev;
++	const struct ad7949_adc_spec *spec;
++	struct ad7949_adc_chip *ad7949_adc;
++	struct iio_dev *indio_dev;
++	int ret;
++
++	indio_dev = devm_iio_device_alloc(dev, sizeof(*ad7949_adc));
++	if (!indio_dev) {
++		dev_err(dev, "can not allocate iio device\n");
++		return -ENOMEM;
++	}
++
++	indio_dev->dev.parent = dev;
++	indio_dev->dev.of_node = dev->of_node;
++	indio_dev->info = &ad7949_spi_info;
++	indio_dev->name = spi_get_device_id(spi)->name;
++	indio_dev->modes = INDIO_DIRECT_MODE;
++	indio_dev->channels = ad7949_adc_channels;
++	spi_set_drvdata(spi, indio_dev);
++
++	ad7949_adc = iio_priv(indio_dev);
++	ad7949_adc->indio_dev = indio_dev;
++	ad7949_adc->spi = spi;
++
++	spec = &ad7949_adc_spec[spi_get_device_id(spi)->driver_data];
++	indio_dev->num_channels = spec->num_channels;
++	ad7949_adc->resolution = spec->resolution;
++
++	ad7949_adc->vref = devm_regulator_get(dev, "vref");
++	if (IS_ERR(ad7949_adc->vref)) {
++		dev_err(dev, "fail to request regulator\n");
++		return PTR_ERR(ad7949_adc->vref);
++	}
++
++	ret = regulator_enable(ad7949_adc->vref);
++	if (ret < 0) {
++		dev_err(dev, "fail to enable regulator\n");
++		return ret;
++	}
++
++	mutex_init(&ad7949_adc->lock);
++
++	ret = ad7949_spi_init(ad7949_adc);
++	if (ret) {
++		dev_err(dev, "enable to init this device: %d\n", ret);
++		goto err;
++	}
++
++	ret = iio_device_register(indio_dev);
++	if (ret) {
++		dev_err(dev, "fail to register iio device: %d\n", ret);
++		goto err;
++	}
++
++	return 0;
++
++err:
++	mutex_destroy(&ad7949_adc->lock);
++	regulator_disable(ad7949_adc->vref);
++
++	return ret;
++}
++
++static int ad7949_spi_remove(struct spi_device *spi)
++{
++	struct iio_dev *indio_dev = spi_get_drvdata(spi);
++	struct ad7949_adc_chip *ad7949_adc = iio_priv(indio_dev);
++
++	iio_device_unregister(indio_dev);
++	mutex_destroy(&ad7949_adc->lock);
++	regulator_disable(ad7949_adc->vref);
++
++	return 0;
++}
++
++static const struct of_device_id ad7949_spi_of_id[] = {
++	{ .compatible = "adi,ad7949" },
++	{ .compatible = "adi,ad7682" },
++	{ .compatible = "adi,ad7689" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, ad7949_spi_of_id);
++
++static const struct spi_device_id ad7949_spi_id[] = {
++	{ "ad7949", ID_AD7949  },
++	{ "ad7682", ID_AD7682 },
++	{ "ad7689", ID_AD7689 },
++	{ }
++};
++MODULE_DEVICE_TABLE(spi, ad7949_spi_id);
++
++static struct spi_driver ad7949_spi_driver = {
++	.driver = {
++		.name		= "ad7949",
++		.of_match_table	= ad7949_spi_of_id,
++	},
++	.probe	  = ad7949_spi_probe,
++	.remove   = ad7949_spi_remove,
++	.id_table = ad7949_spi_id,
++};
++module_spi_driver(ad7949_spi_driver);
++
++MODULE_AUTHOR("Charles-Antoine Couret <charles-antoine.couret@essensium.com>");
++MODULE_DESCRIPTION("Analog Devices 14/16-bit 8-channel ADC driver");
++MODULE_LICENSE("GPL v2");

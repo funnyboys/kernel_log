@@ -1,0 +1,1477 @@
+commit 5481fc6eb8a7f4b76d8ad1be371d2e11b22bfb55
+Author: David Howells <dhowells@redhat.com>
+Date:   Fri Jun 19 23:39:36 2020 +0100
+
+    afs: Fix hang on rmmod due to outstanding timer
+    
+    The fileserver probe timer, net->fs_probe_timer, isn't cancelled when
+    the kafs module is being removed and so the count it holds on
+    net->servers_outstanding doesn't get dropped..
+    
+    This causes rmmod to wait forever.  The hung process shows a stack like:
+    
+            afs_purge_servers+0x1b5/0x23c [kafs]
+            afs_net_exit+0x44/0x6e [kafs]
+            ops_exit_list+0x72/0x93
+            unregister_pernet_operations+0x14c/0x1ba
+            unregister_pernet_subsys+0x1d/0x2a
+            afs_exit+0x29/0x6f [kafs]
+            __do_sys_delete_module.isra.0+0x1a2/0x24b
+            do_syscall_64+0x51/0x95
+            entry_SYSCALL_64_after_hwframe+0x44/0xa9
+    
+    Fix this by:
+    
+     (1) Attempting to cancel the probe timer and, if successful, drop the
+         count that the timer was holding.
+    
+     (2) Make the timer function just drop the count and not schedule the
+         prober if the afs portion of net namespace is being destroyed.
+    
+    Also, whilst we're at it, make the following changes:
+    
+     (3) Initialise net->servers_outstanding to 1 and decrement it before
+         waiting on it so that it doesn't generate wake up events by being
+         decremented to 0 until we're cleaning up.
+    
+     (4) Switch the atomic_dec() on ->servers_outstanding for ->fs_timer in
+         afs_purge_servers() to use the helper function for that.
+    
+    Fixes: f6cbb368bcb0 ("afs: Actively poll fileservers to maintain NAT or firewall openings")
+    Signed-off-by: David Howells <dhowells@redhat.com>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/fs/afs/fs_probe.c b/fs/afs/fs_probe.c
+index b34f74b0f319..5d9ef517cf81 100644
+--- a/fs/afs/fs_probe.c
++++ b/fs/afs/fs_probe.c
+@@ -314,7 +314,7 @@ void afs_fs_probe_timer(struct timer_list *timer)
+ {
+ 	struct afs_net *net = container_of(timer, struct afs_net, fs_probe_timer);
+ 
+-	if (!queue_work(afs_wq, &net->fs_prober))
++	if (!net->live || !queue_work(afs_wq, &net->fs_prober))
+ 		afs_dec_servers_outstanding(net);
+ }
+ 
+@@ -458,3 +458,12 @@ int afs_wait_for_one_fs_probe(struct afs_server *server, bool is_intr)
+ 		return -ETIME;
+ 	return -EDESTADDRREQ;
+ }
++
++/*
++ * Clean up the probing when the namespace is killed off.
++ */
++void afs_fs_probe_cleanup(struct afs_net *net)
++{
++	if (del_timer_sync(&net->fs_probe_timer))
++		afs_dec_servers_outstanding(net);
++}
+
+commit 8409f67b6437c4b327ee95a71081b9c7bfee0b00
+Author: David Howells <dhowells@redhat.com>
+Date:   Wed Apr 22 00:02:46 2020 +0100
+
+    afs: Adjust the fileserver rotation algorithm to reprobe/retry more quickly
+    
+    Adjust the fileserver rotation algorithm so that if we've tried all the
+    addresses on a server (cumulatively over multiple operations) until we've
+    run out of untried addresses, immediately reprobe all that server's
+    interfaces and retry the op at least once before we move onto the next
+    server.
+    
+    Signed-off-by: David Howells <dhowells@redhat.com>
+
+diff --git a/fs/afs/fs_probe.c b/fs/afs/fs_probe.c
+index c41cf3b2ab89..b34f74b0f319 100644
+--- a/fs/afs/fs_probe.c
++++ b/fs/afs/fs_probe.c
+@@ -338,6 +338,18 @@ static void afs_dispatch_fs_probe(struct afs_net *net, struct afs_server *server
+ 	afs_put_server(net, server, afs_server_trace_put_probe);
+ }
+ 
++/*
++ * Probe a server immediately without waiting for its due time to come
++ * round.  This is used when all of the addresses have been tried.
++ */
++void afs_probe_fileserver(struct afs_net *net, struct afs_server *server)
++{
++	write_seqlock(&net->fs_lock);
++	if (!list_empty(&server->probe_link))
++		return afs_dispatch_fs_probe(net, server, true);
++	write_sequnlock(&net->fs_lock);
++}
++
+ /*
+  * Probe dispatcher to regularly dispatch probes to keep NAT alive.
+  */
+@@ -411,3 +423,38 @@ void afs_fs_probe_dispatcher(struct work_struct *work)
+ 		_leave(" [quiesce]");
+ 	}
+ }
++
++/*
++ * Wait for a probe on a particular fileserver to complete for 2s.
++ */
++int afs_wait_for_one_fs_probe(struct afs_server *server, bool is_intr)
++{
++	struct wait_queue_entry wait;
++	unsigned long timo = 2 * HZ;
++
++	if (atomic_read(&server->probe_outstanding) == 0)
++		goto dont_wait;
++
++	init_wait_entry(&wait, 0);
++	for (;;) {
++		prepare_to_wait_event(&server->probe_wq, &wait,
++				      is_intr ? TASK_INTERRUPTIBLE : TASK_UNINTERRUPTIBLE);
++		if (timo == 0 ||
++		    server->probe.responded ||
++		    atomic_read(&server->probe_outstanding) == 0 ||
++		    (is_intr && signal_pending(current)))
++			break;
++		timo = schedule_timeout(timo);
++	}
++
++	finish_wait(&server->probe_wq, &wait);
++
++dont_wait:
++	if (server->probe.responded)
++		return 0;
++	if (is_intr && signal_pending(current))
++		return -ERESTARTSYS;
++	if (timo == 0)
++		return -ETIME;
++	return -EDESTADDRREQ;
++}
+
+commit f3c130e6e6d15822e1553531f91ecc8f3375bac3
+Author: David Howells <dhowells@redhat.com>
+Date:   Sat May 2 13:39:57 2020 +0100
+
+    afs: Don't use probe running state to make decisions outside probe code
+    
+    Don't use the running state for fileserver probes to make decisions about
+    which server to use as the state is cleared at the start of a probe and
+    also intermediate values might be misleading.
+    
+    Instead, add a separate 'latest known' rtt in the afs_server struct and a
+    flag to indicate if the server is known to be responding and update these
+    as and when we know what to change them to.
+    
+    Signed-off-by: David Howells <dhowells@redhat.com>
+
+diff --git a/fs/afs/fs_probe.c b/fs/afs/fs_probe.c
+index 442b5e7944ff..c41cf3b2ab89 100644
+--- a/fs/afs/fs_probe.c
++++ b/fs/afs/fs_probe.c
+@@ -42,10 +42,13 @@ static void afs_finished_fs_probe(struct afs_net *net, struct afs_server *server
+ 	bool responded = server->probe.responded;
+ 
+ 	write_seqlock(&net->fs_lock);
+-	if (responded)
++	if (responded) {
+ 		list_add_tail(&server->probe_link, &net->fs_probe_slow);
+-	else
++	} else {
++		server->rtt = UINT_MAX;
++		clear_bit(AFS_SERVER_FL_RESPONDING, &server->flags);
+ 		list_add_tail(&server->probe_link, &net->fs_probe_fast);
++	}
+ 	write_sequnlock(&net->fs_lock);
+ 
+ 	afs_schedule_fs_probe(net, server, !responded);
+@@ -161,12 +164,14 @@ void afs_fileserver_probe_result(struct afs_call *call)
+ 	rtt_us = rxrpc_kernel_get_srtt(call->net->socket, call->rxcall);
+ 	if (rtt_us < server->probe.rtt) {
+ 		server->probe.rtt = rtt_us;
++		server->rtt = rtt_us;
+ 		alist->preferred = index;
+ 	}
+ 
+ 	smp_wmb(); /* Set rtt before responded. */
+ 	server->probe.responded = true;
+ 	set_bit(index, &alist->responded);
++	set_bit(AFS_SERVER_FL_RESPONDING, &server->flags);
+ out:
+ 	spin_unlock(&server->probe_lock);
+ 
+@@ -224,7 +229,7 @@ int afs_wait_for_fs_probes(struct afs_server_list *slist, unsigned long untried)
+ {
+ 	struct wait_queue_entry *waits;
+ 	struct afs_server *server;
+-	unsigned int rtt = UINT_MAX;
++	unsigned int rtt = UINT_MAX, rtt_s;
+ 	bool have_responders = false;
+ 	int pref = -1, i;
+ 
+@@ -280,10 +285,11 @@ int afs_wait_for_fs_probes(struct afs_server_list *slist, unsigned long untried)
+ 	for (i = 0; i < slist->nr_servers; i++) {
+ 		if (test_bit(i, &untried)) {
+ 			server = slist->servers[i].server;
+-			if (server->probe.responded &&
+-			    server->probe.rtt < rtt) {
++			rtt_s = READ_ONCE(server->rtt);
++			if (test_bit(AFS_SERVER_FL_RESPONDING, &server->flags) &&
++			    rtt_s < rtt) {
+ 				pref = i;
+-				rtt = server->probe.rtt;
++				rtt = rtt_s;
+ 			}
+ 
+ 			remove_wait_queue(&server->probe_wq, &waits[i]);
+
+commit f6cbb368bcb0bc4fa7c11554d5293658bb4b26a2
+Author: David Howells <dhowells@redhat.com>
+Date:   Fri Apr 24 15:10:00 2020 +0100
+
+    afs: Actively poll fileservers to maintain NAT or firewall openings
+    
+    When an AFS client accesses a file, it receives a limited-duration callback
+    promise that the server will notify it if another client changes a file.
+    This callback duration can be a few hours in length.
+    
+    If a client mounts a volume and then an application prevents it from being
+    unmounted, say by chdir'ing into it, but then does nothing for some time,
+    the rxrpc_peer record will expire and rxrpc-level keepalive will cease.
+    
+    If there is NAT or a firewall between the client and the server, the route
+    back for the server may close after a comparatively short duration, meaning
+    that attempts by the server to notify the client may then bounce.
+    
+    The client, however, may (so far as it knows) still have a valid unexpired
+    promise and will then rely on its cached data and will not see changes made
+    on the server by a third party until it incidentally rechecks the status or
+    the promise needs renewal.
+    
+    To deal with this, the client needs to regularly probe the server.  This
+    has two effects: firstly, it keeps a route open back for the server, and
+    secondly, it causes the server to disgorge any notifications that got
+    queued up because they couldn't be sent.
+    
+    Fix this by adding a mechanism to emit regular probes.
+    
+    Two levels of probing are made available: Under normal circumstances the
+    'slow' queue will be used for a fileserver - this just probes the preferred
+    address once every 5 mins or so; however, if server fails to respond to any
+    probes, the server will shift to the 'fast' queue from which all its
+    interfaces will be probed every 30s.  When it finally responds, the record
+    will switch back to the slow queue.
+    
+    Further notes:
+    
+     (1) Probing is now no longer driven from the fileserver rotation
+         algorithm.
+    
+     (2) Probes are dispatched to all interfaces on a fileserver when that an
+         afs_server object is set up to record it.
+    
+     (3) The afs_server object is removed from the probe queues when we start
+         to probe it.  afs_is_probing_server() returns true if it's not listed
+         - ie. it's undergoing probing.
+    
+     (4) The afs_server object is added back on to the probe queue when the
+         final outstanding probe completes, but the probed_at time is set when
+         we're about to launch a probe so that it's not dependent on the probe
+         duration.
+    
+     (5) The timer and the work item added for this must be handed a count on
+         net->servers_outstanding, which they hand on or release.  This makes
+         sure that network namespace cleanup waits for them.
+    
+    Fixes: d2ddc776a458 ("afs: Overhaul volume and server record caching and fileserver rotation")
+    Reported-by: Dave Botsch <botsch@cnf.cornell.edu>
+    Signed-off-by: David Howells <dhowells@redhat.com>
+
+diff --git a/fs/afs/fs_probe.c b/fs/afs/fs_probe.c
+index d37d78eb84bd..442b5e7944ff 100644
+--- a/fs/afs/fs_probe.c
++++ b/fs/afs/fs_probe.c
+@@ -1,7 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ /* AFS fileserver probing
+  *
+- * Copyright (C) 2018 Red Hat, Inc. All Rights Reserved.
++ * Copyright (C) 2018, 2020 Red Hat, Inc. All Rights Reserved.
+  * Written by David Howells (dhowells@redhat.com)
+  */
+ 
+@@ -11,14 +11,83 @@
+ #include "internal.h"
+ #include "protocol_yfs.h"
+ 
+-static bool afs_fs_probe_done(struct afs_server *server)
++static unsigned int afs_fs_probe_fast_poll_interval = 30 * HZ;
++static unsigned int afs_fs_probe_slow_poll_interval = 5 * 60 * HZ;
++
++/*
++ * Start the probe polling timer.  We have to supply it with an inc on the
++ * outstanding server count.
++ */
++static void afs_schedule_fs_probe(struct afs_net *net,
++				  struct afs_server *server, bool fast)
++{
++	unsigned long atj;
++
++	if (!net->live)
++		return;
++
++	atj = server->probed_at;
++	atj += fast ? afs_fs_probe_fast_poll_interval : afs_fs_probe_slow_poll_interval;
++
++	afs_inc_servers_outstanding(net);
++	if (timer_reduce(&net->fs_probe_timer, atj))
++		afs_dec_servers_outstanding(net);
++}
++
++/*
++ * Handle the completion of a set of probes.
++ */
++static void afs_finished_fs_probe(struct afs_net *net, struct afs_server *server)
++{
++	bool responded = server->probe.responded;
++
++	write_seqlock(&net->fs_lock);
++	if (responded)
++		list_add_tail(&server->probe_link, &net->fs_probe_slow);
++	else
++		list_add_tail(&server->probe_link, &net->fs_probe_fast);
++	write_sequnlock(&net->fs_lock);
++
++	afs_schedule_fs_probe(net, server, !responded);
++}
++
++/*
++ * Handle the completion of a probe.
++ */
++static void afs_done_one_fs_probe(struct afs_net *net, struct afs_server *server)
++{
++	_enter("");
++
++	if (atomic_dec_and_test(&server->probe_outstanding))
++		afs_finished_fs_probe(net, server);
++
++	wake_up_all(&server->probe_wq);
++}
++
++/*
++ * Handle inability to send a probe due to ENOMEM when trying to allocate a
++ * call struct.
++ */
++static void afs_fs_probe_not_done(struct afs_net *net,
++				  struct afs_server *server,
++				  struct afs_addr_cursor *ac)
+ {
+-	if (!atomic_dec_and_test(&server->probe_outstanding))
+-		return false;
++	struct afs_addr_list *alist = ac->alist;
++	unsigned int index = ac->index;
++
++	_enter("");
+ 
+-	clear_bit_unlock(AFS_SERVER_FL_PROBING, &server->flags);
+-	wake_up_bit(&server->flags, AFS_SERVER_FL_PROBING);
+-	return true;
++	trace_afs_io_error(0, -ENOMEM, afs_io_error_fs_probe_fail);
++	spin_lock(&server->probe_lock);
++
++	server->probe.local_failure = true;
++	if (server->probe.error == 0)
++		server->probe.error = -ENOMEM;
++
++	set_bit(index, &alist->failed);
++
++	spin_unlock(&server->probe_lock);
++	return afs_done_one_fs_probe(net, server);
+ }
+ 
+ /*
+@@ -29,10 +98,8 @@ void afs_fileserver_probe_result(struct afs_call *call)
+ {
+ 	struct afs_addr_list *alist = call->alist;
+ 	struct afs_server *server = call->server;
+-	unsigned int server_index = call->server_index;
+ 	unsigned int index = call->addr_ix;
+ 	unsigned int rtt_us = 0;
+-	bool have_result = false;
+ 	int ret = call->error;
+ 
+ 	_enter("%pU,%u", &server->uuid, index);
+@@ -51,8 +118,9 @@ void afs_fileserver_probe_result(struct afs_call *call)
+ 		goto responded;
+ 	case -ENOMEM:
+ 	case -ENONET:
++		clear_bit(index, &alist->responded);
+ 		server->probe.local_failure = true;
+-		afs_io_error(call, afs_io_error_fs_probe_fail);
++		trace_afs_io_error(call->debug_id, ret, afs_io_error_fs_probe_fail);
+ 		goto out;
+ 	case -ECONNRESET: /* Responded, but call expired. */
+ 	case -ERFKILL:
+@@ -71,12 +139,11 @@ void afs_fileserver_probe_result(struct afs_call *call)
+ 		     server->probe.error == -ETIMEDOUT ||
+ 		     server->probe.error == -ETIME))
+ 			server->probe.error = ret;
+-		afs_io_error(call, afs_io_error_fs_probe_fail);
++		trace_afs_io_error(call->debug_id, ret, afs_io_error_fs_probe_fail);
+ 		goto out;
+ 	}
+ 
+ responded:
+-	set_bit(index, &alist->responded);
+ 	clear_bit(index, &alist->failed);
+ 
+ 	if (call->service_id == YFS_FS_SERVICE) {
+@@ -95,38 +162,31 @@ void afs_fileserver_probe_result(struct afs_call *call)
+ 	if (rtt_us < server->probe.rtt) {
+ 		server->probe.rtt = rtt_us;
+ 		alist->preferred = index;
+-		have_result = true;
+ 	}
+ 
+ 	smp_wmb(); /* Set rtt before responded. */
+ 	server->probe.responded = true;
+-	set_bit(AFS_SERVER_FL_PROBED, &server->flags);
++	set_bit(index, &alist->responded);
+ out:
+ 	spin_unlock(&server->probe_lock);
+ 
+-	_debug("probe [%u][%u] %pISpc rtt=%u ret=%d",
+-	       server_index, index, &alist->addrs[index].transport, rtt_us, ret);
++	_debug("probe %pU [%u] %pISpc rtt=%u ret=%d",
++	       &server->uuid, index, &alist->addrs[index].transport,
++	       rtt_us, ret);
+ 
+-	have_result |= afs_fs_probe_done(server);
+-	if (have_result)
+-		wake_up_all(&server->probe_wq);
++	return afs_done_one_fs_probe(call->net, server);
+ }
+ 
+ /*
+- * Probe all of a fileserver's addresses to find out the best route and to
+- * query its capabilities.
++ * Probe one or all of a fileserver's addresses to find out the best route and
++ * to query its capabilities.
+  */
+-static int afs_do_probe_fileserver(struct afs_net *net,
+-				   struct afs_server *server,
+-				   struct key *key,
+-				   unsigned int server_index,
+-				   struct afs_error *_e)
++void afs_fs_probe_fileserver(struct afs_net *net, struct afs_server *server,
++			     struct key *key, bool all)
+ {
+ 	struct afs_addr_cursor ac = {
+ 		.index = 0,
+ 	};
+-	struct afs_call *call;
+-	bool in_progress = false;
+ 
+ 	_enter("%pU", &server->uuid);
+ 
+@@ -136,50 +196,25 @@ static int afs_do_probe_fileserver(struct afs_net *net,
+ 	afs_get_addrlist(ac.alist);
+ 	read_unlock(&server->fs_lock);
+ 
+-	atomic_set(&server->probe_outstanding, ac.alist->nr_addrs);
++	server->probed_at = jiffies;
++	atomic_set(&server->probe_outstanding, all ? ac.alist->nr_addrs : 1);
+ 	memset(&server->probe, 0, sizeof(server->probe));
+ 	server->probe.rtt = UINT_MAX;
+ 
+-	for (ac.index = 0; ac.index < ac.alist->nr_addrs; ac.index++) {
+-		call = afs_fs_get_capabilities(net, server, &ac, key, server_index);
+-		if (!IS_ERR(call)) {
+-			afs_put_call(call);
+-			in_progress = true;
+-		} else {
+-			afs_prioritise_error(_e, PTR_ERR(call), ac.abort_code);
+-		}
+-	}
+-
+-	if (!in_progress)
+-		afs_fs_probe_done(server);
+-	afs_put_addrlist(ac.alist);
+-	return in_progress;
+-}
++	ac.index = ac.alist->preferred;
++	if (ac.index < 0 || ac.index >= ac.alist->nr_addrs)
++		all = true;
+ 
+-/*
+- * Send off probes to all unprobed servers.
+- */
+-int afs_probe_fileservers(struct afs_net *net, struct key *key,
+-			  struct afs_server_list *list)
+-{
+-	struct afs_server *server;
+-	struct afs_error e;
+-	bool in_progress = false;
+-	int i;
+-
+-	e.error = 0;
+-	e.responded = false;
+-	for (i = 0; i < list->nr_servers; i++) {
+-		server = list->servers[i].server;
+-		if (test_bit(AFS_SERVER_FL_PROBED, &server->flags))
+-			continue;
+-
+-		if (!test_and_set_bit_lock(AFS_SERVER_FL_PROBING, &server->flags) &&
+-		    afs_do_probe_fileserver(net, server, key, i, &e))
+-			in_progress = true;
++	if (all) {
++		for (ac.index = 0; ac.index < ac.alist->nr_addrs; ac.index++)
++			if (!afs_fs_get_capabilities(net, server, &ac, key))
++				afs_fs_probe_not_done(net, server, &ac);
++	} else {
++		if (!afs_fs_get_capabilities(net, server, &ac, key))
++			afs_fs_probe_not_done(net, server, &ac);
+ 	}
+ 
+-	return in_progress ? 0 : e.error;
++	afs_put_addrlist(ac.alist);
+ }
+ 
+ /*
+@@ -199,7 +234,7 @@ int afs_wait_for_fs_probes(struct afs_server_list *slist, unsigned long untried)
+ 	for (i = 0; i < slist->nr_servers; i++) {
+ 		if (test_bit(i, &untried)) {
+ 			server = slist->servers[i].server;
+-			if (!test_bit(AFS_SERVER_FL_PROBING, &server->flags))
++			if (!atomic_read(&server->probe_outstanding))
+ 				__clear_bit(i, &untried);
+ 			if (server->probe.responded)
+ 				have_responders = true;
+@@ -229,7 +264,7 @@ int afs_wait_for_fs_probes(struct afs_server_list *slist, unsigned long untried)
+ 				server = slist->servers[i].server;
+ 				if (server->probe.responded)
+ 					goto stop;
+-				if (test_bit(AFS_SERVER_FL_PROBING, &server->flags))
++				if (atomic_read(&server->probe_outstanding))
+ 					still_probing = true;
+ 			}
+ 		}
+@@ -264,3 +299,109 @@ int afs_wait_for_fs_probes(struct afs_server_list *slist, unsigned long untried)
+ 		slist->preferred = pref;
+ 	return 0;
+ }
++
++/*
++ * Probe timer.  We have an increment on fs_outstanding that we need to pass
++ * along to the work item.
++ */
++void afs_fs_probe_timer(struct timer_list *timer)
++{
++	struct afs_net *net = container_of(timer, struct afs_net, fs_probe_timer);
++
++	if (!queue_work(afs_wq, &net->fs_prober))
++		afs_dec_servers_outstanding(net);
++}
++
++/*
++ * Dispatch a probe to a server.
++ */
++static void afs_dispatch_fs_probe(struct afs_net *net, struct afs_server *server, bool all)
++	__releases(&net->fs_lock)
++{
++	struct key *key = NULL;
++
++	/* We remove it from the queues here - it will be added back to
++	 * one of the queues on the completion of the probe.
++	 */
++	list_del_init(&server->probe_link);
++
++	afs_get_server(server, afs_server_trace_get_probe);
++	write_sequnlock(&net->fs_lock);
++
++	afs_fs_probe_fileserver(net, server, key, all);
++	afs_put_server(net, server, afs_server_trace_put_probe);
++}
++
++/*
++ * Probe dispatcher to regularly dispatch probes to keep NAT alive.
++ */
++void afs_fs_probe_dispatcher(struct work_struct *work)
++{
++	struct afs_net *net = container_of(work, struct afs_net, fs_prober);
++	struct afs_server *fast, *slow, *server;
++	unsigned long nowj, timer_at, poll_at;
++	bool first_pass = true, set_timer = false;
++
++	if (!net->live)
++		return;
++
++	_enter("");
++
++	if (list_empty(&net->fs_probe_fast) && list_empty(&net->fs_probe_slow)) {
++		_leave(" [none]");
++		return;
++	}
++
++again:
++	write_seqlock(&net->fs_lock);
++
++	fast = slow = server = NULL;
++	nowj = jiffies;
++	timer_at = nowj + MAX_JIFFY_OFFSET;
++
++	if (!list_empty(&net->fs_probe_fast)) {
++		fast = list_first_entry(&net->fs_probe_fast, struct afs_server, probe_link);
++		poll_at = fast->probed_at + afs_fs_probe_fast_poll_interval;
++		if (time_before(nowj, poll_at)) {
++			timer_at = poll_at;
++			set_timer = true;
++			fast = NULL;
++		}
++	}
++
++	if (!list_empty(&net->fs_probe_slow)) {
++		slow = list_first_entry(&net->fs_probe_slow, struct afs_server, probe_link);
++		poll_at = slow->probed_at + afs_fs_probe_slow_poll_interval;
++		if (time_before(nowj, poll_at)) {
++			if (time_before(poll_at, timer_at))
++			    timer_at = poll_at;
++			set_timer = true;
++			slow = NULL;
++		}
++	}
++
++	server = fast ?: slow;
++	if (server)
++		_debug("probe %pU", &server->uuid);
++
++	if (server && (first_pass || !need_resched())) {
++		afs_dispatch_fs_probe(net, server, server == fast);
++		first_pass = false;
++		goto again;
++	}
++
++	write_sequnlock(&net->fs_lock);
++
++	if (server) {
++		if (!queue_work(afs_wq, &net->fs_prober))
++			afs_dec_servers_outstanding(net);
++		_leave(" [requeue]");
++	} else if (set_timer) {
++		if (timer_reduce(&net->fs_probe_timer, timer_at))
++			afs_dec_servers_outstanding(net);
++		_leave(" [timer]");
++	} else {
++		afs_dec_servers_outstanding(net);
++		_leave(" [quiesce]");
++	}
++}
+
+commit 977e5f8ed0ab2786755f8d2a96b78a3c7320f7c4
+Author: David Howells <dhowells@redhat.com>
+Date:   Fri Apr 17 17:31:26 2020 +0100
+
+    afs: Split the usage count on struct afs_server
+    
+    Split the usage count on the afs_server struct to have an active count that
+    registers who's actually using it separately from the reference count on
+    the object.
+    
+    This allows a future patch to dispatch polling probes without advancing the
+    "unuse" time into the future each time we emit a probe, which would
+    otherwise prevent unused server records from expiring.
+    
+    Included in this:
+    
+     (1) The latter part of afs_destroy_server() in which the RCU destruction
+         of afs_server objects is invoked and the outstanding server count is
+         decremented is split out into __afs_put_server().
+    
+     (2) afs_put_server() now calls __afs_put_server() rather then setting the
+         management timer.
+    
+     (3) The calls begun by afs_fs_give_up_all_callbacks() and
+         afs_fs_get_capabilities() can now take a ref on the server record, so
+         afs_destroy_server() can just drop its ref and needn't wait for the
+         completion of these calls.  They'll put the ref when they're done.
+    
+     (4) Because of (3), afs_fs_probe_done() no longer needs to wake up
+         afs_destroy_server() with server->probe_outstanding.
+    
+     (5) afs_gc_servers can be simplified.  It only needs to check if
+         server->active is 0 rather than playing games with the refcount.
+    
+     (6) afs_manage_servers() can propose a server for gc if usage == 0 rather
+         than if ref == 1.  The gc is effected by (5).
+    
+    Signed-off-by: David Howells <dhowells@redhat.com>
+
+diff --git a/fs/afs/fs_probe.c b/fs/afs/fs_probe.c
+index 37d1bba57b00..d37d78eb84bd 100644
+--- a/fs/afs/fs_probe.c
++++ b/fs/afs/fs_probe.c
+@@ -16,7 +16,6 @@ static bool afs_fs_probe_done(struct afs_server *server)
+ 	if (!atomic_dec_and_test(&server->probe_outstanding))
+ 		return false;
+ 
+-	wake_up_var(&server->probe_outstanding);
+ 	clear_bit_unlock(AFS_SERVER_FL_PROBING, &server->flags);
+ 	wake_up_bit(&server->flags, AFS_SERVER_FL_PROBING);
+ 	return true;
+
+commit 8a1d24e1cc6d96a17f2dcb1400d370cadbfb7cb6
+Author: David Howells <dhowells@redhat.com>
+Date:   Fri May 22 23:58:28 2020 +0100
+
+    rxrpc: Fix a warning
+    
+    Fix a warning due to an uninitialised variable.
+    
+    le included from ../fs/afs/fs_probe.c:11:
+    ../fs/afs/fs_probe.c: In function 'afs_fileserver_probe_result':
+    ../fs/afs/internal.h:1453:2: warning: 'rtt_us' may be used uninitialized in this function [-Wmaybe-uninitialized]
+     1453 |  printk("[%-6.6s] "FMT"\n", current->comm ,##__VA_ARGS__)
+          |  ^~~~~~
+    ../fs/afs/fs_probe.c:35:15: note: 'rtt_us' was declared here
+    
+    Signed-off-by: David Howells <dhowells@redhat.com>
+
+diff --git a/fs/afs/fs_probe.c b/fs/afs/fs_probe.c
+index 237352d3cb53..37d1bba57b00 100644
+--- a/fs/afs/fs_probe.c
++++ b/fs/afs/fs_probe.c
+@@ -32,7 +32,7 @@ void afs_fileserver_probe_result(struct afs_call *call)
+ 	struct afs_server *server = call->server;
+ 	unsigned int server_index = call->server_index;
+ 	unsigned int index = call->addr_ix;
+-	unsigned int rtt_us;
++	unsigned int rtt_us = 0;
+ 	bool have_result = false;
+ 	int ret = call->error;
+ 
+
+commit c410bf01933e5e09d142c66c3df9ad470a7eec13
+Author: David Howells <dhowells@redhat.com>
+Date:   Mon May 11 14:54:34 2020 +0100
+
+    rxrpc: Fix the excessive initial retransmission timeout
+    
+    rxrpc currently uses a fixed 4s retransmission timeout until the RTT is
+    sufficiently sampled.  This can cause problems with some fileservers with
+    calls to the cache manager in the afs filesystem being dropped from the
+    fileserver because a packet goes missing and the retransmission timeout is
+    greater than the call expiry timeout.
+    
+    Fix this by:
+    
+     (1) Copying the RTT/RTO calculation code from Linux's TCP implementation
+         and altering it to fit rxrpc.
+    
+     (2) Altering the various users of the RTT to make use of the new SRTT
+         value.
+    
+     (3) Replacing the use of rxrpc_resend_timeout to use the calculated RTO
+         value instead (which is needed in jiffies), along with a backoff.
+    
+    Notes:
+    
+     (1) rxrpc provides RTT samples by matching the serial numbers on outgoing
+         DATA packets that have the RXRPC_REQUEST_ACK set and PING ACK packets
+         against the reference serial number in incoming REQUESTED ACK and
+         PING-RESPONSE ACK packets.
+    
+     (2) Each packet that is transmitted on an rxrpc connection gets a new
+         per-connection serial number, even for retransmissions, so an ACK can
+         be cross-referenced to a specific trigger packet.  This allows RTT
+         information to be drawn from retransmitted DATA packets also.
+    
+     (3) rxrpc maintains the RTT/RTO state on the rxrpc_peer record rather than
+         on an rxrpc_call because many RPC calls won't live long enough to
+         generate more than one sample.
+    
+     (4) The calculated SRTT value is in units of 8ths of a microsecond rather
+         than nanoseconds.
+    
+    The (S)RTT and RTO values are displayed in /proc/net/rxrpc/peers.
+    
+    Fixes: 17926a79320a ([AF_RXRPC]: Provide secure RxRPC sockets for use by userspace and kernel both"")
+    Signed-off-by: David Howells <dhowells@redhat.com>
+
+diff --git a/fs/afs/fs_probe.c b/fs/afs/fs_probe.c
+index a587767b6ae1..237352d3cb53 100644
+--- a/fs/afs/fs_probe.c
++++ b/fs/afs/fs_probe.c
+@@ -32,9 +32,8 @@ void afs_fileserver_probe_result(struct afs_call *call)
+ 	struct afs_server *server = call->server;
+ 	unsigned int server_index = call->server_index;
+ 	unsigned int index = call->addr_ix;
+-	unsigned int rtt = UINT_MAX;
++	unsigned int rtt_us;
+ 	bool have_result = false;
+-	u64 _rtt;
+ 	int ret = call->error;
+ 
+ 	_enter("%pU,%u", &server->uuid, index);
+@@ -93,15 +92,9 @@ void afs_fileserver_probe_result(struct afs_call *call)
+ 		}
+ 	}
+ 
+-	/* Get the RTT and scale it to fit into a 32-bit value that represents
+-	 * over a minute of time so that we can access it with one instruction
+-	 * on a 32-bit system.
+-	 */
+-	_rtt = rxrpc_kernel_get_rtt(call->net->socket, call->rxcall);
+-	_rtt /= 64;
+-	rtt = (_rtt > UINT_MAX) ? UINT_MAX : _rtt;
+-	if (rtt < server->probe.rtt) {
+-		server->probe.rtt = rtt;
++	rtt_us = rxrpc_kernel_get_srtt(call->net->socket, call->rxcall);
++	if (rtt_us < server->probe.rtt) {
++		server->probe.rtt = rtt_us;
+ 		alist->preferred = index;
+ 		have_result = true;
+ 	}
+@@ -113,8 +106,7 @@ void afs_fileserver_probe_result(struct afs_call *call)
+ 	spin_unlock(&server->probe_lock);
+ 
+ 	_debug("probe [%u][%u] %pISpc rtt=%u ret=%d",
+-	       server_index, index, &alist->addrs[index].transport,
+-	       (unsigned int)rtt, ret);
++	       server_index, index, &alist->addrs[index].transport, rtt_us, ret);
+ 
+ 	have_result |= afs_fs_probe_done(server);
+ 	if (have_result)
+
+commit be59167c8f27592e79c0044a0bbc515b38d5eace
+Author: David Howells <dhowells@redhat.com>
+Date:   Fri Apr 24 11:23:17 2020 +0100
+
+    afs: Remove some unused bits
+    
+    Remove three bits:
+    
+     (1) afs_server::no_epoch is neither set nor used.
+    
+     (2) afs_server::have_result is set and a wakeup is applied to it, but
+         nothing looks at it or waits on it.
+    
+     (3) afs_vl_dump_edestaddrreq() prints afs_addr_list::probed, but nothing
+         sets it for VL servers.
+    
+    Signed-off-by: David Howells <dhowells@redhat.com>
+
+diff --git a/fs/afs/fs_probe.c b/fs/afs/fs_probe.c
+index e1b9ed679045..a587767b6ae1 100644
+--- a/fs/afs/fs_probe.c
++++ b/fs/afs/fs_probe.c
+@@ -117,11 +117,8 @@ void afs_fileserver_probe_result(struct afs_call *call)
+ 	       (unsigned int)rtt, ret);
+ 
+ 	have_result |= afs_fs_probe_done(server);
+-	if (have_result) {
+-		server->probe.have_result = true;
+-		wake_up_var(&server->probe.have_result);
++	if (have_result)
+ 		wake_up_all(&server->probe_wq);
+-	}
+ }
+ 
+ /*
+
+commit 9efcc4a129363187c9bf15338692f107c5c9b6f0
+Author: David Howells <dhowells@redhat.com>
+Date:   Thu Mar 26 15:24:07 2020 +0000
+
+    afs: Fix unpinned address list during probing
+    
+    When it's probing all of a fileserver's interfaces to find which one is
+    best to use, afs_do_probe_fileserver() takes a lock on the server record
+    and notes the pointer to the address list.
+    
+    It doesn't, however, pin the address list, so as soon as it drops the
+    lock, there's nothing to stop the address list from being freed under
+    us.
+    
+    Fix this by taking a ref on the address list inside the locked section
+    and dropping it at the end of the function.
+    
+    Fixes: 3bf0fb6f33dd ("afs: Probe multiple fileservers simultaneously")
+    Signed-off-by: David Howells <dhowells@redhat.com>
+    Reviewed-by: Marc Dionne <marc.dionne@auristor.com>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/fs/afs/fs_probe.c b/fs/afs/fs_probe.c
+index cfe62b154f68..e1b9ed679045 100644
+--- a/fs/afs/fs_probe.c
++++ b/fs/afs/fs_probe.c
+@@ -145,6 +145,7 @@ static int afs_do_probe_fileserver(struct afs_net *net,
+ 	read_lock(&server->fs_lock);
+ 	ac.alist = rcu_dereference_protected(server->addresses,
+ 					     lockdep_is_held(&server->fs_lock));
++	afs_get_addrlist(ac.alist);
+ 	read_unlock(&server->fs_lock);
+ 
+ 	atomic_set(&server->probe_outstanding, ac.alist->nr_addrs);
+@@ -163,6 +164,7 @@ static int afs_do_probe_fileserver(struct afs_net *net,
+ 
+ 	if (!in_progress)
+ 		afs_fs_probe_done(server);
++	afs_put_addrlist(ac.alist);
+ 	return in_progress;
+ }
+ 
+
+commit b4d0d230ccfb5d1a9ea85da64aa584df7c148ee9
+Author: Thomas Gleixner <tglx@linutronix.de>
+Date:   Mon May 20 19:08:01 2019 +0200
+
+    treewide: Replace GPLv2 boilerplate/reference with SPDX - rule 36
+    
+    Based on 1 normalized pattern(s):
+    
+      this program is free software you can redistribute it and or modify
+      it under the terms of the gnu general public licence as published by
+      the free software foundation either version 2 of the licence or at
+      your option any later version
+    
+    extracted by the scancode license scanner the SPDX license identifier
+    
+      GPL-2.0-or-later
+    
+    has been chosen to replace the boilerplate/reference in 114 file(s).
+    
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Reviewed-by: Allison Randal <allison@lohutok.net>
+    Reviewed-by: Kate Stewart <kstewart@linuxfoundation.org>
+    Cc: linux-spdx@vger.kernel.org
+    Link: https://lkml.kernel.org/r/20190520170857.552531963@linutronix.de
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/fs/afs/fs_probe.c b/fs/afs/fs_probe.c
+index 9b7266209343..cfe62b154f68 100644
+--- a/fs/afs/fs_probe.c
++++ b/fs/afs/fs_probe.c
+@@ -1,12 +1,8 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
+ /* AFS fileserver probing
+  *
+  * Copyright (C) 2018 Red Hat, Inc. All Rights Reserved.
+  * Written by David Howells (dhowells@redhat.com)
+- *
+- * This program is free software; you can redistribute it and/or
+- * modify it under the terms of the GNU General Public Licence
+- * as published by the Free Software Foundation; either version
+- * 2 of the Licence, or (at your option) any later version.
+  */
+ 
+ #include <linux/sched.h>
+
+commit ffba718e935402e7f42b8cd5d1e00e4a3907d361
+Author: David Howells <dhowells@redhat.com>
+Date:   Thu May 9 22:22:50 2019 +0100
+
+    afs: Get rid of afs_call::reply[]
+    
+    Replace the afs_call::reply[] array with a bunch of typed members so that
+    the compiler can use type-checking on them.  It's also easier for the eye
+    to see what's going on.
+    
+    Signed-off-by: David Howells <dhowells@redhat.com>
+
+diff --git a/fs/afs/fs_probe.c b/fs/afs/fs_probe.c
+index 5d3abde52a0f..9b7266209343 100644
+--- a/fs/afs/fs_probe.c
++++ b/fs/afs/fs_probe.c
+@@ -33,8 +33,8 @@ static bool afs_fs_probe_done(struct afs_server *server)
+ void afs_fileserver_probe_result(struct afs_call *call)
+ {
+ 	struct afs_addr_list *alist = call->alist;
+-	struct afs_server *server = call->reply[0];
+-	unsigned int server_index = (long)call->reply[1];
++	struct afs_server *server = call->server;
++	unsigned int server_index = call->server_index;
+ 	unsigned int index = call->addr_ix;
+ 	unsigned int rtt = UINT_MAX;
+ 	bool have_result = false;
+
+commit 0b9bf3812ad1f0d937584e300826285694f53e2b
+Author: David Howells <dhowells@redhat.com>
+Date:   Thu Apr 25 14:26:50 2019 +0100
+
+    afs: Split wait from afs_make_call()
+    
+    Split the call to afs_wait_for_call_to_complete() from afs_make_call() to
+    make it easier to handle asynchronous calls and to make it easier to
+    convert a synchronous call to an asynchronous one in future, for instance
+    when someone tries to interrupt an operation by pressing Ctrl-C.
+    
+    Signed-off-by: David Howells <dhowells@redhat.com>
+
+diff --git a/fs/afs/fs_probe.c b/fs/afs/fs_probe.c
+index 3a9eaec06756..5d3abde52a0f 100644
+--- a/fs/afs/fs_probe.c
++++ b/fs/afs/fs_probe.c
+@@ -141,8 +141,8 @@ static int afs_do_probe_fileserver(struct afs_net *net,
+ 	struct afs_addr_cursor ac = {
+ 		.index = 0,
+ 	};
++	struct afs_call *call;
+ 	bool in_progress = false;
+-	int err;
+ 
+ 	_enter("%pU", &server->uuid);
+ 
+@@ -156,12 +156,13 @@ static int afs_do_probe_fileserver(struct afs_net *net,
+ 	server->probe.rtt = UINT_MAX;
+ 
+ 	for (ac.index = 0; ac.index < ac.alist->nr_addrs; ac.index++) {
+-		err = afs_fs_get_capabilities(net, server, &ac, key, server_index,
+-					      true);
+-		if (err == -EINPROGRESS)
++		call = afs_fs_get_capabilities(net, server, &ac, key, server_index);
++		if (!IS_ERR(call)) {
++			afs_put_call(call);
+ 			in_progress = true;
+-		else
+-			afs_prioritise_error(_e, err, ac.abort_code);
++		} else {
++			afs_prioritise_error(_e, PTR_ERR(call), ac.abort_code);
++		}
+ 	}
+ 
+ 	if (!in_progress)
+
+commit 08d405c8b845a4b871fa3606c9ebe0d0f3b74614
+Author: Davidlohr Bueso <dave@stgolabs.net>
+Date:   Thu Jan 3 15:28:58 2019 -0800
+
+    fs/: remove caller signal_pending branch predictions
+    
+    This is already done for us internally by the signal machinery.
+    
+    [akpm@linux-foundation.org: fix fs/buffer.c]
+    Link: http://lkml.kernel.org/r/20181116002713.8474-7-dave@stgolabs.net
+    Signed-off-by: Davidlohr Bueso <dave@stgolabs.net>
+    Reviewed-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/fs/afs/fs_probe.c b/fs/afs/fs_probe.c
+index fde6b4d4121e..3a9eaec06756 100644
+--- a/fs/afs/fs_probe.c
++++ b/fs/afs/fs_probe.c
+@@ -247,7 +247,7 @@ int afs_wait_for_fs_probes(struct afs_server_list *slist, unsigned long untried)
+ 			}
+ 		}
+ 
+-		if (!still_probing || unlikely(signal_pending(current)))
++		if (!still_probing || signal_pending(current))
+ 			goto stop;
+ 		schedule();
+ 	}
+
+commit 4584ae96ae307613625e80cb9c7d9a981bed47a7
+Author: David Howells <dhowells@redhat.com>
+Date:   Tue Nov 13 23:20:28 2018 +0000
+
+    afs: Fix missing net error handling
+    
+    kAFS can be given certain network errors (EADDRNOTAVAIL, EHOSTDOWN and
+    ERFKILL) that it doesn't handle in its server/address rotation algorithms.
+    They cause the probing and rotation to abort immediately rather than
+    rotating.
+    
+    Fix this by:
+    
+     (1) Abstracting out the error prioritisation from the VL and FS rotation
+         algorithms into a common function and expand usage into the server
+         probing code.
+    
+         When multiple errors are available, this code selects the one we'd
+         prefer to return.
+    
+     (2) Add handling for EADDRNOTAVAIL, EHOSTDOWN and ERFKILL.
+    
+    Fixes: 0fafdc9f888b ("afs: Fix file locking")
+    Fixes: 0338747d8454 ("afs: Probe multiple fileservers simultaneously")
+    Signed-off-by: David Howells <dhowells@redhat.com>
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/fs/afs/fs_probe.c b/fs/afs/fs_probe.c
+index d049cb459742..fde6b4d4121e 100644
+--- a/fs/afs/fs_probe.c
++++ b/fs/afs/fs_probe.c
+@@ -61,8 +61,11 @@ void afs_fileserver_probe_result(struct afs_call *call)
+ 		afs_io_error(call, afs_io_error_fs_probe_fail);
+ 		goto out;
+ 	case -ECONNRESET: /* Responded, but call expired. */
++	case -ERFKILL:
++	case -EADDRNOTAVAIL:
+ 	case -ENETUNREACH:
+ 	case -EHOSTUNREACH:
++	case -EHOSTDOWN:
+ 	case -ECONNREFUSED:
+ 	case -ETIMEDOUT:
+ 	case -ETIME:
+@@ -132,12 +135,14 @@ void afs_fileserver_probe_result(struct afs_call *call)
+ static int afs_do_probe_fileserver(struct afs_net *net,
+ 				   struct afs_server *server,
+ 				   struct key *key,
+-				   unsigned int server_index)
++				   unsigned int server_index,
++				   struct afs_error *_e)
+ {
+ 	struct afs_addr_cursor ac = {
+ 		.index = 0,
+ 	};
+-	int ret;
++	bool in_progress = false;
++	int err;
+ 
+ 	_enter("%pU", &server->uuid);
+ 
+@@ -151,15 +156,17 @@ static int afs_do_probe_fileserver(struct afs_net *net,
+ 	server->probe.rtt = UINT_MAX;
+ 
+ 	for (ac.index = 0; ac.index < ac.alist->nr_addrs; ac.index++) {
+-		ret = afs_fs_get_capabilities(net, server, &ac, key, server_index,
++		err = afs_fs_get_capabilities(net, server, &ac, key, server_index,
+ 					      true);
+-		if (ret != -EINPROGRESS) {
+-			afs_fs_probe_done(server);
+-			return ret;
+-		}
++		if (err == -EINPROGRESS)
++			in_progress = true;
++		else
++			afs_prioritise_error(_e, err, ac.abort_code);
+ 	}
+ 
+-	return 0;
++	if (!in_progress)
++		afs_fs_probe_done(server);
++	return in_progress;
+ }
+ 
+ /*
+@@ -169,21 +176,23 @@ int afs_probe_fileservers(struct afs_net *net, struct key *key,
+ 			  struct afs_server_list *list)
+ {
+ 	struct afs_server *server;
+-	int i, ret;
++	struct afs_error e;
++	bool in_progress = false;
++	int i;
+ 
++	e.error = 0;
++	e.responded = false;
+ 	for (i = 0; i < list->nr_servers; i++) {
+ 		server = list->servers[i].server;
+ 		if (test_bit(AFS_SERVER_FL_PROBED, &server->flags))
+ 			continue;
+ 
+-		if (!test_and_set_bit_lock(AFS_SERVER_FL_PROBING, &server->flags)) {
+-			ret = afs_do_probe_fileserver(net, server, key, i);
+-			if (ret)
+-				return ret;
+-		}
++		if (!test_and_set_bit_lock(AFS_SERVER_FL_PROBING, &server->flags) &&
++		    afs_do_probe_fileserver(net, server, key, i, &e))
++			in_progress = true;
+ 	}
+ 
+-	return 0;
++	return in_progress ? 0 : e.error;
+ }
+ 
+ /*
+
+commit 3bf0fb6f33dd545693da5e65f5b1b9b9f0bfc35e
+Author: David Howells <dhowells@redhat.com>
+Date:   Sat Oct 20 00:57:59 2018 +0100
+
+    afs: Probe multiple fileservers simultaneously
+    
+    Send probes to all the unprobed fileservers in a fileserver list on all
+    addresses simultaneously in an attempt to find out the fastest route whilst
+    not getting stuck for 20s on any server or address that we don't get a
+    reply from.
+    
+    This alleviates the problem whereby attempting to access a new server can
+    take a long time because the rotation algorithm ends up rotating through
+    all servers and addresses until it finds one that responds.
+    
+    Signed-off-by: David Howells <dhowells@redhat.com>
+
+diff --git a/fs/afs/fs_probe.c b/fs/afs/fs_probe.c
+new file mode 100644
+index 000000000000..d049cb459742
+--- /dev/null
++++ b/fs/afs/fs_probe.c
+@@ -0,0 +1,270 @@
++/* AFS fileserver probing
++ *
++ * Copyright (C) 2018 Red Hat, Inc. All Rights Reserved.
++ * Written by David Howells (dhowells@redhat.com)
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public Licence
++ * as published by the Free Software Foundation; either version
++ * 2 of the Licence, or (at your option) any later version.
++ */
++
++#include <linux/sched.h>
++#include <linux/slab.h>
++#include "afs_fs.h"
++#include "internal.h"
++#include "protocol_yfs.h"
++
++static bool afs_fs_probe_done(struct afs_server *server)
++{
++	if (!atomic_dec_and_test(&server->probe_outstanding))
++		return false;
++
++	wake_up_var(&server->probe_outstanding);
++	clear_bit_unlock(AFS_SERVER_FL_PROBING, &server->flags);
++	wake_up_bit(&server->flags, AFS_SERVER_FL_PROBING);
++	return true;
++}
++
++/*
++ * Process the result of probing a fileserver.  This is called after successful
++ * or failed delivery of an FS.GetCapabilities operation.
++ */
++void afs_fileserver_probe_result(struct afs_call *call)
++{
++	struct afs_addr_list *alist = call->alist;
++	struct afs_server *server = call->reply[0];
++	unsigned int server_index = (long)call->reply[1];
++	unsigned int index = call->addr_ix;
++	unsigned int rtt = UINT_MAX;
++	bool have_result = false;
++	u64 _rtt;
++	int ret = call->error;
++
++	_enter("%pU,%u", &server->uuid, index);
++
++	spin_lock(&server->probe_lock);
++
++	switch (ret) {
++	case 0:
++		server->probe.error = 0;
++		goto responded;
++	case -ECONNABORTED:
++		if (!server->probe.responded) {
++			server->probe.abort_code = call->abort_code;
++			server->probe.error = ret;
++		}
++		goto responded;
++	case -ENOMEM:
++	case -ENONET:
++		server->probe.local_failure = true;
++		afs_io_error(call, afs_io_error_fs_probe_fail);
++		goto out;
++	case -ECONNRESET: /* Responded, but call expired. */
++	case -ENETUNREACH:
++	case -EHOSTUNREACH:
++	case -ECONNREFUSED:
++	case -ETIMEDOUT:
++	case -ETIME:
++	default:
++		clear_bit(index, &alist->responded);
++		set_bit(index, &alist->failed);
++		if (!server->probe.responded &&
++		    (server->probe.error == 0 ||
++		     server->probe.error == -ETIMEDOUT ||
++		     server->probe.error == -ETIME))
++			server->probe.error = ret;
++		afs_io_error(call, afs_io_error_fs_probe_fail);
++		goto out;
++	}
++
++responded:
++	set_bit(index, &alist->responded);
++	clear_bit(index, &alist->failed);
++
++	if (call->service_id == YFS_FS_SERVICE) {
++		server->probe.is_yfs = true;
++		set_bit(AFS_SERVER_FL_IS_YFS, &server->flags);
++		alist->addrs[index].srx_service = call->service_id;
++	} else {
++		server->probe.not_yfs = true;
++		if (!server->probe.is_yfs) {
++			clear_bit(AFS_SERVER_FL_IS_YFS, &server->flags);
++			alist->addrs[index].srx_service = call->service_id;
++		}
++	}
++
++	/* Get the RTT and scale it to fit into a 32-bit value that represents
++	 * over a minute of time so that we can access it with one instruction
++	 * on a 32-bit system.
++	 */
++	_rtt = rxrpc_kernel_get_rtt(call->net->socket, call->rxcall);
++	_rtt /= 64;
++	rtt = (_rtt > UINT_MAX) ? UINT_MAX : _rtt;
++	if (rtt < server->probe.rtt) {
++		server->probe.rtt = rtt;
++		alist->preferred = index;
++		have_result = true;
++	}
++
++	smp_wmb(); /* Set rtt before responded. */
++	server->probe.responded = true;
++	set_bit(AFS_SERVER_FL_PROBED, &server->flags);
++out:
++	spin_unlock(&server->probe_lock);
++
++	_debug("probe [%u][%u] %pISpc rtt=%u ret=%d",
++	       server_index, index, &alist->addrs[index].transport,
++	       (unsigned int)rtt, ret);
++
++	have_result |= afs_fs_probe_done(server);
++	if (have_result) {
++		server->probe.have_result = true;
++		wake_up_var(&server->probe.have_result);
++		wake_up_all(&server->probe_wq);
++	}
++}
++
++/*
++ * Probe all of a fileserver's addresses to find out the best route and to
++ * query its capabilities.
++ */
++static int afs_do_probe_fileserver(struct afs_net *net,
++				   struct afs_server *server,
++				   struct key *key,
++				   unsigned int server_index)
++{
++	struct afs_addr_cursor ac = {
++		.index = 0,
++	};
++	int ret;
++
++	_enter("%pU", &server->uuid);
++
++	read_lock(&server->fs_lock);
++	ac.alist = rcu_dereference_protected(server->addresses,
++					     lockdep_is_held(&server->fs_lock));
++	read_unlock(&server->fs_lock);
++
++	atomic_set(&server->probe_outstanding, ac.alist->nr_addrs);
++	memset(&server->probe, 0, sizeof(server->probe));
++	server->probe.rtt = UINT_MAX;
++
++	for (ac.index = 0; ac.index < ac.alist->nr_addrs; ac.index++) {
++		ret = afs_fs_get_capabilities(net, server, &ac, key, server_index,
++					      true);
++		if (ret != -EINPROGRESS) {
++			afs_fs_probe_done(server);
++			return ret;
++		}
++	}
++
++	return 0;
++}
++
++/*
++ * Send off probes to all unprobed servers.
++ */
++int afs_probe_fileservers(struct afs_net *net, struct key *key,
++			  struct afs_server_list *list)
++{
++	struct afs_server *server;
++	int i, ret;
++
++	for (i = 0; i < list->nr_servers; i++) {
++		server = list->servers[i].server;
++		if (test_bit(AFS_SERVER_FL_PROBED, &server->flags))
++			continue;
++
++		if (!test_and_set_bit_lock(AFS_SERVER_FL_PROBING, &server->flags)) {
++			ret = afs_do_probe_fileserver(net, server, key, i);
++			if (ret)
++				return ret;
++		}
++	}
++
++	return 0;
++}
++
++/*
++ * Wait for the first as-yet untried fileserver to respond.
++ */
++int afs_wait_for_fs_probes(struct afs_server_list *slist, unsigned long untried)
++{
++	struct wait_queue_entry *waits;
++	struct afs_server *server;
++	unsigned int rtt = UINT_MAX;
++	bool have_responders = false;
++	int pref = -1, i;
++
++	_enter("%u,%lx", slist->nr_servers, untried);
++
++	/* Only wait for servers that have a probe outstanding. */
++	for (i = 0; i < slist->nr_servers; i++) {
++		if (test_bit(i, &untried)) {
++			server = slist->servers[i].server;
++			if (!test_bit(AFS_SERVER_FL_PROBING, &server->flags))
++				__clear_bit(i, &untried);
++			if (server->probe.responded)
++				have_responders = true;
++		}
++	}
++	if (have_responders || !untried)
++		return 0;
++
++	waits = kmalloc(array_size(slist->nr_servers, sizeof(*waits)), GFP_KERNEL);
++	if (!waits)
++		return -ENOMEM;
++
++	for (i = 0; i < slist->nr_servers; i++) {
++		if (test_bit(i, &untried)) {
++			server = slist->servers[i].server;
++			init_waitqueue_entry(&waits[i], current);
++			add_wait_queue(&server->probe_wq, &waits[i]);
++		}
++	}
++
++	for (;;) {
++		bool still_probing = false;
++
++		set_current_state(TASK_INTERRUPTIBLE);
++		for (i = 0; i < slist->nr_servers; i++) {
++			if (test_bit(i, &untried)) {
++				server = slist->servers[i].server;
++				if (server->probe.responded)
++					goto stop;
++				if (test_bit(AFS_SERVER_FL_PROBING, &server->flags))
++					still_probing = true;
++			}
++		}
++
++		if (!still_probing || unlikely(signal_pending(current)))
++			goto stop;
++		schedule();
++	}
++
++stop:
++	set_current_state(TASK_RUNNING);
++
++	for (i = 0; i < slist->nr_servers; i++) {
++		if (test_bit(i, &untried)) {
++			server = slist->servers[i].server;
++			if (server->probe.responded &&
++			    server->probe.rtt < rtt) {
++				pref = i;
++				rtt = server->probe.rtt;
++			}
++
++			remove_wait_queue(&server->probe_wq, &waits[i]);
++		}
++	}
++
++	kfree(waits);
++
++	if (pref == -1 && signal_pending(current))
++		return -ERESTARTSYS;
++
++	if (pref >= 0)
++		slist->preferred = pref;
++	return 0;
++}

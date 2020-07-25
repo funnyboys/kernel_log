@@ -1,0 +1,2030 @@
+commit ac8dec420970f5cbaf2f6eda39153a60ec5b257b
+Author: Davidlohr Bueso <dave@stgolabs.net>
+Date:   Mon Nov 18 15:19:35 2019 -0800
+
+    locking/percpu-rwsem: Fold __percpu_up_read()
+    
+    Now that __percpu_up_read() is only ever used from percpu_up_read()
+    merge them, it's a small function.
+    
+    Signed-off-by: Davidlohr Bueso <dave@stgolabs.net>
+    Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+    Acked-by: Will Deacon <will@kernel.org>
+    Acked-by: Waiman Long <longman@redhat.com>
+    Link: https://lkml.kernel.org/r/20200131151540.212415454@infradead.org
+
+diff --git a/include/linux/percpu-rwsem.h b/include/linux/percpu-rwsem.h
+index f5ecf6a8a1dd..5e033fe1ff4e 100644
+--- a/include/linux/percpu-rwsem.h
++++ b/include/linux/percpu-rwsem.h
+@@ -43,7 +43,6 @@ is_static struct percpu_rw_semaphore name = {				\
+ 	__DEFINE_PERCPU_RWSEM(name, static)
+ 
+ extern bool __percpu_down_read(struct percpu_rw_semaphore *, bool);
+-extern void __percpu_up_read(struct percpu_rw_semaphore *);
+ 
+ static inline void percpu_down_read(struct percpu_rw_semaphore *sem)
+ {
+@@ -103,10 +102,22 @@ static inline void percpu_up_read(struct percpu_rw_semaphore *sem)
+ 	/*
+ 	 * Same as in percpu_down_read().
+ 	 */
+-	if (likely(rcu_sync_is_idle(&sem->rss)))
++	if (likely(rcu_sync_is_idle(&sem->rss))) {
+ 		__this_cpu_dec(*sem->read_count);
+-	else
+-		__percpu_up_read(sem); /* Unconditional memory barrier */
++	} else {
++		/*
++		 * slowpath; reader will only ever wake a single blocked
++		 * writer.
++		 */
++		smp_mb(); /* B matches C */
++		/*
++		 * In other words, if they see our decrement (presumably to
++		 * aggregate zero, as that is the only time it matters) they
++		 * will also see our critical section.
++		 */
++		__this_cpu_dec(*sem->read_count);
++		rcuwait_wake_up(&sem->writer);
++	}
+ 	preempt_enable();
+ }
+ 
+
+commit 7f26482a872c36b2ee87ea95b9dcd96e3d5805df
+Author: Peter Zijlstra <peterz@infradead.org>
+Date:   Wed Oct 30 20:30:41 2019 +0100
+
+    locking/percpu-rwsem: Remove the embedded rwsem
+    
+    The filesystem freezer uses percpu-rwsem in a way that is effectively
+    write_non_owner() and achieves this with a few horrible hacks that
+    rely on the rwsem (!percpu) implementation.
+    
+    When PREEMPT_RT replaces the rwsem implementation with a PI aware
+    variant this comes apart.
+    
+    Remove the embedded rwsem and implement it using a waitqueue and an
+    atomic_t.
+    
+     - make readers_block an atomic, and use it, with the waitqueue
+       for a blocking test-and-set write-side.
+    
+     - have the read-side wait for the 'lock' state to clear.
+    
+    Have the waiters use FIFO queueing and mark them (reader/writer) with
+    a new WQ_FLAG. Use a custom wake_function to wake either a single
+    writer or all readers until a writer.
+    
+    Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+    Reviewed-by: Davidlohr Bueso <dbueso@suse.de>
+    Acked-by: Will Deacon <will@kernel.org>
+    Acked-by: Waiman Long <longman@redhat.com>
+    Tested-by: Juri Lelli <juri.lelli@redhat.com>
+    Link: https://lkml.kernel.org/r/20200204092403.GB14879@hirez.programming.kicks-ass.net
+
+diff --git a/include/linux/percpu-rwsem.h b/include/linux/percpu-rwsem.h
+index bb5b71c1e446..f5ecf6a8a1dd 100644
+--- a/include/linux/percpu-rwsem.h
++++ b/include/linux/percpu-rwsem.h
+@@ -3,18 +3,18 @@
+ #define _LINUX_PERCPU_RWSEM_H
+ 
+ #include <linux/atomic.h>
+-#include <linux/rwsem.h>
+ #include <linux/percpu.h>
+ #include <linux/rcuwait.h>
++#include <linux/wait.h>
+ #include <linux/rcu_sync.h>
+ #include <linux/lockdep.h>
+ 
+ struct percpu_rw_semaphore {
+ 	struct rcu_sync		rss;
+ 	unsigned int __percpu	*read_count;
+-	struct rw_semaphore	rw_sem; /* slowpath */
+-	struct rcuwait          writer; /* blocked writer */
+-	int			readers_block;
++	struct rcuwait		writer;
++	wait_queue_head_t	waiters;
++	atomic_t		block;
+ #ifdef CONFIG_DEBUG_LOCK_ALLOC
+ 	struct lockdep_map	dep_map;
+ #endif
+@@ -31,8 +31,9 @@ static DEFINE_PER_CPU(unsigned int, __percpu_rwsem_rc_##name);		\
+ is_static struct percpu_rw_semaphore name = {				\
+ 	.rss = __RCU_SYNC_INITIALIZER(name.rss),			\
+ 	.read_count = &__percpu_rwsem_rc_##name,			\
+-	.rw_sem = __RWSEM_INITIALIZER(name.rw_sem),			\
+ 	.writer = __RCUWAIT_INITIALIZER(name.writer),			\
++	.waiters = __WAIT_QUEUE_HEAD_INITIALIZER(name.waiters),		\
++	.block = ATOMIC_INIT(0),					\
+ 	__PERCPU_RWSEM_DEP_MAP_INIT(name)				\
+ }
+ 
+@@ -130,20 +131,12 @@ static inline void percpu_rwsem_release(struct percpu_rw_semaphore *sem,
+ 					bool read, unsigned long ip)
+ {
+ 	lock_release(&sem->dep_map, ip);
+-#ifdef CONFIG_RWSEM_SPIN_ON_OWNER
+-	if (!read)
+-		atomic_long_set(&sem->rw_sem.owner, RWSEM_OWNER_UNKNOWN);
+-#endif
+ }
+ 
+ static inline void percpu_rwsem_acquire(struct percpu_rw_semaphore *sem,
+ 					bool read, unsigned long ip)
+ {
+ 	lock_acquire(&sem->dep_map, 0, 1, read, 1, NULL, ip);
+-#ifdef CONFIG_RWSEM_SPIN_ON_OWNER
+-	if (!read)
+-		atomic_long_set(&sem->rw_sem.owner, (long)current);
+-#endif
+ }
+ 
+ #endif
+
+commit 71365d40232110f7b029befc9033ea311d680611
+Author: Peter Zijlstra <peterz@infradead.org>
+Date:   Wed Oct 30 20:17:51 2019 +0100
+
+    locking/percpu-rwsem: Move __this_cpu_inc() into the slowpath
+    
+    As preparation to rework __percpu_down_read() move the
+    __this_cpu_inc() into it.
+    
+    Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+    Reviewed-by: Davidlohr Bueso <dbueso@suse.de>
+    Acked-by: Will Deacon <will@kernel.org>
+    Acked-by: Waiman Long <longman@redhat.com>
+    Tested-by: Juri Lelli <juri.lelli@redhat.com>
+    Link: https://lkml.kernel.org/r/20200131151540.041600199@infradead.org
+
+diff --git a/include/linux/percpu-rwsem.h b/include/linux/percpu-rwsem.h
+index 4ceaa1921951..bb5b71c1e446 100644
+--- a/include/linux/percpu-rwsem.h
++++ b/include/linux/percpu-rwsem.h
+@@ -59,8 +59,9 @@ static inline void percpu_down_read(struct percpu_rw_semaphore *sem)
+ 	 * and that once the synchronize_rcu() is done, the writer will see
+ 	 * anything we did within this RCU-sched read-size critical section.
+ 	 */
+-	__this_cpu_inc(*sem->read_count);
+-	if (unlikely(!rcu_sync_is_idle(&sem->rss)))
++	if (likely(rcu_sync_is_idle(&sem->rss)))
++		__this_cpu_inc(*sem->read_count);
++	else
+ 		__percpu_down_read(sem, false); /* Unconditional memory barrier */
+ 	/*
+ 	 * The preempt_enable() prevents the compiler from
+@@ -77,8 +78,9 @@ static inline bool percpu_down_read_trylock(struct percpu_rw_semaphore *sem)
+ 	/*
+ 	 * Same as in percpu_down_read().
+ 	 */
+-	__this_cpu_inc(*sem->read_count);
+-	if (unlikely(!rcu_sync_is_idle(&sem->rss)))
++	if (likely(rcu_sync_is_idle(&sem->rss)))
++		__this_cpu_inc(*sem->read_count);
++	else
+ 		ret = __percpu_down_read(sem, true); /* Unconditional memory barrier */
+ 	preempt_enable();
+ 	/*
+
+commit 206c98ffbeda588dbbd9d272505c42acbc364a30
+Author: Peter Zijlstra <peterz@infradead.org>
+Date:   Wed Oct 30 20:12:37 2019 +0100
+
+    locking/percpu-rwsem: Convert to bool
+    
+    Use bool where possible.
+    
+    Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+    Reviewed-by: Davidlohr Bueso <dbueso@suse.de>
+    Acked-by: Will Deacon <will@kernel.org>
+    Acked-by: Waiman Long <longman@redhat.com>
+    Tested-by: Juri Lelli <juri.lelli@redhat.com>
+    Link: https://lkml.kernel.org/r/20200131151539.984626569@infradead.org
+
+diff --git a/include/linux/percpu-rwsem.h b/include/linux/percpu-rwsem.h
+index f2c36fb5e661..4ceaa1921951 100644
+--- a/include/linux/percpu-rwsem.h
++++ b/include/linux/percpu-rwsem.h
+@@ -41,7 +41,7 @@ is_static struct percpu_rw_semaphore name = {				\
+ #define DEFINE_STATIC_PERCPU_RWSEM(name)	\
+ 	__DEFINE_PERCPU_RWSEM(name, static)
+ 
+-extern int __percpu_down_read(struct percpu_rw_semaphore *, int);
++extern bool __percpu_down_read(struct percpu_rw_semaphore *, bool);
+ extern void __percpu_up_read(struct percpu_rw_semaphore *);
+ 
+ static inline void percpu_down_read(struct percpu_rw_semaphore *sem)
+@@ -69,9 +69,9 @@ static inline void percpu_down_read(struct percpu_rw_semaphore *sem)
+ 	preempt_enable();
+ }
+ 
+-static inline int percpu_down_read_trylock(struct percpu_rw_semaphore *sem)
++static inline bool percpu_down_read_trylock(struct percpu_rw_semaphore *sem)
+ {
+-	int ret = 1;
++	bool ret = true;
+ 
+ 	preempt_disable();
+ 	/*
+
+commit 1751060e2527462714359573a39dca10451ffbf8
+Author: Peter Zijlstra <peterz@infradead.org>
+Date:   Wed Oct 30 20:01:26 2019 +0100
+
+    locking/percpu-rwsem, lockdep: Make percpu-rwsem use its own lockdep_map
+    
+    As preparation for replacing the embedded rwsem, give percpu-rwsem its
+    own lockdep_map.
+    
+    Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+    Reviewed-by: Davidlohr Bueso <dbueso@suse.de>
+    Acked-by: Will Deacon <will@kernel.org>
+    Acked-by: Waiman Long <longman@redhat.com>
+    Tested-by: Juri Lelli <juri.lelli@redhat.com>
+    Link: https://lkml.kernel.org/r/20200131151539.927625541@infradead.org
+
+diff --git a/include/linux/percpu-rwsem.h b/include/linux/percpu-rwsem.h
+index ad2ca2a89d5b..f2c36fb5e661 100644
+--- a/include/linux/percpu-rwsem.h
++++ b/include/linux/percpu-rwsem.h
+@@ -15,8 +15,17 @@ struct percpu_rw_semaphore {
+ 	struct rw_semaphore	rw_sem; /* slowpath */
+ 	struct rcuwait          writer; /* blocked writer */
+ 	int			readers_block;
++#ifdef CONFIG_DEBUG_LOCK_ALLOC
++	struct lockdep_map	dep_map;
++#endif
+ };
+ 
++#ifdef CONFIG_DEBUG_LOCK_ALLOC
++#define __PERCPU_RWSEM_DEP_MAP_INIT(lockname)	.dep_map = { .name = #lockname },
++#else
++#define __PERCPU_RWSEM_DEP_MAP_INIT(lockname)
++#endif
++
+ #define __DEFINE_PERCPU_RWSEM(name, is_static)				\
+ static DEFINE_PER_CPU(unsigned int, __percpu_rwsem_rc_##name);		\
+ is_static struct percpu_rw_semaphore name = {				\
+@@ -24,7 +33,9 @@ is_static struct percpu_rw_semaphore name = {				\
+ 	.read_count = &__percpu_rwsem_rc_##name,			\
+ 	.rw_sem = __RWSEM_INITIALIZER(name.rw_sem),			\
+ 	.writer = __RCUWAIT_INITIALIZER(name.writer),			\
++	__PERCPU_RWSEM_DEP_MAP_INIT(name)				\
+ }
++
+ #define DEFINE_PERCPU_RWSEM(name)		\
+ 	__DEFINE_PERCPU_RWSEM(name, /* not static */)
+ #define DEFINE_STATIC_PERCPU_RWSEM(name)	\
+@@ -37,7 +48,7 @@ static inline void percpu_down_read(struct percpu_rw_semaphore *sem)
+ {
+ 	might_sleep();
+ 
+-	rwsem_acquire_read(&sem->rw_sem.dep_map, 0, 0, _RET_IP_);
++	rwsem_acquire_read(&sem->dep_map, 0, 0, _RET_IP_);
+ 
+ 	preempt_disable();
+ 	/*
+@@ -76,13 +87,15 @@ static inline int percpu_down_read_trylock(struct percpu_rw_semaphore *sem)
+ 	 */
+ 
+ 	if (ret)
+-		rwsem_acquire_read(&sem->rw_sem.dep_map, 0, 1, _RET_IP_);
++		rwsem_acquire_read(&sem->dep_map, 0, 1, _RET_IP_);
+ 
+ 	return ret;
+ }
+ 
+ static inline void percpu_up_read(struct percpu_rw_semaphore *sem)
+ {
++	rwsem_release(&sem->dep_map, _RET_IP_);
++
+ 	preempt_disable();
+ 	/*
+ 	 * Same as in percpu_down_read().
+@@ -92,8 +105,6 @@ static inline void percpu_up_read(struct percpu_rw_semaphore *sem)
+ 	else
+ 		__percpu_up_read(sem); /* Unconditional memory barrier */
+ 	preempt_enable();
+-
+-	rwsem_release(&sem->rw_sem.dep_map, _RET_IP_);
+ }
+ 
+ extern void percpu_down_write(struct percpu_rw_semaphore *);
+@@ -110,15 +121,13 @@ extern void percpu_free_rwsem(struct percpu_rw_semaphore *);
+ 	__percpu_init_rwsem(sem, #sem, &rwsem_key);		\
+ })
+ 
+-#define percpu_rwsem_is_held(sem) lockdep_is_held(&(sem)->rw_sem)
+-
+-#define percpu_rwsem_assert_held(sem)				\
+-	lockdep_assert_held(&(sem)->rw_sem)
++#define percpu_rwsem_is_held(sem)	lockdep_is_held(sem)
++#define percpu_rwsem_assert_held(sem)	lockdep_assert_held(sem)
+ 
+ static inline void percpu_rwsem_release(struct percpu_rw_semaphore *sem,
+ 					bool read, unsigned long ip)
+ {
+-	lock_release(&sem->rw_sem.dep_map, ip);
++	lock_release(&sem->dep_map, ip);
+ #ifdef CONFIG_RWSEM_SPIN_ON_OWNER
+ 	if (!read)
+ 		atomic_long_set(&sem->rw_sem.owner, RWSEM_OWNER_UNKNOWN);
+@@ -128,7 +137,7 @@ static inline void percpu_rwsem_release(struct percpu_rw_semaphore *sem,
+ static inline void percpu_rwsem_acquire(struct percpu_rw_semaphore *sem,
+ 					bool read, unsigned long ip)
+ {
+-	lock_acquire(&sem->rw_sem.dep_map, 0, 1, read, 1, NULL, ip);
++	lock_acquire(&sem->dep_map, 0, 1, read, 1, NULL, ip);
+ #ifdef CONFIG_RWSEM_SPIN_ON_OWNER
+ 	if (!read)
+ 		atomic_long_set(&sem->rw_sem.owner, (long)current);
+
+commit 5facae4f3549b5cf7c0e10ec312a65ffd43b5726
+Author: Qian Cai <cai@lca.pw>
+Date:   Thu Sep 19 12:09:40 2019 -0400
+
+    locking/lockdep: Remove unused @nested argument from lock_release()
+    
+    Since the following commit:
+    
+      b4adfe8e05f1 ("locking/lockdep: Remove unused argument in __lock_release")
+    
+    @nested is no longer used in lock_release(), so remove it from all
+    lock_release() calls and friends.
+    
+    Signed-off-by: Qian Cai <cai@lca.pw>
+    Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+    Acked-by: Will Deacon <will@kernel.org>
+    Acked-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: airlied@linux.ie
+    Cc: akpm@linux-foundation.org
+    Cc: alexander.levin@microsoft.com
+    Cc: daniel@iogearbox.net
+    Cc: davem@davemloft.net
+    Cc: dri-devel@lists.freedesktop.org
+    Cc: duyuyang@gmail.com
+    Cc: gregkh@linuxfoundation.org
+    Cc: hannes@cmpxchg.org
+    Cc: intel-gfx@lists.freedesktop.org
+    Cc: jack@suse.com
+    Cc: jlbec@evilplan.or
+    Cc: joonas.lahtinen@linux.intel.com
+    Cc: joseph.qi@linux.alibaba.com
+    Cc: jslaby@suse.com
+    Cc: juri.lelli@redhat.com
+    Cc: maarten.lankhorst@linux.intel.com
+    Cc: mark@fasheh.com
+    Cc: mhocko@kernel.org
+    Cc: mripard@kernel.org
+    Cc: ocfs2-devel@oss.oracle.com
+    Cc: rodrigo.vivi@intel.com
+    Cc: sean@poorly.run
+    Cc: st@kernel.org
+    Cc: tj@kernel.org
+    Cc: tytso@mit.edu
+    Cc: vdavydov.dev@gmail.com
+    Cc: vincent.guittot@linaro.org
+    Cc: viro@zeniv.linux.org.uk
+    Link: https://lkml.kernel.org/r/1568909380-32199-1-git-send-email-cai@lca.pw
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/include/linux/percpu-rwsem.h b/include/linux/percpu-rwsem.h
+index 3998cdf9cd14..ad2ca2a89d5b 100644
+--- a/include/linux/percpu-rwsem.h
++++ b/include/linux/percpu-rwsem.h
+@@ -93,7 +93,7 @@ static inline void percpu_up_read(struct percpu_rw_semaphore *sem)
+ 		__percpu_up_read(sem); /* Unconditional memory barrier */
+ 	preempt_enable();
+ 
+-	rwsem_release(&sem->rw_sem.dep_map, 1, _RET_IP_);
++	rwsem_release(&sem->rw_sem.dep_map, _RET_IP_);
+ }
+ 
+ extern void percpu_down_write(struct percpu_rw_semaphore *);
+@@ -118,7 +118,7 @@ extern void percpu_free_rwsem(struct percpu_rw_semaphore *);
+ static inline void percpu_rwsem_release(struct percpu_rw_semaphore *sem,
+ 					bool read, unsigned long ip)
+ {
+-	lock_release(&sem->rw_sem.dep_map, 1, ip);
++	lock_release(&sem->rw_sem.dep_map, ip);
+ #ifdef CONFIG_RWSEM_SPIN_ON_OWNER
+ 	if (!read)
+ 		atomic_long_set(&sem->rw_sem.owner, RWSEM_OWNER_UNKNOWN);
+
+commit e1928328699a582a540b105e5f4c160832a7fdcb
+Merge: 46f1ec23a469 9156e545765e
+Author: Linus Torvalds <torvalds@linux-foundation.org>
+Date:   Mon Jul 8 16:12:03 2019 -0700
+
+    Merge branch 'locking-core-for-linus' of git://git.kernel.org/pub/scm/linux/kernel/git/tip/tip
+    
+    Pull locking updates from Ingo Molnar:
+     "The main changes in this cycle are:
+    
+       - rwsem scalability improvements, phase #2, by Waiman Long, which are
+         rather impressive:
+    
+           "On a 2-socket 40-core 80-thread Skylake system with 40 reader
+            and writer locking threads, the min/mean/max locking operations
+            done in a 5-second testing window before the patchset were:
+    
+             40 readers, Iterations Min/Mean/Max = 1,807/1,808/1,810
+             40 writers, Iterations Min/Mean/Max = 1,807/50,344/151,255
+    
+            After the patchset, they became:
+    
+             40 readers, Iterations Min/Mean/Max = 30,057/31,359/32,741
+             40 writers, Iterations Min/Mean/Max = 94,466/95,845/97,098"
+    
+         There's a lot of changes to the locking implementation that makes
+         it similar to qrwlock, including owner handoff for more fair
+         locking.
+    
+         Another microbenchmark shows how across the spectrum the
+         improvements are:
+    
+           "With a locking microbenchmark running on 5.1 based kernel, the
+            total locking rates (in kops/s) on a 2-socket Skylake system
+            with equal numbers of readers and writers (mixed) before and
+            after this patchset were:
+    
+            # of Threads   Before Patch      After Patch
+            ------------   ------------      -----------
+                 2            2,618             4,193
+                 4            1,202             3,726
+                 8              802             3,622
+                16              729             3,359
+                32              319             2,826
+                64              102             2,744"
+    
+         The changes are extensive and the patch-set has been through
+         several iterations addressing various locking workloads. There
+         might be more regressions, but unless they are pathological I
+         believe we want to use this new implementation as the baseline
+         going forward.
+    
+       - jump-label optimizations by Daniel Bristot de Oliveira: the primary
+         motivation was to remove IPI disturbance of isolated RT-workload
+         CPUs, which resulted in the implementation of batched jump-label
+         updates. Beyond the improvement of the real-time characteristics
+         kernel, in one test this patchset improved static key update
+         overhead from 57 msecs to just 1.4 msecs - which is a nice speedup
+         as well.
+    
+       - atomic64_t cross-arch type cleanups by Mark Rutland: over the last
+         ~10 years of atomic64_t existence the various types used by the
+         APIs only had to be self-consistent within each architecture -
+         which means they became wildly inconsistent across architectures.
+         Mark puts and end to this by reworking all the atomic64
+         implementations to use 's64' as the base type for atomic64_t, and
+         to ensure that this type is consistently used for parameters and
+         return values in the API, avoiding further problems in this area.
+    
+       - A large set of small improvements to lockdep by Yuyang Du: type
+         cleanups, output cleanups, function return type and othr cleanups
+         all around the place.
+    
+       - A set of percpu ops cleanups and fixes by Peter Zijlstra.
+    
+       - Misc other changes - please see the Git log for more details"
+    
+    * 'locking-core-for-linus' of git://git.kernel.org/pub/scm/linux/kernel/git/tip/tip: (82 commits)
+      locking/lockdep: increase size of counters for lockdep statistics
+      locking/atomics: Use sed(1) instead of non-standard head(1) option
+      locking/lockdep: Move mark_lock() inside CONFIG_TRACE_IRQFLAGS && CONFIG_PROVE_LOCKING
+      x86/jump_label: Make tp_vec_nr static
+      x86/percpu: Optimize raw_cpu_xchg()
+      x86/percpu, sched/fair: Avoid local_clock()
+      x86/percpu, x86/irq: Relax {set,get}_irq_regs()
+      x86/percpu: Relax smp_processor_id()
+      x86/percpu: Differentiate this_cpu_{}() and __this_cpu_{}()
+      locking/rwsem: Guard against making count negative
+      locking/rwsem: Adaptive disabling of reader optimistic spinning
+      locking/rwsem: Enable time-based spinning on reader-owned rwsem
+      locking/rwsem: Make rwsem->owner an atomic_long_t
+      locking/rwsem: Enable readers spinning on writer
+      locking/rwsem: Clarify usage of owner's nonspinaable bit
+      locking/rwsem: Wake up almost all readers in wait queue
+      locking/rwsem: More optimal RT task handling of null owner
+      locking/rwsem: Always release wait_lock before waking up tasks
+      locking/rwsem: Implement lock handoff to prevent lock starvation
+      locking/rwsem: Make rwsem_spin_on_owner() return owner state
+      ...
+
+commit 94a9717b3c40e77a54e4afacd8f19a9a86bfeead
+Author: Waiman Long <longman@redhat.com>
+Date:   Mon May 20 16:59:12 2019 -0400
+
+    locking/rwsem: Make rwsem->owner an atomic_long_t
+    
+    The rwsem->owner contains not just the task structure pointer, it also
+    holds some flags for storing the current state of the rwsem. Some of
+    the flags may have to be atomically updated. To reflect the new reality,
+    the owner is now changed to an atomic_long_t type.
+    
+    New helper functions are added to properly separate out the task
+    structure pointer and the embedded flags.
+    
+    Suggested-by: Peter Zijlstra <peterz@infradead.org>
+    Signed-off-by: Waiman Long <longman@redhat.com>
+    Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+    Cc: Borislav Petkov <bp@alien8.de>
+    Cc: Davidlohr Bueso <dave@stgolabs.net>
+    Cc: H. Peter Anvin <hpa@zytor.com>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Tim Chen <tim.c.chen@linux.intel.com>
+    Cc: Will Deacon <will.deacon@arm.com>
+    Cc: huang ying <huang.ying.caritas@gmail.com>
+    Link: https://lkml.kernel.org/r/20190520205918.22251-14-longman@redhat.com
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/include/linux/percpu-rwsem.h b/include/linux/percpu-rwsem.h
+index 03cb4b6f842e..0a43830f1932 100644
+--- a/include/linux/percpu-rwsem.h
++++ b/include/linux/percpu-rwsem.h
+@@ -117,7 +117,7 @@ static inline void percpu_rwsem_release(struct percpu_rw_semaphore *sem,
+ 	lock_release(&sem->rw_sem.dep_map, 1, ip);
+ #ifdef CONFIG_RWSEM_SPIN_ON_OWNER
+ 	if (!read)
+-		sem->rw_sem.owner = RWSEM_OWNER_UNKNOWN;
++		atomic_long_set(&sem->rw_sem.owner, RWSEM_OWNER_UNKNOWN);
+ #endif
+ }
+ 
+@@ -127,7 +127,7 @@ static inline void percpu_rwsem_acquire(struct percpu_rw_semaphore *sem,
+ 	lock_acquire(&sem->rw_sem.dep_map, 0, 1, read, 1, NULL, ip);
+ #ifdef CONFIG_RWSEM_SPIN_ON_OWNER
+ 	if (!read)
+-		sem->rw_sem.owner = current;
++		atomic_long_set(&sem->rw_sem.owner, (long)current);
+ #endif
+ }
+ 
+
+commit 3f2947b78151ec938dc06aea4ba0e11e56becdff
+Author: Oleg Nesterov <oleg@redhat.com>
+Date:   Tue Apr 23 18:32:41 2019 +0200
+
+    locking/percpu-rwsem: Add DEFINE_PERCPU_RWSEM(), use it to initialize cgroup_threadgroup_rwsem
+    
+    Turn DEFINE_STATIC_PERCPU_RWSEM() into __DEFINE_PERCPU_RWSEM() with the
+    additional "is_static" argument to introduce DEFINE_PERCPU_RWSEM().
+    
+    Change cgroup.c to use DEFINE_PERCPU_RWSEM(cgroup_threadgroup_rwsem).
+    
+    Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+    Reviewed-by: Ingo Molnar <mingo@kernel.org>
+    Signed-off-by: Paul E. McKenney <paulmck@linux.ibm.com>
+
+diff --git a/include/linux/percpu-rwsem.h b/include/linux/percpu-rwsem.h
+index 6887636ea169..2809b44cbbee 100644
+--- a/include/linux/percpu-rwsem.h
++++ b/include/linux/percpu-rwsem.h
+@@ -17,14 +17,18 @@ struct percpu_rw_semaphore {
+ 	int			readers_block;
+ };
+ 
+-#define DEFINE_STATIC_PERCPU_RWSEM(name)				\
++#define __DEFINE_PERCPU_RWSEM(name, is_static)				\
+ static DEFINE_PER_CPU(unsigned int, __percpu_rwsem_rc_##name);		\
+-static struct percpu_rw_semaphore name = {				\
++is_static struct percpu_rw_semaphore name = {				\
+ 	.rss = __RCU_SYNC_INITIALIZER(name.rss),			\
+ 	.read_count = &__percpu_rwsem_rc_##name,			\
+ 	.rw_sem = __RWSEM_INITIALIZER(name.rw_sem),			\
+ 	.writer = __RCUWAIT_INITIALIZER(name.writer),			\
+ }
++#define DEFINE_PERCPU_RWSEM(name)		\
++	__DEFINE_PERCPU_RWSEM(name, /* not static */)
++#define DEFINE_STATIC_PERCPU_RWSEM(name)	\
++	__DEFINE_PERCPU_RWSEM(name, static)
+ 
+ extern int __percpu_down_read(struct percpu_rw_semaphore *, int);
+ extern void __percpu_up_read(struct percpu_rw_semaphore *);
+
+commit 95bf33b55ff4465399bad843f1d8d618c8baf1f3
+Author: Oleg Nesterov <oleg@redhat.com>
+Date:   Tue Apr 23 14:07:24 2019 +0200
+
+    rcu/sync: Kill rcu_sync_type/gp_type
+    
+    Now that the RCU flavors have been consolidated, rcu_sync_type makes no
+    sense because none of internal update functions aside from .held() depend
+    on gp_type.  This commit therefore removes this field and consolidates
+    the relevant code.
+    
+    Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+    [ paulmck: Added RCU and RCU-bh checks to rcu_sync_is_idle(). ]
+    [ paulmck: And applied subsequent feedback from Oleg Nesterov. ]
+    Signed-off-by: Paul E. McKenney <paulmck@linux.ibm.com>
+
+diff --git a/include/linux/percpu-rwsem.h b/include/linux/percpu-rwsem.h
+index 03cb4b6f842e..6887636ea169 100644
+--- a/include/linux/percpu-rwsem.h
++++ b/include/linux/percpu-rwsem.h
+@@ -20,7 +20,7 @@ struct percpu_rw_semaphore {
+ #define DEFINE_STATIC_PERCPU_RWSEM(name)				\
+ static DEFINE_PER_CPU(unsigned int, __percpu_rwsem_rc_##name);		\
+ static struct percpu_rw_semaphore name = {				\
+-	.rss = __RCU_SYNC_INITIALIZER(name.rss, RCU_SCHED_SYNC),	\
++	.rss = __RCU_SYNC_INITIALIZER(name.rss),			\
+ 	.read_count = &__percpu_rwsem_rc_##name,			\
+ 	.rw_sem = __RWSEM_INITIALIZER(name.rw_sem),			\
+ 	.writer = __RCUWAIT_INITIALIZER(name.writer),			\
+
+commit 02e525b2aff1d665f6466e1d123ee4cb69f1d4b0
+Author: Peter Zijlstra <peterz@infradead.org>
+Date:   Thu Feb 21 15:38:40 2019 +0100
+
+    locking/percpu-rwsem: Remove preempt_disable variants
+    
+    Effective revert commit:
+    
+      87709e28dc7c ("fs/locks: Use percpu_down_read_preempt_disable()")
+    
+    This is causing major pain for PREEMPT_RT.
+    
+    Sebastian did a lot of lockperf runs on 2 and 4 node machines with all
+    preemption modes (PREEMPT=n should be an obvious NOP for this patch
+    and thus serves as a good control) and no results showed significance
+    over 2-sigma (the PREEMPT=n results were almost empty at 1-sigma).
+    
+    Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+    Signed-off-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+    Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+    Cc: Andrew Morton <akpm@linux-foundation.org>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Will Deacon <will.deacon@arm.com>
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/include/linux/percpu-rwsem.h b/include/linux/percpu-rwsem.h
+index 71b75643c432..03cb4b6f842e 100644
+--- a/include/linux/percpu-rwsem.h
++++ b/include/linux/percpu-rwsem.h
+@@ -29,7 +29,7 @@ static struct percpu_rw_semaphore name = {				\
+ extern int __percpu_down_read(struct percpu_rw_semaphore *, int);
+ extern void __percpu_up_read(struct percpu_rw_semaphore *);
+ 
+-static inline void percpu_down_read_preempt_disable(struct percpu_rw_semaphore *sem)
++static inline void percpu_down_read(struct percpu_rw_semaphore *sem)
+ {
+ 	might_sleep();
+ 
+@@ -47,16 +47,10 @@ static inline void percpu_down_read_preempt_disable(struct percpu_rw_semaphore *
+ 	__this_cpu_inc(*sem->read_count);
+ 	if (unlikely(!rcu_sync_is_idle(&sem->rss)))
+ 		__percpu_down_read(sem, false); /* Unconditional memory barrier */
+-	barrier();
+ 	/*
+-	 * The barrier() prevents the compiler from
++	 * The preempt_enable() prevents the compiler from
+ 	 * bleeding the critical section out.
+ 	 */
+-}
+-
+-static inline void percpu_down_read(struct percpu_rw_semaphore *sem)
+-{
+-	percpu_down_read_preempt_disable(sem);
+ 	preempt_enable();
+ }
+ 
+@@ -83,13 +77,9 @@ static inline int percpu_down_read_trylock(struct percpu_rw_semaphore *sem)
+ 	return ret;
+ }
+ 
+-static inline void percpu_up_read_preempt_enable(struct percpu_rw_semaphore *sem)
++static inline void percpu_up_read(struct percpu_rw_semaphore *sem)
+ {
+-	/*
+-	 * The barrier() prevents the compiler from
+-	 * bleeding the critical section out.
+-	 */
+-	barrier();
++	preempt_disable();
+ 	/*
+ 	 * Same as in percpu_down_read().
+ 	 */
+@@ -102,12 +92,6 @@ static inline void percpu_up_read_preempt_enable(struct percpu_rw_semaphore *sem
+ 	rwsem_release(&sem->rw_sem.dep_map, 1, _RET_IP_);
+ }
+ 
+-static inline void percpu_up_read(struct percpu_rw_semaphore *sem)
+-{
+-	preempt_disable();
+-	percpu_up_read_preempt_enable(sem);
+-}
+-
+ extern void percpu_down_write(struct percpu_rw_semaphore *);
+ extern void percpu_up_write(struct percpu_rw_semaphore *);
+ 
+
+commit e3e740544173ef0dd8bffbf158182a7748e6c678
+Author: Paul E. McKenney <paulmck@linux.ibm.com>
+Date:   Wed Nov 7 13:53:34 2018 -0800
+
+    percpu-rwsem: Replace synchronize_sched() with synchronize_rcu()
+    
+    Now that synchronize_rcu() waits for preempt-disable regions of code
+    as well as RCU read-side critical sections, synchronize_sched() can be
+    replaced by synchronize_rcu().  This commit therefore makes this change,
+    even though it is but a comment.
+    
+    Signed-off-by: Paul E. McKenney <paulmck@linux.ibm.com>
+    Cc: Dennis Zhou <dennis@kernel.org>
+    Cc: Christoph Lameter <cl@linux.com>
+    Acked-by: Tejun Heo <tj@kernel.org>
+
+diff --git a/include/linux/percpu-rwsem.h b/include/linux/percpu-rwsem.h
+index 79b99d653e03..71b75643c432 100644
+--- a/include/linux/percpu-rwsem.h
++++ b/include/linux/percpu-rwsem.h
+@@ -41,7 +41,7 @@ static inline void percpu_down_read_preempt_disable(struct percpu_rw_semaphore *
+ 	 * cannot both change sem->state from readers_fast and start checking
+ 	 * counters while we are here. So if we see !sem->state, we know that
+ 	 * the writer won't be checking until we're past the preempt_enable()
+-	 * and that one the synchronize_sched() is done, the writer will see
++	 * and that once the synchronize_rcu() is done, the writer will see
+ 	 * anything we did within this RCU-sched read-size critical section.
+ 	 */
+ 	__this_cpu_inc(*sem->read_count);
+
+commit 5a817641f68a6399a5fac8b7d2da67a73698ffed
+Author: Waiman Long <longman@redhat.com>
+Date:   Tue May 15 17:49:51 2018 -0400
+
+    locking/percpu-rwsem: Annotate rwsem ownership transfer by setting RWSEM_OWNER_UNKNOWN
+    
+    The filesystem freezing code needs to transfer ownership of a rwsem
+    embedded in a percpu-rwsem from the task that does the freezing to
+    another one that does the thawing by calling percpu_rwsem_release()
+    after freezing and percpu_rwsem_acquire() before thawing.
+    
+    However, the new rwsem debug code runs afoul with this scheme by warning
+    that the task that releases the rwsem isn't the one that acquires it,
+    as reported by Amir Goldstein:
+    
+      DEBUG_LOCKS_WARN_ON(sem->owner != get_current())
+      WARNING: CPU: 1 PID: 1401 at /home/amir/build/src/linux/kernel/locking/rwsem.c:133 up_write+0x59/0x79
+    
+      Call Trace:
+       percpu_up_write+0x1f/0x28
+       thaw_super_locked+0xdf/0x120
+       do_vfs_ioctl+0x270/0x5f1
+       ksys_ioctl+0x52/0x71
+       __x64_sys_ioctl+0x16/0x19
+       do_syscall_64+0x5d/0x167
+       entry_SYSCALL_64_after_hwframe+0x49/0xbe
+    
+    To work properly with the rwsem debug code, we need to annotate that the
+    rwsem ownership is unknown during the tranfer period until a brave soul
+    comes forward to acquire the ownership. During that period, optimistic
+    spinning will be disabled.
+    
+    Reported-by: Amir Goldstein <amir73il@gmail.com>
+    Tested-by: Amir Goldstein <amir73il@gmail.com>
+    Signed-off-by: Waiman Long <longman@redhat.com>
+    Acked-by: Peter Zijlstra <peterz@infradead.org>
+    Cc: Andrew Morton <akpm@linux-foundation.org>
+    Cc: Davidlohr Bueso <dave@stgolabs.net>
+    Cc: Jan Kara <jack@suse.cz>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Matthew Wilcox <willy@infradead.org>
+    Cc: Oleg Nesterov <oleg@redhat.com>
+    Cc: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+    Cc: Theodore Y. Ts'o <tytso@mit.edu>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Will Deacon <will.deacon@arm.com>
+    Cc: linux-fsdevel@vger.kernel.org
+    Link: http://lkml.kernel.org/r/1526420991-21213-3-git-send-email-longman@redhat.com
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/include/linux/percpu-rwsem.h b/include/linux/percpu-rwsem.h
+index b1f37a89e368..79b99d653e03 100644
+--- a/include/linux/percpu-rwsem.h
++++ b/include/linux/percpu-rwsem.h
+@@ -133,7 +133,7 @@ static inline void percpu_rwsem_release(struct percpu_rw_semaphore *sem,
+ 	lock_release(&sem->rw_sem.dep_map, 1, ip);
+ #ifdef CONFIG_RWSEM_SPIN_ON_OWNER
+ 	if (!read)
+-		sem->rw_sem.owner = NULL;
++		sem->rw_sem.owner = RWSEM_OWNER_UNKNOWN;
+ #endif
+ }
+ 
+@@ -141,6 +141,10 @@ static inline void percpu_rwsem_acquire(struct percpu_rw_semaphore *sem,
+ 					bool read, unsigned long ip)
+ {
+ 	lock_acquire(&sem->rw_sem.dep_map, 0, 1, read, 1, NULL, ip);
++#ifdef CONFIG_RWSEM_SPIN_ON_OWNER
++	if (!read)
++		sem->rw_sem.owner = current;
++#endif
+ }
+ 
+ #endif
+
+commit b24413180f5600bcb3bb70fbed5cf186b60864bd
+Author: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Date:   Wed Nov 1 15:07:57 2017 +0100
+
+    License cleanup: add SPDX GPL-2.0 license identifier to files with no license
+    
+    Many source files in the tree are missing licensing information, which
+    makes it harder for compliance tools to determine the correct license.
+    
+    By default all files without license information are under the default
+    license of the kernel, which is GPL version 2.
+    
+    Update the files which contain no license information with the 'GPL-2.0'
+    SPDX license identifier.  The SPDX identifier is a legally binding
+    shorthand, which can be used instead of the full boiler plate text.
+    
+    This patch is based on work done by Thomas Gleixner and Kate Stewart and
+    Philippe Ombredanne.
+    
+    How this work was done:
+    
+    Patches were generated and checked against linux-4.14-rc6 for a subset of
+    the use cases:
+     - file had no licensing information it it.
+     - file was a */uapi/* one with no licensing information in it,
+     - file was a */uapi/* one with existing licensing information,
+    
+    Further patches will be generated in subsequent months to fix up cases
+    where non-standard license headers were used, and references to license
+    had to be inferred by heuristics based on keywords.
+    
+    The analysis to determine which SPDX License Identifier to be applied to
+    a file was done in a spreadsheet of side by side results from of the
+    output of two independent scanners (ScanCode & Windriver) producing SPDX
+    tag:value files created by Philippe Ombredanne.  Philippe prepared the
+    base worksheet, and did an initial spot review of a few 1000 files.
+    
+    The 4.13 kernel was the starting point of the analysis with 60,537 files
+    assessed.  Kate Stewart did a file by file comparison of the scanner
+    results in the spreadsheet to determine which SPDX license identifier(s)
+    to be applied to the file. She confirmed any determination that was not
+    immediately clear with lawyers working with the Linux Foundation.
+    
+    Criteria used to select files for SPDX license identifier tagging was:
+     - Files considered eligible had to be source code files.
+     - Make and config files were included as candidates if they contained >5
+       lines of source
+     - File already had some variant of a license header in it (even if <5
+       lines).
+    
+    All documentation files were explicitly excluded.
+    
+    The following heuristics were used to determine which SPDX license
+    identifiers to apply.
+    
+     - when both scanners couldn't find any license traces, file was
+       considered to have no license information in it, and the top level
+       COPYING file license applied.
+    
+       For non */uapi/* files that summary was:
+    
+       SPDX license identifier                            # files
+       ---------------------------------------------------|-------
+       GPL-2.0                                              11139
+    
+       and resulted in the first patch in this series.
+    
+       If that file was a */uapi/* path one, it was "GPL-2.0 WITH
+       Linux-syscall-note" otherwise it was "GPL-2.0".  Results of that was:
+    
+       SPDX license identifier                            # files
+       ---------------------------------------------------|-------
+       GPL-2.0 WITH Linux-syscall-note                        930
+    
+       and resulted in the second patch in this series.
+    
+     - if a file had some form of licensing information in it, and was one
+       of the */uapi/* ones, it was denoted with the Linux-syscall-note if
+       any GPL family license was found in the file or had no licensing in
+       it (per prior point).  Results summary:
+    
+       SPDX license identifier                            # files
+       ---------------------------------------------------|------
+       GPL-2.0 WITH Linux-syscall-note                       270
+       GPL-2.0+ WITH Linux-syscall-note                      169
+       ((GPL-2.0 WITH Linux-syscall-note) OR BSD-2-Clause)    21
+       ((GPL-2.0 WITH Linux-syscall-note) OR BSD-3-Clause)    17
+       LGPL-2.1+ WITH Linux-syscall-note                      15
+       GPL-1.0+ WITH Linux-syscall-note                       14
+       ((GPL-2.0+ WITH Linux-syscall-note) OR BSD-3-Clause)    5
+       LGPL-2.0+ WITH Linux-syscall-note                       4
+       LGPL-2.1 WITH Linux-syscall-note                        3
+       ((GPL-2.0 WITH Linux-syscall-note) OR MIT)              3
+       ((GPL-2.0 WITH Linux-syscall-note) AND MIT)             1
+    
+       and that resulted in the third patch in this series.
+    
+     - when the two scanners agreed on the detected license(s), that became
+       the concluded license(s).
+    
+     - when there was disagreement between the two scanners (one detected a
+       license but the other didn't, or they both detected different
+       licenses) a manual inspection of the file occurred.
+    
+     - In most cases a manual inspection of the information in the file
+       resulted in a clear resolution of the license that should apply (and
+       which scanner probably needed to revisit its heuristics).
+    
+     - When it was not immediately clear, the license identifier was
+       confirmed with lawyers working with the Linux Foundation.
+    
+     - If there was any question as to the appropriate license identifier,
+       the file was flagged for further research and to be revisited later
+       in time.
+    
+    In total, over 70 hours of logged manual review was done on the
+    spreadsheet to determine the SPDX license identifiers to apply to the
+    source files by Kate, Philippe, Thomas and, in some cases, confirmation
+    by lawyers working with the Linux Foundation.
+    
+    Kate also obtained a third independent scan of the 4.13 code base from
+    FOSSology, and compared selected files where the other two scanners
+    disagreed against that SPDX file, to see if there was new insights.  The
+    Windriver scanner is based on an older version of FOSSology in part, so
+    they are related.
+    
+    Thomas did random spot checks in about 500 files from the spreadsheets
+    for the uapi headers and agreed with SPDX license identifier in the
+    files he inspected. For the non-uapi files Thomas did random spot checks
+    in about 15000 files.
+    
+    In initial set of patches against 4.14-rc6, 3 files were found to have
+    copy/paste license identifier errors, and have been fixed to reflect the
+    correct identifier.
+    
+    Additionally Philippe spent 10 hours this week doing a detailed manual
+    inspection and review of the 12,461 patched files from the initial patch
+    version early this week with:
+     - a full scancode scan run, collecting the matched texts, detected
+       license ids and scores
+     - reviewing anything where there was a license detected (about 500+
+       files) to ensure that the applied SPDX license was correct
+     - reviewing anything where there was no detection but the patch license
+       was not GPL-2.0 WITH Linux-syscall-note to ensure that the applied
+       SPDX license was correct
+    
+    This produced a worksheet with 20 files needing minor correction.  This
+    worksheet was then exported into 3 different .csv files for the
+    different types of files to be modified.
+    
+    These .csv files were then reviewed by Greg.  Thomas wrote a script to
+    parse the csv files and add the proper SPDX tag to the file, in the
+    format that the file expected.  This script was further refined by Greg
+    based on the output to detect more types of files automatically and to
+    distinguish between header and source .c files (which need different
+    comment types.)  Finally Greg ran the script using the .csv files to
+    generate the patches.
+    
+    Reviewed-by: Kate Stewart <kstewart@linuxfoundation.org>
+    Reviewed-by: Philippe Ombredanne <pombredanne@nexb.com>
+    Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/include/linux/percpu-rwsem.h b/include/linux/percpu-rwsem.h
+index 93664f022ecf..b1f37a89e368 100644
+--- a/include/linux/percpu-rwsem.h
++++ b/include/linux/percpu-rwsem.h
+@@ -1,3 +1,4 @@
++/* SPDX-License-Identifier: GPL-2.0 */
+ #ifndef _LINUX_PERCPU_RWSEM_H
+ #define _LINUX_PERCPU_RWSEM_H
+ 
+
+commit 52b94129f274937e4c25dd17b76697664a3c43c9
+Author: Davidlohr Bueso <dave@stgolabs.net>
+Date:   Wed Jan 11 07:22:26 2017 -0800
+
+    locking/percpu-rwsem: Replace waitqueue with rcuwait
+    
+    The use of any kind of wait queue is an overkill for pcpu-rwsems.
+    While one option would be to use the less heavy simple (swait)
+    flavor, this is still too much for what pcpu-rwsems needs. For one,
+    we do not care about any sort of queuing in that the only (rare) time
+    writers (and readers, for that matter) are queued is when trying to
+    acquire the regular contended rw_sem. There cannot be any further
+    queuing as writers are serialized by the rw_sem in the first place.
+    
+    Given that percpu_down_write() must not be called after exit_notify(),
+    we can replace the bulky waitqueue with rcuwait such that a writer
+    can wait for its turn to take the lock. As such, we can avoid the
+    queue handling and locking overhead.
+    
+    Signed-off-by: Davidlohr Bueso <dbueso@suse.de>
+    Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+    Reviewed-by: Oleg Nesterov <oleg@redhat.com>
+    Cc: Andrew Morton <akpm@linux-foundation.org>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: dave@stgolabs.net
+    Link: http://lkml.kernel.org/r/1484148146-14210-3-git-send-email-dave@stgolabs.net
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/include/linux/percpu-rwsem.h b/include/linux/percpu-rwsem.h
+index 5b2e6159b744..93664f022ecf 100644
+--- a/include/linux/percpu-rwsem.h
++++ b/include/linux/percpu-rwsem.h
+@@ -4,15 +4,15 @@
+ #include <linux/atomic.h>
+ #include <linux/rwsem.h>
+ #include <linux/percpu.h>
+-#include <linux/wait.h>
++#include <linux/rcuwait.h>
+ #include <linux/rcu_sync.h>
+ #include <linux/lockdep.h>
+ 
+ struct percpu_rw_semaphore {
+ 	struct rcu_sync		rss;
+ 	unsigned int __percpu	*read_count;
+-	struct rw_semaphore	rw_sem;
+-	wait_queue_head_t	writer;
++	struct rw_semaphore	rw_sem; /* slowpath */
++	struct rcuwait          writer; /* blocked writer */
+ 	int			readers_block;
+ };
+ 
+@@ -22,7 +22,7 @@ static struct percpu_rw_semaphore name = {				\
+ 	.rss = __RCU_SYNC_INITIALIZER(name.rss, RCU_SCHED_SYNC),	\
+ 	.read_count = &__percpu_rwsem_rc_##name,			\
+ 	.rw_sem = __RWSEM_INITIALIZER(name.rw_sem),			\
+-	.writer = __WAIT_QUEUE_HEAD_INITIALIZER(name.writer),		\
++	.writer = __RCUWAIT_INITIALIZER(name.writer),			\
+ }
+ 
+ extern int __percpu_down_read(struct percpu_rw_semaphore *, int);
+
+commit 259d69b7f056bc9a543c7d184e791ef6c2775081
+Author: Peter Zijlstra <peterz@infradead.org>
+Date:   Mon Nov 23 15:23:55 2015 +0100
+
+    locking/percpu-rwsem: Add down_read_preempt_disable()
+    
+    Provide a down_read()/up_read() variant that keeps preemption disabled
+    over the whole thing, when possible.
+    
+    This avoids a needless preemption point for constructs such as:
+    
+            percpu_down_read(&global_rwsem);
+            spin_lock(&lock);
+            ...
+            spin_unlock(&lock);
+            percpu_up_read(&global_rwsem);
+    
+    Which perturbs timings. In particular it was found to cure a
+    performance regression in a follow up patch in fs/locks.c
+    
+    Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: linux-kernel@vger.kernel.org
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/include/linux/percpu-rwsem.h b/include/linux/percpu-rwsem.h
+index d402d3924a91..5b2e6159b744 100644
+--- a/include/linux/percpu-rwsem.h
++++ b/include/linux/percpu-rwsem.h
+@@ -28,7 +28,7 @@ static struct percpu_rw_semaphore name = {				\
+ extern int __percpu_down_read(struct percpu_rw_semaphore *, int);
+ extern void __percpu_up_read(struct percpu_rw_semaphore *);
+ 
+-static inline void percpu_down_read(struct percpu_rw_semaphore *sem)
++static inline void percpu_down_read_preempt_disable(struct percpu_rw_semaphore *sem)
+ {
+ 	might_sleep();
+ 
+@@ -46,13 +46,19 @@ static inline void percpu_down_read(struct percpu_rw_semaphore *sem)
+ 	__this_cpu_inc(*sem->read_count);
+ 	if (unlikely(!rcu_sync_is_idle(&sem->rss)))
+ 		__percpu_down_read(sem, false); /* Unconditional memory barrier */
+-	preempt_enable();
++	barrier();
+ 	/*
+-	 * The barrier() from preempt_enable() prevents the compiler from
++	 * The barrier() prevents the compiler from
+ 	 * bleeding the critical section out.
+ 	 */
+ }
+ 
++static inline void percpu_down_read(struct percpu_rw_semaphore *sem)
++{
++	percpu_down_read_preempt_disable(sem);
++	preempt_enable();
++}
++
+ static inline int percpu_down_read_trylock(struct percpu_rw_semaphore *sem)
+ {
+ 	int ret = 1;
+@@ -76,13 +82,13 @@ static inline int percpu_down_read_trylock(struct percpu_rw_semaphore *sem)
+ 	return ret;
+ }
+ 
+-static inline void percpu_up_read(struct percpu_rw_semaphore *sem)
++static inline void percpu_up_read_preempt_enable(struct percpu_rw_semaphore *sem)
+ {
+ 	/*
+-	 * The barrier() in preempt_disable() prevents the compiler from
++	 * The barrier() prevents the compiler from
+ 	 * bleeding the critical section out.
+ 	 */
+-	preempt_disable();
++	barrier();
+ 	/*
+ 	 * Same as in percpu_down_read().
+ 	 */
+@@ -95,6 +101,12 @@ static inline void percpu_up_read(struct percpu_rw_semaphore *sem)
+ 	rwsem_release(&sem->rw_sem.dep_map, 1, _RET_IP_);
+ }
+ 
++static inline void percpu_up_read(struct percpu_rw_semaphore *sem)
++{
++	preempt_disable();
++	percpu_up_read_preempt_enable(sem);
++}
++
+ extern void percpu_down_write(struct percpu_rw_semaphore *);
+ extern void percpu_up_write(struct percpu_rw_semaphore *);
+ 
+
+commit 11d9684ca638aad99f740ef3abcba2aa4c9290bf
+Author: Peter Zijlstra <peterz@infradead.org>
+Date:   Mon Jun 22 14:16:31 2015 +0200
+
+    locking/percpu-rwsem: Add DEFINE_STATIC_PERCPU_RWSEMand percpu_rwsem_assert_held()
+    
+    Provide a static init and a standard locking assertion method.
+    
+    Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: dave@stgolabs.net
+    Cc: der.herr@hofr.at
+    Cc: oleg@redhat.com
+    Cc: paulmck@linux.vnet.ibm.com
+    Cc: riel@redhat.com
+    Cc: tj@kernel.org
+    Cc: viro@ZenIV.linux.org.uk
+    Cc: linux-kernel@vger.kernel.org
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/include/linux/percpu-rwsem.h b/include/linux/percpu-rwsem.h
+index 146efefde2a1..d402d3924a91 100644
+--- a/include/linux/percpu-rwsem.h
++++ b/include/linux/percpu-rwsem.h
+@@ -16,6 +16,15 @@ struct percpu_rw_semaphore {
+ 	int			readers_block;
+ };
+ 
++#define DEFINE_STATIC_PERCPU_RWSEM(name)				\
++static DEFINE_PER_CPU(unsigned int, __percpu_rwsem_rc_##name);		\
++static struct percpu_rw_semaphore name = {				\
++	.rss = __RCU_SYNC_INITIALIZER(name.rss, RCU_SCHED_SYNC),	\
++	.read_count = &__percpu_rwsem_rc_##name,			\
++	.rw_sem = __RWSEM_INITIALIZER(name.rw_sem),			\
++	.writer = __WAIT_QUEUE_HEAD_INITIALIZER(name.writer),		\
++}
++
+ extern int __percpu_down_read(struct percpu_rw_semaphore *, int);
+ extern void __percpu_up_read(struct percpu_rw_semaphore *);
+ 
+@@ -102,6 +111,9 @@ extern void percpu_free_rwsem(struct percpu_rw_semaphore *);
+ 
+ #define percpu_rwsem_is_held(sem) lockdep_is_held(&(sem)->rw_sem)
+ 
++#define percpu_rwsem_assert_held(sem)				\
++	lockdep_assert_held(&(sem)->rw_sem)
++
+ static inline void percpu_rwsem_release(struct percpu_rw_semaphore *sem,
+ 					bool read, unsigned long ip)
+ {
+
+commit 80127a39681bd68c959f0953f84a830cbd7c3b1c
+Author: Peter Zijlstra <peterz@infradead.org>
+Date:   Thu Jul 14 20:08:46 2016 +0200
+
+    locking/percpu-rwsem: Optimize readers and reduce global impact
+    
+    Currently the percpu-rwsem switches to (global) atomic ops while a
+    writer is waiting; which could be quite a while and slows down
+    releasing the readers.
+    
+    This patch cures this problem by ordering the reader-state vs
+    reader-count (see the comments in __percpu_down_read() and
+    percpu_down_write()). This changes a global atomic op into a full
+    memory barrier, which doesn't have the global cacheline contention.
+    
+    This also enables using the percpu-rwsem with rcu_sync disabled in order
+    to bias the implementation differently, reducing the writer latency by
+    adding some cost to readers.
+    
+    Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+    Reviewed-by: Oleg Nesterov <oleg@redhat.com>
+    Cc: Andrew Morton <akpm@linux-foundation.org>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+    Cc: Paul McKenney <paulmck@linux.vnet.ibm.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: linux-kernel@vger.kernel.org
+    [ Fixed modular build. ]
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/include/linux/percpu-rwsem.h b/include/linux/percpu-rwsem.h
+index c2fa3ecb0dce..146efefde2a1 100644
+--- a/include/linux/percpu-rwsem.h
++++ b/include/linux/percpu-rwsem.h
+@@ -10,30 +10,96 @@
+ 
+ struct percpu_rw_semaphore {
+ 	struct rcu_sync		rss;
+-	unsigned int __percpu	*fast_read_ctr;
++	unsigned int __percpu	*read_count;
+ 	struct rw_semaphore	rw_sem;
+-	atomic_t		slow_read_ctr;
+-	wait_queue_head_t	write_waitq;
++	wait_queue_head_t	writer;
++	int			readers_block;
+ };
+ 
+-extern void percpu_down_read(struct percpu_rw_semaphore *);
+-extern int  percpu_down_read_trylock(struct percpu_rw_semaphore *);
+-extern void percpu_up_read(struct percpu_rw_semaphore *);
++extern int __percpu_down_read(struct percpu_rw_semaphore *, int);
++extern void __percpu_up_read(struct percpu_rw_semaphore *);
++
++static inline void percpu_down_read(struct percpu_rw_semaphore *sem)
++{
++	might_sleep();
++
++	rwsem_acquire_read(&sem->rw_sem.dep_map, 0, 0, _RET_IP_);
++
++	preempt_disable();
++	/*
++	 * We are in an RCU-sched read-side critical section, so the writer
++	 * cannot both change sem->state from readers_fast and start checking
++	 * counters while we are here. So if we see !sem->state, we know that
++	 * the writer won't be checking until we're past the preempt_enable()
++	 * and that one the synchronize_sched() is done, the writer will see
++	 * anything we did within this RCU-sched read-size critical section.
++	 */
++	__this_cpu_inc(*sem->read_count);
++	if (unlikely(!rcu_sync_is_idle(&sem->rss)))
++		__percpu_down_read(sem, false); /* Unconditional memory barrier */
++	preempt_enable();
++	/*
++	 * The barrier() from preempt_enable() prevents the compiler from
++	 * bleeding the critical section out.
++	 */
++}
++
++static inline int percpu_down_read_trylock(struct percpu_rw_semaphore *sem)
++{
++	int ret = 1;
++
++	preempt_disable();
++	/*
++	 * Same as in percpu_down_read().
++	 */
++	__this_cpu_inc(*sem->read_count);
++	if (unlikely(!rcu_sync_is_idle(&sem->rss)))
++		ret = __percpu_down_read(sem, true); /* Unconditional memory barrier */
++	preempt_enable();
++	/*
++	 * The barrier() from preempt_enable() prevents the compiler from
++	 * bleeding the critical section out.
++	 */
++
++	if (ret)
++		rwsem_acquire_read(&sem->rw_sem.dep_map, 0, 1, _RET_IP_);
++
++	return ret;
++}
++
++static inline void percpu_up_read(struct percpu_rw_semaphore *sem)
++{
++	/*
++	 * The barrier() in preempt_disable() prevents the compiler from
++	 * bleeding the critical section out.
++	 */
++	preempt_disable();
++	/*
++	 * Same as in percpu_down_read().
++	 */
++	if (likely(rcu_sync_is_idle(&sem->rss)))
++		__this_cpu_dec(*sem->read_count);
++	else
++		__percpu_up_read(sem); /* Unconditional memory barrier */
++	preempt_enable();
++
++	rwsem_release(&sem->rw_sem.dep_map, 1, _RET_IP_);
++}
+ 
+ extern void percpu_down_write(struct percpu_rw_semaphore *);
+ extern void percpu_up_write(struct percpu_rw_semaphore *);
+ 
+ extern int __percpu_init_rwsem(struct percpu_rw_semaphore *,
+ 				const char *, struct lock_class_key *);
++
+ extern void percpu_free_rwsem(struct percpu_rw_semaphore *);
+ 
+-#define percpu_init_rwsem(brw)	\
++#define percpu_init_rwsem(sem)					\
+ ({								\
+ 	static struct lock_class_key rwsem_key;			\
+-	__percpu_init_rwsem(brw, #brw, &rwsem_key);		\
++	__percpu_init_rwsem(sem, #sem, &rwsem_key);		\
+ })
+ 
+-
+ #define percpu_rwsem_is_held(sem) lockdep_is_held(&(sem)->rw_sem)
+ 
+ static inline void percpu_rwsem_release(struct percpu_rw_semaphore *sem,
+
+commit 001dac627ff37433d5528ffb0d897cd19c2b1e43
+Author: Oleg Nesterov <oleg@redhat.com>
+Date:   Fri Aug 21 19:42:57 2015 +0200
+
+    locking/percpu-rwsem: Make use of the rcu_sync infrastructure
+    
+    Currently down_write/up_write calls synchronize_sched_expedited()
+    twice, which is evil.  Change this code to rely on rcu-sync primitives.
+    This avoids the _expedited "big hammer", and this can be faster in
+    the contended case or even in the case when a single thread does
+    down_write/up_write in a loop.
+    
+    Of course, a single down_write() will take more time, but otoh it
+    will be much more friendly to the whole system.
+    
+    To simplify the review this patch doesn't update the comments, fixed
+    by the next change.
+    
+    Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+    Signed-off-by: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+    Reviewed-by: Josh Triplett <josh@joshtriplett.org>
+
+diff --git a/include/linux/percpu-rwsem.h b/include/linux/percpu-rwsem.h
+index 834c4e52cb2d..c2fa3ecb0dce 100644
+--- a/include/linux/percpu-rwsem.h
++++ b/include/linux/percpu-rwsem.h
+@@ -5,11 +5,12 @@
+ #include <linux/rwsem.h>
+ #include <linux/percpu.h>
+ #include <linux/wait.h>
++#include <linux/rcu_sync.h>
+ #include <linux/lockdep.h>
+ 
+ struct percpu_rw_semaphore {
++	struct rcu_sync		rss;
+ 	unsigned int __percpu	*fast_read_ctr;
+-	atomic_t		write_ctr;
+ 	struct rw_semaphore	rw_sem;
+ 	atomic_t		slow_read_ctr;
+ 	wait_queue_head_t	write_waitq;
+
+commit 55cc156505f2e43fa45dbd4bfe8f9c9d848ca44c
+Author: Oleg Nesterov <oleg@redhat.com>
+Date:   Tue Jul 21 20:26:44 2015 +0200
+
+    percpu-rwsem: introduce percpu_rwsem_release() and percpu_rwsem_acquire()
+    
+    Add percpu_rwsem_release() and percpu_rwsem_acquire() for the users
+    which need to return to userspace with percpu-rwsem lock held and/or
+    pass the ownership to another thread.
+    
+    TODO: change percpu_rwsem_release() to use rwsem_clear_owner(). We can
+    either fold kernel/locking/rwsem.h into include/linux/rwsem.h, or add
+    the non-inline percpu_rwsem_clear_owner().
+    
+    Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+
+diff --git a/include/linux/percpu-rwsem.h b/include/linux/percpu-rwsem.h
+index 16c30cd33501..834c4e52cb2d 100644
+--- a/include/linux/percpu-rwsem.h
++++ b/include/linux/percpu-rwsem.h
+@@ -32,4 +32,23 @@ extern void percpu_free_rwsem(struct percpu_rw_semaphore *);
+ 	__percpu_init_rwsem(brw, #brw, &rwsem_key);		\
+ })
+ 
++
++#define percpu_rwsem_is_held(sem) lockdep_is_held(&(sem)->rw_sem)
++
++static inline void percpu_rwsem_release(struct percpu_rw_semaphore *sem,
++					bool read, unsigned long ip)
++{
++	lock_release(&sem->rw_sem.dep_map, 1, ip);
++#ifdef CONFIG_RWSEM_SPIN_ON_OWNER
++	if (!read)
++		sem->rw_sem.owner = NULL;
++#endif
++}
++
++static inline void percpu_rwsem_acquire(struct percpu_rw_semaphore *sem,
++					bool read, unsigned long ip)
++{
++	lock_acquire(&sem->rw_sem.dep_map, 0, 1, read, 1, NULL, ip);
++}
++
+ #endif
+
+commit 9287f6925ad9d8fb8c6283066b4f77fd87f123a9
+Author: Oleg Nesterov <oleg@redhat.com>
+Date:   Tue Jul 21 17:45:57 2015 +0200
+
+    percpu-rwsem: introduce percpu_down_read_trylock()
+    
+    Add percpu_down_read_trylock(), it will have the user soon.
+    
+    Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+
+diff --git a/include/linux/percpu-rwsem.h b/include/linux/percpu-rwsem.h
+index 3e88c9a7d57f..16c30cd33501 100644
+--- a/include/linux/percpu-rwsem.h
++++ b/include/linux/percpu-rwsem.h
+@@ -16,6 +16,7 @@ struct percpu_rw_semaphore {
+ };
+ 
+ extern void percpu_down_read(struct percpu_rw_semaphore *);
++extern int  percpu_down_read_trylock(struct percpu_rw_semaphore *);
+ extern void percpu_up_read(struct percpu_rw_semaphore *);
+ 
+ extern void percpu_down_write(struct percpu_rw_semaphore *);
+
+commit 8ebe34731a0d1a9d89b536430afd98d0fadec99b
+Author: Oleg Nesterov <oleg@redhat.com>
+Date:   Mon Dec 17 16:01:38 2012 -0800
+
+    percpu_rw_semaphore: add lockdep annotations
+    
+    Add lockdep annotations.  Not only this can help to find the potential
+    problems, we do not want the false warnings if, say, the task takes two
+    different percpu_rw_semaphore's for reading.  IOW, at least ->rw_sem
+    should not use a single class.
+    
+    This patch exposes this internal lock to lockdep so that it represents the
+    whole percpu_rw_semaphore.  This way we do not need to add another "fake"
+    ->lockdep_map and lock_class_key.  More importantly, this also makes the
+    output from lockdep much more understandable if it finds the problem.
+    
+    In short, with this patch from lockdep pov percpu_down_read() and
+    percpu_up_read() acquire/release ->rw_sem for reading, this matches the
+    actual semantics.  This abuses __up_read() but I hope this is fine and in
+    fact I'd like to have down_read_no_lockdep() as well,
+    percpu_down_read_recursive_readers() will need it.
+    
+    Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+    Cc: Anton Arapov <anton@redhat.com>
+    Cc: Ingo Molnar <mingo@elte.hu>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Michal Marek <mmarek@suse.cz>
+    Cc: Mikulas Patocka <mpatocka@redhat.com>
+    Cc: "Paul E. McKenney" <paulmck@linux.vnet.ibm.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Srikar Dronamraju <srikar@linux.vnet.ibm.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/include/linux/percpu-rwsem.h b/include/linux/percpu-rwsem.h
+index d2146a4f833e..3e88c9a7d57f 100644
+--- a/include/linux/percpu-rwsem.h
++++ b/include/linux/percpu-rwsem.h
+@@ -5,6 +5,7 @@
+ #include <linux/rwsem.h>
+ #include <linux/percpu.h>
+ #include <linux/wait.h>
++#include <linux/lockdep.h>
+ 
+ struct percpu_rw_semaphore {
+ 	unsigned int __percpu	*fast_read_ctr;
+@@ -20,7 +21,14 @@ extern void percpu_up_read(struct percpu_rw_semaphore *);
+ extern void percpu_down_write(struct percpu_rw_semaphore *);
+ extern void percpu_up_write(struct percpu_rw_semaphore *);
+ 
+-extern int percpu_init_rwsem(struct percpu_rw_semaphore *);
++extern int __percpu_init_rwsem(struct percpu_rw_semaphore *,
++				const char *, struct lock_class_key *);
+ extern void percpu_free_rwsem(struct percpu_rw_semaphore *);
+ 
++#define percpu_init_rwsem(brw)	\
++({								\
++	static struct lock_class_key rwsem_key;			\
++	__percpu_init_rwsem(brw, #brw, &rwsem_key);		\
++})
++
+ #endif
+
+commit 9390ef0c85fd065f01045fef708b046c98cda04c
+Author: Oleg Nesterov <oleg@redhat.com>
+Date:   Mon Dec 17 16:01:36 2012 -0800
+
+    percpu_rw_semaphore: kill ->writer_mutex, add ->write_ctr
+    
+    percpu_rw_semaphore->writer_mutex was only added to simplify the initial
+    rewrite, the only thing it protects is clear_fast_ctr() which otherwise
+    could be called by multiple writers.  ->rw_sem is enough to serialize the
+    writers.
+    
+    Kill this mutex and add "atomic_t write_ctr" instead.  The writers
+    increment/decrement this counter, the readers check it is zero instead of
+    mutex_is_locked().
+    
+    Move atomic_add(clear_fast_ctr(), slow_read_ctr) under down_write() to
+    avoid the race with other writers.  This is a bit sub-optimal, only the
+    first writer needs this and we do not need to exclude the readers at this
+    stage.  But this is simple, we do not want another internal lock until we
+    add more features.
+    
+    And this speeds up the write-contended case.  Before this patch the racing
+    writers sleep in synchronize_sched_expedited() sequentially, with this
+    patch multiple synchronize_sched_expedited's can "overlap" with each
+    other.  Note: we can do more optimizations, this is only the first step.
+    
+    Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+    Cc: Anton Arapov <anton@redhat.com>
+    Cc: Ingo Molnar <mingo@elte.hu>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Michal Marek <mmarek@suse.cz>
+    Cc: Mikulas Patocka <mpatocka@redhat.com>
+    Cc: "Paul E. McKenney" <paulmck@linux.vnet.ibm.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Srikar Dronamraju <srikar@linux.vnet.ibm.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/include/linux/percpu-rwsem.h b/include/linux/percpu-rwsem.h
+index 592f0d610d8e..d2146a4f833e 100644
+--- a/include/linux/percpu-rwsem.h
++++ b/include/linux/percpu-rwsem.h
+@@ -1,14 +1,14 @@
+ #ifndef _LINUX_PERCPU_RWSEM_H
+ #define _LINUX_PERCPU_RWSEM_H
+ 
+-#include <linux/mutex.h>
++#include <linux/atomic.h>
+ #include <linux/rwsem.h>
+ #include <linux/percpu.h>
+ #include <linux/wait.h>
+ 
+ struct percpu_rw_semaphore {
+ 	unsigned int __percpu	*fast_read_ctr;
+-	struct mutex		writer_mutex;
++	atomic_t		write_ctr;
+ 	struct rw_semaphore	rw_sem;
+ 	atomic_t		slow_read_ctr;
+ 	wait_queue_head_t	write_waitq;
+
+commit a1fd3e24d8a484b3265a6d485202afe093c058f3
+Author: Oleg Nesterov <oleg@redhat.com>
+Date:   Mon Dec 17 16:01:32 2012 -0800
+
+    percpu_rw_semaphore: reimplement to not block the readers unnecessarily
+    
+    Currently the writer does msleep() plus synchronize_sched() 3 times to
+    acquire/release the semaphore, and during this time the readers are
+    blocked completely.  Even if the "write" section was not actually started
+    or if it was already finished.
+    
+    With this patch down_write/up_write does synchronize_sched() twice and
+    down_read/up_read are still possible during this time, just they use the
+    slow path.
+    
+    percpu_down_write() first forces the readers to use rw_semaphore and
+    increment the "slow" counter to take the lock for reading, then it
+    takes that rw_semaphore for writing and blocks the readers.
+    
+    Also.  With this patch the code relies on the documented behaviour of
+    synchronize_sched(), it doesn't try to pair synchronize_sched() with
+    barrier.
+    
+    Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+    Reviewed-by: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Mikulas Patocka <mpatocka@redhat.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Ingo Molnar <mingo@elte.hu>
+    Cc: Srikar Dronamraju <srikar@linux.vnet.ibm.com>
+    Cc: Ananth N Mavinakayanahalli <ananth@in.ibm.com>
+    Cc: Anton Arapov <anton@redhat.com>
+    Cc: Jens Axboe <axboe@kernel.dk>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/include/linux/percpu-rwsem.h b/include/linux/percpu-rwsem.h
+index bd1e86071e57..592f0d610d8e 100644
+--- a/include/linux/percpu-rwsem.h
++++ b/include/linux/percpu-rwsem.h
+@@ -2,82 +2,25 @@
+ #define _LINUX_PERCPU_RWSEM_H
+ 
+ #include <linux/mutex.h>
++#include <linux/rwsem.h>
+ #include <linux/percpu.h>
+-#include <linux/rcupdate.h>
+-#include <linux/delay.h>
++#include <linux/wait.h>
+ 
+ struct percpu_rw_semaphore {
+-	unsigned __percpu *counters;
+-	bool locked;
+-	struct mutex mtx;
++	unsigned int __percpu	*fast_read_ctr;
++	struct mutex		writer_mutex;
++	struct rw_semaphore	rw_sem;
++	atomic_t		slow_read_ctr;
++	wait_queue_head_t	write_waitq;
+ };
+ 
+-#define light_mb()	barrier()
+-#define heavy_mb()	synchronize_sched_expedited()
++extern void percpu_down_read(struct percpu_rw_semaphore *);
++extern void percpu_up_read(struct percpu_rw_semaphore *);
+ 
+-static inline void percpu_down_read(struct percpu_rw_semaphore *p)
+-{
+-	rcu_read_lock_sched();
+-	if (unlikely(p->locked)) {
+-		rcu_read_unlock_sched();
+-		mutex_lock(&p->mtx);
+-		this_cpu_inc(*p->counters);
+-		mutex_unlock(&p->mtx);
+-		return;
+-	}
+-	this_cpu_inc(*p->counters);
+-	rcu_read_unlock_sched();
+-	light_mb(); /* A, between read of p->locked and read of data, paired with D */
+-}
++extern void percpu_down_write(struct percpu_rw_semaphore *);
++extern void percpu_up_write(struct percpu_rw_semaphore *);
+ 
+-static inline void percpu_up_read(struct percpu_rw_semaphore *p)
+-{
+-	light_mb(); /* B, between read of the data and write to p->counter, paired with C */
+-	this_cpu_dec(*p->counters);
+-}
+-
+-static inline unsigned __percpu_count(unsigned __percpu *counters)
+-{
+-	unsigned total = 0;
+-	int cpu;
+-
+-	for_each_possible_cpu(cpu)
+-		total += ACCESS_ONCE(*per_cpu_ptr(counters, cpu));
+-
+-	return total;
+-}
+-
+-static inline void percpu_down_write(struct percpu_rw_semaphore *p)
+-{
+-	mutex_lock(&p->mtx);
+-	p->locked = true;
+-	synchronize_sched_expedited(); /* make sure that all readers exit the rcu_read_lock_sched region */
+-	while (__percpu_count(p->counters))
+-		msleep(1);
+-	heavy_mb(); /* C, between read of p->counter and write to data, paired with B */
+-}
+-
+-static inline void percpu_up_write(struct percpu_rw_semaphore *p)
+-{
+-	heavy_mb(); /* D, between write to data and write to p->locked, paired with A */
+-	p->locked = false;
+-	mutex_unlock(&p->mtx);
+-}
+-
+-static inline int percpu_init_rwsem(struct percpu_rw_semaphore *p)
+-{
+-	p->counters = alloc_percpu(unsigned);
+-	if (unlikely(!p->counters))
+-		return -ENOMEM;
+-	p->locked = false;
+-	mutex_init(&p->mtx);
+-	return 0;
+-}
+-
+-static inline void percpu_free_rwsem(struct percpu_rw_semaphore *p)
+-{
+-	free_percpu(p->counters);
+-	p->counters = NULL; /* catch use after free bugs */
+-}
++extern int percpu_init_rwsem(struct percpu_rw_semaphore *);
++extern void percpu_free_rwsem(struct percpu_rw_semaphore *);
+ 
+ #endif
+
+commit 4b05a1c74d1cfae37cf6ff293ee928350f031418
+Author: Mikulas Patocka <mpatocka@redhat.com>
+Date:   Tue Nov 27 22:59:52 2012 -0500
+
+    percpu-rwsem: use synchronize_sched_expedited
+    
+    Use synchronize_sched_expedited() instead of synchronize_sched()
+    to improve mount speed.
+    
+    This patch improves mount time from 0.500s to 0.013s for Jeff's
+    test-case.
+    
+    Signed-off-by: Mikulas Patocka <mpatocka@redhat.com>
+    Reported-and-tested-by: Jeff Chua <jeff.chua.linux@gmail.com>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/include/linux/percpu-rwsem.h b/include/linux/percpu-rwsem.h
+index 250a4acddb2b..bd1e86071e57 100644
+--- a/include/linux/percpu-rwsem.h
++++ b/include/linux/percpu-rwsem.h
+@@ -13,7 +13,7 @@ struct percpu_rw_semaphore {
+ };
+ 
+ #define light_mb()	barrier()
+-#define heavy_mb()	synchronize_sched()
++#define heavy_mb()	synchronize_sched_expedited()
+ 
+ static inline void percpu_down_read(struct percpu_rw_semaphore *p)
+ {
+@@ -51,7 +51,7 @@ static inline void percpu_down_write(struct percpu_rw_semaphore *p)
+ {
+ 	mutex_lock(&p->mtx);
+ 	p->locked = true;
+-	synchronize_sched(); /* make sure that all readers exit the rcu_read_lock_sched region */
++	synchronize_sched_expedited(); /* make sure that all readers exit the rcu_read_lock_sched region */
+ 	while (__percpu_count(p->counters))
+ 		msleep(1);
+ 	heavy_mb(); /* C, between read of p->counter and write to data, paired with B */
+
+commit 1bf11c53535ab87e3bf14ecdf6747bf46f601c5d
+Author: Mikulas Patocka <mpatocka@redhat.com>
+Date:   Mon Oct 22 19:39:16 2012 -0400
+
+    percpu-rw-semaphores: use rcu_read_lock_sched
+    
+    Use rcu_read_lock_sched / rcu_read_unlock_sched / synchronize_sched
+    instead of rcu_read_lock / rcu_read_unlock / synchronize_rcu.
+    
+    This is an optimization. The RCU-protected region is very small, so
+    there will be no latency problems if we disable preempt in this region.
+    
+    So we use rcu_read_lock_sched / rcu_read_unlock_sched that translates
+    to preempt_disable / preempt_disable. It is smaller (and supposedly
+    faster) than preemptible rcu_read_lock / rcu_read_unlock.
+    
+    Signed-off-by: Mikulas Patocka <mpatocka@redhat.com>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/include/linux/percpu-rwsem.h b/include/linux/percpu-rwsem.h
+index 18f35b54286c..250a4acddb2b 100644
+--- a/include/linux/percpu-rwsem.h
++++ b/include/linux/percpu-rwsem.h
+@@ -17,16 +17,16 @@ struct percpu_rw_semaphore {
+ 
+ static inline void percpu_down_read(struct percpu_rw_semaphore *p)
+ {
+-	rcu_read_lock();
++	rcu_read_lock_sched();
+ 	if (unlikely(p->locked)) {
+-		rcu_read_unlock();
++		rcu_read_unlock_sched();
+ 		mutex_lock(&p->mtx);
+ 		this_cpu_inc(*p->counters);
+ 		mutex_unlock(&p->mtx);
+ 		return;
+ 	}
+ 	this_cpu_inc(*p->counters);
+-	rcu_read_unlock();
++	rcu_read_unlock_sched();
+ 	light_mb(); /* A, between read of p->locked and read of data, paired with D */
+ }
+ 
+@@ -51,7 +51,7 @@ static inline void percpu_down_write(struct percpu_rw_semaphore *p)
+ {
+ 	mutex_lock(&p->mtx);
+ 	p->locked = true;
+-	synchronize_rcu();
++	synchronize_sched(); /* make sure that all readers exit the rcu_read_lock_sched region */
+ 	while (__percpu_count(p->counters))
+ 		msleep(1);
+ 	heavy_mb(); /* C, between read of p->counter and write to data, paired with B */
+
+commit 5c1eabe68501d1e1b1586c7f4c46cc531828c4ab
+Author: Mikulas Patocka <mpatocka@redhat.com>
+Date:   Mon Oct 22 19:37:47 2012 -0400
+
+    percpu-rw-semaphores: use light/heavy barriers
+    
+    This patch introduces new barrier pair light_mb() and heavy_mb() for
+    percpu rw semaphores.
+    
+    This patch fixes a bug in percpu-rw-semaphores where a barrier was
+    missing in percpu_up_write.
+    
+    This patch improves performance on the read path of
+    percpu-rw-semaphores: on non-x86 cpus, there was a smp_mb() in
+    percpu_up_read. This patch changes it to a compiler barrier and removes
+    the "#if defined(X86) ..." condition.
+    
+    From: Lai Jiangshan <laijs@cn.fujitsu.com>
+    Signed-off-by: Mikulas Patocka <mpatocka@redhat.com>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/include/linux/percpu-rwsem.h b/include/linux/percpu-rwsem.h
+index cf80f7e5277f..18f35b54286c 100644
+--- a/include/linux/percpu-rwsem.h
++++ b/include/linux/percpu-rwsem.h
+@@ -12,6 +12,9 @@ struct percpu_rw_semaphore {
+ 	struct mutex mtx;
+ };
+ 
++#define light_mb()	barrier()
++#define heavy_mb()	synchronize_sched()
++
+ static inline void percpu_down_read(struct percpu_rw_semaphore *p)
+ {
+ 	rcu_read_lock();
+@@ -24,22 +27,12 @@ static inline void percpu_down_read(struct percpu_rw_semaphore *p)
+ 	}
+ 	this_cpu_inc(*p->counters);
+ 	rcu_read_unlock();
++	light_mb(); /* A, between read of p->locked and read of data, paired with D */
+ }
+ 
+ static inline void percpu_up_read(struct percpu_rw_semaphore *p)
+ {
+-	/*
+-	 * On X86, write operation in this_cpu_dec serves as a memory unlock
+-	 * barrier (i.e. memory accesses may be moved before the write, but
+-	 * no memory accesses are moved past the write).
+-	 * On other architectures this may not be the case, so we need smp_mb()
+-	 * there.
+-	 */
+-#if defined(CONFIG_X86) && (!defined(CONFIG_X86_PPRO_FENCE) && !defined(CONFIG_X86_OOSTORE))
+-	barrier();
+-#else
+-	smp_mb();
+-#endif
++	light_mb(); /* B, between read of the data and write to p->counter, paired with C */
+ 	this_cpu_dec(*p->counters);
+ }
+ 
+@@ -61,11 +54,12 @@ static inline void percpu_down_write(struct percpu_rw_semaphore *p)
+ 	synchronize_rcu();
+ 	while (__percpu_count(p->counters))
+ 		msleep(1);
+-	smp_rmb(); /* paired with smp_mb() in percpu_sem_up_read() */
++	heavy_mb(); /* C, between read of p->counter and write to data, paired with B */
+ }
+ 
+ static inline void percpu_up_write(struct percpu_rw_semaphore *p)
+ {
++	heavy_mb(); /* D, between write to data and write to p->locked, paired with A */
+ 	p->locked = false;
+ 	mutex_unlock(&p->mtx);
+ }
+
+commit 62ac665ff9fc07497ca524bd20d6a96893d11071
+Author: Mikulas Patocka <mpatocka@redhat.com>
+Date:   Wed Sep 26 07:46:43 2012 +0200
+
+    blockdev: turn a rw semaphore into a percpu rw semaphore
+    
+    This avoids cache line bouncing when many processes lock the semaphore
+    for read.
+    
+    New percpu lock implementation
+    
+    The lock consists of an array of percpu unsigned integers, a boolean
+    variable and a mutex.
+    
+    When we take the lock for read, we enter rcu read section, check for a
+    "locked" variable. If it is false, we increase a percpu counter on the
+    current cpu and exit the rcu section. If "locked" is true, we exit the
+    rcu section, take the mutex and drop it (this waits until a writer
+    finished) and retry.
+    
+    Unlocking for read just decreases percpu variable. Note that we can
+    unlock on a difference cpu than where we locked, in this case the
+    counter underflows. The sum of all percpu counters represents the number
+    of processes that hold the lock for read.
+    
+    When we need to lock for write, we take the mutex, set "locked" variable
+    to true and synchronize rcu. Since RCU has been synchronized, no
+    processes can create new read locks. We wait until the sum of percpu
+    counters is zero - when it is, there are no readers in the critical
+    section.
+    
+    Signed-off-by: Mikulas Patocka <mpatocka@redhat.com>
+    Signed-off-by: Jens Axboe <axboe@kernel.dk>
+
+diff --git a/include/linux/percpu-rwsem.h b/include/linux/percpu-rwsem.h
+new file mode 100644
+index 000000000000..cf80f7e5277f
+--- /dev/null
++++ b/include/linux/percpu-rwsem.h
+@@ -0,0 +1,89 @@
++#ifndef _LINUX_PERCPU_RWSEM_H
++#define _LINUX_PERCPU_RWSEM_H
++
++#include <linux/mutex.h>
++#include <linux/percpu.h>
++#include <linux/rcupdate.h>
++#include <linux/delay.h>
++
++struct percpu_rw_semaphore {
++	unsigned __percpu *counters;
++	bool locked;
++	struct mutex mtx;
++};
++
++static inline void percpu_down_read(struct percpu_rw_semaphore *p)
++{
++	rcu_read_lock();
++	if (unlikely(p->locked)) {
++		rcu_read_unlock();
++		mutex_lock(&p->mtx);
++		this_cpu_inc(*p->counters);
++		mutex_unlock(&p->mtx);
++		return;
++	}
++	this_cpu_inc(*p->counters);
++	rcu_read_unlock();
++}
++
++static inline void percpu_up_read(struct percpu_rw_semaphore *p)
++{
++	/*
++	 * On X86, write operation in this_cpu_dec serves as a memory unlock
++	 * barrier (i.e. memory accesses may be moved before the write, but
++	 * no memory accesses are moved past the write).
++	 * On other architectures this may not be the case, so we need smp_mb()
++	 * there.
++	 */
++#if defined(CONFIG_X86) && (!defined(CONFIG_X86_PPRO_FENCE) && !defined(CONFIG_X86_OOSTORE))
++	barrier();
++#else
++	smp_mb();
++#endif
++	this_cpu_dec(*p->counters);
++}
++
++static inline unsigned __percpu_count(unsigned __percpu *counters)
++{
++	unsigned total = 0;
++	int cpu;
++
++	for_each_possible_cpu(cpu)
++		total += ACCESS_ONCE(*per_cpu_ptr(counters, cpu));
++
++	return total;
++}
++
++static inline void percpu_down_write(struct percpu_rw_semaphore *p)
++{
++	mutex_lock(&p->mtx);
++	p->locked = true;
++	synchronize_rcu();
++	while (__percpu_count(p->counters))
++		msleep(1);
++	smp_rmb(); /* paired with smp_mb() in percpu_sem_up_read() */
++}
++
++static inline void percpu_up_write(struct percpu_rw_semaphore *p)
++{
++	p->locked = false;
++	mutex_unlock(&p->mtx);
++}
++
++static inline int percpu_init_rwsem(struct percpu_rw_semaphore *p)
++{
++	p->counters = alloc_percpu(unsigned);
++	if (unlikely(!p->counters))
++		return -ENOMEM;
++	p->locked = false;
++	mutex_init(&p->mtx);
++	return 0;
++}
++
++static inline void percpu_free_rwsem(struct percpu_rw_semaphore *p)
++{
++	free_percpu(p->counters);
++	p->counters = NULL; /* catch use after free bugs */
++}
++
++#endif

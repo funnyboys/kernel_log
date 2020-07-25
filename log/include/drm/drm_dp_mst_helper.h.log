@@ -1,0 +1,4636 @@
+commit d308a881a5917bdb46472c861a1dabe54b46c423
+Author: Lyude Paul <lyude@redhat.com>
+Date:   Fri Apr 24 14:13:08 2020 -0400
+
+    drm/dp_mst: Kill the second sideband tx slot, save the world
+    
+    While we support using both tx slots for sideband transmissions, it
+    appears that DisplayPort devices in the field didn't end up doing a very
+    good job of supporting it. From section 5.2.1 of the DP 2.0
+    specification:
+    
+      There are MST Sink/Branch devices in the field that do not handle
+      interleaved message transactions.
+    
+      To facilitate message transaction handling by downstream devices, an
+      MST Source device shall generate message transactions in an atomic
+      manner (i.e., the MST Source device shall not concurrently interleave
+      multiple message transactions). Therefore, an MST Source device shall
+      clear the Message_Sequence_No value in the Sideband_MSG_Header to 0.
+    
+    This might come as a bit of a surprise since the vast majority of hubs
+    will support using both tx slots even if they don't support interleaved
+    message transactions, and we've also been using both tx slots since MST
+    was introduced into the kernel.
+    
+    However, there is one device we've had trouble getting working
+    consistently with MST for so long that we actually assumed it was just
+    broken: the infamous Dell P2415Qb. Previously this monitor would appear
+    to work sometimes, but in most situations would end up timing out
+    LINK_ADDRESS messages almost at random until you power cycled the whole
+    display. After reading section 5.2.1 in the DP 2.0 spec, some closer
+    investigation into this infamous display revealed it was only ever
+    timing out on sideband messages in the second TX slot.
+    
+    Sure enough, avoiding the second TX slot has suddenly made this monitor
+    function perfectly for the first time in five years. And since they
+    explicitly mention this in the specification, I doubt this is the only
+    monitor out there with this issue. This might even explain explain the
+    seemingly harmless garbage sideband responses we would occasionally see
+    with MST hubs!
+    
+    So - rewrite our sideband TX handlers to only support one TX slot. In
+    order to simplify our sideband handling now that we don't support
+    transmitting to multiple MSTBs at once, we also move all state tracking
+    for down replies from mstbs to the topology manager.
+    
+    Signed-off-by: Lyude Paul <lyude@redhat.com>
+    Fixes: ad7f8a1f9ced ("drm/helper: add Displayport multi-stream helper (v0.6)")
+    Cc: Sean Paul <sean@poorly.run>
+    Cc: "Lin, Wayne" <Wayne.Lin@amd.com>
+    Cc: <stable@vger.kernel.org> # v3.17+
+    Reviewed-by: Sean Paul <sean@poorly.run>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20200424181308.770749-1-lyude@redhat.com
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index 96bcf33c03d3..9e1ffcd7cb68 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -194,11 +194,8 @@ struct drm_dp_sideband_msg_rx {
+  * @rad: Relative Address to talk to this branch device.
+  * @lct: Link count total to talk to this branch device.
+  * @num_ports: number of ports on the branch.
+- * @msg_slots: one bit per transmitted msg slot.
+  * @port_parent: pointer to the port parent, NULL if toplevel.
+  * @mgr: topology manager for this branch device.
+- * @tx_slots: transmission slots for this device.
+- * @last_seqno: last sequence number used to talk to this.
+  * @link_address_sent: if a link address message has been sent to this device yet.
+  * @guid: guid for DP 1.2 branch device. port under this branch can be
+  * identified by port #.
+@@ -239,7 +236,6 @@ struct drm_dp_mst_branch {
+ 	u8 lct;
+ 	int num_ports;
+ 
+-	int msg_slots;
+ 	/**
+ 	 * @ports: the list of ports on this branch device. This should be
+ 	 * considered protected for reading by &drm_dp_mst_topology_mgr.lock.
+@@ -252,20 +248,11 @@ struct drm_dp_mst_branch {
+ 	 */
+ 	struct list_head ports;
+ 
+-	/* list of tx ops queue for this port */
+ 	struct drm_dp_mst_port *port_parent;
+ 	struct drm_dp_mst_topology_mgr *mgr;
+ 
+-	/* slots are protected by mstb->mgr->qlock */
+-	struct drm_dp_sideband_msg_tx *tx_slots[2];
+-	int last_seqno;
+ 	bool link_address_sent;
+ 
+-	/**
+-	 * @down_rep_recv: Message receiver state for down replies.
+-	 */
+-	struct drm_dp_sideband_msg_rx down_rep_recv[2];
+-
+ 	/* global unique identifier to identify branch devices */
+ 	u8 guid[16];
+ };
+@@ -567,6 +554,12 @@ struct drm_dp_mst_topology_mgr {
+ 	 */
+ 	struct drm_dp_sideband_msg_rx up_req_recv;
+ 
++	/**
++	 * @down_rep_recv: Message receiver state for replies to down
++	 * requests.
++	 */
++	struct drm_dp_sideband_msg_rx down_rep_recv;
++
+ 	/**
+ 	 * @lock: protects @mst_state, @mst_primary, @dpcd, and
+ 	 * @payload_id_table_cleared.
+@@ -592,11 +585,6 @@ struct drm_dp_mst_topology_mgr {
+ 	 */
+ 	bool payload_id_table_cleared : 1;
+ 
+-	/**
+-	 * @is_waiting_for_dwn_reply: whether we're waiting for a down reply.
+-	 */
+-	bool is_waiting_for_dwn_reply : 1;
+-
+ 	/**
+ 	 * @mst_primary: Pointer to the primary/first branch device.
+ 	 */
+@@ -621,13 +609,12 @@ struct drm_dp_mst_topology_mgr {
+ 	const struct drm_private_state_funcs *funcs;
+ 
+ 	/**
+-	 * @qlock: protects @tx_msg_downq, the &drm_dp_mst_branch.txslost and
+-	 * &drm_dp_sideband_msg_tx.state once they are queued
++	 * @qlock: protects @tx_msg_downq and &drm_dp_sideband_msg_tx.state
+ 	 */
+ 	struct mutex qlock;
+ 
+ 	/**
+-	 * @tx_msg_downq: List of pending down replies.
++	 * @tx_msg_downq: List of pending down requests
+ 	 */
+ 	struct list_head tx_msg_downq;
+ 
+
+commit 973a5909e99d0301a8832ca0cf07f9be01c4e97a
+Author: Lyude Paul <lyude@redhat.com>
+Date:   Thu Apr 23 12:42:24 2020 -0400
+
+    Revert "drm/dp_mst: Remove single tx msg restriction."
+    
+    This reverts commit 6bb0942e8f46863a745489cce27efe5be2a3885e.
+    
+    Unfortunately it would appear that the rumors we've heard of sideband
+    message interleaving not being very well supported are true. On the
+    Lenovo ThinkPad Thunderbolt 3 dock that I have, interleaved messages
+    appear to just get dropped:
+    
+      [drm:drm_dp_mst_wait_tx_reply [drm_kms_helper]] timedout msg send
+      00000000571ddfd0 2 1
+      [dp_mst] txmsg cur_offset=2 cur_len=2 seqno=1 state=SENT path_msg=1 dst=00
+      [dp_mst]      type=ENUM_PATH_RESOURCES contents:
+      [dp_mst]              port=2
+    
+    DP descriptor for this hub:
+      OUI 90-cc-24 dev-ID SYNA3  HW-rev 1.0 SW-rev 3.12 quirks 0x0008
+    
+    It would seem like as well that this is a somewhat well known issue in
+    the field. From section 5.4.2 of the DisplayPort 2.0 specification:
+    
+      There are MST Sink/Branch devices in the field that do not handle
+      interleaved message transactions.
+    
+      To facilitate message transaction handling by downstream devices, an
+      MST Source device shall generate message transactions in an atomic
+      manner (i.e., the MST Source device shall not concurrently interleave
+      multiple message transactions). Therefore, an MST Source device shall
+      clear the Message_Sequence_No value in the Sideband_MSG_Header to 0.
+    
+      MST Source devices that support field policy updates by way of
+      software should update the policy to forego the generation of
+      interleaved message transactions.
+    
+    This is a bit disappointing, as features like HDCP require that we send
+    a sideband request every ~2 seconds for each active stream. However,
+    there isn't really anything in the specification that allows us to
+    accurately probe for interleaved messages.
+    
+    If it ends up being that we -really- need this in the future, we might
+    be able to whitelist hubs where interleaving is known to work-or maybe
+    try some sort of heuristics. But for now, let's just play it safe and
+    not use it.
+    
+    Signed-off-by: Lyude Paul <lyude@redhat.com>
+    Fixes: 6bb0942e8f46 ("drm/dp_mst: Remove single tx msg restriction.")
+    Cc: Wayne Lin <Wayne.Lin@amd.com>
+    Cc: Sean Paul <seanpaul@chromium.org>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20200423164225.680178-1-lyude@redhat.com
+    Reviewed-by: Sean Paul <sean@poorly.run>
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index 2d7c26592c05..96bcf33c03d3 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -592,6 +592,11 @@ struct drm_dp_mst_topology_mgr {
+ 	 */
+ 	bool payload_id_table_cleared : 1;
+ 
++	/**
++	 * @is_waiting_for_dwn_reply: whether we're waiting for a down reply.
++	 */
++	bool is_waiting_for_dwn_reply : 1;
++
+ 	/**
+ 	 * @mst_primary: Pointer to the primary/first branch device.
+ 	 */
+
+commit 08d99b2c23dfa84ca5b5e5c194062a0550888b71
+Merge: 13e3d94110d8 8f3d9f354286
+Author: Thomas Zimmermann <tzimmermann@suse.de>
+Date:   Fri Apr 17 08:12:22 2020 +0200
+
+    Merge drm/drm-next into drm-misc-next
+    
+    Backmerging required to pull topic/phy-compliance.
+    
+    Signed-off-by: Thomas Zimmermann <tzimmermann@suse.de>
+
+commit 20c22ad3295766b9a7f6da29b3620f570993c2f3
+Author: Lyude Paul <lyude@redhat.com>
+Date:   Mon Apr 6 16:06:42 2020 -0400
+
+    drm/dp_mst: Remove drm_dp_mst_has_audio()
+    
+    Drive-by fix I noticed the other day - drm_dp_mst_has_audio() only ever
+    made sense back when we still had to validate ports before accessing
+    them in order to (attempt to) avoid NULL dereferences. Since we have
+    proper reference counting that guarantees we always can safely access
+    the MST port, there's no use in keeping this function around as all it
+    does is validate the port pointer before checking the audio status.
+    
+    Note - drm_dp_mst_port->has_audio is technically protected by
+    drm_device->mode_config.connection_mutex, since it's only ever updated
+    from drm_dp_mst_get_edid(). Additionally, we change the declaration for
+    port in struct intel_connector to be properly typed, so we can directly
+    access it.
+    
+    Changes since v1:
+    * Change type of intel_connector->port in a separate patch - Sean Paul
+    
+    Cc: "Lee, Shawn C" <shawn.c.lee@intel.com>
+    Reviewed-by: Sean Paul <sean@poorly.run>
+    Signed-off-by: Lyude Paul <lyude@redhat.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20200406200646.1263435-2-lyude@redhat.com
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index e36e53de269e..e689f8d25869 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -732,8 +732,6 @@ drm_dp_mst_detect_port(struct drm_connector *connector,
+ 		       struct drm_dp_mst_topology_mgr *mgr,
+ 		       struct drm_dp_mst_port *port);
+ 
+-bool drm_dp_mst_port_has_audio(struct drm_dp_mst_topology_mgr *mgr,
+-					struct drm_dp_mst_port *port);
+ struct edid *drm_dp_mst_get_edid(struct drm_connector *connector, struct drm_dp_mst_topology_mgr *mgr, struct drm_dp_mst_port *port);
+ 
+ 
+
+commit 72dc0f5159138b61762a500d0fde9bbc1af82884
+Author: Lyude Paul <lyude@redhat.com>
+Date:   Tue Mar 31 16:57:37 2020 -0400
+
+    drm/dp_mst: Remove drm_dp_mst_topology_cbs.destroy_connector
+    
+    Now that we've removed the last user of this callback, get rid of it and
+    drm_dp_destroy_connector().
+    
+    Signed-off-by: Lyude Paul <lyude@redhat.com>
+    Cc: Pankaj Bharadiya <pankaj.laxminarayan.bharadiya@intel.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20200331205740.135525-5-lyude@redhat.com
+    Reviewed-by: Alex Deucher <alexdeucher@gmail.com>
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index e1f212b2505a..e36e53de269e 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -488,8 +488,6 @@ struct drm_dp_mst_topology_mgr;
+ struct drm_dp_mst_topology_cbs {
+ 	/* create a connector for a port */
+ 	struct drm_connector *(*add_connector)(struct drm_dp_mst_topology_mgr *mgr, struct drm_dp_mst_port *port, const char *path);
+-	void (*destroy_connector)(struct drm_dp_mst_topology_mgr *mgr,
+-				  struct drm_connector *connector);
+ };
+ 
+ #define DP_MAX_PAYLOAD (sizeof(unsigned long) * 8)
+
+commit 5fc0df93fccd4dc8412bfc488ba4ba8268aa12dc
+Merge: 700d6ab987f3 7111951b8d49
+Author: Dave Airlie <airlied@redhat.com>
+Date:   Tue Mar 31 15:15:47 2020 +1000
+
+    Merge v5.6 into drm-next
+    
+    msm needed rc6, so I just went and merged release
+    (msm has been in drm-next outside of this tree)
+    
+    Signed-off-by: Dave Airlie <airlied@redhat.com>
+
+commit 6c0ac4d5fff7fc5d990cc79c0231f02d88a69b9b
+Author: Sam Ravnborg <sam@ravnborg.org>
+Date:   Sat Mar 28 14:20:24 2020 +0100
+
+    drm/dp_mst: add kernel-doc for drm_dp_mst_port.fec_capable
+    
+    Fix kernel-doc warnings for drm_dp_mst_port.fec_capable.
+    This fixed the following warning:
+    drm_dp_mst_helper.h:162: warning: Function parameter or member
+    'fec_capable' not described in 'drm_dp_mst_port'
+    
+    Signed-off-by: Sam Ravnborg <sam@ravnborg.org>
+    Cc: David Francis <David.Francis@amd.com>
+    Cc: Lyude Paul <lyude@redhat.com>
+    Cc: Harry Wentland <harry.wentland@amd.com>
+    Cc: Mikita Lipski <mikita.lipski@amd.com>
+    Cc: Alex Deucher <alexander.deucher@amd.com>
+    Cc: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+    Cc: Maxime Ripard <mripard@kernel.org>
+    Cc: Thomas Zimmermann <tzimmermann@suse.de>
+    Cc: David Airlie <airlied@linux.ie>
+    Cc: Daniel Vetter <daniel@ffwll.ch>
+    [Wrapped commit msg + s/network/topology]
+    Signed-off-by: Lyude Paul <lyude@redhat.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20200328132025.19910-6-sam@ravnborg.org
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index bf5e65d2303e..e1f212b2505a 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -157,6 +157,10 @@ struct drm_dp_mst_port {
+ 	 */
+ 	bool has_audio;
+ 
++	/**
++	 * @fec_capable: bool indicating if FEC can be supported up to that
++	 * point in the MST topology.
++	 */
+ 	bool fec_capable;
+ };
+ 
+
+commit 6bb0942e8f46863a745489cce27efe5be2a3885e
+Author: Sean Paul <seanpaul@chromium.org>
+Date:   Thu Feb 13 16:15:20 2020 -0500
+
+    drm/dp_mst: Remove single tx msg restriction.
+    
+    Now that we can support multiple simultaneous replies, remove the
+    restrictions placed on sending new tx msgs.
+    
+    This patch essentially just reverts commit
+      5a64967a2f3b ("drm/dp_mst: Have DP_Tx send one msg at a time")
+    now that the problem is solved in a different way.
+    
+    Cc: Wayne Lin <Wayne.Lin@amd.com>
+    Reviewed-by: Lyude Paul <lyude@redhat.com>
+    Reviewed-by: Wayne Lin <waynelin@amd.com>
+    Signed-off-by: Sean Paul <seanpaul@chromium.org>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20200213211523.156998-4-sean@poorly.run
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index cff135070535..bf5e65d2303e 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -590,11 +590,6 @@ struct drm_dp_mst_topology_mgr {
+ 	 */
+ 	bool payload_id_table_cleared : 1;
+ 
+-	/**
+-	 * @is_waiting_for_dwn_reply: whether we're waiting for a down reply.
+-	 */
+-	bool is_waiting_for_dwn_reply : 1;
+-
+ 	/**
+ 	 * @mst_primary: Pointer to the primary/first branch device.
+ 	 */
+
+commit fbc821c4a506a960e85f3e97e32cfab63d43f7d0
+Author: Sean Paul <seanpaul@chromium.org>
+Date:   Thu Feb 13 16:15:19 2020 -0500
+
+    drm/mst: Support simultaneous down replies
+    
+    Currently we have one down reply message servicing the mst manager, so
+    we need to serialize all tx msgs to ensure we only have one message in
+    flight at a time. For obvious reasons this is suboptimal (but less
+    suboptimal than the free-for-all we had before serialization).
+    
+    This patch removes the single down_rep_recv message from manager and
+    adds 2 replies in the branch structure. The 2 replies mirrors the tx_slots
+    which we use to rate-limit outgoing messages and correspond to seqno in
+    the packet headers.
+    
+    Cc: Wayne Lin <Wayne.Lin@amd.com>
+    Reviewed-by: Lyude Paul <lyude@redhat.com>
+    Reviewed-by: Wayne Lin <waynelin@amd.com>
+    Signed-off-by: Sean Paul <seanpaul@chromium.org>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20200213211523.156998-3-sean@poorly.run
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index 9a1e8ba4f839..cff135070535 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -160,6 +160,31 @@ struct drm_dp_mst_port {
+ 	bool fec_capable;
+ };
+ 
++/* sideband msg header - not bit struct */
++struct drm_dp_sideband_msg_hdr {
++	u8 lct;
++	u8 lcr;
++	u8 rad[8];
++	bool broadcast;
++	bool path_msg;
++	u8 msg_len;
++	bool somt;
++	bool eomt;
++	bool seqno;
++};
++
++struct drm_dp_sideband_msg_rx {
++	u8 chunk[48];
++	u8 msg[256];
++	u8 curchunk_len;
++	u8 curchunk_idx; /* chunk we are parsing now */
++	u8 curchunk_hdrlen;
++	u8 curlen; /* total length of the msg */
++	bool have_somt;
++	bool have_eomt;
++	struct drm_dp_sideband_msg_hdr initial_hdr;
++};
++
+ /**
+  * struct drm_dp_mst_branch - MST branch device.
+  * @rad: Relative Address to talk to this branch device.
+@@ -232,24 +257,16 @@ struct drm_dp_mst_branch {
+ 	int last_seqno;
+ 	bool link_address_sent;
+ 
++	/**
++	 * @down_rep_recv: Message receiver state for down replies.
++	 */
++	struct drm_dp_sideband_msg_rx down_rep_recv[2];
++
+ 	/* global unique identifier to identify branch devices */
+ 	u8 guid[16];
+ };
+ 
+ 
+-/* sideband msg header - not bit struct */
+-struct drm_dp_sideband_msg_hdr {
+-	u8 lct;
+-	u8 lcr;
+-	u8 rad[8];
+-	bool broadcast;
+-	bool path_msg;
+-	u8 msg_len;
+-	bool somt;
+-	bool eomt;
+-	bool seqno;
+-};
+-
+ struct drm_dp_nak_reply {
+ 	u8 guid[16];
+ 	u8 reason;
+@@ -306,18 +323,6 @@ struct drm_dp_remote_i2c_write_ack_reply {
+ };
+ 
+ 
+-struct drm_dp_sideband_msg_rx {
+-	u8 chunk[48];
+-	u8 msg[256];
+-	u8 curchunk_len;
+-	u8 curchunk_idx; /* chunk we are parsing now */
+-	u8 curchunk_hdrlen;
+-	u8 curlen; /* total length of the msg */
+-	bool have_somt;
+-	bool have_eomt;
+-	struct drm_dp_sideband_msg_hdr initial_hdr;
+-};
+-
+ #define DRM_DP_MAX_SDP_STREAMS 16
+ struct drm_dp_allocate_payload {
+ 	u8 port_number;
+@@ -555,10 +560,6 @@ struct drm_dp_mst_topology_mgr {
+ 	 */
+ 	int conn_base_id;
+ 
+-	/**
+-	 * @down_rep_recv: Message receiver state for down replies.
+-	 */
+-	struct drm_dp_sideband_msg_rx down_rep_recv;
+ 	/**
+ 	 * @up_req_recv: Message receiver state for up requests.
+ 	 */
+
+commit 1cfff5f01563c8dd8e7243244b47a17998b81187
+Author: Lyude Paul <lyude@redhat.com>
+Date:   Wed Jan 22 14:48:46 2020 -0500
+
+    drm/dp_mst: Convert drm_dp_mst_topology_mgr.is_waiting_for_dwn_reply to bitfield
+    
+    Small nitpick that I noticed a second ago - we can save some space in
+    the struct by making this a bitfield and sticking it with the rest of
+    the bitfields. Also, some small cleanup to the kdocs for this member.
+    
+    There should be no functional changes in this patch.
+    
+    Signed-off-by: Lyude Paul <lyude@redhat.com>
+    Cc: Wayne Lin <Wayne.Lin@amd.com>
+    Reviewed-by: Wayne Lin <Wayne.Lin@amd.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20200122194846.16025-1-lyude@redhat.com
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index 885ada3c15a5..9a1e8ba4f839 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -589,6 +589,11 @@ struct drm_dp_mst_topology_mgr {
+ 	 */
+ 	bool payload_id_table_cleared : 1;
+ 
++	/**
++	 * @is_waiting_for_dwn_reply: whether we're waiting for a down reply.
++	 */
++	bool is_waiting_for_dwn_reply : 1;
++
+ 	/**
+ 	 * @mst_primary: Pointer to the primary/first branch device.
+ 	 */
+@@ -618,11 +623,6 @@ struct drm_dp_mst_topology_mgr {
+ 	 */
+ 	struct mutex qlock;
+ 
+-	/**
+-	 * @is_waiting_for_dwn_reply: indicate whether is waiting for down reply
+-	 */
+-	bool is_waiting_for_dwn_reply;
+-
+ 	/**
+ 	 * @tx_msg_downq: List of pending down replies.
+ 	 */
+
+commit fcf4638075964268bf8a0e212407096c6aab6fd3
+Author: Lyude Paul <lyude@redhat.com>
+Date:   Fri Mar 6 18:46:20 2020 -0500
+
+    drm/dp_mst: Use full_pbn instead of available_pbn for bandwidth checks
+    
+    DisplayPort specifications are fun. For a while, it's been really
+    unclear to us what available_pbn actually does. There's a somewhat vague
+    explanation in the DisplayPort spec (starting from 1.2) that partially
+    explains it:
+    
+      The minimum payload bandwidth number supported by the path. Each node
+      updates this number with its available payload bandwidth number if its
+      payload bandwidth number is less than that in the Message Transaction
+      reply.
+    
+    So, it sounds like available_pbn represents the smallest link rate in
+    use between the source and the branch device. Cool, so full_pbn is just
+    the highest possible PBN that the branch device supports right?
+    
+    Well, we assumed that for quite a while until Sean Paul noticed that on
+    some MST hubs, available_pbn will actually get set to 0 whenever there's
+    any active payloads on the respective branch device. This caused quite a
+    bit of confusion since clearing the payload ID table would end up fixing
+    the available_pbn value.
+    
+    So, we just went with that until commit cd82d82cbc04 ("drm/dp_mst: Add
+    branch bandwidth validation to MST atomic check") started breaking
+    people's setups due to us getting erroneous available_pbn values. So, we
+    did some more digging and got confused until we finally looked at the
+    definition for full_pbn:
+    
+      The bandwidth of the link at the trained link rate and lane count
+      between the DP Source device and the DP Sink device with no time slots
+      allocated to VC Payloads, represented as a Payload Bandwidth Number. As
+      with the Available_Payload_Bandwidth_Number, this number is determined
+      by the link with the lowest lane count and link rate.
+    
+    That's what we get for not reading specs closely enough, hehe. So, since
+    full_pbn is definitely what we want for doing bandwidth restriction
+    checks - let's start using that instead and ignore available_pbn
+    entirely.
+    
+    Signed-off-by: Lyude Paul <lyude@redhat.com>
+    Fixes: cd82d82cbc04 ("drm/dp_mst: Add branch bandwidth validation to MST atomic check")
+    Cc: Mikita Lipski <mikita.lipski@amd.com>
+    Cc: Hans de Goede <hdegoede@redhat.com>
+    Cc: Sean Paul <sean@poorly.run>
+    Reviewed-by: Mikita Lipski <mikita.lipski@amd.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20200306234623.547525-3-lyude@redhat.com
+    Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+    Tested-by: Hans de Goede <hdegoede@redhat.com>
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index bcb39da9adb4..41725d88d27e 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -81,7 +81,7 @@ struct drm_dp_vcpi {
+  * &drm_dp_mst_topology_mgr.base.lock.
+  * @num_sdp_stream_sinks: Number of stream sinks. Protected by
+  * &drm_dp_mst_topology_mgr.base.lock.
+- * @available_pbn: Available bandwidth for this port. Protected by
++ * @full_pbn: Max possible bandwidth for this port. Protected by
+  * &drm_dp_mst_topology_mgr.base.lock.
+  * @next: link to next port on this branch device
+  * @aux: i2c aux transport to talk to device connected to this port, protected
+@@ -126,7 +126,7 @@ struct drm_dp_mst_port {
+ 	u8 dpcd_rev;
+ 	u8 num_sdp_streams;
+ 	u8 num_sdp_stream_sinks;
+-	uint16_t available_pbn;
++	uint16_t full_pbn;
+ 	struct list_head next;
+ 	/**
+ 	 * @mstb: the branch device connected to this port, if there is one.
+
+commit a5c4dc165957d626eaf9c6e2570d70bd78745f0f
+Author: Pankaj Bharadiya <pankaj.laxminarayan.bharadiya@intel.com>
+Date:   Sat Mar 7 14:00:21 2020 +0530
+
+    drm/dp_mst: Remove register_connector callback
+    
+    Now drm_dp_mst_topology_cbs.register_connector callback is not getting
+    used anymore hence remove it.
+    
+    Signed-off-by: Pankaj Bharadiya <pankaj.laxminarayan.bharadiya@intel.com>
+    Suggested-by: Emil Velikov <emil.velikov@collabora.com>
+    Suggested-by: Lyude Paul <lyude@redhat.com>
+    Signed-off-by: Lyude Paul <lyude@redhat.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20200307083023.76498-4-pankaj.laxminarayan.bharadiya@intel.com
+    Reviewed-by: Lyude Paul <lyude@redhat.com>
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index 5483f888712a..885ada3c15a5 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -479,7 +479,6 @@ struct drm_dp_mst_topology_mgr;
+ struct drm_dp_mst_topology_cbs {
+ 	/* create a connector for a port */
+ 	struct drm_connector *(*add_connector)(struct drm_dp_mst_topology_mgr *mgr, struct drm_dp_mst_port *port, const char *path);
+-	void (*register_connector)(struct drm_connector *connector);
+ 	void (*destroy_connector)(struct drm_dp_mst_topology_mgr *mgr,
+ 				  struct drm_connector *connector);
+ };
+
+commit 28f2aff1caa4997f58ca31179cad1b4a84a62827
+Merge: 3e8a3844fefb 11a48a5a18c6
+Author: Maxime Ripard <maxime@cerno.tech>
+Date:   Mon Feb 17 10:34:34 2020 +0100
+
+    Merge v5.6-rc2 into drm-misc-next
+    
+    Lyude needs some patches in 5.6-rc2 and we didn't bring drm-misc-next
+    forward yet, so it looks like a good occasion.
+    
+    Signed-off-by: Maxime Ripard <maxime@cerno.tech>
+
+commit a727fe8f05b72ea84416f0283b669edeb1dd18d8
+Author: Lyude Paul <lyude@redhat.com>
+Date:   Wed Jan 22 14:43:21 2020 -0500
+
+    drm/dp_mst: Mention max_payloads in proposed_vcpis/payloads docs
+    
+    Mention that the size of these two structs is determined by
+    max_payloads. Suggested by Ville Syrjälä.
+    
+    Signed-off-by: Lyude Paul <lyude@redhat.com>
+    Cc: Ville Syrjälä <ville.syrjala@linux.intel.com>
+    Reviewed-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20200122194321.14953-2-lyude@redhat.com
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index 5699493c6fb1..7b9453b8b5c4 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -624,11 +624,13 @@ struct drm_dp_mst_topology_mgr {
+ 	struct mutex payload_lock;
+ 	/**
+ 	 * @proposed_vcpis: Array of pointers for the new VCPI allocation. The
+-	 * VCPI structure itself is &drm_dp_mst_port.vcpi.
++	 * VCPI structure itself is &drm_dp_mst_port.vcpi, and the size of
++	 * this array is determined by @max_payloads.
+ 	 */
+ 	struct drm_dp_vcpi **proposed_vcpis;
+ 	/**
+-	 * @payloads: Array of payloads.
++	 * @payloads: Array of payloads. The size of this array is determined
++	 * by @max_payloads.
+ 	 */
+ 	struct drm_dp_payload *payloads;
+ 	/**
+
+commit 3d4743131b8de970faa4b979ead0fadfe5d2de9d
+Merge: df95968ff789 def9d2780727
+Author: Dave Airlie <airlied@redhat.com>
+Date:   Mon Jan 20 11:08:11 2020 +1000
+
+    Backmerge v5.5-rc7 into drm-next
+    
+    msm needs 5.5-rc4, go to the latest.
+    
+    Signed-off-by: Dave Airlie <airlied@redhat.com>
+
+commit 5a64967a2f3bbc01cc708ee43c7b0893089c61c4
+Author: Wayne Lin <Wayne.Lin@amd.com>
+Date:   Mon Jan 13 17:36:49 2020 +0800
+
+    drm/dp_mst: Have DP_Tx send one msg at a time
+    
+    [Why]
+    Noticed this while testing MST with the 4 ports MST hub from
+    StarTech.com. Sometimes can't light up monitors normally and get the
+    error message as 'sideband msg build failed'.
+    
+    Look into aux transactions, found out that source sometimes will send
+    out another down request before receiving the down reply of the
+    previous down request. On the other hand, in drm_dp_get_one_sb_msg(),
+    current code doesn't handle the interleaved replies case. Hence, source
+    can't build up message completely and can't light up monitors.
+    
+    [How]
+    For good compatibility, enforce source to send out one down request at a
+    time. Add a flag, is_waiting_for_dwn_reply, to determine if the source
+    can send out a down request immediately or not.
+    
+    - Check the flag before calling process_single_down_tx_qlock to send out
+    a msg
+    - Set the flag when successfully send out a down request
+    - Clear the flag when successfully build up a down reply
+    - Clear the flag when find erros during sending out a down request
+    - Clear the flag when find errors during building up a down reply
+    - Clear the flag when timeout occurs during waiting for a down reply
+    - Use drm_dp_mst_kick_tx() to try to send another down request in queue
+    at the end of drm_dp_mst_wait_tx_reply() (attempt to send out messages
+    in queue when errors occur)
+    
+    Cc: Lyude Paul <lyude@redhat.com>
+    Signed-off-by: Wayne Lin <Wayne.Lin@amd.com>
+    Signed-off-by: Lyude Paul <lyude@redhat.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20200113093649.11755-1-Wayne.Lin@amd.com
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index d5fc90b30487..c1bda7030e2d 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -605,6 +605,12 @@ struct drm_dp_mst_topology_mgr {
+ 	 * &drm_dp_sideband_msg_tx.state once they are queued
+ 	 */
+ 	struct mutex qlock;
++
++	/**
++	 * @is_waiting_for_dwn_reply: indicate whether is waiting for down reply
++	 */
++	bool is_waiting_for_dwn_reply;
++
+ 	/**
+ 	 * @tx_msg_downq: List of pending down replies.
+ 	 */
+
+commit 8ec046716ca8ee79a9d2699f78511c08753c2e56
+Author: Mikita Lipski <mikita.lipski@amd.com>
+Date:   Sat Nov 16 13:32:15 2019 -0500
+
+    drm/dp_mst: Add helper to trigger modeset on affected DSC MST CRTCs
+    
+    [why]
+    Whenever a connector on an MST network is changed or
+    undergoes a modeset, the DSC configs for each stream on that
+    topology will be recalculated. This can change their required
+    bandwidth, requiring a full reprogramming, as though a modeset
+    was performed, even if that stream did not change timing.
+    
+    [how]
+    Adding helper to trigger modesets on MST DSC connectors
+    by setting mode_changed flag on CRTCs in the same topology
+    as affected connector
+    
+    v2: use drm_dp_mst_dsc_aux_for_port function to verify
+    if the port is DSC capable
+    
+    v3: - added _must_check attribute
+        - removed topology manager check
+        - fix typos and indentations
+    
+    Reviewed-by: Lyude Paul <lyude@redhat.com>
+    Signed-off-by: Mikita Lipski <mikita.lipski@amd.com>
+    Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index d940f45c7637..e5503771232f 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -788,6 +788,9 @@ int drm_dp_mst_atomic_enable_dsc(struct drm_atomic_state *state,
+ 				 int pbn, int pbn_div,
+ 				 bool enable);
+ int __must_check
++drm_dp_mst_add_affected_dsc_crtcs(struct drm_atomic_state *state,
++				  struct drm_dp_mst_topology_mgr *mgr);
++int __must_check
+ drm_dp_atomic_release_vcpi_slots(struct drm_atomic_state *state,
+ 				 struct drm_dp_mst_topology_mgr *mgr,
+ 				 struct drm_dp_mst_port *port);
+
+commit cd82d82cbc0484e47918d3166f356c98f0066db8
+Author: Mikita Lipski <mikita.lipski@amd.com>
+Date:   Wed Nov 6 13:11:23 2019 -0500
+
+    drm/dp_mst: Add branch bandwidth validation to MST atomic check
+    
+    [why]
+    Adding PBN attribute to drm_dp_vcpi_allocation structure to
+    keep track of how much bandwidth each Port requires.
+    Adding drm_dp_mst_atomic_check_bw_limit to verify that
+    state's bandwidth needs doesn't exceed available bandwidth.
+    The funtion is called in drm_dp_mst_atomic_check after
+    drm_dp_mst_atomic_check_topology_state to fully verify that
+    the proposed topology is supported.
+    
+    v2: Fixing some typos and indenting
+    v3: Return correct error enums if no bw space available
+    
+    Reviewed-by: Lyude Paul <lyude@redhat.com>
+    Signed-off-by: Mikita Lipski <mikita.lipski@amd.com>
+    Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index 14ccda19d9cc..d940f45c7637 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -502,6 +502,7 @@ struct drm_dp_payload {
+ struct drm_dp_vcpi_allocation {
+ 	struct drm_dp_mst_port *port;
+ 	int vcpi;
++	int pbn;
+ 	bool dsc_enabled;
+ 	struct list_head next;
+ };
+
+commit 8afb7e6afadb36b160143794c1d2fdfbde189750
+Author: Mikita Lipski <mikita.lipski@amd.com>
+Date:   Mon Oct 28 17:33:32 2019 -0400
+
+    drm/dp_mst: Add DSC enablement helpers to DRM
+    
+    Adding a helper function to be called by
+    drivers outside of DRM to enable DSC on
+    the MST ports.
+    
+    Function is called to recalculate VCPI allocation
+    if DSC is enabled and raise the DSC flag to enable.
+    In case of disabling DSC the flag is set to false
+    and recalculation of VCPI slots is expected to be done
+    in encoder's atomic_check.
+    
+    v2: squash separate functions into one and call it per
+    port
+    v3: Fix comment typos
+    
+    Reviewed-by: Lyude Paul <lyude@redhat.com>
+    Signed-off-by: Mikita Lipski <mikita.lipski@amd.com>
+    Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index 82ab6776ad5b..14ccda19d9cc 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -502,6 +502,7 @@ struct drm_dp_payload {
+ struct drm_dp_vcpi_allocation {
+ 	struct drm_dp_mst_port *port;
+ 	int vcpi;
++	bool dsc_enabled;
+ 	struct list_head next;
+ };
+ 
+@@ -781,6 +782,10 @@ drm_dp_atomic_find_vcpi_slots(struct drm_atomic_state *state,
+ 			      struct drm_dp_mst_topology_mgr *mgr,
+ 			      struct drm_dp_mst_port *port, int pbn,
+ 			      int pbn_div);
++int drm_dp_mst_atomic_enable_dsc(struct drm_atomic_state *state,
++				 struct drm_dp_mst_port *port,
++				 int pbn, int pbn_div,
++				 bool enable);
+ int __must_check
+ drm_dp_atomic_release_vcpi_slots(struct drm_atomic_state *state,
+ 				 struct drm_dp_mst_topology_mgr *mgr,
+
+commit 1c6c1cb5afc77cc8afbe563937c3bd1a41172459
+Author: Mikita Lipski <mikita.lipski@amd.com>
+Date:   Thu Nov 14 16:24:29 2019 -0500
+
+    drm/dp_mst: Manually overwrite PBN divider for calculating timeslots
+    
+    [why]
+    For DSC case we cannot use topology manager's PBN divider
+    variable. The default divider does not take FEC into account.
+    Therefore the driver has to calculate its own divider based
+    on the link rate and lane count its handling, as it is hw specific.
+    
+    [how]
+    Pass pbn_div as an argument, which is used if its more than
+    zero, otherwise default topology manager's pbn_div will be used.
+    
+    Reviewed-by: Lyude Paul <lyude@redhat.com>
+    Signed-off-by: Mikita Lipski <mikita.lipski@amd.com>
+    Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index c217b2aaaafa..82ab6776ad5b 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -779,7 +779,8 @@ struct drm_dp_mst_topology_state *drm_atomic_get_mst_topology_state(struct drm_a
+ int __must_check
+ drm_dp_atomic_find_vcpi_slots(struct drm_atomic_state *state,
+ 			      struct drm_dp_mst_topology_mgr *mgr,
+-			      struct drm_dp_mst_port *port, int pbn);
++			      struct drm_dp_mst_port *port, int pbn,
++			      int pbn_div);
+ int __must_check
+ drm_dp_atomic_release_vcpi_slots(struct drm_atomic_state *state,
+ 				 struct drm_dp_mst_topology_mgr *mgr,
+
+commit c2bc1b6eabe65d6bf26a892d803907dca9097311
+Author: David Francis <David.Francis@amd.com>
+Date:   Mon Aug 26 09:50:28 2019 -0400
+
+    drm/dp_mst: Add helpers for MST DSC and virtual DPCD aux
+    
+    Add drm_dp_mst_dsc_aux_for_port. To enable DSC, the DSC_ENABLED
+    register might have to be written on the leaf port's DPCD,
+    its parent's DPCD, or the MST manager's DPCD. This function
+    finds the correct aux for the job.
+    
+    As part of this, add drm_dp_mst_is_virtual_dpcd. Virtual DPCD
+    is a DP feature new in DP v1.4, which exposes certain DPCD
+    registers on virtual ports.
+    
+    v2: Remember to unlock mutex on all paths
+    v3: Refactor to match coding style and increase brevity
+    v4: - Check DSC capable MST sink connected directly to the device.
+        - Check branch's port_parent to be set
+    
+    Cc: Lyude Paul <lyude@redhat.com>
+    Reviewed-by: Wenjing Liu <Wenjing.Liu@amd.com>
+    Signed-off-by: David Francis <David.Francis@amd.com>
+    Signed-off-by: Mikita Lipski <mikita.lipski@amd.com>
+    Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index f4b8bc027553..c217b2aaaafa 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -791,6 +791,8 @@ int __must_check drm_dp_mst_atomic_check(struct drm_atomic_state *state);
+ void drm_dp_mst_get_port_malloc(struct drm_dp_mst_port *port);
+ void drm_dp_mst_put_port_malloc(struct drm_dp_mst_port *port);
+ 
++struct drm_dp_aux *drm_dp_mst_dsc_aux_for_port(struct drm_dp_mst_port *port);
++
+ extern const struct drm_private_state_funcs drm_dp_mst_topology_state_funcs;
+ 
+ /**
+
+commit a3c2b0ffc007e5d98f5313ed951fff092535fb6d
+Author: David Francis <David.Francis@amd.com>
+Date:   Thu Jun 6 11:20:10 2019 -0400
+
+    drm/dp_mst: Parse FEC capability on MST ports
+    
+    As of DP1.4, ENUM_PATH_RESOURCES returns a bit indicating
+    if FEC can be supported up to that point in the MST network.
+    
+    The bit is the first byte of the ENUM_PATH_RESOURCES ack reply,
+    bottom-most bit (refer to section 2.11.9.4 of DP standard,
+    v1.4)
+    
+    That value is needed for FEC and DSC support
+    
+    Store it on drm_dp_mst_port
+    
+    Reviewed-by: Lyude Paul <lyude@redhat.com>
+    Reviewed-by: Harry Wentland <harry.wentland@amd.com>
+    Signed-off-by: David Francis <David.Francis@amd.com>
+    Signed-off-by: Mikita Lipski <mikita.lipski@amd.com>
+    Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index 0c59c9a348bd..f4b8bc027553 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -156,6 +156,8 @@ struct drm_dp_mst_port {
+ 	 * audio-capable.
+ 	 */
+ 	bool has_audio;
++
++	bool fec_capable;
+ };
+ 
+ /**
+@@ -383,6 +385,7 @@ struct drm_dp_port_number_req {
+ 
+ struct drm_dp_enum_path_resources_ack_reply {
+ 	u8 port_number;
++	bool fec_capable;
+ 	u16 full_payload_bw_number;
+ 	u16 avail_payload_bw_number;
+ };
+
+commit dc48529fb14ee8450705c00d91f4dcc155e1c2cb
+Author: David Francis <David.Francis@amd.com>
+Date:   Wed Aug 21 10:33:26 2019 -0400
+
+    drm/dp_mst: Add PBN calculation for DSC modes
+    
+    With DSC, bpp can be fractional in multiples of 1/16.
+    
+    Change drm_dp_calc_pbn_mode to reflect this, adding a new
+    parameter bool dsc. When this parameter is true, treat the
+    bpp parameter as having units not of bits per pixel, but
+    1/16 of a bit per pixel
+    
+    v2: Don't add separate function for this
+    v3: In the equation divide bpp by 16 as it is expected
+    not to leave any remainder
+    v4: Added DSC test parameters for selftest
+    
+    Reviewed-by: Manasi Navare <manasi.d.navare@intel.com>
+    Reviewed-by: Lyude Paul <lyude@redhat.com>
+    Reviewed-by: Harry Wentland <harry.wentland@amd.com>
+    Signed-off-by: David Francis <David.Francis@amd.com>
+    Signed-off-by: Mikita Lipski <mikita.lipski@amd.com>
+    Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index 5699493c6fb1..0c59c9a348bd 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -727,8 +727,7 @@ bool drm_dp_mst_port_has_audio(struct drm_dp_mst_topology_mgr *mgr,
+ struct edid *drm_dp_mst_get_edid(struct drm_connector *connector, struct drm_dp_mst_topology_mgr *mgr, struct drm_dp_mst_port *port);
+ 
+ 
+-int drm_dp_calc_pbn_mode(int clock, int bpp);
+-
++int drm_dp_calc_pbn_mode(int clock, int bpp, bool dsc);
+ 
+ bool drm_dp_mst_allocate_vcpi(struct drm_dp_mst_topology_mgr *mgr,
+ 			      struct drm_dp_mst_port *port, int pbn, int slots);
+
+commit 6c56e8adc0011b3bc01b6b2bab7e41d5ecb43c0f
+Merge: d1eef1c61974 2156873f08c7
+Author: Daniel Vetter <daniel.vetter@ffwll.ch>
+Date:   Tue Dec 17 13:57:54 2019 +0100
+
+    Merge tag 'drm-misc-next-2019-12-16' of git://anongit.freedesktop.org/drm/drm-misc into drm-next
+    
+    drm-misc-next for v5.6:
+    
+    UAPI Changes:
+    - Add support for DMA-BUF HEAPS.
+    
+    Cross-subsystem Changes:
+    - mipi dsi definition updates, pulled into drm-intel as well.
+    - Add lockdep annotations for dma_resv vs mmap_sem and fs_reclaim.
+    - Remove support for dma-buf kmap/kunmap.
+    - Constify fb_ops in all fbdev drivers, including drm drivers and drm-core, and media as well.
+    
+    Core Changes:
+    - Small cleanups to ttm.
+    - Fix SCDC definition.
+    - Assorted cleanups to core.
+    - Add todo to remove load/unload hooks, and use generic fbdev emulation.
+    - Assorted documentation updates.
+    - Use blocking ww lock in ttm fault handler.
+    - Remove drm_fb_helper_fbdev_setup/teardown.
+    - Warning fixes with W=1 for atomic.
+    - Use drm_debug_enabled() instead of drm_debug flag testing in various drivers.
+    - Fallback to nontiled mode in fbdev emulation when not all tiles are present. (Later on reverted)
+    - Various kconfig indentation fixes in core and drivers.
+    - Fix freeing transactions in dp-mst correctly.
+    - Sean Paul is steping down as core maintainer. :-(
+    - Add lockdep annotations for atomic locks vs dma-resv.
+    - Prevent use-after-free for a bad job in drm_scheduler.
+    - Fill out all block sizes in the P01x and P210 definitions.
+    - Avoid division by zero in drm/rect, and fix bounds.
+    - Add drm/rect selftests.
+    - Add aspect ratio and alternate clocks for HDMI 4k modes.
+    - Add todo for drm_framebuffer_funcs and fb_create cleanup.
+    - Drop DRM_AUTH for prime import/export ioctls.
+    - Clear DP-MST payload id tables downstream when initializating.
+    - Fix for DSC throughput definition.
+    - Add extra FEC definitions.
+    - Fix fake offset in drm_gem_object_funs.mmap.
+    - Stop using encoder->bridge in core directly
+    - Handle bridge chaining slightly better.
+    - Add backlight support to drm/panel, and use it in many panel drivers.
+    - Increase max number of y420 modes from 128 to 256, as preparation to add the new modes.
+    
+    Driver Changes:
+    - Small fixes all over.
+    - Fix documentation in vkms.
+    - Fix mmap_sem vs dma_resv in nouveau.
+    - Small cleanup in komeda.
+    - Add page flip support in gma500 for psb/cdv.
+    - Add ddc symlink in the connector sysfs directory for many drivers.
+    - Add support for analogic an6345, and fix small bugs in it.
+    - Add atomic modesetting support to ast.
+    - Fix radeon fault handler VMA race.
+    - Switch udl to use generic shmem helpers.
+    - Unconditional vblank handling for mcde.
+    - Miscellaneous fixes to mcde.
+    - Tweak debug output from komeda using debugfs.
+    - Add gamma and color transform support to komeda for DOU-IPS.
+    - Add support for sony acx424AKP panel.
+    - Various small cleanups to gma500.
+    - Use generic fbdev emulation in udl, and replace udl_framebuffer with generic implementation.
+    - Add support for Logic PD Type 28 panel.
+    - Use drm_panel_* wrapper functions in exynos/tegra/msm.
+    - Add devicetree bindings for generic DSI panels.
+    - Don't include drm_pci.h directly in many drivers.
+    - Add support for begin/end_cpu_access in udmabuf.
+    - Stop using drm_get_pci_dev in gma500 and mga200.
+    - Fixes to UDL damage handling, and use dma_buf_begin/end_cpu_access.
+    - Add devfreq thermal support to panfrost.
+    - Fix hotplug with daisy chained monitors by removing VCPI when disabling topology manager.
+    - meson: Add support for OSD1 plane AFBC commit.
+    - Stop displaying garbage when toggling ast primary plane on/off.
+    - More cleanups and fixes to UDL.
+    - Add D32 suport to komeda.
+    - Remove globle copy of drm_dev in gma500.
+    - Add support for Boe Himax8279d MIPI-DSI LCD panel.
+    - Add support for ingenic JZ4770 panel.
+    - Small null pointer deference fix in ingenic.
+    - Remove support for the special tfp420 driver, as there is a generic way to do it.
+    
+    Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+    
+    From: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/ba73535a-9334-5302-2e1f-5208bd7390bd@linux.intel.com
+
+commit f79489074c59a5fd6bc35b21ca9911237993a045
+Author: Sean Paul <seanpaul@chromium.org>
+Date:   Wed Aug 28 20:09:44 2019 -0400
+
+    drm/dp_mst: Clear all payload id tables downstream when initializing
+    
+    It seems that on certain MST hubs, namely the CableMatters USB-C 2x DP
+    hub, using the DP_PAYLOAD_ALLOCATE_SET and DP_PAYLOAD_TABLE_UPDATE_STATUS
+    register ranges to clear any pre-existing payload allocations on the hub isn't
+    always enough to reset things if the source device has been reset unexpectedly.
+    
+    Or at least, that's the current running theory. The precise behavior appears to
+    be that when the source device gets reset unexpectedly, the hub begins reporting
+    an available_pbn value of 0 for all of its ports. This is a bit inconsistent
+    with the our theory, since this seems to happen even if previously set PBN
+    allocations should have resulted in a non-zero available_pbn value. So, it's
+    possible that something else may be going on here.
+    
+    Strangely though, sending a CLEAR_PAYLOAD_ID_TABLE broadcast request when
+    initializing the MST topology seems to bring things into working order and make
+    available_pbn work again. Since this is a pretty safe solution, let's go ahead
+    and implement it.
+    
+    Changes since v1:
+    * Change indenting on drm_dp_send_clear_payload_id_table() prototype
+    * Remove some braces in drm_dp_send_clear_payload_id_table()
+    * Reorganize some variable declarations in drm_dp_send_clear_payload_id_table()
+    * Don't forget to handle DP_CLEAR_PAYLOAD_ID_TABLE in
+      drm_dp_sideband_parse_reply()
+    * Move drm_dp_send_clear_payload_id_table() call into
+      drm_dp_mst_link_probe_work(), since we can't send sideband messages
+      while under lock in drm_dp_mst_topology_mgr_set_mst()
+    * Change commit message
+    
+    Acked-by: Daniel Vetter <daniel@ffwll.ch>
+    Signed-off-by: Sean Paul <seanpaul@chromium.org>
+    Signed-off-by: Lyude Paul <lyude@redhat.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20190829000944.20722-1-lyude@redhat.com
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index 4a25e0577ae0..a448d701dc7e 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -490,15 +490,23 @@ struct drm_dp_mst_topology_mgr {
+ 	struct drm_dp_sideband_msg_rx up_req_recv;
+ 
+ 	/**
+-	 * @lock: protects mst state, primary, dpcd.
++	 * @lock: protects @mst_state, @mst_primary, @dpcd, and
++	 * @payload_id_table_cleared.
+ 	 */
+ 	struct mutex lock;
+ 
+ 	/**
+-	 * @mst_state: If this manager is enabled for an MST capable port. False
+-	 * if no MST sink/branch devices is connected.
++	 * @mst_state: If this manager is enabled for an MST capable port.
++	 * False if no MST sink/branch devices is connected.
+ 	 */
+-	bool mst_state;
++	bool mst_state : 1;
++
++	/**
++	 * @payload_id_table_cleared: Whether or not we've cleared the payload
++	 * ID table for @mst_primary. Protected by @lock.
++	 */
++	bool payload_id_table_cleared : 1;
++
+ 	/**
+ 	 * @mst_primary: Pointer to the primary/first branch device.
+ 	 */
+
+commit 12a280c7286857119cf0d88c487f695e3a1c0912
+Author: Lyude Paul <lyude@redhat.com>
+Date:   Thu Jun 20 17:59:25 2019 -0400
+
+    drm/dp_mst: Add topology ref history tracking for debugging
+    
+    For very subtle mistakes with topology refs, it can be rather difficult
+    to trace them down with the debugging info that we already have. I had
+    one such issue recently while trying to implement suspend/resume
+    reprobing for MST, and ended up coming up with this.
+    
+    Inspired by Chris Wilson's wakeref tracking for i915, this adds a very
+    similar feature to the DP MST helpers, which allows for partial tracking
+    of topology refs for both ports and branch devices. This is a lot less
+    advanced then wakeref tracking: we merely keep a count of all of the
+    spots where a topology ref has been grabbed or dropped, then dump out
+    that history in chronological order when a port or branch device's
+    topology refcount reaches 0. So far, I've found this incredibly useful
+    for debugging topology refcount errors.
+    
+    Since this has the potential to be somewhat slow and loud, we add an
+    expert kernel config option to enable or disable this feature,
+    CONFIG_DRM_DEBUG_DP_MST_TOPOLOGY_REFS.
+    
+    Changes since v1:
+    * Don't forget to destroy topology_ref_history_lock
+    Changes since v4:
+    * Correct order of kref_put()/topology_ref_history_unlock - we can't
+      unlock the history after kref_put() since the memory might have been
+      freed by that point
+    * Don't print message on allocation error failures, the kernel already
+      does this for us
+    Changes since v5:
+    * Get rid of some leftover usages of %px
+    * Remove a leftover empty return; statement
+    
+    Cc: Juston Li <juston.li@intel.com>
+    Cc: Imre Deak <imre.deak@intel.com>
+    Cc: Ville Syrjälä <ville.syrjala@linux.intel.com>
+    Cc: Harry Wentland <hwentlan@amd.com>
+    Cc: Daniel Vetter <daniel.vetter@ffwll.ch>
+    Reviewed-by: Sean Paul <sean@poorly.run>
+    Signed-off-by: Lyude Paul <lyude@redhat.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20191022023641.8026-15-lyude@redhat.com
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index 144027e27464..d5fc90b30487 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -26,6 +26,26 @@
+ #include <drm/drm_dp_helper.h>
+ #include <drm/drm_atomic.h>
+ 
++#if IS_ENABLED(CONFIG_DRM_DEBUG_DP_MST_TOPOLOGY_REFS)
++#include <linux/stackdepot.h>
++#include <linux/timekeeping.h>
++
++enum drm_dp_mst_topology_ref_type {
++	DRM_DP_MST_TOPOLOGY_REF_GET,
++	DRM_DP_MST_TOPOLOGY_REF_PUT,
++};
++
++struct drm_dp_mst_topology_ref_history {
++	struct drm_dp_mst_topology_ref_entry {
++		enum drm_dp_mst_topology_ref_type type;
++		int count;
++		ktime_t ts_nsec;
++		depot_stack_handle_t backtrace;
++	} *entries;
++	int len;
++};
++#endif /* IS_ENABLED(CONFIG_DRM_DEBUG_DP_MST_TOPOLOGY_REFS) */
++
+ struct drm_dp_mst_branch;
+ 
+ /**
+@@ -89,6 +109,14 @@ struct drm_dp_mst_port {
+ 	 */
+ 	struct kref malloc_kref;
+ 
++#if IS_ENABLED(CONFIG_DRM_DEBUG_DP_MST_TOPOLOGY_REFS)
++	/**
++	 * @topology_ref_history: A history of each topology
++	 * reference/dereference. See CONFIG_DRM_DEBUG_DP_MST_TOPOLOGY_REFS.
++	 */
++	struct drm_dp_mst_topology_ref_history topology_ref_history;
++#endif
++
+ 	u8 port_num;
+ 	bool input;
+ 	bool mcs;
+@@ -162,6 +190,14 @@ struct drm_dp_mst_branch {
+ 	 */
+ 	struct kref malloc_kref;
+ 
++#if IS_ENABLED(CONFIG_DRM_DEBUG_DP_MST_TOPOLOGY_REFS)
++	/**
++	 * @topology_ref_history: A history of each topology
++	 * reference/dereference. See CONFIG_DRM_DEBUG_DP_MST_TOPOLOGY_REFS.
++	 */
++	struct drm_dp_mst_topology_ref_history topology_ref_history;
++#endif
++
+ 	/**
+ 	 * @destroy_next: linked-list entry used by
+ 	 * drm_dp_delayed_destroy_work()
+@@ -647,6 +683,15 @@ struct drm_dp_mst_topology_mgr {
+ 	 * transmissions.
+ 	 */
+ 	struct work_struct up_req_work;
++
++#if IS_ENABLED(CONFIG_DRM_DEBUG_DP_MST_TOPOLOGY_REFS)
++	/**
++	 * @topology_ref_history_lock: protects
++	 * &drm_dp_mst_port.topology_ref_history and
++	 * &drm_dp_mst_branch.topology_ref_history.
++	 */
++	struct mutex topology_ref_history_lock;
++#endif
+ };
+ 
+ int drm_dp_mst_topology_mgr_init(struct drm_dp_mst_topology_mgr *mgr,
+
+commit 6f85f73821f6af4de4429ab2f2f7958dbd81cb90
+Author: Lyude Paul <lyude@redhat.com>
+Date:   Mon Jun 17 19:57:33 2019 -0400
+
+    drm/dp_mst: Add basic topology reprobing when resuming
+    
+    Finally! For a very long time, our MST helpers have had one very
+    annoying issue: They don't know how to reprobe the topology state when
+    coming out of suspend. This means that if a user has a machine connected
+    to an MST topology and decides to suspend their machine, we lose all
+    topology changes that happened during that period. That can be a big
+    problem if the machine was connected to a different topology on the same
+    port before resuming, as we won't bother reprobing any of the ports and
+    likely cause the user's monitors not to come back up as expected.
+    
+    So, we start fixing this by teaching our MST helpers how to reprobe the
+    link addresses of each connected topology when resuming. As it turns
+    out, the behavior that we want here is identical to the behavior we want
+    when initially probing a newly connected MST topology, with a couple of
+    important differences:
+    
+    - We need to be more careful about handling the potential races between
+      events from the MST hub that could change the topology state as we're
+      performing the link address reprobe
+    - We need to be more careful about handling unlikely state changes on
+      ports - such as an input port turning into an output port, something
+      that would be far more likely to happen in situations like the MST hub
+      we're connected to being changed while we're suspend
+    
+    Both of which have been solved by previous commits. That leaves one
+    requirement:
+    
+    - We need to prune any MST ports in our in-memory topology state that
+      were present when suspending, but have not appeared in the post-resume
+      link address response from their parent branch device
+    
+    Which we can now handle in this commit by modifying
+    drm_dp_send_link_address(). We then introduce suspend/resume reprobing
+    by introducing drm_dp_mst_topology_mgr_invalidate_mstb(), which we call
+    in drm_dp_mst_topology_mgr_suspend() to traverse the in-memory topology
+    state to indicate that each mstb needs it's link address resent and PBN
+    resources reprobed.
+    
+    On resume, we start back up &mgr->work and have it reprobe the topology
+    in the same way we would on a hotplug, removing any leftover ports that
+    no longer appear in the topology state.
+    
+    Changes since v4:
+    * Split indenting changes in drm_dp_mst_topology_mgr_resume() into a
+      separate patch
+    * Only fire hotplugs when something has actually changed after a link
+      address probe
+    * Don't try to change port->connector at all on ports, just throw out
+      ports that need their connectors removed to make things easier.
+    
+    Cc: Juston Li <juston.li@intel.com>
+    Cc: Imre Deak <imre.deak@intel.com>
+    Cc: Ville Syrjälä <ville.syrjala@linux.intel.com>
+    Cc: Harry Wentland <hwentlan@amd.com>
+    Cc: Daniel Vetter <daniel.vetter@ffwll.ch>
+    Reviewed-by: Sean Paul <sean@poorly.run>
+    Signed-off-by: Lyude Paul <lyude@redhat.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20191022023641.8026-14-lyude@redhat.com
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index fd142db42cb0..144027e27464 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -706,7 +706,8 @@ void drm_dp_mst_dump_topology(struct seq_file *m,
+ 
+ void drm_dp_mst_topology_mgr_suspend(struct drm_dp_mst_topology_mgr *mgr);
+ int __must_check
+-drm_dp_mst_topology_mgr_resume(struct drm_dp_mst_topology_mgr *mgr);
++drm_dp_mst_topology_mgr_resume(struct drm_dp_mst_topology_mgr *mgr,
++			       bool sync);
+ 
+ ssize_t drm_dp_mst_dpcd_read(struct drm_dp_aux *aux,
+ 			     unsigned int offset, void *buffer, size_t size);
+
+commit 3f9b3f02dda501ea1889d773d547dcff12a3f7bb
+Author: Lyude Paul <lyude@redhat.com>
+Date:   Mon Jun 17 17:59:29 2019 -0400
+
+    drm/dp_mst: Protect drm_dp_mst_port members with locking
+    
+    This is a complicated one. Essentially, there's currently a problem in the MST
+    core that hasn't really caused any issues that we're aware of (emphasis on "that
+    we're aware of"): locking.
+    
+    When we go through and probe the link addresses and path resources in a
+    topology, we hold no locks when updating ports with said information. The
+    members I'm referring to in particular are:
+    
+    - ldps
+    - ddps
+    - mcs
+    - pdt
+    - dpcd_rev
+    - num_sdp_streams
+    - num_sdp_stream_sinks
+    - available_pbn
+    - input
+    - connector
+    
+    Now that we're handling UP requests asynchronously and will be using some of
+    the struct members mentioned above in atomic modesetting in the future for
+    features such as PBN validation, this is going to become a lot more important.
+    As well, the next few commits that prepare us for and introduce suspend/resume
+    reprobing will also need clear locking in order to prevent from additional
+    racing hilarities that we never could have hit in the past.
+    
+    So, let's solve this issue by using &mgr->base.lock, the modesetting
+    lock which currently only protects &mgr->base.state. This works
+    perfectly because it allows us to avoid blocking connection_mutex
+    unnecessarily, and we can grab this in connector detection paths since
+    it's a ww mutex. We start by having drm_dp_mst_handle_up_req() hold this
+    when updating ports. For drm_dp_mst_handle_link_address_port() things
+    are a bit more complicated. As I've learned the hard way, we can grab
+    &mgr->lock.base for everything except for port->connector. See, our
+    normal driver probing paths end up generating this rather obvious
+    lockdep chain:
+    
+    &drm->mode_config.mutex
+      -> crtc_ww_class_mutex/crtc_ww_class_acquire
+        -> &connector->mutex
+    
+    However, sysfs grabs &drm->mode_config.mutex in order to protect itself
+    from connector state changing under it. Because this entails grabbing
+    kn->count, e.g. the lock that the kernel provides for protecting sysfs
+    contexts, we end up grabbing kn->count followed by
+    &drm->mode_config.mutex. This ends up creating an extremely rude chain:
+    
+    &kn->count
+      -> &drm->mode_config.mutex
+        -> crtc_ww_class_mutex/crtc_ww_class_acquire
+          -> &connector->mutex
+    
+    I mean, look at that thing! It's just evil!!! This gross thing ends up
+    making any calls to drm_connector_register()/drm_connector_unregister()
+    impossible when holding any kind of modesetting lock. This is annoying
+    because ideally, we always want to ensure that
+    drm_dp_mst_port->connector never changes when doing an atomic commit or
+    check that would affect the atomic topology state so that it can
+    reliably and easily be used from future DRM DP MST helpers to assist
+    with tasks such as scanning through the current VCPI allocations and
+    adding connectors which need to have their allocations updated in
+    response to a bandwidth change or the like.
+    
+    Being able to hold &mgr->base.lock throughout the entire link probe
+    process would have been _great_, since we could prevent userspace from
+    ever seeing any states in-between individual port changes and as a
+    result likely end up with a much faster probe and more consistent
+    results from said probes. But without some rework of how we handle
+    connector probing in sysfs it's not at all currently possible. In the
+    future, maybe we can try using the sysfs locks to protect updates to
+    connector probing state and fix this mess.
+    
+    So for now, to protect everything other than port->connector under
+    &mgr->base.lock and ensure that we still have the guarantee that atomic
+    check/commit contexts will never see port->connector change we use a
+    silly trick. See: port->connector only needs to change in order to
+    ensure that input ports (see the MST spec) never have a ghost connector
+    associated with them. But, there's nothing stopping us from simply
+    throwing the entire port out and creating a new one in order to maintain
+    that requirement while still keeping port->connector consistent across
+    the lifetime of the port in atomic check/commit contexts. For all
+    intended purposes this works fine, as we validate ports in any contexts
+    we care about before using them and as such will end up reporting the
+    connector as disconnected until it's port's destruction finalizes. So,
+    we just do that in cases where we detect port->input has transitioned
+    from true->false. We don't need to worry about the other direction,
+    since a port without a connector isn't visible to userspace and as such
+    doesn't need to be protected by &mgr->base.lock until we finish
+    registering a connector for it.
+    
+    For updating members of drm_dp_mst_port other than port->connector, we
+    simply grab &mgr->base.lock in drm_dp_mst_link_probe_work() for already
+    registered ports, update said members and drop the lock before
+    potentially registering a connector and probing the link address of it's
+    children.
+    
+    Finally, we modify drm_dp_mst_detect_port() to take a modesetting lock
+    acquisition context in order to acquire &mgr->base.lock under
+    &connection_mutex and convert all it's users over to using the
+    .detect_ctx probe hooks.
+    
+    With that, we finally have well defined locking.
+    
+    Changes since v4:
+    * Get rid of port->mutex, stop using connection_mutex and just use our own
+      modesetting lock - mgr->base.lock. Also, add a probe_lock that comes
+      before this patch.
+    * Just throw out ports that get changed from an output to an input, and
+      replace them with new ports. This lets us ensure that modesetting
+      contexts never see port->connector go from having a connector to being
+      NULL.
+    * Write an extremely detailed explanation of what problems this is
+      trying to fix, since there's a _lot_ of context here and I honestly
+      forgot some of it myself a couple times.
+    * Don't grab mgr->lock when reading port->mstb in
+      drm_dp_mst_handle_link_address_port(). It's not needed.
+    
+    Cc: Juston Li <juston.li@intel.com>
+    Cc: Imre Deak <imre.deak@intel.com>
+    Cc: Ville Syrjälä <ville.syrjala@linux.intel.com>
+    Cc: Harry Wentland <hwentlan@amd.com>
+    Cc: Daniel Vetter <daniel.vetter@ffwll.ch>
+    Reviewed-by: Sean Paul <sean@poorly.run>
+    Signed-off-by: Lyude Paul <lyude@redhat.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20191022023641.8026-7-lyude@redhat.com
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index bccb5514e0ef..fd142db42cb0 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -45,21 +45,31 @@ struct drm_dp_vcpi {
+ /**
+  * struct drm_dp_mst_port - MST port
+  * @port_num: port number
+- * @input: if this port is an input port.
+- * @mcs: message capability status - DP 1.2 spec.
+- * @ddps: DisplayPort Device Plug Status - DP 1.2
+- * @pdt: Peer Device Type
+- * @ldps: Legacy Device Plug Status
+- * @dpcd_rev: DPCD revision of device on this port
+- * @num_sdp_streams: Number of simultaneous streams
+- * @num_sdp_stream_sinks: Number of stream sinks
+- * @available_pbn: Available bandwidth for this port.
++ * @input: if this port is an input port. Protected by
++ * &drm_dp_mst_topology_mgr.base.lock.
++ * @mcs: message capability status - DP 1.2 spec. Protected by
++ * &drm_dp_mst_topology_mgr.base.lock.
++ * @ddps: DisplayPort Device Plug Status - DP 1.2. Protected by
++ * &drm_dp_mst_topology_mgr.base.lock.
++ * @pdt: Peer Device Type. Protected by
++ * &drm_dp_mst_topology_mgr.base.lock.
++ * @ldps: Legacy Device Plug Status. Protected by
++ * &drm_dp_mst_topology_mgr.base.lock.
++ * @dpcd_rev: DPCD revision of device on this port. Protected by
++ * &drm_dp_mst_topology_mgr.base.lock.
++ * @num_sdp_streams: Number of simultaneous streams. Protected by
++ * &drm_dp_mst_topology_mgr.base.lock.
++ * @num_sdp_stream_sinks: Number of stream sinks. Protected by
++ * &drm_dp_mst_topology_mgr.base.lock.
++ * @available_pbn: Available bandwidth for this port. Protected by
++ * &drm_dp_mst_topology_mgr.base.lock.
+  * @next: link to next port on this branch device
+  * @aux: i2c aux transport to talk to device connected to this port, protected
+- * by &drm_dp_mst_topology_mgr.lock
++ * by &drm_dp_mst_topology_mgr.base.lock.
+  * @parent: branch device parent of this port
+  * @vcpi: Virtual Channel Payload info for this port.
+- * @connector: DRM connector this port is connected to.
++ * @connector: DRM connector this port is connected to. Protected by
++ * &drm_dp_mst_topology_mgr.base.lock.
+  * @mgr: topology manager this port lives under.
+  *
+  * This structure represents an MST port endpoint on a device somewhere
+@@ -653,7 +663,11 @@ int drm_dp_mst_topology_mgr_set_mst(struct drm_dp_mst_topology_mgr *mgr, bool ms
+ int drm_dp_mst_hpd_irq(struct drm_dp_mst_topology_mgr *mgr, u8 *esi, bool *handled);
+ 
+ 
+-enum drm_connector_status drm_dp_mst_detect_port(struct drm_connector *connector, struct drm_dp_mst_topology_mgr *mgr, struct drm_dp_mst_port *port);
++int
++drm_dp_mst_detect_port(struct drm_connector *connector,
++		       struct drm_modeset_acquire_ctx *ctx,
++		       struct drm_dp_mst_topology_mgr *mgr,
++		       struct drm_dp_mst_port *port);
+ 
+ bool drm_dp_mst_port_has_audio(struct drm_dp_mst_topology_mgr *mgr,
+ 					struct drm_dp_mst_port *port);
+
+commit 14692a3637d4f1cd8ccdb8c605222037b3ac3494
+Author: Lyude Paul <lyude@redhat.com>
+Date:   Wed Oct 16 16:02:59 2019 -0400
+
+    drm/dp_mst: Add probe_lock
+    
+    Currently, MST lacks locking in a lot of places that really should have
+    some sort of locking. Hotplugging and link address code paths are some
+    of the offenders here, as there is actually nothing preventing us from
+    running a link address probe while at the same time handling a
+    connection status update request - something that's likely always been
+    possible but never seen in the wild because hotplugging has been broken
+    for ages now (with the exception of amdgpu, for reasons I don't think
+    are worth digging into very far).
+    
+    Note: I'm going to start using the term "in-memory topology layout" here
+    to refer to drm_dp_mst_port->mstb and drm_dp_mst_branch->ports.
+    
+    Locking in these places is a little tougher then it looks though.
+    Generally we protect anything having to do with the in-memory topology
+    layout under &mgr->lock. But this becomes nearly impossible to do from
+    the context of link address probes due to the fact that &mgr->lock is
+    usually grabbed under random various modesetting locks, meaning that
+    there's no way we can just invert the &mgr->lock order and keep it
+    locked throughout the whole process of updating the topology.
+    
+    Luckily there are only two workers which can modify the in-memory
+    topology layout: drm_dp_mst_up_req_work() and
+    drm_dp_mst_link_probe_work(), meaning as long as we prevent these two
+    workers from traveling the topology layout in parallel with the intent
+    of updating it we don't need to worry about grabbing &mgr->lock in these
+    workers for reads. We only need to grab &mgr->lock in these workers for
+    writes, so that readers outside these two workers are still protected
+    from the topology layout changing beneath them.
+    
+    So, add the new &mgr->probe_lock and use it in both
+    drm_dp_mst_link_probe_work() and drm_dp_mst_up_req_work(). Additionally,
+    add some more detailed explanations for how this locking is intended to
+    work to drm_dp_mst_port->mstb and drm_dp_mst_branch->ports.
+    
+    Signed-off-by: Lyude Paul <lyude@redhat.com>
+    Reviewed-by: Sean Paul <sean@poorly.run>
+    Cc: Juston Li <juston.li@intel.com>
+    Cc: Imre Deak <imre.deak@intel.com>
+    Cc: Ville Syrjälä <ville.syrjala@linux.intel.com>
+    Cc: Harry Wentland <hwentlan@amd.com>
+    Cc: Daniel Vetter <daniel.vetter@ffwll.ch>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20191022023641.8026-6-lyude@redhat.com
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index 7d80c38ee00e..bccb5514e0ef 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -55,8 +55,6 @@ struct drm_dp_vcpi {
+  * @num_sdp_stream_sinks: Number of stream sinks
+  * @available_pbn: Available bandwidth for this port.
+  * @next: link to next port on this branch device
+- * @mstb: branch device on this port, protected by
+- * &drm_dp_mst_topology_mgr.lock
+  * @aux: i2c aux transport to talk to device connected to this port, protected
+  * by &drm_dp_mst_topology_mgr.lock
+  * @parent: branch device parent of this port
+@@ -92,7 +90,17 @@ struct drm_dp_mst_port {
+ 	u8 num_sdp_stream_sinks;
+ 	uint16_t available_pbn;
+ 	struct list_head next;
+-	struct drm_dp_mst_branch *mstb; /* pointer to an mstb if this port has one */
++	/**
++	 * @mstb: the branch device connected to this port, if there is one.
++	 * This should be considered protected for reading by
++	 * &drm_dp_mst_topology_mgr.lock. There are two exceptions to this:
++	 * &drm_dp_mst_topology_mgr.up_req_work and
++	 * &drm_dp_mst_topology_mgr.work, which do not grab
++	 * &drm_dp_mst_topology_mgr.lock during reads but are the only
++	 * updaters of this list and are protected from writing concurrently
++	 * by &drm_dp_mst_topology_mgr.probe_lock.
++	 */
++	struct drm_dp_mst_branch *mstb;
+ 	struct drm_dp_aux aux; /* i2c bus for this port? */
+ 	struct drm_dp_mst_branch *parent;
+ 
+@@ -118,7 +126,6 @@ struct drm_dp_mst_port {
+  * @lct: Link count total to talk to this branch device.
+  * @num_ports: number of ports on the branch.
+  * @msg_slots: one bit per transmitted msg slot.
+- * @ports: linked list of ports on this branch.
+  * @port_parent: pointer to the port parent, NULL if toplevel.
+  * @mgr: topology manager for this branch device.
+  * @tx_slots: transmission slots for this device.
+@@ -156,6 +163,16 @@ struct drm_dp_mst_branch {
+ 	int num_ports;
+ 
+ 	int msg_slots;
++	/**
++	 * @ports: the list of ports on this branch device. This should be
++	 * considered protected for reading by &drm_dp_mst_topology_mgr.lock.
++	 * There are two exceptions to this:
++	 * &drm_dp_mst_topology_mgr.up_req_work and
++	 * &drm_dp_mst_topology_mgr.work, which do not grab
++	 * &drm_dp_mst_topology_mgr.lock during reads but are the only
++	 * updaters of this list and are protected from updating the list
++	 * concurrently by @drm_dp_mst_topology_mgr.probe_lock
++	 */
+ 	struct list_head ports;
+ 
+ 	/* list of tx ops queue for this port */
+@@ -502,6 +519,13 @@ struct drm_dp_mst_topology_mgr {
+ 	 */
+ 	struct mutex lock;
+ 
++	/**
++	 * @probe_lock: Prevents @work and @up_req_work, the only writers of
++	 * &drm_dp_mst_port.mstb and &drm_dp_mst_branch.ports, from racing
++	 * while they update the topology.
++	 */
++	struct mutex probe_lock;
++
+ 	/**
+ 	 * @mst_state: If this manager is enabled for an MST capable port. False
+ 	 * if no MST sink/branch devices is connected.
+
+commit 9408cc94eb041d0c2f9f00189a613b94c0449450
+Author: Lyude Paul <lyude@redhat.com>
+Date:   Mon Jun 17 16:37:18 2019 -0400
+
+    drm/dp_mst: Handle UP requests asynchronously
+    
+    Once upon a time, hotplugging devices on MST branches actually worked in
+    DRM. Now, it only works in amdgpu (likely because of how it's hotplug
+    handlers are implemented). On both i915 and nouveau, hotplug
+    notifications from MST branches are noticed - but trying to respond to
+    them causes messaging timeouts and causes the whole topology state to go
+    out of sync with reality, usually resulting in the user needing to
+    replug the entire topology in hopes that it actually fixes things.
+    
+    The reason for this is because the way we currently handle UP requests
+    in MST is completely bogus. drm_dp_mst_handle_up_req() is called from
+    drm_dp_mst_hpd_irq(), which is usually called from the driver's hotplug
+    handler. Because we handle sending the hotplug event from this function,
+    we actually cause the driver's hotplug handler (and in turn, all
+    sideband transactions) to block on
+    drm_device->mode_config.connection_mutex. This makes it impossible to
+    send any sideband messages from the driver's connector probing
+    functions, resulting in the aforementioned sideband message timeout.
+    
+    There's even more problems with this beyond breaking hotplugging on MST
+    branch devices. It also makes it almost impossible to protect
+    drm_dp_mst_port struct members under a lock because we then have to
+    worry about dealing with all of the lock dependency issues that ensue.
+    
+    So, let's finally actually fix this issue by handling the processing of
+    up requests asyncronously. This way we can send sideband messages from
+    most contexts without having to deal with getting blocked if we hold
+    connection_mutex. This also fixes MST branch device hotplugging on i915,
+    finally!
+    
+    Cc: Juston Li <juston.li@intel.com>
+    Cc: Imre Deak <imre.deak@intel.com>
+    Cc: Ville Syrjälä <ville.syrjala@linux.intel.com>
+    Cc: Harry Wentland <hwentlan@amd.com>
+    Cc: Daniel Vetter <daniel.vetter@ffwll.ch>
+    Reviewed-by: Sean Paul <sean@poorly.run>
+    Signed-off-by: Lyude Paul <lyude@redhat.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20191022023641.8026-5-lyude@redhat.com
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index 8ba2a01324bb..7d80c38ee00e 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -597,6 +597,22 @@ struct drm_dp_mst_topology_mgr {
+ 	 * devices, needed to avoid locking inversion.
+ 	 */
+ 	struct work_struct delayed_destroy_work;
++
++	/**
++	 * @up_req_list: List of pending up requests from the topology that
++	 * need to be processed, in chronological order.
++	 */
++	struct list_head up_req_list;
++	/**
++	 * @up_req_lock: Protects @up_req_list
++	 */
++	struct mutex up_req_lock;
++	/**
++	 * @up_req_work: Work item to process up requests received from the
++	 * topology. Needed to avoid blocking hotplug handling and sideband
++	 * transmissions.
++	 */
++	struct work_struct up_req_work;
+ };
+ 
+ int drm_dp_mst_topology_mgr_init(struct drm_dp_mst_topology_mgr *mgr,
+
+commit c485e2c97dae4e13f239ccad455070e99213dd4b
+Author: Lyude Paul <lyude@redhat.com>
+Date:   Wed Mar 13 13:51:41 2019 -0400
+
+    drm/dp_mst: Refactor pdt setup/teardown, add more locking
+    
+    Since we're going to be implementing suspend/resume reprobing very soon,
+    we need to make sure we are extra careful to ensure that our locking
+    actually protects the topology state where we expect it to. Turns out
+    this isn't the case with drm_dp_port_setup_pdt() and
+    drm_dp_port_teardown_pdt(), both of which change port->mstb without
+    grabbing &mgr->lock.
+    
+    Additionally, since most callers of these functions are just using it to
+    teardown the port's previous PDT and setup a new one we can simplify
+    things a bit and combine drm_dp_port_setup_pdt() and
+    drm_dp_port_teardown_pdt() into a single function:
+    drm_dp_port_set_pdt(). This function also handles actually ensuring that
+    we grab the correct locks when we need to modify port->mstb.
+    
+    Cc: Juston Li <juston.li@intel.com>
+    Cc: Imre Deak <imre.deak@intel.com>
+    Cc: Ville Syrjälä <ville.syrjala@linux.intel.com>
+    Cc: Harry Wentland <hwentlan@amd.com>
+    Cc: Daniel Vetter <daniel.vetter@ffwll.ch>
+    Reviewed-by: Sean Paul <sean@poorly.run>
+    Signed-off-by: Lyude Paul <lyude@redhat.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20191022023641.8026-4-lyude@redhat.com
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index b2160c366fb7..8ba2a01324bb 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -55,8 +55,10 @@ struct drm_dp_vcpi {
+  * @num_sdp_stream_sinks: Number of stream sinks
+  * @available_pbn: Available bandwidth for this port.
+  * @next: link to next port on this branch device
+- * @mstb: branch device attach below this port
+- * @aux: i2c aux transport to talk to device connected to this port.
++ * @mstb: branch device on this port, protected by
++ * &drm_dp_mst_topology_mgr.lock
++ * @aux: i2c aux transport to talk to device connected to this port, protected
++ * by &drm_dp_mst_topology_mgr.lock
+  * @parent: branch device parent of this port
+  * @vcpi: Virtual Channel Payload info for this port.
+  * @connector: DRM connector this port is connected to.
+
+commit 7cb12d48314eabdaaf30e4b3275f04811b458ed3
+Author: Lyude Paul <lyude@redhat.com>
+Date:   Tue Feb 19 17:41:02 2019 -0500
+
+    drm/dp_mst: Destroy MSTBs asynchronously
+    
+    When reprobing an MST topology during resume, we have to account for the
+    fact that while we were suspended it's possible that mstbs may have been
+    removed from any ports in the topology. Since iterating downwards in the
+    topology requires that we hold &mgr->lock, destroying MSTBs from this
+    context would result in attempting to lock &mgr->lock a second time and
+    deadlocking.
+    
+    So, fix this by first moving destruction of MSTBs into
+    destroy_connector_work, then rename destroy_connector_work and friends
+    to reflect that they now destroy both ports and mstbs.
+    
+    Note that even though this means that MSTBs will still be accessible for
+    a short period of time between their removal from the topology and
+    delayed destruction, we are still protected against referencing a MSTB
+    with a refcount of 0 since we use kref_get_unless_zero() in most places.
+    
+    Changes since v1:
+    * s/destroy_connector_list/destroy_port_list/
+      s/connector_destroy_lock/delayed_destroy_lock/
+      s/connector_destroy_work/delayed_destroy_work/
+      s/drm_dp_finish_destroy_branch_device/drm_dp_delayed_destroy_mstb/
+      s/drm_dp_finish_destroy_port/drm_dp_delayed_destroy_port/
+      - danvet
+    * Use two loops in drm_dp_delayed_destroy_work() - danvet
+    * Better explain why we need to do this - danvet
+    * Use cancel_work_sync() instead of flush_work() - flush_work() doesn't
+      account for work requeing
+    
+    Cc: Juston Li <juston.li@intel.com>
+    Cc: Imre Deak <imre.deak@intel.com>
+    Cc: Ville Syrjälä <ville.syrjala@linux.intel.com>
+    Cc: Harry Wentland <hwentlan@amd.com>
+    Cc: Daniel Vetter <daniel@ffwll.ch>
+    Reviewed-by: Sean Paul <sean@poorly.run>
+    Signed-off-by: Lyude Paul <lyude@redhat.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20191022023641.8026-2-lyude@redhat.com
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index 4a25e0577ae0..b2160c366fb7 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -143,6 +143,12 @@ struct drm_dp_mst_branch {
+ 	 */
+ 	struct kref malloc_kref;
+ 
++	/**
++	 * @destroy_next: linked-list entry used by
++	 * drm_dp_delayed_destroy_work()
++	 */
++	struct list_head destroy_next;
++
+ 	u8 rad[8];
+ 	u8 lct;
+ 	int num_ports;
+@@ -571,18 +577,24 @@ struct drm_dp_mst_topology_mgr {
+ 	struct work_struct tx_work;
+ 
+ 	/**
+-	 * @destroy_connector_list: List of to be destroyed connectors.
++	 * @destroy_port_list: List of to be destroyed connectors.
++	 */
++	struct list_head destroy_port_list;
++	/**
++	 * @destroy_branch_device_list: List of to be destroyed branch
++	 * devices.
+ 	 */
+-	struct list_head destroy_connector_list;
++	struct list_head destroy_branch_device_list;
+ 	/**
+-	 * @destroy_connector_lock: Protects @connector_list.
++	 * @delayed_destroy_lock: Protects @destroy_port_list and
++	 * @destroy_branch_device_list.
+ 	 */
+-	struct mutex destroy_connector_lock;
++	struct mutex delayed_destroy_lock;
+ 	/**
+-	 * @destroy_connector_work: Work item to destroy connectors. Needed to
+-	 * avoid locking inversion.
++	 * @delayed_destroy_work: Work item to destroy MST port and branch
++	 * devices, needed to avoid locking inversion.
+ 	 */
+-	struct work_struct destroy_connector_work;
++	struct work_struct delayed_destroy_work;
+ };
+ 
+ int drm_dp_mst_topology_mgr_init(struct drm_dp_mst_topology_mgr *mgr,
+
+commit 857833698536b9abc1540e9df25d32697b9b25c0
+Author: Lyude Paul <lyude@redhat.com>
+Date:   Tue Sep 3 16:45:56 2019 -0400
+
+    drm/dp_mst: Remove lies in {up, down}_rep_recv documentation
+    
+    These are most certainly accessed from far more than the mgr work. In
+    fact, up_req_recv is -only- ever accessed from outside the mgr work.
+    
+    Cc: Juston Li <juston.li@intel.com>
+    Cc: Imre Deak <imre.deak@intel.com>
+    Cc: Ville Syrjälä <ville.syrjala@linux.intel.com>
+    Cc: Harry Wentland <hwentlan@amd.com>
+    Cc: Daniel Vetter <daniel.vetter@ffwll.ch>
+    Signed-off-by: Lyude Paul <lyude@redhat.com>
+    Reviewed-by: Sean Paul <sean@poorly.run>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20190903204645.25487-19-lyude@redhat.com
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index f09dabd595a5..4a25e0577ae0 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -481,15 +481,11 @@ struct drm_dp_mst_topology_mgr {
+ 	int conn_base_id;
+ 
+ 	/**
+-	 * @down_rep_recv: Message receiver state for down replies. This and
+-	 * @up_req_recv are only ever access from the work item, which is
+-	 * serialised.
++	 * @down_rep_recv: Message receiver state for down replies.
+ 	 */
+ 	struct drm_dp_sideband_msg_rx down_rep_recv;
+ 	/**
+-	 * @up_req_recv: Message receiver state for up requests. This and
+-	 * @down_rep_recv are only ever access from the work item, which is
+-	 * serialised.
++	 * @up_req_recv: Message receiver state for up requests.
+ 	 */
+ 	struct drm_dp_sideband_msg_rx up_req_recv;
+ 
+
+commit 2f015ec6eab69301fdcf54d397810d72362d7223
+Author: Lyude Paul <lyude@redhat.com>
+Date:   Tue Sep 3 16:45:45 2019 -0400
+
+    drm/dp_mst: Add sideband down request tracing + selftests
+    
+    Unfortunately the DP MST helpers do not have much in the way of
+    debugging utilities. So, let's add some!
+    
+    This adds basic debugging output for down sideband requests that we send
+    from the driver, so that we can actually discern what's happening when
+    sideband requests timeout.
+    
+    Since there wasn't really a good way of testing that any of this worked,
+    I ended up writing simple selftests that lightly test sideband message
+    encoding and decoding as well. Enjoy!
+    
+    Changes since v1:
+    * Clean up DO_TEST() and sideband_msg_req_encode_decode() - danvet
+    * Get rid of pr_fmt(), just define a prefix string instead and use
+      drm_printf()
+    * Check highest bit of VCPI in drm_dp_decode_sideband_req() - danvet
+    * Make the switch case order between drm_dp_decode_sideband_req() and
+      drm_dp_encode_sideband_req() the same - danvet
+    * Only check DRM_UT_DP - danvet
+    * Clean up sideband_msg_req_equal() from selftests a bit, and add
+      comments explaining why we can't just use memcmp - danvet
+    
+    Cc: Juston Li <juston.li@intel.com>
+    Cc: Imre Deak <imre.deak@intel.com>
+    Cc: Ville Syrjälä <ville.syrjala@linux.intel.com>
+    Cc: Harry Wentland <hwentlan@amd.com>
+    Reviewed-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+    Signed-off-by: Lyude Paul <lyude@redhat.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20190903204645.25487-8-lyude@redhat.com
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index fc349204a71b..f09dabd595a5 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -287,7 +287,7 @@ struct drm_dp_remote_dpcd_write {
+ struct drm_dp_remote_i2c_read {
+ 	u8 num_transactions;
+ 	u8 port_number;
+-	struct {
++	struct drm_dp_remote_i2c_read_tx {
+ 		u8 i2c_dev_id;
+ 		u8 num_bytes;
+ 		u8 *bytes;
+
+commit 268de6530aa18fe5773062367fd119f0045f6e88
+Author: Sean Paul <seanpaul@chromium.org>
+Date:   Thu Aug 29 12:52:19 2019 -0400
+
+    drm: mst: Fix query_payload ack reply struct
+    
+    Spec says[1] Allocated_PBN is 16 bits
+    
+    [1]- DisplayPort 1.2 Spec, Section 2.11.9.8, Table 2-98
+    
+    Fixes: ad7f8a1f9ced ("drm/helper: add Displayport multi-stream helper (v0.6)")
+    Cc: Lyude Paul <lyude@redhat.com>
+    Cc: Todd Previte <tprevite@gmail.com>
+    Cc: Dave Airlie <airlied@redhat.com>
+    Cc: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+    Cc: Maxime Ripard <maxime.ripard@bootlin.com>
+    Cc: Sean Paul <sean@poorly.run>
+    Cc: David Airlie <airlied@linux.ie>
+    Cc: Daniel Vetter <daniel@ffwll.ch>
+    Cc: dri-devel@lists.freedesktop.org
+    Reviewed-by: Lyude Paul <lyude@redhat.com>
+    Signed-off-by: Sean Paul <seanpaul@chromium.org>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20190829165223.129662-1-sean@poorly.run
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index 2ba6253ea6d3..fc349204a71b 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -334,7 +334,7 @@ struct drm_dp_resource_status_notify {
+ 
+ struct drm_dp_query_payload_ack_reply {
+ 	u8 port_number;
+-	u8 allocated_pbn;
++	u16 allocated_pbn;
+ };
+ 
+ struct drm_dp_sideband_msg_req_body {
+
+commit 562836a269e363cdb74b551e3be7021c9d228378
+Author: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Date:   Tue Jul 23 19:28:01 2019 -0400
+
+    drm/dp_mst: Enable registration of AUX devices for MST ports
+    
+    All available downstream ports - physical and logical - are exposed for
+    each MST device. They are listed in /dev/, following the same naming
+    scheme as SST devices by appending an incremental ID.
+    
+    Although all downstream ports are exposed, only some will work as
+    expected. Consider the following topology:
+    
+                   +---------+
+                   |  ASIC   |
+                   +---------+
+                  Conn-0|
+                        |
+                   +----v----+
+              +----| MST HUB |----+
+              |    +---------+    |
+              |                   |
+              |Port-1       Port-2|
+        +-----v-----+       +-----v-----+
+        |  MST      |       |  SST      |
+        |  Display  |       |  Display  |
+        +-----------+       +-----------+
+              |Port-1
+              x
+    
+     MST Path  | MST Device
+     ----------+----------------------------------
+     sst:0     | MST Hub
+     mst:0-1   | MST Display
+     mst:0-1-1 | MST Display's disconnected DP out
+     mst:0-1-8 | MST Display's internal sink
+     mst:0-2   | SST Display
+    
+    On certain MST displays, the upstream physical port will ACK DPCD reads.
+    However, reads on the local logical port to the internal sink will
+    *NAK*. i.e. reading mst:0-1 ACKs, but mst:0-1-8 NAKs.
+    
+    There may also be duplicates. Some displays will return the same GUID
+    when reading DPCD from both mst:0-1 and mst:0-1-8.
+    
+    There are some device-dependent behavior as well. The MST hub used
+    during testing will actually *ACK* read requests on a disconnected
+    physical port, whereas the MST displays will NAK.
+    
+    In light of these discrepancies, it's simpler to expose all downstream
+    ports - both physical and logical - and let the user decide what to use.
+    
+    v3 changes:
+    * Change WARN_ON_ONCE -> DRM_ERROR on dpcd read errors
+    * Docstring and cosmetic fixes
+    
+    v2 changes:
+    
+    Moved remote aux device (un)registration to new mst connector late
+    register and early unregister helpers. Drivers should call these from
+    their own mst connector function hooks.
+    
+    This is to solve an issue during driver unload, where mst connector
+    devices are unregistered before the remote aux devices are. In a setup
+    where aux devices are created as children of connector devices, the aux
+    device would be removed too early, and uncleanly. Doing so in
+    early_unregister solves this issue, as that is called before connector
+    unregistration.
+    
+    Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+    Signed-off-by: Leo Li <sunpeng.li@amd.com>
+    Reviewed-by: Lyude Paul <lyude@redhat.com>
+    Signed-off-by: Harry Wentland <harry.wentland@amd.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20190723232808.28128-3-sunpeng.li@amd.com
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index 8c97a5f92c47..2ba6253ea6d3 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -643,6 +643,17 @@ void drm_dp_mst_dump_topology(struct seq_file *m,
+ void drm_dp_mst_topology_mgr_suspend(struct drm_dp_mst_topology_mgr *mgr);
+ int __must_check
+ drm_dp_mst_topology_mgr_resume(struct drm_dp_mst_topology_mgr *mgr);
++
++ssize_t drm_dp_mst_dpcd_read(struct drm_dp_aux *aux,
++			     unsigned int offset, void *buffer, size_t size);
++ssize_t drm_dp_mst_dpcd_write(struct drm_dp_aux *aux,
++			      unsigned int offset, void *buffer, size_t size);
++
++int drm_dp_mst_connector_late_register(struct drm_connector *connector,
++				       struct drm_dp_mst_port *port);
++void drm_dp_mst_connector_early_unregister(struct drm_connector *connector,
++					   struct drm_dp_mst_port *port);
++
+ struct drm_dp_mst_topology_state *drm_atomic_get_mst_topology_state(struct drm_atomic_state *state,
+ 								    struct drm_dp_mst_topology_mgr *mgr);
+ int __must_check
+
+commit c06de56121e3ac0f0f1f4a081c041654ffcacd62
+Merge: 8d451a4b6e9f a3b22b9f11d9
+Author: Dave Airlie <airlied@redhat.com>
+Date:   Mon Feb 18 13:27:15 2019 +1000
+
+    Merge v5.0-rc7 into drm-next
+    
+    Backmerging for nouveau and imx that needed some fixes for next pulls.
+    
+    Signed-off-by: Dave Airlie <airlied@redhat.com>
+
+commit eceae147246749c6dbaeefda802b30f804a3c54c
+Author: Lyude Paul <lyude@redhat.com>
+Date:   Thu Jan 10 19:53:41 2019 -0500
+
+    drm/dp_mst: Start tracking per-port VCPI allocations
+    
+    There has been a TODO waiting for quite a long time in
+    drm_dp_mst_topology.c:
+    
+            /* We cannot rely on port->vcpi.num_slots to update
+             * topology_state->avail_slots as the port may not exist if the parent
+             * branch device was unplugged. This should be fixed by tracking
+             * per-port slot allocation in drm_dp_mst_topology_state instead of
+             * depending on the caller to tell us how many slots to release.
+             */
+    
+    That's not the only reason we should fix this: forcing the driver to
+    track the VCPI allocations throughout a state's atomic check is
+    error prone, because it means that extra care has to be taken with the
+    order that drm_dp_atomic_find_vcpi_slots() and
+    drm_dp_atomic_release_vcpi_slots() are called in in order to ensure
+    idempotency. Currently the only driver actually using these helpers,
+    i915, doesn't even do this correctly: multiple ->best_encoder() checks
+    with i915's current implementation would not be idempotent and would
+    over-allocate VCPI slots, something I learned trying to implement
+    fallback retraining in MST.
+    
+    So: simplify this whole mess, and teach drm_dp_atomic_find_vcpi_slots()
+    and drm_dp_atomic_release_vcpi_slots() to track the VCPI allocations for
+    each port. This allows us to ensure idempotency without having to rely
+    on the driver as much. Additionally: the driver doesn't need to do any
+    kind of VCPI slot tracking anymore if it doesn't need it for it's own
+    internal state.
+    
+    Additionally; this adds a new drm_dp_mst_atomic_check() helper which
+    must be used by atomic drivers to perform validity checks for the new
+    VCPI allocations incurred by a state.
+    
+    Also: update the documentation and make it more obvious that these
+    /must/ be called by /all/ atomic drivers supporting MST.
+    
+    Changes since v9:
+    * Add some missing changes that were requested by danvet that I forgot
+      about after I redid all of the kref stuff:
+      * Remove unnecessary state changes in intel_dp_mst_atomic_check
+      * Cleanup atomic check logic for VCPI allocations - all we need to check in
+        compute_config is whether or not this state disables a CRTC, then free
+        VCPI based off that
+    
+    Changes since v8:
+     * Fix compile errors, whoops!
+    
+    Changes since v7:
+     - Don't check for mixed stale/valid VCPI allocations, just rely on
+     connector registration to stop such erroneous modesets
+    
+    Changes since v6:
+     - Keep a kref to all of the ports we have allocations on. This required
+       a good bit of changing to when we call drm_dp_find_vcpi_slots(),
+       mainly that we need to ensure that we only redo VCPI allocations on
+       actual mode or CRTC changes, not crtc_state->active changes.
+       Additionally, we no longer take the registration of the DRM connector
+       for each port into account because so long as we have a kref to the
+       port in the new or previous atomic state, the connector will stay
+       registered.
+     - Use the small changes to drm_dp_put_port() to add even more error
+       checking to make misusage of the helpers more obvious. I added this
+       after having to chase down various use-after-free conditions that
+       started popping up from the new helpers so no one else has to
+       troubleshoot that.
+     - Move some accidental DRM_DEBUG_KMS() calls to DRM_DEBUG_ATOMIC()
+     - Update documentation again, note that find/release() should both not be
+       called on the same port in a single atomic check phase (but multiple
+       calls to one or the other is OK)
+    
+    Changes since v4:
+     - Don't skip the atomic checks for VCPI allocations if no new VCPI
+       allocations happen in a state. This makes the next change I'm about
+       to list here a lot easier to implement.
+     - Don't ignore VCPI allocations on destroyed ports, instead ensure that
+       when ports are destroyed and still have VCPI allocations in the
+       topology state, the only state changes allowed are releasing said
+       ports' VCPI. This prevents a state with a mix of VCPI allocations
+       from destroyed ports, and allocations from valid ports.
+    
+    Changes since v3:
+     - Don't release VCPI allocations in the topology state immediately in
+       drm_dp_atomic_release_vcpi_slots(), instead mark them as 0 and skip
+       over them in drm_dp_mst_duplicate_state(). This makes it so
+       drm_dp_atomic_release_vcpi_slots() is still idempotent while also
+       throwing warnings if the driver messes up it's book keeping and tries
+       to release VCPI slots on a port that doesn't have any pre-existing
+       VCPI allocation - danvet
+     - Change mst_state/state in some debugging messages to "mst state"
+    
+    Changes since v2:
+     - Use kmemdup() for duplicating MST state - danvet
+     - Move port validation out of duplicate state callback - danvet
+     - Handle looping through MST topology states in
+       drm_dp_mst_atomic_check() so the driver doesn't have to do it
+     - Fix documentation in drm_dp_atomic_find_vcpi_slots()
+     - Move the atomic check for each individual topology state into it's
+       own function, reduces indenting
+     - Don't consider "stale" MST ports when calculating the bandwidth
+       requirements. This is needed because originally we relied on the
+       state duplication functions to prune any stale ports from the new
+       state, which would prevent us from incorrectly considering their
+       bandwidth requirements alongside legitimate new payloads.
+     - Add function references in drm_dp_atomic_release_vcpi_slots() - danvet
+     - Annotate atomic VCPI and atomic check functions with __must_check
+       - danvet
+    
+    Changes since v1:
+     - Don't use the now-removed ->atomic_check() for private objects hook,
+       just give drivers a function to call themselves
+    
+    Signed-off-by: Lyude Paul <lyude@redhat.com>
+    Reviewed-by: Daniel Vetter <daniel@ffwll.ch>
+    Cc: David Airlie <airlied@redhat.com>
+    Cc: Jerry Zuo <Jerry.Zuo@amd.com>
+    Cc: Harry Wentland <harry.wentland@amd.com>
+    Cc: Juston Li <juston.li@intel.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20190111005343.17443-19-lyude@redhat.com
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index 581163c8d7d7..451d020f0137 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -425,9 +425,15 @@ struct drm_dp_payload {
+ 
+ #define to_dp_mst_topology_state(x) container_of(x, struct drm_dp_mst_topology_state, base)
+ 
++struct drm_dp_vcpi_allocation {
++	struct drm_dp_mst_port *port;
++	int vcpi;
++	struct list_head next;
++};
++
+ struct drm_dp_mst_topology_state {
+ 	struct drm_private_state base;
+-	int avail_slots;
++	struct list_head vcpis;
+ 	struct drm_dp_mst_topology_mgr *mgr;
+ };
+ 
+@@ -638,14 +644,17 @@ void drm_dp_mst_topology_mgr_suspend(struct drm_dp_mst_topology_mgr *mgr);
+ int drm_dp_mst_topology_mgr_resume(struct drm_dp_mst_topology_mgr *mgr);
+ struct drm_dp_mst_topology_state *drm_atomic_get_mst_topology_state(struct drm_atomic_state *state,
+ 								    struct drm_dp_mst_topology_mgr *mgr);
+-int drm_dp_atomic_find_vcpi_slots(struct drm_atomic_state *state,
+-				  struct drm_dp_mst_topology_mgr *mgr,
+-				  struct drm_dp_mst_port *port, int pbn);
+-int drm_dp_atomic_release_vcpi_slots(struct drm_atomic_state *state,
+-				     struct drm_dp_mst_topology_mgr *mgr,
+-				     int slots);
++int __must_check
++drm_dp_atomic_find_vcpi_slots(struct drm_atomic_state *state,
++			      struct drm_dp_mst_topology_mgr *mgr,
++			      struct drm_dp_mst_port *port, int pbn);
++int __must_check
++drm_dp_atomic_release_vcpi_slots(struct drm_atomic_state *state,
++				 struct drm_dp_mst_topology_mgr *mgr,
++				 struct drm_dp_mst_port *port);
+ int drm_dp_send_power_updown_phy(struct drm_dp_mst_topology_mgr *mgr,
+ 				 struct drm_dp_mst_port *port, bool power_up);
++int __must_check drm_dp_mst_atomic_check(struct drm_atomic_state *state);
+ 
+ void drm_dp_mst_get_port_malloc(struct drm_dp_mst_port *port);
+ void drm_dp_mst_put_port_malloc(struct drm_dp_mst_port *port);
+
+commit bea5c38f1eb66982d9506ece9d7a3941f339ac10
+Author: Lyude Paul <lyude@redhat.com>
+Date:   Thu Jan 10 19:53:40 2019 -0500
+
+    drm/dp_mst: Add some atomic state iterator macros
+    
+    Changes since v6:
+     - Move EXPORT_SYMBOL() for drm_dp_mst_topology_state_funcs to this
+       commit
+     - Document __drm_dp_mst_state_iter_get() and note that it shouldn't be
+       called directly
+    
+    Signed-off-by: Lyude Paul <lyude@redhat.com>
+    Reviewed-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+    Cc: David Airlie <airlied@redhat.com>
+    Cc: Jerry Zuo <Jerry.Zuo@amd.com>
+    Cc: Harry Wentland <harry.wentland@amd.com>
+    Cc: Juston Li <juston.li@intel.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20190111005343.17443-18-lyude@redhat.com
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index 8eca5f29242c..581163c8d7d7 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -650,4 +650,100 @@ int drm_dp_send_power_updown_phy(struct drm_dp_mst_topology_mgr *mgr,
+ void drm_dp_mst_get_port_malloc(struct drm_dp_mst_port *port);
+ void drm_dp_mst_put_port_malloc(struct drm_dp_mst_port *port);
+ 
++extern const struct drm_private_state_funcs drm_dp_mst_topology_state_funcs;
++
++/**
++ * __drm_dp_mst_state_iter_get - private atomic state iterator function for
++ * macro-internal use
++ * @state: &struct drm_atomic_state pointer
++ * @mgr: pointer to the &struct drm_dp_mst_topology_mgr iteration cursor
++ * @old_state: optional pointer to the old &struct drm_dp_mst_topology_state
++ * iteration cursor
++ * @new_state: optional pointer to the new &struct drm_dp_mst_topology_state
++ * iteration cursor
++ * @i: int iteration cursor, for macro-internal use
++ *
++ * Used by for_each_oldnew_mst_mgr_in_state(),
++ * for_each_old_mst_mgr_in_state(), and for_each_new_mst_mgr_in_state(). Don't
++ * call this directly.
++ *
++ * Returns:
++ * True if the current &struct drm_private_obj is a &struct
++ * drm_dp_mst_topology_mgr, false otherwise.
++ */
++static inline bool
++__drm_dp_mst_state_iter_get(struct drm_atomic_state *state,
++			    struct drm_dp_mst_topology_mgr **mgr,
++			    struct drm_dp_mst_topology_state **old_state,
++			    struct drm_dp_mst_topology_state **new_state,
++			    int i)
++{
++	struct __drm_private_objs_state *objs_state = &state->private_objs[i];
++
++	if (objs_state->ptr->funcs != &drm_dp_mst_topology_state_funcs)
++		return false;
++
++	*mgr = to_dp_mst_topology_mgr(objs_state->ptr);
++	if (old_state)
++		*old_state = to_dp_mst_topology_state(objs_state->old_state);
++	if (new_state)
++		*new_state = to_dp_mst_topology_state(objs_state->new_state);
++
++	return true;
++}
++
++/**
++ * for_each_oldnew_mst_mgr_in_state - iterate over all DP MST topology
++ * managers in an atomic update
++ * @__state: &struct drm_atomic_state pointer
++ * @mgr: &struct drm_dp_mst_topology_mgr iteration cursor
++ * @old_state: &struct drm_dp_mst_topology_state iteration cursor for the old
++ * state
++ * @new_state: &struct drm_dp_mst_topology_state iteration cursor for the new
++ * state
++ * @__i: int iteration cursor, for macro-internal use
++ *
++ * This iterates over all DRM DP MST topology managers in an atomic update,
++ * tracking both old and new state. This is useful in places where the state
++ * delta needs to be considered, for example in atomic check functions.
++ */
++#define for_each_oldnew_mst_mgr_in_state(__state, mgr, old_state, new_state, __i) \
++	for ((__i) = 0; (__i) < (__state)->num_private_objs; (__i)++) \
++		for_each_if(__drm_dp_mst_state_iter_get((__state), &(mgr), &(old_state), &(new_state), (__i)))
++
++/**
++ * for_each_old_mst_mgr_in_state - iterate over all DP MST topology managers
++ * in an atomic update
++ * @__state: &struct drm_atomic_state pointer
++ * @mgr: &struct drm_dp_mst_topology_mgr iteration cursor
++ * @old_state: &struct drm_dp_mst_topology_state iteration cursor for the old
++ * state
++ * @__i: int iteration cursor, for macro-internal use
++ *
++ * This iterates over all DRM DP MST topology managers in an atomic update,
++ * tracking only the old state. This is useful in disable functions, where we
++ * need the old state the hardware is still in.
++ */
++#define for_each_old_mst_mgr_in_state(__state, mgr, old_state, __i) \
++	for ((__i) = 0; (__i) < (__state)->num_private_objs; (__i)++) \
++		for_each_if(__drm_dp_mst_state_iter_get((__state), &(mgr), &(old_state), NULL, (__i)))
++
++/**
++ * for_each_new_mst_mgr_in_state - iterate over all DP MST topology managers
++ * in an atomic update
++ * @__state: &struct drm_atomic_state pointer
++ * @mgr: &struct drm_dp_mst_topology_mgr iteration cursor
++ * @new_state: &struct drm_dp_mst_topology_state iteration cursor for the new
++ * state
++ * @__i: int iteration cursor, for macro-internal use
++ *
++ * This iterates over all DRM DP MST topology managers in an atomic update,
++ * tracking only the new state. This is useful in enable functions, where we
++ * need the new state the hardware should be in when the atomic commit
++ * operation has completed.
++ */
++#define for_each_new_mst_mgr_in_state(__state, mgr, new_state, __i) \
++	for ((__i) = 0; (__i) < (__state)->num_private_objs; (__i)++) \
++		for_each_if(__drm_dp_mst_state_iter_get((__state), &(mgr), NULL, &(new_state), (__i)))
++
+ #endif
+
+commit ebcc0e6b509108b4a67daa4c55809a05ab7f4b77
+Author: Lyude Paul <lyude@redhat.com>
+Date:   Thu Jan 10 19:53:29 2019 -0500
+
+    drm/dp_mst: Introduce new refcounting scheme for mstbs and ports
+    
+    The current way of handling refcounting in the DP MST helpers is really
+    confusing and probably just plain wrong because it's been hacked up many
+    times over the years without anyone actually going over the code and
+    seeing if things could be simplified.
+    
+    To the best of my understanding, the current scheme works like this:
+    drm_dp_mst_port and drm_dp_mst_branch both have a single refcount. When
+    this refcount hits 0 for either of the two, they're removed from the
+    topology state, but not immediately freed. Both ports and branch devices
+    will reinitialize their kref once it's hit 0 before actually destroying
+    themselves. The intended purpose behind this is so that we can avoid
+    problems like not being able to free a remote payload that might still
+    be active, due to us having removed all of the port/branch device
+    structures in memory, as per:
+    
+    commit 91a25e463130 ("drm/dp/mst: deallocate payload on port destruction")
+    
+    Which may have worked, but then it caused use-after-free errors. Being
+    new to MST at the time, I tried fixing it;
+    
+    commit 263efde31f97 ("drm/dp/mst: Get validated port ref in drm_dp_update_payload_part1()")
+    
+    But, that was broken: both drm_dp_mst_port and drm_dp_mst_branch structs
+    are validated in almost every DP MST helper function. Simply put, this
+    means we go through the topology and try to see if the given
+    drm_dp_mst_branch or drm_dp_mst_port is still attached to something
+    before trying to use it in order to avoid dereferencing freed memory
+    (something that has happened a LOT in the past with this library).
+    Because of this it doesn't actually matter whether or not we keep keep
+    the ports and branches around in memory as that's not enough, because
+    any function that validates the branches and ports passed to it will
+    still reject them anyway since they're no longer in the topology
+    structure. So, use-after-free errors were fixed but payload deallocation
+    was completely broken.
+    
+    Two years later, AMD informed me about this issue and I attempted to
+    come up with a temporary fix, pending a long-overdue cleanup of this
+    library:
+    
+    commit c54c7374ff44 ("drm/dp_mst: Skip validating ports during destruction, just ref")
+    
+    But then that introduced use-after-free errors, so I quickly reverted
+    it:
+    
+    commit 9765635b3075 ("Revert "drm/dp_mst: Skip validating ports during destruction, just ref"")
+    
+    And in the process, learned that there is just no simple fix for this:
+    the design is just broken. Unfortunately, the usage of these helpers are
+    quite broken as well. Some drivers like i915 have been smart enough to
+    avoid accessing any kind of information from MST port structures, but
+    others like nouveau have assumed, understandably so, that
+    drm_dp_mst_port structures are normal and can just be accessed at any
+    time without worrying about use-after-free errors.
+    
+    After a lot of discussion, me and Daniel Vetter came up with a better
+    idea to replace all of this.
+    
+    To summarize, since this is documented far more indepth in the
+    documentation this patch introduces, we make it so that drm_dp_mst_port
+    and drm_dp_mst_branch structures have two different classes of
+    refcounts: topology_kref, and malloc_kref. topology_kref corresponds to
+    the lifetime of the given drm_dp_mst_port or drm_dp_mst_branch in it's
+    given topology. Once it hits zero, any associated connectors are removed
+    and the branch or port can no longer be validated. malloc_kref
+    corresponds to the lifetime of the memory allocation for the actual
+    structure, and will always be non-zero so long as the topology_kref is
+    non-zero. This gives us a way to allow callers to hold onto port and
+    branch device structures past their topology lifetime, and dramatically
+    simplifies the lifetimes of both structures. This also finally fixes the
+    port deallocation problem, properly.
+    
+    Additionally: since this now means that we can keep ports and branch
+    devices allocated in memory for however long we need, we no longer need
+    a significant amount of the port validation that we currently do.
+    
+    Additionally, there is one last scenario that this fixes, which couldn't
+    have been fixed properly beforehand:
+    
+    - CPU1 unrefs port from topology (refcount 1->0)
+    - CPU2 refs port in topology(refcount 0->1)
+    
+    Since we now can guarantee memory safety for ports and branches
+    as-needed, we also can make our main reference counting functions fix
+    this problem by using kref_get_unless_zero() internally so that topology
+    refcounts can only ever reach 0 once.
+    
+    Changes since v4:
+    * Change the kernel-figure summary for dp-mst/topology-figure-1.dot a
+      bit - danvet
+    * Remove figure numbers - danvet
+    
+    Changes since v3:
+    * Remove rebase detritus - danvet
+    * Split out purely style changes into separate patches - hwentlan
+    
+    Changes since v2:
+    * Fix commit message - checkpatch
+    * s/)-1/) - 1/g - checkpatch
+    
+    Changes since v1:
+    * Remove forward declarations - danvet
+    * Move "Branch device and port refcounting" section from documentation
+      into kernel-doc comments - danvet
+    * Export internal topology lifetime functions into their own section in
+      the kernel-docs - danvet
+    * s/@/&/g for struct references in kernel-docs - danvet
+    * Drop the "when they are no longer being used" bits from the kernel
+      docs - danvet
+    * Modify diagrams to show how the DRM driver interacts with the topology
+      and payloads - danvet
+    * Make suggested documentation changes for
+      drm_dp_mst_topology_get_mstb() and drm_dp_mst_topology_get_port() -
+      danvet
+    * Better explain the relationship between malloc refs and topology krefs
+      in the documentation for drm_dp_mst_topology_get_port() and
+      drm_dp_mst_topology_get_mstb() - danvet
+    * Fix "See also" in drm_dp_mst_topology_get_mstb() - danvet
+    * Rename drm_dp_mst_topology_get_(port|mstb)() ->
+      drm_dp_mst_topology_try_get_(port|mstb)() and
+      drm_dp_mst_topology_ref_(port|mstb)() ->
+      drm_dp_mst_topology_get_(port|mstb)() - danvet
+    * s/should/must in docs - danvet
+    * WARN_ON(refcount == 0) in topology_get_(mstb|port) - danvet
+    * Move kdocs for mstb/port structs inline - danvet
+    * Split drm_dp_get_last_connected_port_and_mstb() changes into their own
+      commit - danvet
+    
+    Signed-off-by: Lyude Paul <lyude@redhat.com>
+    Reviewed-by: Harry Wentland <harry.wentland@amd.com>
+    Reviewed-by: Daniel Vetter <daniel@ffwll.ch>
+    Cc: David Airlie <airlied@redhat.com>
+    Cc: Jerry Zuo <Jerry.Zuo@amd.com>
+    Cc: Juston Li <juston.li@intel.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20190111005343.17443-7-lyude@redhat.com
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index 371cc2816477..8eca5f29242c 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -44,7 +44,6 @@ struct drm_dp_vcpi {
+ 
+ /**
+  * struct drm_dp_mst_port - MST port
+- * @kref: reference count for this port.
+  * @port_num: port number
+  * @input: if this port is an input port.
+  * @mcs: message capability status - DP 1.2 spec.
+@@ -67,7 +66,18 @@ struct drm_dp_vcpi {
+  * in the MST topology.
+  */
+ struct drm_dp_mst_port {
+-	struct kref kref;
++	/**
++	 * @topology_kref: refcount for this port's lifetime in the topology,
++	 * only the DP MST helpers should need to touch this
++	 */
++	struct kref topology_kref;
++
++	/**
++	 * @malloc_kref: refcount for the memory allocation containing this
++	 * structure. See drm_dp_mst_get_port_malloc() and
++	 * drm_dp_mst_put_port_malloc().
++	 */
++	struct kref malloc_kref;
+ 
+ 	u8 port_num;
+ 	bool input;
+@@ -102,7 +112,6 @@ struct drm_dp_mst_port {
+ 
+ /**
+  * struct drm_dp_mst_branch - MST branch device.
+- * @kref: reference count for this port.
+  * @rad: Relative Address to talk to this branch device.
+  * @lct: Link count total to talk to this branch device.
+  * @num_ports: number of ports on the branch.
+@@ -121,7 +130,19 @@ struct drm_dp_mst_port {
+  * to downstream port of parent branches.
+  */
+ struct drm_dp_mst_branch {
+-	struct kref kref;
++	/**
++	 * @topology_kref: refcount for this branch device's lifetime in the
++	 * topology, only the DP MST helpers should need to touch this
++	 */
++	struct kref topology_kref;
++
++	/**
++	 * @malloc_kref: refcount for the memory allocation containing this
++	 * structure. See drm_dp_mst_get_mstb_malloc() and
++	 * drm_dp_mst_put_mstb_malloc().
++	 */
++	struct kref malloc_kref;
++
+ 	u8 rad[8];
+ 	u8 lct;
+ 	int num_ports;
+@@ -626,4 +647,7 @@ int drm_dp_atomic_release_vcpi_slots(struct drm_atomic_state *state,
+ int drm_dp_send_power_updown_phy(struct drm_dp_mst_topology_mgr *mgr,
+ 				 struct drm_dp_mst_port *port, bool power_up);
+ 
++void drm_dp_mst_get_port_malloc(struct drm_dp_mst_port *port);
++void drm_dp_mst_put_port_malloc(struct drm_dp_mst_port *port);
++
+ #endif
+
+commit c235316d935a19deedc2fc48076798c9a56e1a7c
+Author: Lyude Paul <lyude@redhat.com>
+Date:   Tue Jan 8 16:11:29 2019 -0500
+
+    drm/dp_mst: Add __must_check to drm_dp_mst_topology_mgr_resume()
+    
+    Since I've had to fix two cases of drivers not checking the return code
+    from this function, let's make the compiler complain so this doesn't
+    come up again in the future.
+    
+    Changes since v1:
+    * Remove unneeded __must_check in function declaration - danvet
+    
+    Signed-off-by: Lyude Paul <lyude@redhat.com>
+    Cc: Jerry Zuo <Jerry.Zuo@amd.com>
+    Reviewed-by: Daniel Vetter <daniel@ffwll.ch>
+    Reviewed-by: Harry Wentland <harry.wentland@amd.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20190108211133.32564-4-lyude@redhat.com
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index 59f005b419cf..727af08e5ea6 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -616,7 +616,8 @@ void drm_dp_mst_dump_topology(struct seq_file *m,
+ 			      struct drm_dp_mst_topology_mgr *mgr);
+ 
+ void drm_dp_mst_topology_mgr_suspend(struct drm_dp_mst_topology_mgr *mgr);
+-int drm_dp_mst_topology_mgr_resume(struct drm_dp_mst_topology_mgr *mgr);
++int __must_check
++drm_dp_mst_topology_mgr_resume(struct drm_dp_mst_topology_mgr *mgr);
+ struct drm_dp_mst_topology_state *drm_atomic_get_mst_topology_state(struct drm_atomic_state *state,
+ 								    struct drm_dp_mst_topology_mgr *mgr);
+ int drm_dp_atomic_find_vcpi_slots(struct drm_atomic_state *state,
+
+commit 16bff572cc660f19e58c99941368dea050b36a05
+Author: Daniel Vetter <daniel.vetter@ffwll.ch>
+Date:   Wed Nov 28 23:12:34 2018 +0100
+
+    drm/dp-mst-helper: Remove hotplug callback
+    
+    When everyone implements it exactly the same way, among all 4
+    implementations, there's not really a need to overwrite this at all.
+    
+    Aside: drm_kms_helper_hotplug_event is pretty much core functionality
+    at this point. Probably should move it there.
+    
+    Reviewed-by: Lyude Paul <lyude@redhat.com>
+    Acked-by: Alex Deucher <alexander.deucher@amd.com>
+    Signed-off-by: Daniel Vetter <daniel.vetter@intel.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20181128221234.15054-1-daniel.vetter@ffwll.ch
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index 59f005b419cf..371cc2816477 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -387,8 +387,6 @@ struct drm_dp_mst_topology_cbs {
+ 	void (*register_connector)(struct drm_connector *connector);
+ 	void (*destroy_connector)(struct drm_dp_mst_topology_mgr *mgr,
+ 				  struct drm_connector *connector);
+-	void (*hotplug)(struct drm_dp_mst_topology_mgr *mgr);
+-
+ };
+ 
+ #define DP_MAX_PAYLOAD (sizeof(unsigned long) * 8)
+
+commit f6764815358b57c520ea137599e8297479bded4c
+Author: Lyude Paul <lyude@redhat.com>
+Date:   Tue Oct 23 19:12:47 2018 -0400
+
+    drm/dp_mst: Remove all evil duplicate state pointers
+    
+    There's no reason to track the atomic state three times. Unfortunately,
+    this is currently what we're doing, and even worse is that there is only
+    one actually correct state pointer: the one in mst_state->base.state.
+    mgr->state never seems to be used, along with the one in
+    mst_state->state.
+    
+    This confused me for over 4 hours until I realized there was no magic
+    behind these pointers. So, let's save everyone else from the trouble.
+    
+    Signed-off-by: Lyude Paul <lyude@redhat.com>.
+    Cc: Daniel Vetter <daniel.vetter@ffwll.ch>
+    Reviewed-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20181023231251.16883-3-lyude@redhat.com
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index 7f78d26a0766..59f005b419cf 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -409,7 +409,6 @@ struct drm_dp_payload {
+ struct drm_dp_mst_topology_state {
+ 	struct drm_private_state base;
+ 	int avail_slots;
+-	struct drm_atomic_state *state;
+ 	struct drm_dp_mst_topology_mgr *mgr;
+ };
+ 
+@@ -497,11 +496,6 @@ struct drm_dp_mst_topology_mgr {
+ 	 */
+ 	int pbn_div;
+ 
+-	/**
+-	 * @state: State information for topology manager
+-	 */
+-	struct drm_dp_mst_topology_state *state;
+-
+ 	/**
+ 	 * @funcs: Atomic helper callbacks
+ 	 */
+
+commit 0bb9c2b27f5e503e683ad27a0f0a6286f5b5da34
+Author: Dhinakaran Pandiyan <dhinakaran.pandiyan@intel.com>
+Date:   Wed Sep 6 17:14:58 2017 -0700
+
+    drm/dp/mst: Sideband message transaction to power up/down nodes
+    
+    The POWER_DOWN_PHY and POWER_UP_PHY sideband message transactions allow
+    the source to reqest any node in a mst path or a whole path to be
+    powered down or up. This allows drivers to target a specific sink in the
+    MST topology, an improvement over just power managing the imediate
+    downstream device. Secondly, since the request-reply protocol waits for an
+    ACK, we can be sure that a downstream sink has enough time to respond to a
+    power up/down request.
+    
+    v2: Fix memory leak (Lyude)
+    Cc: Lyude <lyude@redhat.com>
+    Cc: Ville Syrjälä <ville.syrjala@linux.intel.com>
+    Cc: Harry Wentland <harry.wentland@amd.com>
+    Signed-off-by: Dhinakaran Pandiyan <dhinakaran.pandiyan@intel.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20170907001458.9399-1-dhinakaran.pandiyan@intel.com
+    Reviewed-by: Lyude Paul <lyude@redhat.com>
+    Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index d55abb75f29a..7f78d26a0766 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -631,5 +631,7 @@ int drm_dp_atomic_find_vcpi_slots(struct drm_atomic_state *state,
+ int drm_dp_atomic_release_vcpi_slots(struct drm_atomic_state *state,
+ 				     struct drm_dp_mst_topology_mgr *mgr,
+ 				     int slots);
++int drm_dp_send_power_updown_phy(struct drm_dp_mst_topology_mgr *mgr,
++				 struct drm_dp_mst_port *port, bool power_up);
+ 
+ #endif
+
+commit a4370c777406c2810e37fafd166ccddecdb2a60c
+Author: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Date:   Wed Jul 12 18:51:02 2017 +0300
+
+    drm/atomic: Make private objs proper objects
+    
+    Make the atomic private object stuff less special by introducing proper
+    base classes for the object and its state. Drivers can embed these in
+    their own appropriate objects, after which these things will work
+    exactly like the plane/crtc/connector states during atomic operations.
+    
+    v2: Reorder to not depend on drm_dynarray (Daniel)
+    
+    Cc: Dhinakaran Pandiyan <dhinakaran.pandiyan@intel.com>
+    Cc: Daniel Vetter <daniel.vetter@ffwll.ch>
+    Reviewed-by: Daniel Vetter <daniel.vetter@ffwll.ch> #v1
+    Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+    Link: http://patchwork.freedesktop.org/patch/msgid/20170712155102.26276-3-ville.syrjala@linux.intel.com
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index 177ab6f86855..d55abb75f29a 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -404,12 +404,17 @@ struct drm_dp_payload {
+ 	int vcpi;
+ };
+ 
++#define to_dp_mst_topology_state(x) container_of(x, struct drm_dp_mst_topology_state, base)
++
+ struct drm_dp_mst_topology_state {
++	struct drm_private_state base;
+ 	int avail_slots;
+ 	struct drm_atomic_state *state;
+ 	struct drm_dp_mst_topology_mgr *mgr;
+ };
+ 
++#define to_dp_mst_topology_mgr(x) container_of(x, struct drm_dp_mst_topology_mgr, base)
++
+ /**
+  * struct drm_dp_mst_topology_mgr - DisplayPort MST manager
+  *
+@@ -418,6 +423,11 @@ struct drm_dp_mst_topology_state {
+  * on the GPU.
+  */
+ struct drm_dp_mst_topology_mgr {
++	/**
++	 * @base: Base private object for atomic
++	 */
++	struct drm_private_obj base;
++
+ 	/**
+ 	 * @dev: device pointer for adding i2c devices etc.
+ 	 */
+
+commit edb1ed1ab7d314e114de84003f763da34c0f34c0
+Author: Pandiyan, Dhinakaran <dhinakaran.pandiyan@intel.com>
+Date:   Thu Apr 20 22:51:32 2017 -0700
+
+    drm/dp: Add DP MST helpers to atomically find and release vcpi slots
+    
+    drm_dp_atomic_find_vcpi_slots() should be called from ->atomic_check() to
+    check there are sufficient vcpi slots for a mode and to add that to the
+    state. This should be followed by a call to drm_dp_mst_allocate_vcpi()
+    in ->atomic_commit() to initialize a struct vcpi for the port.
+    
+    drm_dp_atomic_release_vcpi_slots() should be called from
+    ->atomic_check() to release a port's vcpi slot allocation from the
+    state.
+    
+    Drivers that do not make use of this atomic helper are expected to call
+    drm_dp_find_vcpi_slots() instead before calling
+    drm_dp_mst_allocate_vcpi().
+    
+    v3: drm_dp_atomic_release_vcpi_slots() now needs to know how many slots
+        to release as we may not have a valid reference to port.
+    v2:
+    Added checks for verifying the port reference is valid
+    Moved get_mst_topology_state() into the helpers (Daniel)
+    Changed find_vcpi_slots() to not depend on current allocation
+    
+    Cc: Daniel Vetter <daniel.vetter@ffwll.ch>
+    Cc: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+    Cc: Archit Taneja <architt@codeaurora.org>
+    Cc: Chris Wilson <chris@chris-wilson.co.uk>
+    Cc: Harry Wentland <Harry.wentland@amd.com>
+    Reviewed-by: Harry Wentland <harry.wentland@amd.com>
+    Reviewed-by: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+    Signed-off-by: Dhinakaran Pandiyan <dhinakaran.pandiyan@intel.com>
+    Signed-off-by: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+    Link: http://patchwork.freedesktop.org/patch/msgid/1492753893-3748-4-git-send-email-dhinakaran.pandiyan@intel.com
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index 0b371dffed00..177ab6f86855 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -615,5 +615,11 @@ void drm_dp_mst_topology_mgr_suspend(struct drm_dp_mst_topology_mgr *mgr);
+ int drm_dp_mst_topology_mgr_resume(struct drm_dp_mst_topology_mgr *mgr);
+ struct drm_dp_mst_topology_state *drm_atomic_get_mst_topology_state(struct drm_atomic_state *state,
+ 								    struct drm_dp_mst_topology_mgr *mgr);
++int drm_dp_atomic_find_vcpi_slots(struct drm_atomic_state *state,
++				  struct drm_dp_mst_topology_mgr *mgr,
++				  struct drm_dp_mst_port *port, int pbn);
++int drm_dp_atomic_release_vcpi_slots(struct drm_atomic_state *state,
++				     struct drm_dp_mst_topology_mgr *mgr,
++				     int slots);
+ 
+ #endif
+
+commit 3f3353b7e1218d208507bc52688cacb4ff893c28
+Author: Pandiyan, Dhinakaran <dhinakaran.pandiyan@intel.com>
+Date:   Thu Apr 20 22:51:31 2017 -0700
+
+    drm/dp: Introduce MST topology state to track available link bandwidth
+    
+    Link bandwidth is shared between multiple display streams in DP MST
+    configurations. The DP MST topology manager structure maintains the
+    shared link bandwidth for a primary link directly connected to the GPU. For
+    atomic modesetting drivers, checking if there is sufficient link bandwidth
+    for a mode needs to be done during the atomic_check phase to avoid failed
+    modesets. Let's encapsulate the available link bw information in a
+    private state structure so that bw can be allocated and released atomically
+    for each of the ports sharing the primary link.
+    
+    v3: WARN_ON() if connection_mutex is not held (Archit)
+    v2: Included kernel doc, moved state initialization and switched to
+    kmemdup() for allocation (Daniel)
+    
+    Cc: Daniel Vetter <daniel.vetter@ffwll.ch>
+    Cc: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+    Cc: Archit Taneja <architt@codeaurora.org>
+    Cc: Chris Wilson <chris@chris-wilson.co.uk>
+    Cc: Harry Wentland <Harry.wentland@amd.com>
+    Reviewed-by: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+    Reviewed-by: Harry Wentland <harry.wentland@amd.com>
+    Signed-off-by: Dhinakaran Pandiyan <dhinakaran.pandiyan@intel.com>
+    Signed-off-by: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+    Link: http://patchwork.freedesktop.org/patch/msgid/1492753893-3748-3-git-send-email-dhinakaran.pandiyan@intel.com
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index 5b024764666c..0b371dffed00 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -24,6 +24,7 @@
+ 
+ #include <linux/types.h>
+ #include <drm/drm_dp_helper.h>
++#include <drm/drm_atomic.h>
+ 
+ struct drm_dp_mst_branch;
+ 
+@@ -403,6 +404,12 @@ struct drm_dp_payload {
+ 	int vcpi;
+ };
+ 
++struct drm_dp_mst_topology_state {
++	int avail_slots;
++	struct drm_atomic_state *state;
++	struct drm_dp_mst_topology_mgr *mgr;
++};
++
+ /**
+  * struct drm_dp_mst_topology_mgr - DisplayPort MST manager
+  *
+@@ -480,6 +487,16 @@ struct drm_dp_mst_topology_mgr {
+ 	 */
+ 	int pbn_div;
+ 
++	/**
++	 * @state: State information for topology manager
++	 */
++	struct drm_dp_mst_topology_state *state;
++
++	/**
++	 * @funcs: Atomic helper callbacks
++	 */
++	const struct drm_private_state_funcs *funcs;
++
+ 	/**
+ 	 * @qlock: protects @tx_msg_downq, the &drm_dp_mst_branch.txslost and
+ 	 * &drm_dp_sideband_msg_tx.state once they are queued
+@@ -596,4 +613,7 @@ void drm_dp_mst_dump_topology(struct seq_file *m,
+ 
+ void drm_dp_mst_topology_mgr_suspend(struct drm_dp_mst_topology_mgr *mgr);
+ int drm_dp_mst_topology_mgr_resume(struct drm_dp_mst_topology_mgr *mgr);
++struct drm_dp_mst_topology_state *drm_atomic_get_mst_topology_state(struct drm_atomic_state *state,
++								    struct drm_dp_mst_topology_mgr *mgr);
++
+ #endif
+
+commit 1e797f556c616a42f1e039b1ff1d3c58f61b6104
+Author: Pandiyan, Dhinakaran <dhinakaran.pandiyan@intel.com>
+Date:   Thu Mar 16 00:10:26 2017 -0700
+
+    drm/dp: Split drm_dp_mst_allocate_vcpi
+    
+    drm_dp_mst_allocate_vcpi() apart from setting up the vcpi structure,
+    also finds if there are enough slots available. This check is a duplicate
+    of that implemented in drm_dp_mst_find_vcpi_slots(). Let's move this check
+    out and reuse the existing drm_dp_mst_find_vcpi_slots() function to check
+    if there are enough vcpi slots before allocating them.
+    
+    This brings the check to one place. Additionally drivers that will use MST
+    state tracking for atomic modesets can use the atomic version of
+    find_vcpi_slots() and reuse drm_dp_mst_allocate_vcpi()
+    
+    Signed-off-by: Dhinakaran Pandiyan <dhinakaran.pandiyan@intel.com>
+    Reviewed-by: Dave Airlie <airlied@redhat.com>
+    Reviewed-by: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+    Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+    Link: http://patchwork.freedesktop.org/patch/msgid/1489648231-30700-4-git-send-email-dhinakaran.pandiyan@intel.com
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index d8365110eb23..5b024764666c 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -567,7 +567,8 @@ struct edid *drm_dp_mst_get_edid(struct drm_connector *connector, struct drm_dp_
+ int drm_dp_calc_pbn_mode(int clock, int bpp);
+ 
+ 
+-bool drm_dp_mst_allocate_vcpi(struct drm_dp_mst_topology_mgr *mgr, struct drm_dp_mst_port *port, int pbn, int *slots);
++bool drm_dp_mst_allocate_vcpi(struct drm_dp_mst_topology_mgr *mgr,
++			      struct drm_dp_mst_port *port, int pbn, int slots);
+ 
+ int drm_dp_mst_get_vcpi_slots(struct drm_dp_mst_topology_mgr *mgr, struct drm_dp_mst_port *port);
+ 
+
+commit feb2c3bc331576ed4e0bf9608966351b1bb9b622
+Author: Pandiyan, Dhinakaran <dhinakaran.pandiyan@intel.com>
+Date:   Thu Mar 16 00:10:25 2017 -0700
+
+    drm/dp: Kill unused MST vcpi slot availability tracking
+    
+    The avail_slots member in the MST topology manager is never updated to
+    reflect the available vcpi slots. The check is effectively against
+    total slots, 63. So, let's make that check obvious and remove
+    avail_slots. While at it, make debug messages more descriptive.
+    
+    Cc: Daniel Vetter <daniel.vetter@ffwll.ch>
+    Cc: Archit Taneja <architt@codeaurora.org>
+    Cc: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+    Cc: Chris Wilson <chris@chris-wilson.co.uk>
+    Cc: Harry Wentland <Harry.wentland@amd.com>
+    Signed-off-by: Dhinakaran Pandiyan <dhinakaran.pandiyan@intel.com>
+    Reviewed-by: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+    Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+    Link: http://patchwork.freedesktop.org/patch/msgid/1489648231-30700-3-git-send-email-dhinakaran.pandiyan@intel.com
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index 1a7e0f41d6fe..d8365110eb23 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -480,11 +480,6 @@ struct drm_dp_mst_topology_mgr {
+ 	 */
+ 	int pbn_div;
+ 
+-	/**
+-	 * @avail_slots: Still available slots that can be allocated.
+-	 */
+-	int avail_slots;
+-
+ 	/**
+ 	 * @qlock: protects @tx_msg_downq, the &drm_dp_mst_branch.txslost and
+ 	 * &drm_dp_sideband_msg_tx.state once they are queued
+
+commit a538d6137dffc5dc8082b9ebe9819c4106fa3f83
+Author: Pandiyan, Dhinakaran <dhinakaran.pandiyan@intel.com>
+Date:   Thu Mar 16 00:10:24 2017 -0700
+
+    drm/dp: Kill total_pbn and total_slots in struct drm_dp_mst_topology_mgr
+    
+    The total vcpi time slots is always 63 and does not depend on the link BW,
+    remove total_slots from MST topology manager struct. The next change is to
+    remove total_pbn which is hardcoded to 2560. The total PBN that the
+    topology manager allocates from depends on the link rate and is not a
+    constant. So, fix this by removing the total_pbn member itself.
+    
+    Cc: Daniel Vetter <daniel.vetter@ffwll.ch>
+    Cc: Archit Taneja <architt@codeaurora.org>
+    Cc: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+    Cc: Chris Wilson <chris@chris-wilson.co.uk>
+    Cc: Harry Wentland <Harry.wentland@amd.com>
+    Signed-off-by: Dhinakaran Pandiyan <dhinakaran.pandiyan@intel.com>
+    Reviewed-by: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+    Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+    Link: http://patchwork.freedesktop.org/patch/msgid/1489648231-30700-2-git-send-email-dhinakaran.pandiyan@intel.com
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index f4b4d154b98e..1a7e0f41d6fe 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -479,18 +479,11 @@ struct drm_dp_mst_topology_mgr {
+ 	 * @pbn_div: PBN to slots divisor.
+ 	 */
+ 	int pbn_div;
+-	/**
+-	 * @total_slots: Total slots that can be allocated.
+-	 */
+-	int total_slots;
++
+ 	/**
+ 	 * @avail_slots: Still available slots that can be allocated.
+ 	 */
+ 	int avail_slots;
+-	/**
+-	 * @total_pbn: Total PBN count.
+-	 */
+-	int total_pbn;
+ 
+ 	/**
+ 	 * @qlock: protects @tx_msg_downq, the &drm_dp_mst_branch.txslost and
+
+commit 6806cdf9aa1c822afd89881e48908315aed18451
+Author: Daniel Vetter <daniel.vetter@ffwll.ch>
+Date:   Wed Jan 25 07:26:43 2017 +0100
+
+    drm/kms-helpers: Use recommened kerneldoc for struct member refs
+    
+    I just learned that &struct_name.member_name works and looks pretty
+    even. It doesn't (yet) link to the member directly though, which would
+    be really good for big structures or vfunc tables (where the
+    per-member kerneldoc tends to be long).
+    
+    Also some minor drive-by polish where it makes sense, I read a lot
+    of docs ...
+    
+    v2: Comments from Gustavo.
+    
+    Cc: Jani Nikula <jani.nikula@linux.intel.com>
+    Cc: Chris Wilson <chris@chris-wilson.co.uk>
+    Rewiewed-by: Gustavo Padovan <gustavo.padovan@collabora.com>
+    Signed-off-by: Daniel Vetter <daniel.vetter@intel.com>
+    Link: http://patchwork.freedesktop.org/patch/msgid/20170125062657.19270-2-daniel.vetter@ffwll.ch
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index 27f3e99f55d1..f4b4d154b98e 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -493,8 +493,8 @@ struct drm_dp_mst_topology_mgr {
+ 	int total_pbn;
+ 
+ 	/**
+-	 * @qlock: protects @tx_msg_downq, the tx_slots in struct
+-	 * &drm_dp_mst_branch and txmsg->state once they are queued
++	 * @qlock: protects @tx_msg_downq, the &drm_dp_mst_branch.txslost and
++	 * &drm_dp_sideband_msg_tx.state once they are queued
+ 	 */
+ 	struct mutex qlock;
+ 	/**
+@@ -508,8 +508,7 @@ struct drm_dp_mst_topology_mgr {
+ 	struct mutex payload_lock;
+ 	/**
+ 	 * @proposed_vcpis: Array of pointers for the new VCPI allocation. The
+-	 * VCPI structure itself is embedded into the corresponding
+-	 * &drm_dp_mst_port structure.
++	 * VCPI structure itself is &drm_dp_mst_port.vcpi.
+ 	 */
+ 	struct drm_dp_vcpi **proposed_vcpis;
+ 	/**
+
+commit 7b0a89a6db9a5912065e174162ec4a653c9b25d6
+Author: Dhinakaran Pandiyan <dhinakaran.pandiyan@intel.com>
+Date:   Tue Jan 24 15:49:29 2017 -0800
+
+    drm/dp: Store drm_device in MST topology manager
+    
+    struct drm_dp_mst_topology_mgr currently stores a pointer to struct dev.
+    Changing this to instead hold a pointer to drm_device is more useful as it
+    gives access to DRM structures. This also makes it consistent with other
+    DRM structures like drm_crtc, drm_connector etc.
+    
+    Signed-off-by: Dhinakaran Pandiyan <dhinakaran.pandiyan@intel.com>
+    Reviewed-by: Dave Airlie <airlied@redhat.com>
+    Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+    Link: http://patchwork.freedesktop.org/patch/msgid/1485301777-3465-2-git-send-email-dhinakaran.pandiyan@intel.com
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index 003207670597..27f3e99f55d1 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -414,7 +414,7 @@ struct drm_dp_mst_topology_mgr {
+ 	/**
+ 	 * @dev: device pointer for adding i2c devices etc.
+ 	 */
+-	struct device *dev;
++	struct drm_device *dev;
+ 	/**
+ 	 * @cbs: callbacks for connector addition and destruction.
+ 	 */
+@@ -556,7 +556,10 @@ struct drm_dp_mst_topology_mgr {
+ 	struct work_struct destroy_connector_work;
+ };
+ 
+-int drm_dp_mst_topology_mgr_init(struct drm_dp_mst_topology_mgr *mgr, struct device *dev, struct drm_dp_aux *aux, int max_dpcd_transaction_bytes, int max_payloads, int conn_base_id);
++int drm_dp_mst_topology_mgr_init(struct drm_dp_mst_topology_mgr *mgr,
++				 struct drm_device *dev, struct drm_dp_aux *aux,
++				 int max_dpcd_transaction_bytes,
++				 int max_payloads, int conn_base_id);
+ 
+ void drm_dp_mst_topology_mgr_destroy(struct drm_dp_mst_topology_mgr *mgr);
+ 
+
+commit 132d49d728f3af67378ebb01b98cd513f4a2ab1b
+Author: Daniel Vetter <daniel.vetter@ffwll.ch>
+Date:   Fri Jul 15 21:48:04 2016 +0200
+
+    drm/dp-mst: Missing kernel doc
+    
+    Cc: Dave Airlie <airlied@redhat.com>
+    Acked-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+    Link: http://patchwork.freedesktop.org/patch/msgid/1468612088-9721-7-git-send-email-daniel.vetter@ffwll.ch
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index c49bbfaf3cbb..003207670597 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -87,7 +87,15 @@ struct drm_dp_mst_port {
+ 	struct drm_connector *connector;
+ 	struct drm_dp_mst_topology_mgr *mgr;
+ 
+-	struct edid *cached_edid; /* for DP logical ports - make tiling work */
++	/**
++	 * @cached_edid: for DP logical ports - make tiling work by ensuring
++	 * that the EDID for all connectors is read immediately.
++	 */
++	struct edid *cached_edid;
++	/**
++	 * @has_audio: Tracks whether the sink connector to this port is
++	 * audio-capable.
++	 */
+ 	bool has_audio;
+ };
+ 
+@@ -397,70 +405,154 @@ struct drm_dp_payload {
+ 
+ /**
+  * struct drm_dp_mst_topology_mgr - DisplayPort MST manager
+- * @dev: device pointer for adding i2c devices etc.
+- * @cbs: callbacks for connector addition and destruction.
+- * @max_dpcd_transaction_bytes - maximum number of bytes to read/write in one go.
+- * @aux: aux channel for the DP connector.
+- * @max_payloads: maximum number of payloads the GPU can generate.
+- * @conn_base_id: DRM connector ID this mgr is connected to.
+- * @down_rep_recv: msg receiver state for down replies.
+- * @up_req_recv: msg receiver state for up requests.
+- * @lock: protects mst state, primary, dpcd.
+- * @mst_state: if this manager is enabled for an MST capable port.
+- * @mst_primary: pointer to the primary branch device.
+- * @dpcd: cache of DPCD for primary port.
+- * @pbn_div: PBN to slots divisor.
+  *
+  * This struct represents the toplevel displayport MST topology manager.
+  * There should be one instance of this for every MST capable DP connector
+  * on the GPU.
+  */
+ struct drm_dp_mst_topology_mgr {
+-
++	/**
++	 * @dev: device pointer for adding i2c devices etc.
++	 */
+ 	struct device *dev;
++	/**
++	 * @cbs: callbacks for connector addition and destruction.
++	 */
+ 	const struct drm_dp_mst_topology_cbs *cbs;
++	/**
++	 * @max_dpcd_transaction_bytes: maximum number of bytes to read/write
++	 * in one go.
++	 */
+ 	int max_dpcd_transaction_bytes;
+-	struct drm_dp_aux *aux; /* auxch for this topology mgr to use */
++	/**
++	 * @aux: AUX channel for the DP MST connector this topolgy mgr is
++	 * controlling.
++	 */
++	struct drm_dp_aux *aux;
++	/**
++	 * @max_payloads: maximum number of payloads the GPU can generate.
++	 */
+ 	int max_payloads;
++	/**
++	 * @conn_base_id: DRM connector ID this mgr is connected to. Only used
++	 * to build the MST connector path value.
++	 */
+ 	int conn_base_id;
+ 
+-	/* only ever accessed from the workqueue - which should be serialised */
++	/**
++	 * @down_rep_recv: Message receiver state for down replies. This and
++	 * @up_req_recv are only ever access from the work item, which is
++	 * serialised.
++	 */
+ 	struct drm_dp_sideband_msg_rx down_rep_recv;
++	/**
++	 * @up_req_recv: Message receiver state for up requests. This and
++	 * @down_rep_recv are only ever access from the work item, which is
++	 * serialised.
++	 */
+ 	struct drm_dp_sideband_msg_rx up_req_recv;
+ 
+-	/* pointer to info about the initial MST device */
+-	struct mutex lock; /* protects mst_state + primary + dpcd */
++	/**
++	 * @lock: protects mst state, primary, dpcd.
++	 */
++	struct mutex lock;
+ 
++	/**
++	 * @mst_state: If this manager is enabled for an MST capable port. False
++	 * if no MST sink/branch devices is connected.
++	 */
+ 	bool mst_state;
++	/**
++	 * @mst_primary: Pointer to the primary/first branch device.
++	 */
+ 	struct drm_dp_mst_branch *mst_primary;
+ 
++	/**
++	 * @dpcd: Cache of DPCD for primary port.
++	 */
+ 	u8 dpcd[DP_RECEIVER_CAP_SIZE];
++	/**
++	 * @sink_count: Sink count from DEVICE_SERVICE_IRQ_VECTOR_ESI0.
++	 */
+ 	u8 sink_count;
++	/**
++	 * @pbn_div: PBN to slots divisor.
++	 */
+ 	int pbn_div;
++	/**
++	 * @total_slots: Total slots that can be allocated.
++	 */
+ 	int total_slots;
++	/**
++	 * @avail_slots: Still available slots that can be allocated.
++	 */
+ 	int avail_slots;
++	/**
++	 * @total_pbn: Total PBN count.
++	 */
+ 	int total_pbn;
+ 
+-	/* messages to be transmitted */
+-	/* qlock protects the upq/downq and in_progress,
+-	   the mstb tx_slots and txmsg->state once they are queued */
++	/**
++	 * @qlock: protects @tx_msg_downq, the tx_slots in struct
++	 * &drm_dp_mst_branch and txmsg->state once they are queued
++	 */
+ 	struct mutex qlock;
++	/**
++	 * @tx_msg_downq: List of pending down replies.
++	 */
+ 	struct list_head tx_msg_downq;
+ 
+-	/* payload info + lock for it */
++	/**
++	 * @payload_lock: Protect payload information.
++	 */
+ 	struct mutex payload_lock;
++	/**
++	 * @proposed_vcpis: Array of pointers for the new VCPI allocation. The
++	 * VCPI structure itself is embedded into the corresponding
++	 * &drm_dp_mst_port structure.
++	 */
+ 	struct drm_dp_vcpi **proposed_vcpis;
++	/**
++	 * @payloads: Array of payloads.
++	 */
+ 	struct drm_dp_payload *payloads;
++	/**
++	 * @payload_mask: Elements of @payloads actually in use. Since
++	 * reallocation of active outputs isn't possible gaps can be created by
++	 * disabling outputs out of order compared to how they've been enabled.
++	 */
+ 	unsigned long payload_mask;
++	/**
++	 * @vcpi_mask: Similar to @payload_mask, but for @proposed_vcpis.
++	 */
+ 	unsigned long vcpi_mask;
+ 
++	/**
++	 * @tx_waitq: Wait to queue stall for the tx worker.
++	 */
+ 	wait_queue_head_t tx_waitq;
++	/**
++	 * @work: Probe work.
++	 */
+ 	struct work_struct work;
+-
++	/**
++	 * @tx_work: Sideband transmit worker. This can nest within the main
++	 * @work worker for each transaction @work launches.
++	 */
+ 	struct work_struct tx_work;
+ 
++	/**
++	 * @destroy_connector_list: List of to be destroyed connectors.
++	 */
+ 	struct list_head destroy_connector_list;
++	/**
++	 * @destroy_connector_lock: Protects @connector_list.
++	 */
+ 	struct mutex destroy_connector_lock;
++	/**
++	 * @destroy_connector_work: Work item to destroy connectors. Needed to
++	 * avoid locking inversion.
++	 */
+ 	struct work_struct destroy_connector_work;
+ };
+ 
+
+commit cb021a3eb6e9870d2f3539e37d8b6de4c9d919f6
+Author: Daniel Vetter <daniel.vetter@ffwll.ch>
+Date:   Fri Jul 15 21:48:03 2016 +0200
+
+    drm/dp-mst: Remove tx_down_in_progress
+    
+    Just replicates whether the list is empty or not. Nuke code
+    to avoid writing docs for it!
+    
+    Cc: Dave Airlie <airlied@redhat.com>
+    Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+    Link: http://patchwork.freedesktop.org/patch/msgid/1468612088-9721-6-git-send-email-daniel.vetter@ffwll.ch
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index fdb47051d549..c49bbfaf3cbb 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -446,7 +446,6 @@ struct drm_dp_mst_topology_mgr {
+ 	   the mstb tx_slots and txmsg->state once they are queued */
+ 	struct mutex qlock;
+ 	struct list_head tx_msg_downq;
+-	bool tx_down_in_progress;
+ 
+ 	/* payload info + lock for it */
+ 	struct mutex payload_lock;
+
+commit 5e93b8208d3c419b515fb75e2601931c027e12ab
+Author: Hersen Wu <hersenxs.wu@amd.com>
+Date:   Fri Jan 22 17:07:28 2016 -0500
+
+    drm/dp/mst: move GUID storage from mgr, port to only mst branch
+    
+    Previous implementation does not handle case below: boot up one MST branch
+    to DP connector of ASIC. After boot up, hot plug 2nd MST branch to DP output
+    of 1st MST, GUID is not created for 2nd MST branch. When downstream port of
+    2nd MST branch send upstream request, it fails because 2nd MST branch GUID
+    is not available.
+    
+    New Implementation: only create GUID for MST branch and save it within Branch.
+    
+    Signed-off-by: Hersen Wu <hersenxs.wu@amd.com>
+    Reviewed-by: Harry Wentland <harry.wentland@amd.com>
+    Cc: stable@vger.kernel.org
+    Acked-by: Alex Deucher <alexander.deucher@amd.com>
+    Signed-off-by: Dave Airlie <airlied@redhat.com>
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index 24ab1787b771..fdb47051d549 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -44,8 +44,6 @@ struct drm_dp_vcpi {
+ /**
+  * struct drm_dp_mst_port - MST port
+  * @kref: reference count for this port.
+- * @guid_valid: for DP 1.2 devices if we have validated the GUID.
+- * @guid: guid for DP 1.2 device on this port.
+  * @port_num: port number
+  * @input: if this port is an input port.
+  * @mcs: message capability status - DP 1.2 spec.
+@@ -70,10 +68,6 @@ struct drm_dp_vcpi {
+ struct drm_dp_mst_port {
+ 	struct kref kref;
+ 
+-	/* if dpcd 1.2 device is on this port - its GUID info */
+-	bool guid_valid;
+-	u8 guid[16];
+-
+ 	u8 port_num;
+ 	bool input;
+ 	bool mcs;
+@@ -110,10 +104,12 @@ struct drm_dp_mst_port {
+  * @tx_slots: transmission slots for this device.
+  * @last_seqno: last sequence number used to talk to this.
+  * @link_address_sent: if a link address message has been sent to this device yet.
++ * @guid: guid for DP 1.2 branch device. port under this branch can be
++ * identified by port #.
+  *
+  * This structure represents an MST branch device, there is one
+- * primary branch device at the root, along with any others connected
+- * to downstream ports
++ * primary branch device at the root, along with any other branches connected
++ * to downstream port of parent branches.
+  */
+ struct drm_dp_mst_branch {
+ 	struct kref kref;
+@@ -132,6 +128,9 @@ struct drm_dp_mst_branch {
+ 	struct drm_dp_sideband_msg_tx *tx_slots[2];
+ 	int last_seqno;
+ 	bool link_address_sent;
++
++	/* global unique identifier to identify branch devices */
++	u8 guid[16];
+ };
+ 
+ 
+@@ -406,11 +405,9 @@ struct drm_dp_payload {
+  * @conn_base_id: DRM connector ID this mgr is connected to.
+  * @down_rep_recv: msg receiver state for down replies.
+  * @up_req_recv: msg receiver state for up requests.
+- * @lock: protects mst state, primary, guid, dpcd.
++ * @lock: protects mst state, primary, dpcd.
+  * @mst_state: if this manager is enabled for an MST capable port.
+  * @mst_primary: pointer to the primary branch device.
+- * @guid_valid: GUID valid for the primary branch device.
+- * @guid: GUID for primary port.
+  * @dpcd: cache of DPCD for primary port.
+  * @pbn_div: PBN to slots divisor.
+  *
+@@ -432,13 +429,11 @@ struct drm_dp_mst_topology_mgr {
+ 	struct drm_dp_sideband_msg_rx up_req_recv;
+ 
+ 	/* pointer to info about the initial MST device */
+-	struct mutex lock; /* protects mst_state + primary + guid + dpcd */
++	struct mutex lock; /* protects mst_state + primary + dpcd */
+ 
+ 	bool mst_state;
+ 	struct drm_dp_mst_branch *mst_primary;
+-	/* primary MST device GUID */
+-	bool guid_valid;
+-	u8 guid[16];
++
+ 	u8 dpcd[DP_RECEIVER_CAP_SIZE];
+ 	u8 sink_count;
+ 	int pbn_div;
+
+commit 28f03607bb2e7a3dab71d0a377fd13f6ed3ebb9f
+Merge: e9c5e7402dad 4314e19ef4ae
+Author: Dave Airlie <airlied@redhat.com>
+Date:   Mon Jan 18 07:01:16 2016 +1000
+
+    Merge tag 'topic/drm-misc-2016-01-17' of git://anongit.freedesktop.org/drm-intel into drm-next
+    
+    Since your main drm-next pull isn't out of the door yet I figured I might
+    as well flush out drm-misc instead of delaying for 4.6. It's really just
+    random stuff all over, biggest thing probably connector_mask tracking from
+    Maarten.
+    
+    * tag 'topic/drm-misc-2016-01-17' of git://anongit.freedesktop.org/drm-intel: (24 commits)
+      drm/fb_cma_helper: Remove implicit call to disable_unused_functions
+      drm/sysfs: use kobj_to_dev()
+      drm/i915: Init power domains early in driver load
+      drm: Do not set connector->encoder in drivers
+      apple-gmux: Add initial documentation
+      drm: move MODULE_PARM_DESC to other file
+      drm/edid: index CEA/HDMI mode tables using the VIC
+      drm/atomic: Remove drm_atomic_connectors_for_crtc.
+      drm/i915: Update connector_mask during readout, v2.
+      drm: Remove opencoded drm_gem_object_release_handle()
+      drm: Do not set outparam on error during GEM handle allocation
+      drm/docs: more leftovers from the big vtable documentation pile
+      drm/atomic-helper: Reject legacy flips on a disabled pipe
+      drm/atomic: add connector mask to drm_crtc_state.
+      drm/tegra: Use __drm_atomic_helper_reset_connector for subclassing connector state, v2.
+      drm/atomic: Add __drm_atomic_helper_connector_reset, v2.
+      drm/i915: Set connector_state->connector using the helper.
+      drm: Use a normal idr allocation for the obj->name
+      drm: Only bump object-reference count when adding first handle
+      drm: Balance error path for GEM handle allocation
+      ...
+
+commit 1f16ee7fa13649f4e55aa48ad31c3eb0722a62d3
+Author: Mykola Lysenko <Mykola.Lysenko@amd.com>
+Date:   Fri Dec 18 17:14:43 2015 -0500
+
+    drm/dp/mst: always send reply for UP request
+    
+    We should always send reply for UP request in order
+    to make downstream device clean-up resources appropriately.
+    
+    Issue was that reply for UP request was sent only once.
+    
+    Acked-by: Dave Airlie <airlied@gmail.com>
+    Signed-off-by: Mykola Lysenko <Mykola.Lysenko@amd.com>
+    Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+    Cc: stable@vger.kernel.org
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index 74b5888bbc73..4fc55a87dfee 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -451,9 +451,7 @@ struct drm_dp_mst_topology_mgr {
+ 	   the mstb tx_slots and txmsg->state once they are queued */
+ 	struct mutex qlock;
+ 	struct list_head tx_msg_downq;
+-	struct list_head tx_msg_upq;
+ 	bool tx_down_in_progress;
+-	bool tx_up_in_progress;
+ 
+ 	/* payload info + lock for it */
+ 	struct mutex payload_lock;
+
+commit 69a0f89c0641668d402573a05b327ac8ed6d2560
+Author: Julia Lawall <Julia.Lawall@lip6.fr>
+Date:   Wed Dec 30 22:20:30 2015 +0100
+
+    drm/dp/mst: constify drm_dp_mst_topology_cbs structures
+    
+    The drm_dp_mst_topology_cbs structures are never modified, so declare them
+    as const.
+    
+    Done with the help of Coccinelle.
+    
+    Signed-off-by: Julia Lawall <Julia.Lawall@lip6.fr>
+    Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index 5340099741ae..16663713cc9f 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -420,7 +420,7 @@ struct drm_dp_payload {
+ struct drm_dp_mst_topology_mgr {
+ 
+ 	struct device *dev;
+-	struct drm_dp_mst_topology_cbs *cbs;
++	const struct drm_dp_mst_topology_cbs *cbs;
+ 	int max_dpcd_transaction_bytes;
+ 	struct drm_dp_aux *aux; /* auxch for this topology mgr to use */
+ 	int max_payloads;
+
+commit ef8f9bea1368b89d0d6d1819025586ae0bea0612
+Author: Libin Yang <libin.yang@linux.intel.com>
+Date:   Wed Dec 2 14:09:43 2015 +0800
+
+    dp/mst: add SDP stream support
+    
+    This adds code to initialise the SDP streams
+    for a sink in the simplest ordering.
+    
+    I've no idea how you'd want to control the
+    ordering at this level, so don't bother
+    until someone comes up with a use case.
+    
+    Reviewed-by: Ander Conselvan de Oliveira <conselvan2@gmail.com>
+    Signed-off-by: Libin Yang <libin.yang@linux.intel.com>
+    Signed-off-by: Dave Airlie <airlied@redhat.com>
+    Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+    Link: http://patchwork.freedesktop.org/patch/msgid/1449036584-105393-1-git-send-email-libin.yang@linux.intel.com
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index 5340099741ae..74b5888bbc73 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -94,6 +94,7 @@ struct drm_dp_mst_port {
+ 	struct drm_dp_mst_topology_mgr *mgr;
+ 
+ 	struct edid *cached_edid; /* for DP logical ports - make tiling work */
++	bool has_audio;
+ };
+ 
+ /**
+@@ -215,13 +216,13 @@ struct drm_dp_sideband_msg_rx {
+ 	struct drm_dp_sideband_msg_hdr initial_hdr;
+ };
+ 
+-
++#define DRM_DP_MAX_SDP_STREAMS 16
+ struct drm_dp_allocate_payload {
+ 	u8 port_number;
+ 	u8 number_sdp_streams;
+ 	u8 vcpi;
+ 	u16 pbn;
+-	u8 sdp_stream_sink[8];
++	u8 sdp_stream_sink[DRM_DP_MAX_SDP_STREAMS];
+ };
+ 
+ struct drm_dp_allocate_payload_ack_reply {
+@@ -484,6 +485,8 @@ int drm_dp_mst_hpd_irq(struct drm_dp_mst_topology_mgr *mgr, u8 *esi, bool *handl
+ 
+ enum drm_connector_status drm_dp_mst_detect_port(struct drm_connector *connector, struct drm_dp_mst_topology_mgr *mgr, struct drm_dp_mst_port *port);
+ 
++bool drm_dp_mst_port_has_audio(struct drm_dp_mst_topology_mgr *mgr,
++					struct drm_dp_mst_port *port);
+ struct edid *drm_dp_mst_get_edid(struct drm_connector *connector, struct drm_dp_mst_topology_mgr *mgr, struct drm_dp_mst_port *port);
+ 
+ 
+
+commit ae491542cbbbcca0ec8938c37d4079a985e58440
+Author: Dave Airlie <airlied@gmail.com>
+Date:   Wed Oct 14 18:51:17 2015 +1000
+
+    drm/dp/mst: make mst i2c transfer code more robust.
+    
+    This zeroes the msg so no random stack data ends up getting
+    sent, it also limits the function to not accepting > 4
+    i2c msgs.
+    
+    Cc: stable@vger.kernel.org
+    Reviewed-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+    Signed-off-by: Dave Airlie <airlied@redhat.com>
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index 0f408b002d98..5340099741ae 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -253,6 +253,7 @@ struct drm_dp_remote_dpcd_write {
+ 	u8 *bytes;
+ };
+ 
++#define DP_REMOTE_I2C_READ_MAX_TRANSACTIONS 4
+ struct drm_dp_remote_i2c_read {
+ 	u8 num_transactions;
+ 	u8 port_number;
+@@ -262,7 +263,7 @@ struct drm_dp_remote_i2c_read {
+ 		u8 *bytes;
+ 		u8 no_stop_bit;
+ 		u8 i2c_transaction_delay;
+-	} transactions[4];
++	} transactions[DP_REMOTE_I2C_READ_MAX_TRANSACTIONS];
+ 	u8 read_i2c_device_id;
+ 	u8 num_bytes_read;
+ };
+
+commit d9515c5ec1a20c77d83471e634ad9bb12deb0eac
+Author: Dave Airlie <airlied@redhat.com>
+Date:   Wed Sep 16 17:55:23 2015 +1000
+
+    drm/dp/mst: split connector registration into two parts (v2)
+    
+    In order to cache the EDID properly for tiled displays, we
+    need to retrieve it before we register the connector with
+    userspace, otherwise userspace can call get resources
+    and try and get the edid before we've even cached it.
+    
+    This fixes some problems when hotplugging mst monitors,
+    with X/mutter running. As mutter seems to get 0 modes
+    for one of the monitors in the tile.
+    
+    v2: fix warning in radeon
+    handle tile setting in cached path rather than
+    get edid path.
+    
+    Reviewed-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+    Cc: stable@vger.kernel.org
+    Signed-off-by: Dave Airlie <airlied@redhat.com>
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index 86d0b25ed054..0f408b002d98 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -374,6 +374,7 @@ struct drm_dp_mst_topology_mgr;
+ struct drm_dp_mst_topology_cbs {
+ 	/* create a connector for a port */
+ 	struct drm_connector *(*add_connector)(struct drm_dp_mst_topology_mgr *mgr, struct drm_dp_mst_port *port, const char *path);
++	void (*register_connector)(struct drm_connector *connector);
+ 	void (*destroy_connector)(struct drm_dp_mst_topology_mgr *mgr,
+ 				  struct drm_connector *connector);
+ 	void (*hotplug)(struct drm_dp_mst_topology_mgr *mgr);
+
+commit 6b8eeca65b18ae77e175cc2b6571731f0ee413bf
+Author: Dave Airlie <airlied@redhat.com>
+Date:   Mon Jun 15 10:34:28 2015 +1000
+
+    drm/dp/mst: close deadlock in connector destruction.
+    
+    I've only seen this once, and I failed to capture the
+    lockdep backtrace, but I did some investigations.
+    
+    If we are calling into the MST layer from EDID probing,
+    we have the mode_config mutex held, if during that EDID
+    probing, the MST hub goes away, then we can get a deadlock
+    where the connector destruction function in the driver
+    tries to retake the mode config mutex.
+    
+    This offloads connector destruction to a workqueue,
+    and avoid the subsequenct lock ordering issue.
+    
+    Acked-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+    Cc: stable@vger.kernel.org
+    Signed-off-by: Dave Airlie <airlied@redhat.com>
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index a2507817be41..86d0b25ed054 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -463,6 +463,10 @@ struct drm_dp_mst_topology_mgr {
+ 	struct work_struct work;
+ 
+ 	struct work_struct tx_work;
++
++	struct list_head destroy_connector_list;
++	struct mutex destroy_connector_lock;
++	struct work_struct destroy_connector_work;
+ };
+ 
+ int drm_dp_mst_topology_mgr_init(struct drm_dp_mst_topology_mgr *mgr, struct device *dev, struct drm_dp_aux *aux, int max_dpcd_transaction_bytes, int max_payloads, int conn_base_id);
+
+commit 87f5942d1f7bc320a0ec70ac4a8a3396024c7091
+Author: Dave Airlie <airlied@redhat.com>
+Date:   Tue Feb 24 09:23:55 2015 +1000
+
+    drm/dp_mst: add a function to retrieve vcpi slots
+    
+    radeon requires this to get the slots for later filling
+    out a table on every transition.
+    
+    Signed-off-by: Dave Airlie <airlied@redhat.com>
+    Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index 00c1da927245..a2507817be41 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -486,6 +486,8 @@ int drm_dp_calc_pbn_mode(int clock, int bpp);
+ 
+ bool drm_dp_mst_allocate_vcpi(struct drm_dp_mst_topology_mgr *mgr, struct drm_dp_mst_port *port, int pbn, int *slots);
+ 
++int drm_dp_mst_get_vcpi_slots(struct drm_dp_mst_topology_mgr *mgr, struct drm_dp_mst_port *port);
++
+ 
+ void drm_dp_mst_reset_vcpi_slots(struct drm_dp_mst_topology_mgr *mgr, struct drm_dp_mst_port *port);
+ 
+
+commit c6a0aed4d493936f61cd153db84531026705c94d
+Author: Dave Airlie <airlied@redhat.com>
+Date:   Mon Oct 20 16:28:02 2014 +1000
+
+    drm/mst: cached EDID for logical ports (v2)
+    
+    Logical ports are never going to have EDID changes,
+    they are used for the internal ports on MST monitors.
+    
+    We cache the EDIDs from these to save time at MST probe.
+    
+    v2: drop misplace tile property line, meant for other patch.
+    
+    Signed-off-by: Dave Airlie <airlied@redhat.com>
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index cec6383bbdb8..00c1da927245 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -92,6 +92,8 @@ struct drm_dp_mst_port {
+ 	struct drm_dp_vcpi vcpi;
+ 	struct drm_connector *connector;
+ 	struct drm_dp_mst_topology_mgr *mgr;
++
++	struct edid *cached_edid; /* for DP logical ports - make tiling work */
+ };
+ 
+ /**
+@@ -474,7 +476,7 @@ int drm_dp_mst_topology_mgr_set_mst(struct drm_dp_mst_topology_mgr *mgr, bool ms
+ int drm_dp_mst_hpd_irq(struct drm_dp_mst_topology_mgr *mgr, u8 *esi, bool *handled);
+ 
+ 
+-enum drm_connector_status drm_dp_mst_detect_port(struct drm_dp_mst_topology_mgr *mgr, struct drm_dp_mst_port *port);
++enum drm_connector_status drm_dp_mst_detect_port(struct drm_connector *connector, struct drm_dp_mst_topology_mgr *mgr, struct drm_dp_mst_port *port);
+ 
+ struct edid *drm_dp_mst_get_edid(struct drm_connector *connector, struct drm_dp_mst_topology_mgr *mgr, struct drm_dp_mst_port *port);
+ 
+
+commit 4fb2ac6ebe3ece9cafb2bb6d4a2e8e4edb124637
+Merge: 8aa3dc3c17f8 37d74578d819
+Author: Dave Airlie <airlied@redhat.com>
+Date:   Sat Nov 15 09:37:20 2014 +1000
+
+    Merge tag 'drm/fixes/for-3.19-rc1' of git://people.freedesktop.org/~tagr/linux into drm-next
+    
+    drm: Miscellaneous fixes for v3.19-rc1
+    
+    This is a small collection of fixes that I've been carrying around for a
+    while now. Many of these have been posted and reviewed or acked. The few
+    that haven't I deemed too trivial to bother.
+    
+    * tag 'drm/fixes/for-3.19-rc1' of git://people.freedesktop.org/~tagr/linux:
+      video/hdmi: Relicense header under MIT license
+      drm/gma500: mdfld: Reuse video/mipi_display.h
+      drm: Make drm_mode_create_tv_properties() signature consistent
+      drm: Implement drm_get_pci_dev() dummy for !PCI
+      drm/prime: Use unsigned type for number of pages
+      drm/gem: Fix typo in kerneldoc
+      drm: Use const data when creating blob properties
+      drm: Use size_t for blob property sizes
+
+commit 12e6cecd55e541d3e8110f7dfbb6a601e81733ff
+Author: Thierry Reding <treding@nvidia.com>
+Date:   Tue May 13 11:38:36 2014 +0200
+
+    drm: Use const data when creating blob properties
+    
+    Creating a blob property will always copy the input data so the data
+    that is passed in can be const.
+    
+    Signed-off-by: Thierry Reding <treding@nvidia.com>
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index 338fc1053835..fdcd7f271b66 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -371,7 +371,7 @@ struct drm_dp_sideband_msg_tx {
+ struct drm_dp_mst_topology_mgr;
+ struct drm_dp_mst_topology_cbs {
+ 	/* create a connector for a port */
+-	struct drm_connector *(*add_connector)(struct drm_dp_mst_topology_mgr *mgr, struct drm_dp_mst_port *port, char *path);
++	struct drm_connector *(*add_connector)(struct drm_dp_mst_topology_mgr *mgr, struct drm_dp_mst_port *port, const char *path);
+ 	void (*destroy_connector)(struct drm_dp_mst_topology_mgr *mgr,
+ 				  struct drm_connector *connector);
+ 	void (*hotplug)(struct drm_dp_mst_topology_mgr *mgr);
+
+commit 1f9e14baa9139fce2265206746fe5491be7726e9
+Merge: 5fa2704e011e babc94936b7a
+Author: Dave Airlie <airlied@redhat.com>
+Date:   Fri Nov 7 10:58:46 2014 +1000
+
+    Merge tag 'topic/core-stuff-2014-11-05' of git://anongit.freedesktop.org/drm-intel into drm-next
+    
+    Just various stuff all over from a bunch of people. Shortlog gives a beter
+    overview, it's really all misc drm patches.
+    
+    * tag 'topic/core-stuff-2014-11-05' of git://anongit.freedesktop.org/drm-intel:
+      drm/edid: add #defines and helpers for ELD
+      drm/dp: Add counters in the drm_dp_aux struct for I2C NACKs and DEFERs
+      drm: Remove compiler BUG_ON() test
+      drm: Fix DRM_FORCE_ON_DIGITAL use
+      drm/gma500: Don't destroy DRM properties in the driver
+      drm/i915: Don't destroy DRM properties in the driver
+      drm: Add a note to drm_property_create() about property lifetime
+      gpu: drm: Fix warning caused by a parameter description in drm_crtc.c
+      drm/dp-helper: Move the legacy helpers to gma500
+      drm/crtc: Remove duplicated ioctl code
+      drm/crtc: Fix two typos
+      gpu:drm: Fix typo in Documentation/DocBook/drm.xml
+      gpu: drm: drm_dp_mst_topology.c: Fix improper use of strncat
+      drm: drm_err: Remove unnecessary __func__ argument
+      drm: Implement O_NONBLOCK support on /dev/dri/cardN
+
+commit 32197aab0425dbecc38462a91bc5c8acf70b2036
+Author: Masanari Iida <standby24x7@gmail.com>
+Date:   Mon Oct 20 23:53:13 2014 +0900
+
+    gpu:drm: Fix typo in Documentation/DocBook/drm.xml
+    
+    This patch fix spelling typos found in drm.xml.
+    It is because the file is generated from comments in
+    source codes, I have to fix the typos within source files.
+    
+    Signed-off-by: Masanari Iida <standby24x7@gmail.com>
+    Acked-by: Randy Dunlap <rdunlap@infradead.org>
+    Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index 9b446ada2532..3ecfcc143bdd 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -28,7 +28,7 @@
+ struct drm_dp_mst_branch;
+ 
+ /**
+- * struct drm_dp_vcpi - Virtual Channel Payload Identifer
++ * struct drm_dp_vcpi - Virtual Channel Payload Identifier
+  * @vcpi: Virtual channel ID.
+  * @pbn: Payload Bandwidth Number for this channel
+  * @aligned_pbn: PBN aligned with slot size
+
+commit dfda0df3426483cf5fc7441f23f318edbabecb03
+Author: Dave Airlie <airlied@redhat.com>
+Date:   Wed Aug 6 16:26:21 2014 +1000
+
+    drm/mst: rework payload table allocation to conform better.
+    
+    The old code has problems with the Dell MST monitors due to some
+    assumptions I made that weren't true.
+    
+    I initially thought the Virtual Channel Payload IDs had to be in
+    the DPCD table in ascending order, however it appears that assumption
+    is bogus.
+    
+    The old code also assumed it was possible to insert a member
+    into the table and it would move other members up, like it does
+    when you remove table entries, however reality has shown this
+    isn't true.
+    
+    So the new code allocates VCPIs separate from entries in the payload
+    tracking table, and when we remove an entry from the DPCD table,
+    I shuffle the tracking payload entries around in the struct.
+    
+    This appears to make VT switch more robust (still not perfect)
+    with an MST enabled Dell monitor.
+    
+    Signed-off-by: Dave Airlie <airlied@redhat.com>
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+index 9b446ada2532..338fc1053835 100644
+--- a/include/drm/drm_dp_mst_helper.h
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -388,6 +388,7 @@ struct drm_dp_payload {
+ 	int payload_state;
+ 	int start_slot;
+ 	int num_slots;
++	int vcpi;
+ };
+ 
+ /**
+@@ -454,6 +455,7 @@ struct drm_dp_mst_topology_mgr {
+ 	struct drm_dp_vcpi **proposed_vcpis;
+ 	struct drm_dp_payload *payloads;
+ 	unsigned long payload_mask;
++	unsigned long vcpi_mask;
+ 
+ 	wait_queue_head_t tx_waitq;
+ 	struct work_struct work;
+
+commit ad7f8a1f9ced7f049f9b66d588723f243a7034cd
+Author: Dave Airlie <airlied@redhat.com>
+Date:   Thu Jun 5 14:01:32 2014 +1000
+
+    drm/helper: add Displayport multi-stream helper (v0.6)
+    
+    This is the initial import of the helper for displayport multistream.
+    
+    It consists of a topology manager, init/destroy/set mst state
+    
+    It supports DP 1.2 MST sideband msg protocol handler - via hpd irqs
+    
+    connector detect and edid retrieval interface.
+    
+    It supports i2c device over DP 1.2 sideband msg protocol (EDID reads only)
+    
+    bandwidth manager API via vcpi allocation and payload updating,
+    along with a helper to check the ACT status.
+    
+    Objects:
+    MST topology manager - one per toplevel MST capable GPU port - not sure if this should be higher level again
+    MST branch unit - one instance per plugged branching unit - one at top of hierarchy - others hanging from ports
+    MST port - one port per port reported by branching units, can have MST units hanging from them as well.
+    
+    Changes since initial posting:
+    a) add a mutex responsbile for the queues, it locks the sideband and msg slots, and msgs to transmit state
+    b) add worker to handle connection state change events, for MST device chaining and hotplug
+    c) add a payload spinlock
+    d) add path sideband msg support
+    e) fixup enum path resources transmit
+    f) reduce max dpcd msg to 16, as per DP1.2 spec.
+    g) separate tx queue kicking from irq processing and move irq acking back to drivers.
+    
+    Changes since v0.2:
+    a) reorganise code,
+    b) drop ACT forcing code
+    c) add connector naming interface using path property
+    d) add topology dumper helper
+    e) proper reference counting and lookup for ports and mstbs.
+    f) move tx kicking into a workq
+    g) add aux locking - this should be redone
+    h) split teardown into two parts
+    i) start working on documentation on interface.
+    
+    Changes since v0.3:
+    a) vc payload locking and tracking fixes
+    b) add hotplug callback into driver - replaces crazy return 1 scheme
+    c) txmsg + mst branch device refcount fixes
+    d) don't bail on mst shutdown if device is gone
+    e) change irq handler to take all 4 bytes of SINK_COUNT + ESI vectors
+    f) make DP payload updates timeout longer - observed on docking station redock
+    g) add more info to debugfs dumper
+    
+    Changes since v0.4:
+    a) suspend/resume support
+    b) more debugging in debugfs
+    
+    Changes since v0.5:
+    a) use byte * to avoid unnecessary stack usage
+    b) fix num_sdp_streams interpretation.
+    c) init payload state for unplug events
+    d) remove lenovo dock sink count hack
+    e) drop aux lock - post rebase
+    f) call hotplug on port destroy
+    
+    TODO:
+    misc features
+    
+    Reviewed-by: Todd Previte <tprevite@gmail.com>
+    Signed-off-by: Dave Airlie <airlied@redhat.com>
+
+diff --git a/include/drm/drm_dp_mst_helper.h b/include/drm/drm_dp_mst_helper.h
+new file mode 100644
+index 000000000000..9b446ada2532
+--- /dev/null
++++ b/include/drm/drm_dp_mst_helper.h
+@@ -0,0 +1,509 @@
++/*
++ * Copyright © 2014 Red Hat.
++ *
++ * Permission to use, copy, modify, distribute, and sell this software and its
++ * documentation for any purpose is hereby granted without fee, provided that
++ * the above copyright notice appear in all copies and that both that copyright
++ * notice and this permission notice appear in supporting documentation, and
++ * that the name of the copyright holders not be used in advertising or
++ * publicity pertaining to distribution of the software without specific,
++ * written prior permission.  The copyright holders make no representations
++ * about the suitability of this software for any purpose.  It is provided "as
++ * is" without express or implied warranty.
++ *
++ * THE COPYRIGHT HOLDERS DISCLAIM ALL WARRANTIES WITH REGARD TO THIS SOFTWARE,
++ * INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS, IN NO
++ * EVENT SHALL THE COPYRIGHT HOLDERS BE LIABLE FOR ANY SPECIAL, INDIRECT OR
++ * CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE,
++ * DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER
++ * TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE
++ * OF THIS SOFTWARE.
++ */
++#ifndef _DRM_DP_MST_HELPER_H_
++#define _DRM_DP_MST_HELPER_H_
++
++#include <linux/types.h>
++#include <drm/drm_dp_helper.h>
++
++struct drm_dp_mst_branch;
++
++/**
++ * struct drm_dp_vcpi - Virtual Channel Payload Identifer
++ * @vcpi: Virtual channel ID.
++ * @pbn: Payload Bandwidth Number for this channel
++ * @aligned_pbn: PBN aligned with slot size
++ * @num_slots: number of slots for this PBN
++ */
++struct drm_dp_vcpi {
++	int vcpi;
++	int pbn;
++	int aligned_pbn;
++	int num_slots;
++};
++
++/**
++ * struct drm_dp_mst_port - MST port
++ * @kref: reference count for this port.
++ * @guid_valid: for DP 1.2 devices if we have validated the GUID.
++ * @guid: guid for DP 1.2 device on this port.
++ * @port_num: port number
++ * @input: if this port is an input port.
++ * @mcs: message capability status - DP 1.2 spec.
++ * @ddps: DisplayPort Device Plug Status - DP 1.2
++ * @pdt: Peer Device Type
++ * @ldps: Legacy Device Plug Status
++ * @dpcd_rev: DPCD revision of device on this port
++ * @num_sdp_streams: Number of simultaneous streams
++ * @num_sdp_stream_sinks: Number of stream sinks
++ * @available_pbn: Available bandwidth for this port.
++ * @next: link to next port on this branch device
++ * @mstb: branch device attach below this port
++ * @aux: i2c aux transport to talk to device connected to this port.
++ * @parent: branch device parent of this port
++ * @vcpi: Virtual Channel Payload info for this port.
++ * @connector: DRM connector this port is connected to.
++ * @mgr: topology manager this port lives under.
++ *
++ * This structure represents an MST port endpoint on a device somewhere
++ * in the MST topology.
++ */
++struct drm_dp_mst_port {
++	struct kref kref;
++
++	/* if dpcd 1.2 device is on this port - its GUID info */
++	bool guid_valid;
++	u8 guid[16];
++
++	u8 port_num;
++	bool input;
++	bool mcs;
++	bool ddps;
++	u8 pdt;
++	bool ldps;
++	u8 dpcd_rev;
++	u8 num_sdp_streams;
++	u8 num_sdp_stream_sinks;
++	uint16_t available_pbn;
++	struct list_head next;
++	struct drm_dp_mst_branch *mstb; /* pointer to an mstb if this port has one */
++	struct drm_dp_aux aux; /* i2c bus for this port? */
++	struct drm_dp_mst_branch *parent;
++
++	struct drm_dp_vcpi vcpi;
++	struct drm_connector *connector;
++	struct drm_dp_mst_topology_mgr *mgr;
++};
++
++/**
++ * struct drm_dp_mst_branch - MST branch device.
++ * @kref: reference count for this port.
++ * @rad: Relative Address to talk to this branch device.
++ * @lct: Link count total to talk to this branch device.
++ * @num_ports: number of ports on the branch.
++ * @msg_slots: one bit per transmitted msg slot.
++ * @ports: linked list of ports on this branch.
++ * @port_parent: pointer to the port parent, NULL if toplevel.
++ * @mgr: topology manager for this branch device.
++ * @tx_slots: transmission slots for this device.
++ * @last_seqno: last sequence number used to talk to this.
++ * @link_address_sent: if a link address message has been sent to this device yet.
++ *
++ * This structure represents an MST branch device, there is one
++ * primary branch device at the root, along with any others connected
++ * to downstream ports
++ */
++struct drm_dp_mst_branch {
++	struct kref kref;
++	u8 rad[8];
++	u8 lct;
++	int num_ports;
++
++	int msg_slots;
++	struct list_head ports;
++
++	/* list of tx ops queue for this port */
++	struct drm_dp_mst_port *port_parent;
++	struct drm_dp_mst_topology_mgr *mgr;
++
++	/* slots are protected by mstb->mgr->qlock */
++	struct drm_dp_sideband_msg_tx *tx_slots[2];
++	int last_seqno;
++	bool link_address_sent;
++};
++
++
++/* sideband msg header - not bit struct */
++struct drm_dp_sideband_msg_hdr {
++	u8 lct;
++	u8 lcr;
++	u8 rad[8];
++	bool broadcast;
++	bool path_msg;
++	u8 msg_len;
++	bool somt;
++	bool eomt;
++	bool seqno;
++};
++
++struct drm_dp_nak_reply {
++	u8 guid[16];
++	u8 reason;
++	u8 nak_data;
++};
++
++struct drm_dp_link_address_ack_reply {
++	u8 guid[16];
++	u8 nports;
++	struct drm_dp_link_addr_reply_port {
++		bool input_port;
++		u8 peer_device_type;
++		u8 port_number;
++		bool mcs;
++		bool ddps;
++		bool legacy_device_plug_status;
++		u8 dpcd_revision;
++		u8 peer_guid[16];
++		u8 num_sdp_streams;
++		u8 num_sdp_stream_sinks;
++	} ports[16];
++};
++
++struct drm_dp_remote_dpcd_read_ack_reply {
++	u8 port_number;
++	u8 num_bytes;
++	u8 bytes[255];
++};
++
++struct drm_dp_remote_dpcd_write_ack_reply {
++	u8 port_number;
++};
++
++struct drm_dp_remote_dpcd_write_nak_reply {
++	u8 port_number;
++	u8 reason;
++	u8 bytes_written_before_failure;
++};
++
++struct drm_dp_remote_i2c_read_ack_reply {
++	u8 port_number;
++	u8 num_bytes;
++	u8 bytes[255];
++};
++
++struct drm_dp_remote_i2c_read_nak_reply {
++	u8 port_number;
++	u8 nak_reason;
++	u8 i2c_nak_transaction;
++};
++
++struct drm_dp_remote_i2c_write_ack_reply {
++	u8 port_number;
++};
++
++
++struct drm_dp_sideband_msg_rx {
++	u8 chunk[48];
++	u8 msg[256];
++	u8 curchunk_len;
++	u8 curchunk_idx; /* chunk we are parsing now */
++	u8 curchunk_hdrlen;
++	u8 curlen; /* total length of the msg */
++	bool have_somt;
++	bool have_eomt;
++	struct drm_dp_sideband_msg_hdr initial_hdr;
++};
++
++
++struct drm_dp_allocate_payload {
++	u8 port_number;
++	u8 number_sdp_streams;
++	u8 vcpi;
++	u16 pbn;
++	u8 sdp_stream_sink[8];
++};
++
++struct drm_dp_allocate_payload_ack_reply {
++	u8 port_number;
++	u8 vcpi;
++	u16 allocated_pbn;
++};
++
++struct drm_dp_connection_status_notify {
++	u8 guid[16];
++	u8 port_number;
++	bool legacy_device_plug_status;
++	bool displayport_device_plug_status;
++	bool message_capability_status;
++	bool input_port;
++	u8 peer_device_type;
++};
++
++struct drm_dp_remote_dpcd_read {
++	u8 port_number;
++	u32 dpcd_address;
++	u8 num_bytes;
++};
++
++struct drm_dp_remote_dpcd_write {
++	u8 port_number;
++	u32 dpcd_address;
++	u8 num_bytes;
++	u8 *bytes;
++};
++
++struct drm_dp_remote_i2c_read {
++	u8 num_transactions;
++	u8 port_number;
++	struct {
++		u8 i2c_dev_id;
++		u8 num_bytes;
++		u8 *bytes;
++		u8 no_stop_bit;
++		u8 i2c_transaction_delay;
++	} transactions[4];
++	u8 read_i2c_device_id;
++	u8 num_bytes_read;
++};
++
++struct drm_dp_remote_i2c_write {
++	u8 port_number;
++	u8 write_i2c_device_id;
++	u8 num_bytes;
++	u8 *bytes;
++};
++
++/* this covers ENUM_RESOURCES, POWER_DOWN_PHY, POWER_UP_PHY */
++struct drm_dp_port_number_req {
++	u8 port_number;
++};
++
++struct drm_dp_enum_path_resources_ack_reply {
++	u8 port_number;
++	u16 full_payload_bw_number;
++	u16 avail_payload_bw_number;
++};
++
++/* covers POWER_DOWN_PHY, POWER_UP_PHY */
++struct drm_dp_port_number_rep {
++	u8 port_number;
++};
++
++struct drm_dp_query_payload {
++	u8 port_number;
++	u8 vcpi;
++};
++
++struct drm_dp_resource_status_notify {
++	u8 port_number;
++	u8 guid[16];
++	u16 available_pbn;
++};
++
++struct drm_dp_query_payload_ack_reply {
++	u8 port_number;
++	u8 allocated_pbn;
++};
++
++struct drm_dp_sideband_msg_req_body {
++	u8 req_type;
++	union ack_req {
++		struct drm_dp_connection_status_notify conn_stat;
++		struct drm_dp_port_number_req port_num;
++		struct drm_dp_resource_status_notify resource_stat;
++
++		struct drm_dp_query_payload query_payload;
++		struct drm_dp_allocate_payload allocate_payload;
++
++		struct drm_dp_remote_dpcd_read dpcd_read;
++		struct drm_dp_remote_dpcd_write dpcd_write;
++
++		struct drm_dp_remote_i2c_read i2c_read;
++		struct drm_dp_remote_i2c_write i2c_write;
++	} u;
++};
++
++struct drm_dp_sideband_msg_reply_body {
++	u8 reply_type;
++	u8 req_type;
++	union ack_replies {
++		struct drm_dp_nak_reply nak;
++		struct drm_dp_link_address_ack_reply link_addr;
++		struct drm_dp_port_number_rep port_number;
++
++		struct drm_dp_enum_path_resources_ack_reply path_resources;
++		struct drm_dp_allocate_payload_ack_reply allocate_payload;
++		struct drm_dp_query_payload_ack_reply query_payload;
++
++		struct drm_dp_remote_dpcd_read_ack_reply remote_dpcd_read_ack;
++		struct drm_dp_remote_dpcd_write_ack_reply remote_dpcd_write_ack;
++		struct drm_dp_remote_dpcd_write_nak_reply remote_dpcd_write_nack;
++
++		struct drm_dp_remote_i2c_read_ack_reply remote_i2c_read_ack;
++		struct drm_dp_remote_i2c_read_nak_reply remote_i2c_read_nack;
++		struct drm_dp_remote_i2c_write_ack_reply remote_i2c_write_ack;
++	} u;
++};
++
++/* msg is queued to be put into a slot */
++#define DRM_DP_SIDEBAND_TX_QUEUED 0
++/* msg has started transmitting on a slot - still on msgq */
++#define DRM_DP_SIDEBAND_TX_START_SEND 1
++/* msg has finished transmitting on a slot - removed from msgq only in slot */
++#define DRM_DP_SIDEBAND_TX_SENT 2
++/* msg has received a response - removed from slot */
++#define DRM_DP_SIDEBAND_TX_RX 3
++#define DRM_DP_SIDEBAND_TX_TIMEOUT 4
++
++struct drm_dp_sideband_msg_tx {
++	u8 msg[256];
++	u8 chunk[48];
++	u8 cur_offset;
++	u8 cur_len;
++	struct drm_dp_mst_branch *dst;
++	struct list_head next;
++	int seqno;
++	int state;
++	bool path_msg;
++	struct drm_dp_sideband_msg_reply_body reply;
++};
++
++/* sideband msg handler */
++struct drm_dp_mst_topology_mgr;
++struct drm_dp_mst_topology_cbs {
++	/* create a connector for a port */
++	struct drm_connector *(*add_connector)(struct drm_dp_mst_topology_mgr *mgr, struct drm_dp_mst_port *port, char *path);
++	void (*destroy_connector)(struct drm_dp_mst_topology_mgr *mgr,
++				  struct drm_connector *connector);
++	void (*hotplug)(struct drm_dp_mst_topology_mgr *mgr);
++
++};
++
++#define DP_MAX_PAYLOAD (sizeof(unsigned long) * 8)
++
++#define DP_PAYLOAD_LOCAL 1
++#define DP_PAYLOAD_REMOTE 2
++#define DP_PAYLOAD_DELETE_LOCAL 3
++
++struct drm_dp_payload {
++	int payload_state;
++	int start_slot;
++	int num_slots;
++};
++
++/**
++ * struct drm_dp_mst_topology_mgr - DisplayPort MST manager
++ * @dev: device pointer for adding i2c devices etc.
++ * @cbs: callbacks for connector addition and destruction.
++ * @max_dpcd_transaction_bytes - maximum number of bytes to read/write in one go.
++ * @aux: aux channel for the DP connector.
++ * @max_payloads: maximum number of payloads the GPU can generate.
++ * @conn_base_id: DRM connector ID this mgr is connected to.
++ * @down_rep_recv: msg receiver state for down replies.
++ * @up_req_recv: msg receiver state for up requests.
++ * @lock: protects mst state, primary, guid, dpcd.
++ * @mst_state: if this manager is enabled for an MST capable port.
++ * @mst_primary: pointer to the primary branch device.
++ * @guid_valid: GUID valid for the primary branch device.
++ * @guid: GUID for primary port.
++ * @dpcd: cache of DPCD for primary port.
++ * @pbn_div: PBN to slots divisor.
++ *
++ * This struct represents the toplevel displayport MST topology manager.
++ * There should be one instance of this for every MST capable DP connector
++ * on the GPU.
++ */
++struct drm_dp_mst_topology_mgr {
++
++	struct device *dev;
++	struct drm_dp_mst_topology_cbs *cbs;
++	int max_dpcd_transaction_bytes;
++	struct drm_dp_aux *aux; /* auxch for this topology mgr to use */
++	int max_payloads;
++	int conn_base_id;
++
++	/* only ever accessed from the workqueue - which should be serialised */
++	struct drm_dp_sideband_msg_rx down_rep_recv;
++	struct drm_dp_sideband_msg_rx up_req_recv;
++
++	/* pointer to info about the initial MST device */
++	struct mutex lock; /* protects mst_state + primary + guid + dpcd */
++
++	bool mst_state;
++	struct drm_dp_mst_branch *mst_primary;
++	/* primary MST device GUID */
++	bool guid_valid;
++	u8 guid[16];
++	u8 dpcd[DP_RECEIVER_CAP_SIZE];
++	u8 sink_count;
++	int pbn_div;
++	int total_slots;
++	int avail_slots;
++	int total_pbn;
++
++	/* messages to be transmitted */
++	/* qlock protects the upq/downq and in_progress,
++	   the mstb tx_slots and txmsg->state once they are queued */
++	struct mutex qlock;
++	struct list_head tx_msg_downq;
++	struct list_head tx_msg_upq;
++	bool tx_down_in_progress;
++	bool tx_up_in_progress;
++
++	/* payload info + lock for it */
++	struct mutex payload_lock;
++	struct drm_dp_vcpi **proposed_vcpis;
++	struct drm_dp_payload *payloads;
++	unsigned long payload_mask;
++
++	wait_queue_head_t tx_waitq;
++	struct work_struct work;
++
++	struct work_struct tx_work;
++};
++
++int drm_dp_mst_topology_mgr_init(struct drm_dp_mst_topology_mgr *mgr, struct device *dev, struct drm_dp_aux *aux, int max_dpcd_transaction_bytes, int max_payloads, int conn_base_id);
++
++void drm_dp_mst_topology_mgr_destroy(struct drm_dp_mst_topology_mgr *mgr);
++
++
++int drm_dp_mst_topology_mgr_set_mst(struct drm_dp_mst_topology_mgr *mgr, bool mst_state);
++
++
++int drm_dp_mst_hpd_irq(struct drm_dp_mst_topology_mgr *mgr, u8 *esi, bool *handled);
++
++
++enum drm_connector_status drm_dp_mst_detect_port(struct drm_dp_mst_topology_mgr *mgr, struct drm_dp_mst_port *port);
++
++struct edid *drm_dp_mst_get_edid(struct drm_connector *connector, struct drm_dp_mst_topology_mgr *mgr, struct drm_dp_mst_port *port);
++
++
++int drm_dp_calc_pbn_mode(int clock, int bpp);
++
++
++bool drm_dp_mst_allocate_vcpi(struct drm_dp_mst_topology_mgr *mgr, struct drm_dp_mst_port *port, int pbn, int *slots);
++
++
++void drm_dp_mst_reset_vcpi_slots(struct drm_dp_mst_topology_mgr *mgr, struct drm_dp_mst_port *port);
++
++
++void drm_dp_mst_deallocate_vcpi(struct drm_dp_mst_topology_mgr *mgr,
++				struct drm_dp_mst_port *port);
++
++
++int drm_dp_find_vcpi_slots(struct drm_dp_mst_topology_mgr *mgr,
++			   int pbn);
++
++
++int drm_dp_update_payload_part1(struct drm_dp_mst_topology_mgr *mgr);
++
++
++int drm_dp_update_payload_part2(struct drm_dp_mst_topology_mgr *mgr);
++
++int drm_dp_check_act_status(struct drm_dp_mst_topology_mgr *mgr);
++
++void drm_dp_mst_dump_topology(struct seq_file *m,
++			      struct drm_dp_mst_topology_mgr *mgr);
++
++void drm_dp_mst_topology_mgr_suspend(struct drm_dp_mst_topology_mgr *mgr);
++int drm_dp_mst_topology_mgr_resume(struct drm_dp_mst_topology_mgr *mgr);
++#endif

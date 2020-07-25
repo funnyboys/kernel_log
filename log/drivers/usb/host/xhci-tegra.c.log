@@ -1,0 +1,4742 @@
+commit f836e7843036fbf34320356e156cd4267fa5bfa2
+Author: Nagarjuna Kristam <nkristam@nvidia.com>
+Date:   Mon Feb 10 13:41:34 2020 +0530
+
+    usb: xhci-tegra: Add OTG support
+    
+    Get usb-phy's for availbale USB 2 phys. Register id notifiers for available
+    usb-phy's to receive role change notifications. Perform PP for the received
+    role change usb ports.
+    
+    Signed-off-by: Nagarjuna Kristam <nkristam@nvidia.com>
+    [treding@nvidia.com: rebase onto Greg's usb-next branch]
+    Signed-off-by: Thierry Reding <treding@nvidia.com>
+
+diff --git a/drivers/usb/host/xhci-tegra.c b/drivers/usb/host/xhci-tegra.c
+index a6e36b3c968f..2eaf5c0af80c 100644
+--- a/drivers/usb/host/xhci-tegra.c
++++ b/drivers/usb/host/xhci-tegra.c
+@@ -24,6 +24,9 @@
+ #include <linux/regulator/consumer.h>
+ #include <linux/reset.h>
+ #include <linux/slab.h>
++#include <linux/usb/otg.h>
++#include <linux/usb/phy.h>
++#include <linux/usb/role.h>
+ #include <soc/tegra/pmc.h>
+ 
+ #include "xhci.h"
+@@ -204,6 +207,7 @@ struct tegra_xusb_soc {
+ 	bool scale_ss_clock;
+ 	bool has_ipfs;
+ 	bool lpm_support;
++	bool otg_reset_sspi;
+ };
+ 
+ struct tegra_xusb_context {
+@@ -251,6 +255,14 @@ struct tegra_xusb {
+ 	struct phy **phys;
+ 	unsigned int num_phys;
+ 
++	struct usb_phy **usbphy;
++	unsigned int num_usb_phys;
++	int otg_usb2_port;
++	int otg_usb3_port;
++	bool host_mode;
++	struct notifier_block id_nb;
++	struct work_struct id_work;
++
+ 	/* Firmware loading related */
+ 	struct {
+ 		size_t size;
+@@ -1082,6 +1094,205 @@ static int tegra_xusb_enable_firmware_messages(struct tegra_xusb *tegra)
+ 	return err;
+ }
+ 
++static void tegra_xhci_set_port_power(struct tegra_xusb *tegra, bool main,
++						 bool set)
++{
++	struct xhci_hcd *xhci = hcd_to_xhci(tegra->hcd);
++	struct usb_hcd *hcd = main ?  xhci->main_hcd : xhci->shared_hcd;
++	unsigned int wait = (!main && !set) ? 1000 : 10;
++	u16 typeReq = set ? SetPortFeature : ClearPortFeature;
++	u16 wIndex = main ? tegra->otg_usb2_port + 1 : tegra->otg_usb3_port + 1;
++	u32 status;
++	u32 stat_power = main ? USB_PORT_STAT_POWER : USB_SS_PORT_STAT_POWER;
++	u32 status_val = set ? stat_power : 0;
++
++	dev_dbg(tegra->dev, "%s():%s %s port power\n", __func__,
++		set ? "set" : "clear", main ? "HS" : "SS");
++
++	hcd->driver->hub_control(hcd, typeReq, USB_PORT_FEAT_POWER, wIndex,
++				 NULL, 0);
++
++	do {
++		tegra_xhci_hc_driver.hub_control(hcd, GetPortStatus, 0, wIndex,
++					(char *) &status, sizeof(status));
++		if (status_val == (status & stat_power))
++			break;
++
++		if (!main && !set)
++			usleep_range(600, 700);
++		else
++			usleep_range(10, 20);
++	} while (--wait > 0);
++
++	if (status_val != (status & stat_power))
++		dev_info(tegra->dev, "failed to %s %s PP %d\n",
++						set ? "set" : "clear",
++						main ? "HS" : "SS", status);
++}
++
++static struct phy *tegra_xusb_get_phy(struct tegra_xusb *tegra, char *name,
++								int port)
++{
++	unsigned int i, phy_count = 0;
++
++	for (i = 0; i < tegra->soc->num_types; i++) {
++		if (!strncmp(tegra->soc->phy_types[i].name, "usb2",
++							    strlen(name)))
++			return tegra->phys[phy_count+port];
++
++		phy_count += tegra->soc->phy_types[i].num;
++	}
++
++	return NULL;
++}
++
++static void tegra_xhci_id_work(struct work_struct *work)
++{
++	struct tegra_xusb *tegra = container_of(work, struct tegra_xusb,
++						id_work);
++	struct xhci_hcd *xhci = hcd_to_xhci(tegra->hcd);
++	struct tegra_xusb_mbox_msg msg;
++	struct phy *phy = tegra_xusb_get_phy(tegra, "usb2",
++						    tegra->otg_usb2_port);
++	u32 status;
++	int ret;
++
++	dev_dbg(tegra->dev, "host mode %s\n", tegra->host_mode ? "on" : "off");
++
++	mutex_lock(&tegra->lock);
++
++	if (tegra->host_mode)
++		phy_set_mode_ext(phy, PHY_MODE_USB_OTG, USB_ROLE_HOST);
++	else
++		phy_set_mode_ext(phy, PHY_MODE_USB_OTG, USB_ROLE_NONE);
++
++	mutex_unlock(&tegra->lock);
++
++	if (tegra->host_mode) {
++		/* switch to host mode */
++		if (tegra->otg_usb3_port >= 0) {
++			if (tegra->soc->otg_reset_sspi) {
++				/* set PP=0 */
++				tegra_xhci_hc_driver.hub_control(
++					xhci->shared_hcd, GetPortStatus,
++					0, tegra->otg_usb3_port+1,
++					(char *) &status, sizeof(status));
++				if (status & USB_SS_PORT_STAT_POWER)
++					tegra_xhci_set_port_power(tegra, false,
++								  false);
++
++				/* reset OTG port SSPI */
++				msg.cmd = MBOX_CMD_RESET_SSPI;
++				msg.data = tegra->otg_usb3_port+1;
++
++				ret = tegra_xusb_mbox_send(tegra, &msg);
++				if (ret < 0) {
++					dev_info(tegra->dev,
++						"failed to RESET_SSPI %d\n",
++						ret);
++				}
++			}
++
++			tegra_xhci_set_port_power(tegra, false, true);
++		}
++
++		tegra_xhci_set_port_power(tegra, true, true);
++
++	} else {
++		if (tegra->otg_usb3_port >= 0)
++			tegra_xhci_set_port_power(tegra, false, false);
++
++		tegra_xhci_set_port_power(tegra, true, false);
++	}
++}
++
++static int tegra_xusb_get_usb2_port(struct tegra_xusb *tegra,
++					      struct usb_phy *usbphy)
++{
++	unsigned int i;
++
++	for (i = 0; i < tegra->num_usb_phys; i++) {
++		if (tegra->usbphy[i] && usbphy == tegra->usbphy[i])
++			return i;
++	}
++
++	return -1;
++}
++
++static int tegra_xhci_id_notify(struct notifier_block *nb,
++					 unsigned long action, void *data)
++{
++	struct tegra_xusb *tegra = container_of(nb, struct tegra_xusb,
++						    id_nb);
++	struct usb_phy *usbphy = (struct usb_phy *)data;
++
++	dev_dbg(tegra->dev, "%s(): action is %d", __func__, usbphy->last_event);
++
++	if ((tegra->host_mode && usbphy->last_event == USB_EVENT_ID) ||
++		(!tegra->host_mode && usbphy->last_event != USB_EVENT_ID)) {
++		dev_dbg(tegra->dev, "Same role(%d) received. Ignore",
++			tegra->host_mode);
++		return NOTIFY_OK;
++	}
++
++	tegra->otg_usb2_port = tegra_xusb_get_usb2_port(tegra, usbphy);
++	tegra->otg_usb3_port = tegra_xusb_padctl_get_usb3_companion(
++							tegra->padctl,
++							tegra->otg_usb2_port);
++
++	tegra->host_mode = (usbphy->last_event == USB_EVENT_ID) ? true : false;
++
++	schedule_work(&tegra->id_work);
++
++	return NOTIFY_OK;
++}
++
++static int tegra_xusb_init_usb_phy(struct tegra_xusb *tegra)
++{
++	unsigned int i;
++
++	tegra->usbphy = devm_kcalloc(tegra->dev, tegra->num_usb_phys,
++				   sizeof(*tegra->usbphy), GFP_KERNEL);
++	if (!tegra->usbphy)
++		return -ENOMEM;
++
++	INIT_WORK(&tegra->id_work, tegra_xhci_id_work);
++	tegra->id_nb.notifier_call = tegra_xhci_id_notify;
++
++	for (i = 0; i < tegra->num_usb_phys; i++) {
++		struct phy *phy = tegra_xusb_get_phy(tegra, "usb2", i);
++
++		if (!phy)
++			continue;
++
++		tegra->usbphy[i] = devm_usb_get_phy_by_node(tegra->dev,
++							phy->dev.of_node,
++							&tegra->id_nb);
++		if (!IS_ERR(tegra->usbphy[i])) {
++			dev_dbg(tegra->dev, "usbphy-%d registered", i);
++			otg_set_host(tegra->usbphy[i]->otg, &tegra->hcd->self);
++		} else {
++			/*
++			 * usb-phy is optional, continue if its not available.
++			 */
++			tegra->usbphy[i] = NULL;
++		}
++	}
++
++	return 0;
++}
++
++static void tegra_xusb_deinit_usb_phy(struct tegra_xusb *tegra)
++{
++	unsigned int i;
++
++	cancel_work_sync(&tegra->id_work);
++
++	for (i = 0; i < tegra->num_usb_phys; i++)
++		if (tegra->usbphy[i])
++			otg_set_host(tegra->usbphy[i]->otg, NULL);
++}
++
+ static int tegra_xusb_probe(struct platform_device *pdev)
+ {
+ 	struct tegra_xusb *tegra;
+@@ -1255,8 +1466,11 @@ static int tegra_xusb_probe(struct platform_device *pdev)
+ 		goto put_powerdomains;
+ 	}
+ 
+-	for (i = 0; i < tegra->soc->num_types; i++)
++	for (i = 0; i < tegra->soc->num_types; i++) {
++		if (!strncmp(tegra->soc->phy_types[i].name, "usb2", 4))
++			tegra->num_usb_phys = tegra->soc->phy_types[i].num;
+ 		tegra->num_phys += tegra->soc->phy_types[i].num;
++	}
+ 
+ 	tegra->phys = devm_kcalloc(&pdev->dev, tegra->num_phys,
+ 				   sizeof(*tegra->phys), GFP_KERNEL);
+@@ -1385,6 +1599,12 @@ static int tegra_xusb_probe(struct platform_device *pdev)
+ 		goto remove_usb3;
+ 	}
+ 
++	err = tegra_xusb_init_usb_phy(tegra);
++	if (err < 0) {
++		dev_err(&pdev->dev, "failed to init USB PHY: %d\n", err);
++		goto remove_usb3;
++	}
++
+ 	return 0;
+ 
+ remove_usb3:
+@@ -1421,6 +1641,8 @@ static int tegra_xusb_remove(struct platform_device *pdev)
+ 	struct tegra_xusb *tegra = platform_get_drvdata(pdev);
+ 	struct xhci_hcd *xhci = hcd_to_xhci(tegra->hcd);
+ 
++	tegra_xusb_deinit_usb_phy(tegra);
++
+ 	usb_remove_hcd(xhci->shared_hcd);
+ 	usb_put_hcd(xhci->shared_hcd);
+ 	xhci->shared_hcd = NULL;
+@@ -1695,6 +1917,7 @@ static const struct tegra_xusb_soc tegra124_soc = {
+ 	},
+ 	.scale_ss_clock = true,
+ 	.has_ipfs = true,
++	.otg_reset_sspi = false,
+ 	.mbox = {
+ 		.cmd = 0xe4,
+ 		.data_in = 0xe8,
+@@ -1734,6 +1957,7 @@ static const struct tegra_xusb_soc tegra210_soc = {
+ 	},
+ 	.scale_ss_clock = false,
+ 	.has_ipfs = true,
++	.otg_reset_sspi = true,
+ 	.mbox = {
+ 		.cmd = 0xe4,
+ 		.data_in = 0xe8,
+@@ -1774,6 +1998,7 @@ static const struct tegra_xusb_soc tegra186_soc = {
+ 	},
+ 	.scale_ss_clock = false,
+ 	.has_ipfs = false,
++	.otg_reset_sspi = false,
+ 	.mbox = {
+ 		.cmd = 0xe4,
+ 		.data_in = 0xe8,
+@@ -1804,6 +2029,7 @@ static const struct tegra_xusb_soc tegra194_soc = {
+ 	},
+ 	.scale_ss_clock = false,
+ 	.has_ipfs = false,
++	.otg_reset_sspi = false,
+ 	.mbox = {
+ 		.cmd = 0x68,
+ 		.data_in = 0x6c,
+
+commit cbb23d5572f0186f193b1af65a7994f2d40b1d43
+Author: JC Kuo <jckuo@nvidia.com>
+Date:   Thu Mar 12 16:45:13 2020 +0200
+
+    usb: host: xhci-tegra: Tegra186/Tegra194 LPM
+    
+    Tegra186 and Tegra194 xHC supports USB 3.0 LPM. This commit enables
+    XHCI_LPM_SUPPORT quirk for Tegra186 and Tegra194.
+    
+    Signed-off-by: JC Kuo <jckuo@nvidia.com>
+    Acked-by: Thierry Reding <treding@nvidia.com>
+    Signed-off-by: Mathias Nyman <mathias.nyman@linux.intel.com>
+    Link: https://lore.kernel.org/r/20200312144517.1593-6-mathias.nyman@linux.intel.com
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/usb/host/xhci-tegra.c b/drivers/usb/host/xhci-tegra.c
+index 8163aefc6c6b..a6e36b3c968f 100644
+--- a/drivers/usb/host/xhci-tegra.c
++++ b/drivers/usb/host/xhci-tegra.c
+@@ -203,6 +203,7 @@ struct tegra_xusb_soc {
+ 
+ 	bool scale_ss_clock;
+ 	bool has_ipfs;
++	bool lpm_support;
+ };
+ 
+ struct tegra_xusb_context {
+@@ -1779,6 +1780,7 @@ static const struct tegra_xusb_soc tegra186_soc = {
+ 		.data_out = 0xec,
+ 		.owner = 0xf0,
+ 	},
++	.lpm_support = true,
+ };
+ 
+ static const char * const tegra194_supply_names[] = {
+@@ -1808,6 +1810,7 @@ static const struct tegra_xusb_soc tegra194_soc = {
+ 		.data_out = 0x70,
+ 		.owner = 0x74,
+ 	},
++	.lpm_support = true,
+ };
+ MODULE_FIRMWARE("nvidia/tegra194/xusb.bin");
+ 
+@@ -1832,7 +1835,11 @@ static struct platform_driver tegra_xusb_driver = {
+ 
+ static void tegra_xhci_quirks(struct device *dev, struct xhci_hcd *xhci)
+ {
++	struct tegra_xusb *tegra = dev_get_drvdata(dev);
++
+ 	xhci->quirks |= XHCI_PLAT;
++	if (tegra && tegra->soc->lpm_support)
++		xhci->quirks |= XHCI_LPM_SUPPORT;
+ }
+ 
+ static int tegra_xhci_setup(struct usb_hcd *hcd)
+
+commit e1f236efd9c579a29d7df75aa052127d0d975267
+Author: Peter Robinson <pbrobinson@gmail.com>
+Date:   Mon Jan 20 14:19:10 2020 +0000
+
+    usb: host: xhci-tegra: set MODULE_FIRMWARE for tegra186
+    
+    Set the MODULE_FIRMWARE for tegra186, it's registered for 124/210 and
+    ensures the firmware is available at the appropriate time such as in
+    the initrd, else if the firmware is unavailable the driver fails with
+    the following errors:
+    
+    tegra-xusb 3530000.usb: Direct firmware load for nvidia/tegra186/xusb.bin failed with error -2
+    tegra-xusb 3530000.usb: failed to request firmware: -2
+    tegra-xusb 3530000.usb: failed to load firmware: -2
+    tegra-xusb: probe of 3530000.usb failed with error -2
+    
+    Fixes: 5f9be5f3f899 ("usb: host: xhci-tegra: Add Tegra186 XUSB support")
+    Signed-off-by: Peter Robinson <pbrobinson@gmail.com>
+    Acked-by: Thierry Reding <treding@nvidia.com>
+    Cc: stable <stable@vger.kernel.org>
+    Link: https://lore.kernel.org/r/20200120141910.116097-1-pbrobinson@gmail.com
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/usb/host/xhci-tegra.c b/drivers/usb/host/xhci-tegra.c
+index 0b58ef3a7f7f..8163aefc6c6b 100644
+--- a/drivers/usb/host/xhci-tegra.c
++++ b/drivers/usb/host/xhci-tegra.c
+@@ -1744,6 +1744,7 @@ MODULE_FIRMWARE("nvidia/tegra210/xusb.bin");
+ 
+ static const char * const tegra186_supply_names[] = {
+ };
++MODULE_FIRMWARE("nvidia/tegra186/xusb.bin");
+ 
+ static const struct tegra_xusb_phy_type tegra186_phy_types[] = {
+ 	{ .name = "usb3", .num = 3, },
+
+commit cad0a5c74e7a1760d90a41df8e6151a53a598676
+Author: Thierry Reding <treding@nvidia.com>
+Date:   Fri Dec 6 15:06:53 2019 +0100
+
+    usb: host: xhci-tegra: Implement basic ELPG support
+    
+    This implements basic engine-level powergate support which allows the
+    XUSB controller to be put into a low power mode on system sleep and get
+    it out of that low power mode again on resume.
+    
+    Based on work by JC Kuo <jckuo@nvidia.com>.
+    
+    Signed-off-by: Thierry Reding <treding@nvidia.com>
+    Link: https://lore.kernel.org/r/20191206140653.2085561-11-thierry.reding@gmail.com
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/usb/host/xhci-tegra.c b/drivers/usb/host/xhci-tegra.c
+index 7f6657ad5ce5..0b58ef3a7f7f 100644
+--- a/drivers/usb/host/xhci-tegra.c
++++ b/drivers/usb/host/xhci-tegra.c
+@@ -1447,6 +1447,45 @@ static int tegra_xusb_remove(struct platform_device *pdev)
+ }
+ 
+ #ifdef CONFIG_PM_SLEEP
++static bool xhci_hub_ports_suspended(struct xhci_hub *hub)
++{
++	struct device *dev = hub->hcd->self.controller;
++	bool status = true;
++	unsigned int i;
++	u32 value;
++
++	for (i = 0; i < hub->num_ports; i++) {
++		value = readl(hub->ports[i]->addr);
++		if ((value & PORT_PE) == 0)
++			continue;
++
++		if ((value & PORT_PLS_MASK) != XDEV_U3) {
++			dev_info(dev, "%u-%u isn't suspended: %#010x\n",
++				 hub->hcd->self.busnum, i + 1, value);
++			status = false;
++		}
++	}
++
++	return status;
++}
++
++static int tegra_xusb_check_ports(struct tegra_xusb *tegra)
++{
++	struct xhci_hcd *xhci = hcd_to_xhci(tegra->hcd);
++	unsigned long flags;
++	int err = 0;
++
++	spin_lock_irqsave(&xhci->lock, flags);
++
++	if (!xhci_hub_ports_suspended(&xhci->usb2_rhub) ||
++	    !xhci_hub_ports_suspended(&xhci->usb3_rhub))
++		err = -EBUSY;
++
++	spin_unlock_irqrestore(&xhci->lock, flags);
++
++	return err;
++}
++
+ static void tegra_xusb_save_context(struct tegra_xusb *tegra)
+ {
+ 	const struct tegra_xusb_context_soc *soc = tegra->soc->context;
+@@ -1481,31 +1520,103 @@ static void tegra_xusb_restore_context(struct tegra_xusb *tegra)
+ 	}
+ }
+ 
+-static int tegra_xusb_suspend(struct device *dev)
++static int tegra_xusb_enter_elpg(struct tegra_xusb *tegra, bool wakeup)
+ {
+-	struct tegra_xusb *tegra = dev_get_drvdata(dev);
+ 	struct xhci_hcd *xhci = hcd_to_xhci(tegra->hcd);
+-	bool wakeup = device_may_wakeup(dev);
+ 	int err;
+ 
+-	/* TODO: Powergate controller across suspend/resume. */
++	err = tegra_xusb_check_ports(tegra);
++	if (err < 0) {
++		dev_err(tegra->dev, "not all ports suspended: %d\n", err);
++		return err;
++	}
++
+ 	err = xhci_suspend(xhci, wakeup);
+-	if (err < 0)
++	if (err < 0) {
++		dev_err(tegra->dev, "failed to suspend XHCI: %d\n", err);
+ 		return err;
++	}
+ 
+ 	tegra_xusb_save_context(tegra);
++	tegra_xusb_phy_disable(tegra);
++	tegra_xusb_clk_disable(tegra);
+ 
+ 	return 0;
+ }
+ 
+-static int tegra_xusb_resume(struct device *dev)
++static int tegra_xusb_exit_elpg(struct tegra_xusb *tegra, bool wakeup)
+ {
+-	struct tegra_xusb *tegra = dev_get_drvdata(dev);
+ 	struct xhci_hcd *xhci = hcd_to_xhci(tegra->hcd);
++	int err;
+ 
++	err = tegra_xusb_clk_enable(tegra);
++	if (err < 0) {
++		dev_err(tegra->dev, "failed to enable clocks: %d\n", err);
++		return err;
++	}
++
++	err = tegra_xusb_phy_enable(tegra);
++	if (err < 0) {
++		dev_err(tegra->dev, "failed to enable PHYs: %d\n", err);
++		goto disable_clk;
++	}
++
++	tegra_xusb_config(tegra);
+ 	tegra_xusb_restore_context(tegra);
+ 
+-	return xhci_resume(xhci, false);
++	err = tegra_xusb_load_firmware(tegra);
++	if (err < 0) {
++		dev_err(tegra->dev, "failed to load firmware: %d\n", err);
++		goto disable_phy;
++	}
++
++	err = __tegra_xusb_enable_firmware_messages(tegra);
++	if (err < 0) {
++		dev_err(tegra->dev, "failed to enable messages: %d\n", err);
++		goto disable_phy;
++	}
++
++	err = xhci_resume(xhci, true);
++	if (err < 0) {
++		dev_err(tegra->dev, "failed to resume XHCI: %d\n", err);
++		goto disable_phy;
++	}
++
++	return 0;
++
++disable_phy:
++	tegra_xusb_phy_disable(tegra);
++disable_clk:
++	tegra_xusb_clk_disable(tegra);
++	return err;
++}
++
++static int tegra_xusb_suspend(struct device *dev)
++{
++	struct tegra_xusb *tegra = dev_get_drvdata(dev);
++	bool wakeup = device_may_wakeup(dev);
++	int err;
++
++	synchronize_irq(tegra->mbox_irq);
++
++	mutex_lock(&tegra->lock);
++	err = tegra_xusb_enter_elpg(tegra, wakeup);
++	mutex_unlock(&tegra->lock);
++
++	return err;
++}
++
++static int tegra_xusb_resume(struct device *dev)
++{
++	struct tegra_xusb *tegra = dev_get_drvdata(dev);
++	bool wakeup = device_may_wakeup(dev);
++	int err;
++
++	mutex_lock(&tegra->lock);
++	err = tegra_xusb_exit_elpg(tegra, wakeup);
++	mutex_unlock(&tegra->lock);
++
++	return err;
+ }
+ #endif
+ 
+
+commit 9ccae88e572b36a3ede1c2fe67cfd3f2b36e0610
+Author: Thierry Reding <treding@nvidia.com>
+Date:   Fri Dec 6 15:06:52 2019 +0100
+
+    usb: host: xhci-tegra: Add XUSB controller context
+    
+    Define the offsets of the registers that need to be saved on suspend and
+    restored on resume for the various NVIDIA Tegra generations supported by
+    the XUSB driver.
+    
+    Based on work by JC Kuo <jckuo@nvidia.com>.
+    
+    Signed-off-by: Thierry Reding <treding@nvidia.com>
+    Link: https://lore.kernel.org/r/20191206140653.2085561-10-thierry.reding@gmail.com
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/usb/host/xhci-tegra.c b/drivers/usb/host/xhci-tegra.c
+index 1b5e4ee313ce..7f6657ad5ce5 100644
+--- a/drivers/usb/host/xhci-tegra.c
++++ b/drivers/usb/host/xhci-tegra.c
+@@ -39,7 +39,15 @@
+ #define XUSB_CFG_4				0x010
+ #define  XUSB_BASE_ADDR_SHIFT			15
+ #define  XUSB_BASE_ADDR_MASK			0x1ffff
++#define XUSB_CFG_16				0x040
++#define XUSB_CFG_24				0x060
++#define XUSB_CFG_AXI_CFG			0x0f8
+ #define XUSB_CFG_ARU_C11_CSBRANGE		0x41c
++#define XUSB_CFG_ARU_CONTEXT			0x43c
++#define XUSB_CFG_ARU_CONTEXT_HS_PLS		0x478
++#define XUSB_CFG_ARU_CONTEXT_FS_PLS		0x47c
++#define XUSB_CFG_ARU_CONTEXT_HSFS_SPEED		0x480
++#define XUSB_CFG_ARU_CONTEXT_HSFS_PP		0x484
+ #define XUSB_CFG_CSB_BASE_ADDR			0x800
+ 
+ /* FPCI mailbox registers */
+@@ -63,11 +71,20 @@
+ #define  MBOX_SMI_INTR_EN			BIT(3)
+ 
+ /* IPFS registers */
++#define IPFS_XUSB_HOST_MSI_BAR_SZ_0		0x0c0
++#define IPFS_XUSB_HOST_MSI_AXI_BAR_ST_0		0x0c4
++#define IPFS_XUSB_HOST_MSI_FPCI_BAR_ST_0	0x0c8
++#define IPFS_XUSB_HOST_MSI_VEC0_0		0x100
++#define IPFS_XUSB_HOST_MSI_EN_VEC0_0		0x140
+ #define IPFS_XUSB_HOST_CONFIGURATION_0		0x180
+ #define  IPFS_EN_FPCI				BIT(0)
++#define IPFS_XUSB_HOST_FPCI_ERROR_MASKS_0	0x184
+ #define IPFS_XUSB_HOST_INTR_MASK_0		0x188
+ #define  IPFS_IP_INT_MASK			BIT(16)
++#define IPFS_XUSB_HOST_INTR_ENABLE_0		0x198
++#define IPFS_XUSB_HOST_UFPCI_CONFIG_0		0x19c
+ #define IPFS_XUSB_HOST_CLKGATE_HYSTERESIS_0	0x1bc
++#define IPFS_XUSB_HOST_MCCIF_FIFOCTRL_0		0x1dc
+ 
+ #define CSB_PAGE_SELECT_MASK			0x7fffff
+ #define CSB_PAGE_SELECT_SHIFT			9
+@@ -821,13 +838,6 @@ static int tegra_xusb_init_context(struct tegra_xusb *tegra)
+ {
+ 	const struct tegra_xusb_context_soc *soc = tegra->soc->context;
+ 
+-	/*
+-	 * Skip support for context save/restore if the SoC doesn't have any
+-	 * XUSB specific context that needs to be saved/restored.
+-	 */
+-	if (!soc)
+-		return 0;
+-
+ 	tegra->context.ipfs = devm_kcalloc(tegra->dev, soc->ipfs.num_offsets,
+ 					   sizeof(u32), GFP_KERNEL);
+ 	if (!tegra->context.ipfs)
+@@ -1443,12 +1453,12 @@ static void tegra_xusb_save_context(struct tegra_xusb *tegra)
+ 	struct tegra_xusb_context *ctx = &tegra->context;
+ 	unsigned int i;
+ 
+-	if (soc && soc->ipfs.num_offsets > 0) {
++	if (soc->ipfs.num_offsets > 0) {
+ 		for (i = 0; i < soc->ipfs.num_offsets; i++)
+ 			ctx->ipfs[i] = ipfs_readl(tegra, soc->ipfs.offsets[i]);
+ 	}
+ 
+-	if (soc && soc->fpci.num_offsets > 0) {
++	if (soc->fpci.num_offsets > 0) {
+ 		for (i = 0; i < soc->fpci.num_offsets; i++)
+ 			ctx->fpci[i] = fpci_readl(tegra, soc->fpci.offsets[i]);
+ 	}
+@@ -1460,12 +1470,12 @@ static void tegra_xusb_restore_context(struct tegra_xusb *tegra)
+ 	struct tegra_xusb_context *ctx = &tegra->context;
+ 	unsigned int i;
+ 
+-	if (soc && soc->fpci.num_offsets > 0) {
++	if (soc->fpci.num_offsets > 0) {
+ 		for (i = 0; i < soc->fpci.num_offsets; i++)
+ 			fpci_writel(tegra, ctx->fpci[i], soc->fpci.offsets[i]);
+ 	}
+ 
+-	if (soc && soc->ipfs.num_offsets > 0) {
++	if (soc->ipfs.num_offsets > 0) {
+ 		for (i = 0; i < soc->ipfs.num_offsets; i++)
+ 			ipfs_writel(tegra, ctx->ipfs[i], soc->ipfs.offsets[i]);
+ 	}
+@@ -1522,12 +1532,50 @@ static const struct tegra_xusb_phy_type tegra124_phy_types[] = {
+ 	{ .name = "hsic", .num = 2, },
+ };
+ 
++static const unsigned int tegra124_xusb_context_ipfs[] = {
++	IPFS_XUSB_HOST_MSI_BAR_SZ_0,
++	IPFS_XUSB_HOST_MSI_BAR_SZ_0,
++	IPFS_XUSB_HOST_MSI_AXI_BAR_ST_0,
++	IPFS_XUSB_HOST_MSI_FPCI_BAR_ST_0,
++	IPFS_XUSB_HOST_MSI_VEC0_0,
++	IPFS_XUSB_HOST_MSI_EN_VEC0_0,
++	IPFS_XUSB_HOST_FPCI_ERROR_MASKS_0,
++	IPFS_XUSB_HOST_INTR_MASK_0,
++	IPFS_XUSB_HOST_INTR_ENABLE_0,
++	IPFS_XUSB_HOST_UFPCI_CONFIG_0,
++	IPFS_XUSB_HOST_CLKGATE_HYSTERESIS_0,
++	IPFS_XUSB_HOST_MCCIF_FIFOCTRL_0,
++};
++
++static const unsigned int tegra124_xusb_context_fpci[] = {
++	XUSB_CFG_ARU_CONTEXT_HS_PLS,
++	XUSB_CFG_ARU_CONTEXT_FS_PLS,
++	XUSB_CFG_ARU_CONTEXT_HSFS_SPEED,
++	XUSB_CFG_ARU_CONTEXT_HSFS_PP,
++	XUSB_CFG_ARU_CONTEXT,
++	XUSB_CFG_AXI_CFG,
++	XUSB_CFG_24,
++	XUSB_CFG_16,
++};
++
++static const struct tegra_xusb_context_soc tegra124_xusb_context = {
++	.ipfs = {
++		.num_offsets = ARRAY_SIZE(tegra124_xusb_context_ipfs),
++		.offsets = tegra124_xusb_context_ipfs,
++	},
++	.fpci = {
++		.num_offsets = ARRAY_SIZE(tegra124_xusb_context_fpci),
++		.offsets = tegra124_xusb_context_fpci,
++	},
++};
++
+ static const struct tegra_xusb_soc tegra124_soc = {
+ 	.firmware = "nvidia/tegra124/xusb.bin",
+ 	.supply_names = tegra124_supply_names,
+ 	.num_supplies = ARRAY_SIZE(tegra124_supply_names),
+ 	.phy_types = tegra124_phy_types,
+ 	.num_types = ARRAY_SIZE(tegra124_phy_types),
++	.context = &tegra124_xusb_context,
+ 	.ports = {
+ 		.usb2 = { .offset = 4, .count = 4, },
+ 		.hsic = { .offset = 6, .count = 2, },
+@@ -1566,6 +1614,7 @@ static const struct tegra_xusb_soc tegra210_soc = {
+ 	.num_supplies = ARRAY_SIZE(tegra210_supply_names),
+ 	.phy_types = tegra210_phy_types,
+ 	.num_types = ARRAY_SIZE(tegra210_phy_types),
++	.context = &tegra124_xusb_context,
+ 	.ports = {
+ 		.usb2 = { .offset = 4, .count = 4, },
+ 		.hsic = { .offset = 8, .count = 1, },
+@@ -1591,12 +1640,20 @@ static const struct tegra_xusb_phy_type tegra186_phy_types[] = {
+ 	{ .name = "hsic", .num = 1, },
+ };
+ 
++static const struct tegra_xusb_context_soc tegra186_xusb_context = {
++	.fpci = {
++		.num_offsets = ARRAY_SIZE(tegra124_xusb_context_fpci),
++		.offsets = tegra124_xusb_context_fpci,
++	},
++};
++
+ static const struct tegra_xusb_soc tegra186_soc = {
+ 	.firmware = "nvidia/tegra186/xusb.bin",
+ 	.supply_names = tegra186_supply_names,
+ 	.num_supplies = ARRAY_SIZE(tegra186_supply_names),
+ 	.phy_types = tegra186_phy_types,
+ 	.num_types = ARRAY_SIZE(tegra186_phy_types),
++	.context = &tegra186_xusb_context,
+ 	.ports = {
+ 		.usb3 = { .offset = 0, .count = 3, },
+ 		.usb2 = { .offset = 3, .count = 3, },
+@@ -1626,6 +1683,7 @@ static const struct tegra_xusb_soc tegra194_soc = {
+ 	.num_supplies = ARRAY_SIZE(tegra194_supply_names),
+ 	.phy_types = tegra194_phy_types,
+ 	.num_types = ARRAY_SIZE(tegra194_phy_types),
++	.context = &tegra186_xusb_context,
+ 	.ports = {
+ 		.usb3 = { .offset = 0, .count = 4, },
+ 		.usb2 = { .offset = 4, .count = 4, },
+
+commit 5c4e8d3781bc00363183b639cf3b603bd16d3994
+Author: Thierry Reding <treding@nvidia.com>
+Date:   Fri Dec 6 15:06:51 2019 +0100
+
+    usb: host: xhci-tegra: Add support for XUSB context save/restore
+    
+    The XUSB controller contains registers that need to be saved on suspend
+    and restored on resume in addition to the XHCI specific registers. Add
+    support for saving and restoring the XUSB specific context.
+    
+    Based on work by JC Kuo <jckuo@nvidia.com>.
+    
+    Signed-off-by: Thierry Reding <treding@nvidia.com>
+    Link: https://lore.kernel.org/r/20191206140653.2085561-9-thierry.reding@gmail.com
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/usb/host/xhci-tegra.c b/drivers/usb/host/xhci-tegra.c
+index 117e91b8ac6f..1b5e4ee313ce 100644
+--- a/drivers/usb/host/xhci-tegra.c
++++ b/drivers/usb/host/xhci-tegra.c
+@@ -155,12 +155,25 @@ struct tegra_xusb_mbox_regs {
+ 	u16 owner;
+ };
+ 
++struct tegra_xusb_context_soc {
++	struct {
++		const unsigned int *offsets;
++		unsigned int num_offsets;
++	} ipfs;
++
++	struct {
++		const unsigned int *offsets;
++		unsigned int num_offsets;
++	} fpci;
++};
++
+ struct tegra_xusb_soc {
+ 	const char *firmware;
+ 	const char * const *supply_names;
+ 	unsigned int num_supplies;
+ 	const struct tegra_xusb_phy_type *phy_types;
+ 	unsigned int num_types;
++	const struct tegra_xusb_context_soc *context;
+ 
+ 	struct {
+ 		struct {
+@@ -175,6 +188,11 @@ struct tegra_xusb_soc {
+ 	bool has_ipfs;
+ };
+ 
++struct tegra_xusb_context {
++	u32 *ipfs;
++	u32 *fpci;
++};
++
+ struct tegra_xusb {
+ 	struct device *dev;
+ 	void __iomem *regs;
+@@ -221,6 +239,8 @@ struct tegra_xusb {
+ 		void *virt;
+ 		dma_addr_t phys;
+ 	} fw;
++
++	struct tegra_xusb_context context;
+ };
+ 
+ static struct hc_driver __read_mostly tegra_xhci_hc_driver;
+@@ -796,6 +816,37 @@ static int tegra_xusb_runtime_resume(struct device *dev)
+ 	return err;
+ }
+ 
++#ifdef CONFIG_PM_SLEEP
++static int tegra_xusb_init_context(struct tegra_xusb *tegra)
++{
++	const struct tegra_xusb_context_soc *soc = tegra->soc->context;
++
++	/*
++	 * Skip support for context save/restore if the SoC doesn't have any
++	 * XUSB specific context that needs to be saved/restored.
++	 */
++	if (!soc)
++		return 0;
++
++	tegra->context.ipfs = devm_kcalloc(tegra->dev, soc->ipfs.num_offsets,
++					   sizeof(u32), GFP_KERNEL);
++	if (!tegra->context.ipfs)
++		return -ENOMEM;
++
++	tegra->context.fpci = devm_kcalloc(tegra->dev, soc->ipfs.num_offsets,
++					   sizeof(u32), GFP_KERNEL);
++	if (!tegra->context.fpci)
++		return -ENOMEM;
++
++	return 0;
++}
++#else
++static inline int tegra_xusb_init_context(struct tegra_xusb *tegra)
++{
++	return 0;
++}
++#endif
++
+ static int tegra_xusb_request_firmware(struct tegra_xusb *tegra)
+ {
+ 	struct tegra_xusb_fw_header *header;
+@@ -1039,6 +1090,10 @@ static int tegra_xusb_probe(struct platform_device *pdev)
+ 	mutex_init(&tegra->lock);
+ 	tegra->dev = &pdev->dev;
+ 
++	err = tegra_xusb_init_context(tegra);
++	if (err < 0)
++		return err;
++
+ 	regs = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+ 	tegra->regs = devm_ioremap_resource(&pdev->dev, regs);
+ 	if (IS_ERR(tegra->regs))
+@@ -1382,14 +1437,55 @@ static int tegra_xusb_remove(struct platform_device *pdev)
+ }
+ 
+ #ifdef CONFIG_PM_SLEEP
++static void tegra_xusb_save_context(struct tegra_xusb *tegra)
++{
++	const struct tegra_xusb_context_soc *soc = tegra->soc->context;
++	struct tegra_xusb_context *ctx = &tegra->context;
++	unsigned int i;
++
++	if (soc && soc->ipfs.num_offsets > 0) {
++		for (i = 0; i < soc->ipfs.num_offsets; i++)
++			ctx->ipfs[i] = ipfs_readl(tegra, soc->ipfs.offsets[i]);
++	}
++
++	if (soc && soc->fpci.num_offsets > 0) {
++		for (i = 0; i < soc->fpci.num_offsets; i++)
++			ctx->fpci[i] = fpci_readl(tegra, soc->fpci.offsets[i]);
++	}
++}
++
++static void tegra_xusb_restore_context(struct tegra_xusb *tegra)
++{
++	const struct tegra_xusb_context_soc *soc = tegra->soc->context;
++	struct tegra_xusb_context *ctx = &tegra->context;
++	unsigned int i;
++
++	if (soc && soc->fpci.num_offsets > 0) {
++		for (i = 0; i < soc->fpci.num_offsets; i++)
++			fpci_writel(tegra, ctx->fpci[i], soc->fpci.offsets[i]);
++	}
++
++	if (soc && soc->ipfs.num_offsets > 0) {
++		for (i = 0; i < soc->ipfs.num_offsets; i++)
++			ipfs_writel(tegra, ctx->ipfs[i], soc->ipfs.offsets[i]);
++	}
++}
++
+ static int tegra_xusb_suspend(struct device *dev)
+ {
+ 	struct tegra_xusb *tegra = dev_get_drvdata(dev);
+ 	struct xhci_hcd *xhci = hcd_to_xhci(tegra->hcd);
+ 	bool wakeup = device_may_wakeup(dev);
++	int err;
+ 
+ 	/* TODO: Powergate controller across suspend/resume. */
+-	return xhci_suspend(xhci, wakeup);
++	err = xhci_suspend(xhci, wakeup);
++	if (err < 0)
++		return err;
++
++	tegra_xusb_save_context(tegra);
++
++	return 0;
+ }
+ 
+ static int tegra_xusb_resume(struct device *dev)
+@@ -1397,7 +1493,9 @@ static int tegra_xusb_resume(struct device *dev)
+ 	struct tegra_xusb *tegra = dev_get_drvdata(dev);
+ 	struct xhci_hcd *xhci = hcd_to_xhci(tegra->hcd);
+ 
+-	return xhci_resume(xhci, 0);
++	tegra_xusb_restore_context(tegra);
++
++	return xhci_resume(xhci, false);
+ }
+ #endif
+ 
+
+commit 17926924be44b21556043a2faccc3b449110bd00
+Author: Thierry Reding <treding@nvidia.com>
+Date:   Fri Dec 6 15:06:50 2019 +0100
+
+    usb: host: xhci-tegra: Enable runtime PM as late as possible
+    
+    A number of things can currently go wrong after the XUSB controller has
+    been enabled, which means that it might need to be disabled again before
+    it has ever been used.
+    
+    Avoid this by delaying runtime PM enablement until it's really required
+    right before registers are accessed for the first time.
+    
+    Signed-off-by: Thierry Reding <treding@nvidia.com>
+    Link: https://lore.kernel.org/r/20191206140653.2085561-8-thierry.reding@gmail.com
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/usb/host/xhci-tegra.c b/drivers/usb/host/xhci-tegra.c
+index 31411f85e742..117e91b8ac6f 100644
+--- a/drivers/usb/host/xhci-tegra.c
++++ b/drivers/usb/host/xhci-tegra.c
+@@ -1242,19 +1242,6 @@ static int tegra_xusb_probe(struct platform_device *pdev)
+ 		goto put_hcd;
+ 	}
+ 
+-	pm_runtime_enable(&pdev->dev);
+-	if (pm_runtime_enabled(&pdev->dev))
+-		err = pm_runtime_get_sync(&pdev->dev);
+-	else
+-		err = tegra_xusb_runtime_resume(&pdev->dev);
+-
+-	if (err < 0) {
+-		dev_err(&pdev->dev, "failed to enable device: %d\n", err);
+-		goto disable_phy;
+-	}
+-
+-	tegra_xusb_config(tegra);
+-
+ 	/*
+ 	 * The XUSB Falcon microcontroller can only address 40 bits, so set
+ 	 * the DMA mask accordingly.
+@@ -1262,7 +1249,7 @@ static int tegra_xusb_probe(struct platform_device *pdev)
+ 	err = dma_set_mask_and_coherent(tegra->dev, DMA_BIT_MASK(40));
+ 	if (err < 0) {
+ 		dev_err(&pdev->dev, "failed to set DMA mask: %d\n", err);
+-		goto put_rpm;
++		goto disable_phy;
+ 	}
+ 
+ 	err = tegra_xusb_request_firmware(tegra);
+@@ -1271,16 +1258,30 @@ static int tegra_xusb_probe(struct platform_device *pdev)
+ 		goto disable_phy;
+ 	}
+ 
++	pm_runtime_enable(&pdev->dev);
++
++	if (!pm_runtime_enabled(&pdev->dev))
++		err = tegra_xusb_runtime_resume(&pdev->dev);
++	else
++		err = pm_runtime_get_sync(&pdev->dev);
++
++	if (err < 0) {
++		dev_err(&pdev->dev, "failed to enable device: %d\n", err);
++		goto free_firmware;
++	}
++
++	tegra_xusb_config(tegra);
++
+ 	err = tegra_xusb_load_firmware(tegra);
+ 	if (err < 0) {
+ 		dev_err(&pdev->dev, "failed to load firmware: %d\n", err);
+-		goto free_firmware;
++		goto put_rpm;
+ 	}
+ 
+ 	err = usb_add_hcd(tegra->hcd, tegra->xhci_irq, IRQF_SHARED);
+ 	if (err < 0) {
+ 		dev_err(&pdev->dev, "failed to add USB HCD: %d\n", err);
+-		goto free_firmware;
++		goto put_rpm;
+ 	}
+ 
+ 	device_wakeup_enable(tegra->hcd->self.controller);
+
+commit ecd0fbd12d0fb5ee030d97d5be44766552aba07c
+Author: Thierry Reding <treding@nvidia.com>
+Date:   Fri Dec 6 15:06:49 2019 +0100
+
+    usb: host: xhci-tegra: Reuse stored register base address
+    
+    The base address of the XUSB controller's registers is already stored in
+    the HCD. Move assignment to the HCD fields to an earlier point so that
+    they can be reused in the tegra_xusb_config() function. This avoids the
+    need to pass the base address as an extra parameter, which in turn comes
+    in handy in subsequent patches that need to call this function from the
+    suspend/resume paths where these values are no longer readily available.
+    
+    Based on work by JC Kuo <jckuo@nvidia.com>.
+    
+    Signed-off-by: Thierry Reding <treding@nvidia.com>
+    Link: https://lore.kernel.org/r/20191206140653.2085561-7-thierry.reding@gmail.com
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/usb/host/xhci-tegra.c b/drivers/usb/host/xhci-tegra.c
+index 499104c05668..31411f85e742 100644
+--- a/drivers/usb/host/xhci-tegra.c
++++ b/drivers/usb/host/xhci-tegra.c
+@@ -626,9 +626,9 @@ static irqreturn_t tegra_xusb_mbox_thread(int irq, void *data)
+ 	return IRQ_HANDLED;
+ }
+ 
+-static void tegra_xusb_config(struct tegra_xusb *tegra,
+-			      struct resource *regs)
++static void tegra_xusb_config(struct tegra_xusb *tegra)
+ {
++	u32 regs = tegra->hcd->rsrc_start;
+ 	u32 value;
+ 
+ 	if (tegra->soc->has_ipfs) {
+@@ -642,7 +642,7 @@ static void tegra_xusb_config(struct tegra_xusb *tegra,
+ 	/* Program BAR0 space */
+ 	value = fpci_readl(tegra, XUSB_CFG_4);
+ 	value &= ~(XUSB_BASE_ADDR_MASK << XUSB_BASE_ADDR_SHIFT);
+-	value |= regs->start & (XUSB_BASE_ADDR_MASK << XUSB_BASE_ADDR_SHIFT);
++	value |= regs & (XUSB_BASE_ADDR_MASK << XUSB_BASE_ADDR_SHIFT);
+ 	fpci_writel(tegra, value, XUSB_CFG_4);
+ 
+ 	usleep_range(100, 200);
+@@ -1226,6 +1226,10 @@ static int tegra_xusb_probe(struct platform_device *pdev)
+ 		goto put_powerdomains;
+ 	}
+ 
++	tegra->hcd->regs = tegra->regs;
++	tegra->hcd->rsrc_start = regs->start;
++	tegra->hcd->rsrc_len = resource_size(regs);
++
+ 	/*
+ 	 * This must happen after usb_create_hcd(), because usb_create_hcd()
+ 	 * will overwrite the drvdata of the device with the hcd it creates.
+@@ -1249,7 +1253,7 @@ static int tegra_xusb_probe(struct platform_device *pdev)
+ 		goto disable_phy;
+ 	}
+ 
+-	tegra_xusb_config(tegra, regs);
++	tegra_xusb_config(tegra);
+ 
+ 	/*
+ 	 * The XUSB Falcon microcontroller can only address 40 bits, so set
+@@ -1273,10 +1277,6 @@ static int tegra_xusb_probe(struct platform_device *pdev)
+ 		goto free_firmware;
+ 	}
+ 
+-	tegra->hcd->regs = tegra->regs;
+-	tegra->hcd->rsrc_start = regs->start;
+-	tegra->hcd->rsrc_len = resource_size(regs);
+-
+ 	err = usb_add_hcd(tegra->hcd, tegra->xhci_irq, IRQF_SHARED);
+ 	if (err < 0) {
+ 		dev_err(&pdev->dev, "failed to add USB HCD: %d\n", err);
+
+commit 96d8f628f0b35e1c1d93340cd4d2cde1ed3b8d9f
+Author: Thierry Reding <treding@nvidia.com>
+Date:   Fri Dec 6 15:06:48 2019 +0100
+
+    usb: host: xhci-tegra: Extract firmware enable helper
+    
+    Extract a helper that enables message generation from the firmware. This
+    removes clutter from tegra_xusb_probe() and will also come in useful for
+    subsequent patches that introduce suspend/resume support.
+    
+    Based on work by JC Kuo <jckuo@nvidia.com>.
+    
+    Signed-off-by: Thierry Reding <treding@nvidia.com>
+    Link: https://lore.kernel.org/r/20191206140653.2085561-6-thierry.reding@gmail.com
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/usb/host/xhci-tegra.c b/drivers/usb/host/xhci-tegra.c
+index eda5e1d50828..499104c05668 100644
+--- a/drivers/usb/host/xhci-tegra.c
++++ b/drivers/usb/host/xhci-tegra.c
+@@ -993,11 +993,37 @@ static int tegra_xusb_powerdomain_init(struct device *dev,
+ 	return 0;
+ }
+ 
+-static int tegra_xusb_probe(struct platform_device *pdev)
++static int __tegra_xusb_enable_firmware_messages(struct tegra_xusb *tegra)
+ {
+ 	struct tegra_xusb_mbox_msg msg;
+-	struct resource *regs;
++	int err;
++
++	/* Enable firmware messages from controller. */
++	msg.cmd = MBOX_CMD_MSG_ENABLED;
++	msg.data = 0;
++
++	err = tegra_xusb_mbox_send(tegra, &msg);
++	if (err < 0)
++		dev_err(tegra->dev, "failed to enable messages: %d\n", err);
++
++	return err;
++}
++
++static int tegra_xusb_enable_firmware_messages(struct tegra_xusb *tegra)
++{
++	int err;
++
++	mutex_lock(&tegra->lock);
++	err = __tegra_xusb_enable_firmware_messages(tegra);
++	mutex_unlock(&tegra->lock);
++
++	return err;
++}
++
++static int tegra_xusb_probe(struct platform_device *pdev)
++{
+ 	struct tegra_xusb *tegra;
++	struct resource *regs;
+ 	struct xhci_hcd *xhci;
+ 	unsigned int i, j, k;
+ 	struct phy *phy;
+@@ -1277,21 +1303,12 @@ static int tegra_xusb_probe(struct platform_device *pdev)
+ 		goto put_usb3;
+ 	}
+ 
+-	mutex_lock(&tegra->lock);
+-
+-	/* Enable firmware messages from controller. */
+-	msg.cmd = MBOX_CMD_MSG_ENABLED;
+-	msg.data = 0;
+-
+-	err = tegra_xusb_mbox_send(tegra, &msg);
++	err = tegra_xusb_enable_firmware_messages(tegra);
+ 	if (err < 0) {
+ 		dev_err(&pdev->dev, "failed to enable messages: %d\n", err);
+-		mutex_unlock(&tegra->lock);
+ 		goto remove_usb3;
+ 	}
+ 
+-	mutex_unlock(&tegra->lock);
+-
+ 	err = devm_request_threaded_irq(&pdev->dev, tegra->mbox_irq,
+ 					tegra_xusb_mbox_irq,
+ 					tegra_xusb_mbox_thread, 0,
+
+commit 482ba7a6b42fa87dc8fa7d8c6140a916d0506549
+Author: Thierry Reding <treding@nvidia.com>
+Date:   Fri Dec 6 15:06:47 2019 +0100
+
+    usb: host: xhci-tegra: Use CNR as firmware ready indicator
+    
+    The Falcon CPU state is a suboptimal indicator for firmware readiness,
+    since the Falcon can be in a running state if the firmware is handling
+    port state changes or running other tasks. Instead, the driver should
+    check the STS_CNR bit to determine whether or not the firmware has been
+    successfully loaded and is ready for XHCI operation.
+    
+    Based on work by JC Kuo <jckuo@nvidia.com>.
+    
+    Signed-off-by: Thierry Reding <treding@nvidia.com>
+    Link: https://lore.kernel.org/r/20191206140653.2085561-5-thierry.reding@gmail.com
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/usb/host/xhci-tegra.c b/drivers/usb/host/xhci-tegra.c
+index e80fce712fd5..eda5e1d50828 100644
+--- a/drivers/usb/host/xhci-tegra.c
++++ b/drivers/usb/host/xhci-tegra.c
+@@ -830,10 +830,10 @@ static int tegra_xusb_request_firmware(struct tegra_xusb *tegra)
+ static int tegra_xusb_load_firmware(struct tegra_xusb *tegra)
+ {
+ 	unsigned int code_tag_blocks, code_size_blocks, code_blocks;
++	struct xhci_cap_regs __iomem *cap = tegra->regs;
+ 	struct tegra_xusb_fw_header *header;
+-	struct xhci_cap_regs __iomem *cap;
+-	struct xhci_op_regs __iomem *op;
+ 	struct device *dev = tegra->dev;
++	struct xhci_op_regs __iomem *op;
+ 	unsigned long timeout;
+ 	time64_t timestamp;
+ 	struct tm time;
+@@ -842,6 +842,7 @@ static int tegra_xusb_load_firmware(struct tegra_xusb *tegra)
+ 	int err;
+ 
+ 	header = (struct tegra_xusb_fw_header *)tegra->fw.virt;
++	op = tegra->regs + HC_LENGTH(readl(&cap->hc_capbase));
+ 
+ 	if (csb_readl(tegra, XUSB_CSB_MP_ILOAD_BASE_LO) != 0) {
+ 		dev_info(dev, "Firmware already loaded, Falcon state %#x\n",
+@@ -911,21 +912,23 @@ static int tegra_xusb_load_firmware(struct tegra_xusb *tegra)
+ 	csb_writel(tegra, le32_to_cpu(header->boot_codetag),
+ 		   XUSB_FALC_BOOTVEC);
+ 
+-	/* Boot Falcon CPU and wait for it to enter the STOPPED (idle) state. */
+-	timeout = jiffies + msecs_to_jiffies(5);
+-
++	/* Boot Falcon CPU and wait for USBSTS_CNR to get cleared. */
+ 	csb_writel(tegra, CPUCTL_STARTCPU, XUSB_FALC_CPUCTL);
+ 
+-	while (time_before(jiffies, timeout)) {
+-		if (csb_readl(tegra, XUSB_FALC_CPUCTL) == CPUCTL_STATE_STOPPED)
++	timeout = jiffies + msecs_to_jiffies(200);
++
++	do {
++		value = readl(&op->status);
++		if ((value & STS_CNR) == 0)
+ 			break;
+ 
+-		usleep_range(100, 200);
+-	}
++		usleep_range(1000, 2000);
++	} while (time_is_after_jiffies(timeout));
+ 
+-	if (csb_readl(tegra, XUSB_FALC_CPUCTL) != CPUCTL_STATE_STOPPED) {
+-		dev_err(dev, "Falcon failed to start, state: %#x\n",
+-			csb_readl(tegra, XUSB_FALC_CPUCTL));
++	value = readl(&op->status);
++	if (value & STS_CNR) {
++		value = csb_readl(tegra, XUSB_FALC_CPUCTL);
++		dev_err(dev, "XHCI controller not read: %#010x\n", value);
+ 		return -EIO;
+ 	}
+ 
+
+commit ec12ac10c9a7e2f1edf15c488e54f4c813cf0f52
+Author: Thierry Reding <treding@nvidia.com>
+Date:   Fri Dec 6 15:06:46 2019 +0100
+
+    usb: host: xhci-tegra: Avoid a fixed duration sleep
+    
+    Do not use a fixed duration sleep to wait for the DMA controller to
+    become ready. Instead, poll the L2IMEMOP_RESULT register for the VLD
+    flag to determine when the XUSB controller's DMA master is ready.
+    
+    Based on work by JC Kuo <jckuo@nvidia.com>.
+    
+    Signed-off-by: Thierry Reding <treding@nvidia.com>
+    Link: https://lore.kernel.org/r/20191206140653.2085561-4-thierry.reding@gmail.com
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/usb/host/xhci-tegra.c b/drivers/usb/host/xhci-tegra.c
+index 5cfd54862670..e80fce712fd5 100644
+--- a/drivers/usb/host/xhci-tegra.c
++++ b/drivers/usb/host/xhci-tegra.c
+@@ -11,6 +11,7 @@
+ #include <linux/dma-mapping.h>
+ #include <linux/firmware.h>
+ #include <linux/interrupt.h>
++#include <linux/iopoll.h>
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+ #include <linux/of_device.h>
+@@ -101,6 +102,8 @@
+ #define  L2IMEMOP_ACTION_SHIFT			24
+ #define  L2IMEMOP_INVALIDATE_ALL		(0x40 << L2IMEMOP_ACTION_SHIFT)
+ #define  L2IMEMOP_LOAD_LOCKED_RESULT		(0x11 << L2IMEMOP_ACTION_SHIFT)
++#define XUSB_CSB_MEMPOOL_L2IMEMOP_RESULT	0x101a18
++#define  L2IMEMOP_RESULT_VLD			BIT(31)
+ #define XUSB_CSB_MP_APMAP			0x10181c
+ #define  APMAP_BOOTPATH				BIT(31)
+ 
+@@ -836,6 +839,7 @@ static int tegra_xusb_load_firmware(struct tegra_xusb *tegra)
+ 	struct tm time;
+ 	u64 address;
+ 	u32 value;
++	int err;
+ 
+ 	header = (struct tegra_xusb_fw_header *)tegra->fw.virt;
+ 
+@@ -893,7 +897,16 @@ static int tegra_xusb_load_firmware(struct tegra_xusb *tegra)
+ 
+ 	csb_writel(tegra, 0, XUSB_FALC_DMACTL);
+ 
+-	msleep(50);
++	/* wait for RESULT_VLD to get set */
++#define tegra_csb_readl(offset) csb_readl(tegra, offset)
++	err = readx_poll_timeout(tegra_csb_readl,
++				 XUSB_CSB_MEMPOOL_L2IMEMOP_RESULT, value,
++				 value & L2IMEMOP_RESULT_VLD, 100, 10000);
++	if (err < 0) {
++		dev_err(dev, "DMA controller not ready %#010x\n", value);
++		return err;
++	}
++#undef tegra_csb_readl
+ 
+ 	csb_writel(tegra, le32_to_cpu(header->boot_codetag),
+ 		   XUSB_FALC_BOOTVEC);
+
+commit 741d6e5d84f30266694ca23641f1d028b55f7f40
+Author: Thierry Reding <treding@nvidia.com>
+Date:   Fri Dec 6 15:06:45 2019 +0100
+
+    usb: host: xhci-tegra: Separate firmware request and load
+    
+    Subsequent patches for system suspend/resume support will need to reload
+    the firmware on resume. Since the firmware remains in system memory, the
+    driver doesn't need to reload it from the filesystem. However, the XUSB
+    controller will be reset across suspend/resume, so it needs to load the
+    firmware into its microcontroller on resume.
+    
+    Split the firmware request and the firmware load code into two separate
+    functions so that the driver can reuse the firmware in system memory to
+    reload the microcontroller on resume.
+    
+    Based on work by JC Kuo <jckuo@nvidia.com>.
+    
+    Signed-off-by: Thierry Reding <treding@nvidia.com>
+    Link: https://lore.kernel.org/r/20191206140653.2085561-3-thierry.reding@gmail.com
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/usb/host/xhci-tegra.c b/drivers/usb/host/xhci-tegra.c
+index aa1c4e5fd750..5cfd54862670 100644
+--- a/drivers/usb/host/xhci-tegra.c
++++ b/drivers/usb/host/xhci-tegra.c
+@@ -793,17 +793,10 @@ static int tegra_xusb_runtime_resume(struct device *dev)
+ 	return err;
+ }
+ 
+-static int tegra_xusb_load_firmware(struct tegra_xusb *tegra)
++static int tegra_xusb_request_firmware(struct tegra_xusb *tegra)
+ {
+-	unsigned int code_tag_blocks, code_size_blocks, code_blocks;
+ 	struct tegra_xusb_fw_header *header;
+-	struct device *dev = tegra->dev;
+ 	const struct firmware *fw;
+-	unsigned long timeout;
+-	time64_t timestamp;
+-	struct tm time;
+-	u64 address;
+-	u32 value;
+ 	int err;
+ 
+ 	err = request_firmware(&fw, tegra->soc->firmware, tegra->dev);
+@@ -828,6 +821,24 @@ static int tegra_xusb_load_firmware(struct tegra_xusb *tegra)
+ 	memcpy(tegra->fw.virt, fw->data, tegra->fw.size);
+ 	release_firmware(fw);
+ 
++	return 0;
++}
++
++static int tegra_xusb_load_firmware(struct tegra_xusb *tegra)
++{
++	unsigned int code_tag_blocks, code_size_blocks, code_blocks;
++	struct tegra_xusb_fw_header *header;
++	struct xhci_cap_regs __iomem *cap;
++	struct xhci_op_regs __iomem *op;
++	struct device *dev = tegra->dev;
++	unsigned long timeout;
++	time64_t timestamp;
++	struct tm time;
++	u64 address;
++	u32 value;
++
++	header = (struct tegra_xusb_fw_header *)tegra->fw.virt;
++
+ 	if (csb_readl(tegra, XUSB_CSB_MP_ILOAD_BASE_LO) != 0) {
+ 		dev_info(dev, "Firmware already loaded, Falcon state %#x\n",
+ 			 csb_readl(tegra, XUSB_FALC_CPUCTL));
+@@ -1208,10 +1219,16 @@ static int tegra_xusb_probe(struct platform_device *pdev)
+ 		goto put_rpm;
+ 	}
+ 
++	err = tegra_xusb_request_firmware(tegra);
++	if (err < 0) {
++		dev_err(&pdev->dev, "failed to request firmware: %d\n", err);
++		goto disable_phy;
++	}
++
+ 	err = tegra_xusb_load_firmware(tegra);
+ 	if (err < 0) {
+ 		dev_err(&pdev->dev, "failed to load firmware: %d\n", err);
+-		goto put_rpm;
++		goto free_firmware;
+ 	}
+ 
+ 	tegra->hcd->regs = tegra->regs;
+@@ -1221,7 +1238,7 @@ static int tegra_xusb_probe(struct platform_device *pdev)
+ 	err = usb_add_hcd(tegra->hcd, tegra->xhci_irq, IRQF_SHARED);
+ 	if (err < 0) {
+ 		dev_err(&pdev->dev, "failed to add USB HCD: %d\n", err);
+-		goto put_rpm;
++		goto free_firmware;
+ 	}
+ 
+ 	device_wakeup_enable(tegra->hcd->self.controller);
+@@ -1281,6 +1298,9 @@ static int tegra_xusb_probe(struct platform_device *pdev)
+ 		tegra_xusb_runtime_suspend(&pdev->dev);
+ put_hcd:
+ 	usb_put_hcd(tegra->hcd);
++free_firmware:
++	dma_free_coherent(&pdev->dev, tegra->fw.size, tegra->fw.virt,
++			  tegra->fw.phys);
+ disable_phy:
+ 	tegra_xusb_phy_disable(tegra);
+ 	pm_runtime_disable(&pdev->dev);
+
+commit c763771504d158abefcdb965df632d09f7602e9f
+Author: Thierry Reding <treding@nvidia.com>
+Date:   Fri Dec 6 15:06:44 2019 +0100
+
+    usb: host: xhci-tegra: Fix "tega" -> "tegra" typo
+    
+    The tegra_xusb_mbox_regs structure was misspelled tega_xusb_mbox_regs.
+    Fortunately this was done consistently so it didn't cause any issues.
+    
+    Reviewed-by: JC Kuo <jckuo@nvidia.com>
+    Signed-off-by: Thierry Reding <treding@nvidia.com>
+    Link: https://lore.kernel.org/r/20191206140653.2085561-2-thierry.reding@gmail.com
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/usb/host/xhci-tegra.c b/drivers/usb/host/xhci-tegra.c
+index bf9065438320..aa1c4e5fd750 100644
+--- a/drivers/usb/host/xhci-tegra.c
++++ b/drivers/usb/host/xhci-tegra.c
+@@ -145,7 +145,7 @@ struct tegra_xusb_phy_type {
+ 	unsigned int num;
+ };
+ 
+-struct tega_xusb_mbox_regs {
++struct tegra_xusb_mbox_regs {
+ 	u16 cmd;
+ 	u16 data_in;
+ 	u16 data_out;
+@@ -166,7 +166,7 @@ struct tegra_xusb_soc {
+ 		} usb2, ulpi, hsic, usb3;
+ 	} ports;
+ 
+-	struct tega_xusb_mbox_regs mbox;
++	struct tegra_xusb_mbox_regs mbox;
+ 
+ 	bool scale_ss_clock;
+ 	bool has_ipfs;
+
+commit 6351653febbb784d86fdf83afe41f7523a61b392
+Author: Nagarjuna Kristam <nkristam@nvidia.com>
+Date:   Mon Nov 4 14:54:30 2019 +0530
+
+    usb: host: xhci-tegra: Correct phy enable sequence
+    
+    XUSB phy needs to be enabled before un-powergating the power partitions.
+    However in the current sequence, it happens opposite. Correct the phy
+    enable and powergating partition sequence to avoid any boot hangs.
+    
+    Signed-off-by: Nagarjuna Kristam <nkristam@nvidia.com>
+    Cc: stable <stable@vger.kernel.org>
+    Signed-off-by: Jui Chang Kuo <jckuo@nvidia.com>
+    Tested-by: Jon Hunter <jonathanh@nvidia.com>
+    Acked-by: Thierry Reding <treding@nvidia.com>
+    Link: https://lore.kernel.org/r/1572859470-7823-1-git-send-email-nkristam@nvidia.com
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/usb/host/xhci-tegra.c b/drivers/usb/host/xhci-tegra.c
+index 540b47a99824..bf9065438320 100644
+--- a/drivers/usb/host/xhci-tegra.c
++++ b/drivers/usb/host/xhci-tegra.c
+@@ -763,7 +763,6 @@ static int tegra_xusb_runtime_suspend(struct device *dev)
+ {
+ 	struct tegra_xusb *tegra = dev_get_drvdata(dev);
+ 
+-	tegra_xusb_phy_disable(tegra);
+ 	regulator_bulk_disable(tegra->soc->num_supplies, tegra->supplies);
+ 	tegra_xusb_clk_disable(tegra);
+ 
+@@ -787,16 +786,8 @@ static int tegra_xusb_runtime_resume(struct device *dev)
+ 		goto disable_clk;
+ 	}
+ 
+-	err = tegra_xusb_phy_enable(tegra);
+-	if (err < 0) {
+-		dev_err(dev, "failed to enable PHYs: %d\n", err);
+-		goto disable_regulator;
+-	}
+-
+ 	return 0;
+ 
+-disable_regulator:
+-	regulator_bulk_disable(tegra->soc->num_supplies, tegra->supplies);
+ disable_clk:
+ 	tegra_xusb_clk_disable(tegra);
+ 	return err;
+@@ -1188,6 +1179,12 @@ static int tegra_xusb_probe(struct platform_device *pdev)
+ 	 */
+ 	platform_set_drvdata(pdev, tegra);
+ 
++	err = tegra_xusb_phy_enable(tegra);
++	if (err < 0) {
++		dev_err(&pdev->dev, "failed to enable PHYs: %d\n", err);
++		goto put_hcd;
++	}
++
+ 	pm_runtime_enable(&pdev->dev);
+ 	if (pm_runtime_enabled(&pdev->dev))
+ 		err = pm_runtime_get_sync(&pdev->dev);
+@@ -1196,7 +1193,7 @@ static int tegra_xusb_probe(struct platform_device *pdev)
+ 
+ 	if (err < 0) {
+ 		dev_err(&pdev->dev, "failed to enable device: %d\n", err);
+-		goto disable_rpm;
++		goto disable_phy;
+ 	}
+ 
+ 	tegra_xusb_config(tegra, regs);
+@@ -1282,9 +1279,11 @@ static int tegra_xusb_probe(struct platform_device *pdev)
+ put_rpm:
+ 	if (!pm_runtime_status_suspended(&pdev->dev))
+ 		tegra_xusb_runtime_suspend(&pdev->dev);
+-disable_rpm:
+-	pm_runtime_disable(&pdev->dev);
++put_hcd:
+ 	usb_put_hcd(tegra->hcd);
++disable_phy:
++	tegra_xusb_phy_disable(tegra);
++	pm_runtime_disable(&pdev->dev);
+ put_powerdomains:
+ 	if (!of_property_read_bool(pdev->dev.of_node, "power-domains")) {
+ 		tegra_powergate_power_off(TEGRA_POWERGATE_XUSBC);
+@@ -1321,6 +1320,8 @@ static int tegra_xusb_remove(struct platform_device *pdev)
+ 		tegra_xusb_powerdomain_remove(&pdev->dev, tegra);
+ 	}
+ 
++	tegra_xusb_phy_disable(tegra);
++
+ 	tegra_xusb_padctl_put(tegra->padctl);
+ 
+ 	return 0;
+
+commit 2538f0ee8a2920d58812687e84c854b4a9882013
+Author: JC Kuo <jckuo@nvidia.com>
+Date:   Sat Oct 5 00:29:01 2019 +0800
+
+    usb: host: xhci-tegra: Add Tegra194 XHCI support
+    
+    This commit adds Tegra194 XUSB host mode controller support. This is
+    very similar to the existing Tegra124/Tegra210/Tegra186 XHCI, except
+      1. the number of ports and PHYs differs
+      2. the IPFS wrapper being removed
+      3. mailbox registers address changes
+    
+    Signed-off-by: JC Kuo <jckuo@nvidia.com>
+    Link: https://lore.kernel.org/r/20191004162906.4818-3-jckuo@nvidia.com
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/usb/host/xhci-tegra.c b/drivers/usb/host/xhci-tegra.c
+index 9e78d8120a8c..540b47a99824 100644
+--- a/drivers/usb/host/xhci-tegra.c
++++ b/drivers/usb/host/xhci-tegra.c
+@@ -1459,10 +1459,40 @@ static const struct tegra_xusb_soc tegra186_soc = {
+ 	},
+ };
+ 
++static const char * const tegra194_supply_names[] = {
++};
++
++static const struct tegra_xusb_phy_type tegra194_phy_types[] = {
++	{ .name = "usb3", .num = 4, },
++	{ .name = "usb2", .num = 4, },
++};
++
++static const struct tegra_xusb_soc tegra194_soc = {
++	.firmware = "nvidia/tegra194/xusb.bin",
++	.supply_names = tegra194_supply_names,
++	.num_supplies = ARRAY_SIZE(tegra194_supply_names),
++	.phy_types = tegra194_phy_types,
++	.num_types = ARRAY_SIZE(tegra194_phy_types),
++	.ports = {
++		.usb3 = { .offset = 0, .count = 4, },
++		.usb2 = { .offset = 4, .count = 4, },
++	},
++	.scale_ss_clock = false,
++	.has_ipfs = false,
++	.mbox = {
++		.cmd = 0x68,
++		.data_in = 0x6c,
++		.data_out = 0x70,
++		.owner = 0x74,
++	},
++};
++MODULE_FIRMWARE("nvidia/tegra194/xusb.bin");
++
+ static const struct of_device_id tegra_xusb_of_match[] = {
+ 	{ .compatible = "nvidia,tegra124-xusb", .data = &tegra124_soc },
+ 	{ .compatible = "nvidia,tegra210-xusb", .data = &tegra210_soc },
+ 	{ .compatible = "nvidia,tegra186-xusb", .data = &tegra186_soc },
++	{ .compatible = "nvidia,tegra194-xusb", .data = &tegra194_soc },
+ 	{ },
+ };
+ MODULE_DEVICE_TABLE(of, tegra_xusb_of_match);
+
+commit 8a02a23f33be50a52cfdbf3aa825b5e0c649e67e
+Author: JC Kuo <jckuo@nvidia.com>
+Date:   Sat Oct 5 00:29:00 2019 +0800
+
+    xhci: tegra: Parameterize mailbox register addresses
+    
+    Tegra194 XUSB host controller has rearranged mailbox registers. This
+    commit makes mailbox registers address a part of "soc" data so that
+    xhci-tegra driver can be used for Tegra194.
+    
+    Signed-off-by: JC Kuo <jckuo@nvidia.com>
+    Link: https://lore.kernel.org/r/20191004162906.4818-2-jckuo@nvidia.com
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/usb/host/xhci-tegra.c b/drivers/usb/host/xhci-tegra.c
+index 111a16376087..9e78d8120a8c 100644
+--- a/drivers/usb/host/xhci-tegra.c
++++ b/drivers/usb/host/xhci-tegra.c
+@@ -42,19 +42,18 @@
+ #define XUSB_CFG_CSB_BASE_ADDR			0x800
+ 
+ /* FPCI mailbox registers */
+-#define XUSB_CFG_ARU_MBOX_CMD			0x0e4
++/* XUSB_CFG_ARU_MBOX_CMD */
+ #define  MBOX_DEST_FALC				BIT(27)
+ #define  MBOX_DEST_PME				BIT(28)
+ #define  MBOX_DEST_SMI				BIT(29)
+ #define  MBOX_DEST_XHCI				BIT(30)
+ #define  MBOX_INT_EN				BIT(31)
+-#define XUSB_CFG_ARU_MBOX_DATA_IN		0x0e8
++/* XUSB_CFG_ARU_MBOX_DATA_IN and XUSB_CFG_ARU_MBOX_DATA_OUT */
+ #define  CMD_DATA_SHIFT				0
+ #define  CMD_DATA_MASK				0xffffff
+ #define  CMD_TYPE_SHIFT				24
+ #define  CMD_TYPE_MASK				0xff
+-#define XUSB_CFG_ARU_MBOX_DATA_OUT		0x0ec
+-#define XUSB_CFG_ARU_MBOX_OWNER			0x0f0
++/* XUSB_CFG_ARU_MBOX_OWNER */
+ #define  MBOX_OWNER_NONE			0
+ #define  MBOX_OWNER_FW				1
+ #define  MBOX_OWNER_SW				2
+@@ -146,6 +145,13 @@ struct tegra_xusb_phy_type {
+ 	unsigned int num;
+ };
+ 
++struct tega_xusb_mbox_regs {
++	u16 cmd;
++	u16 data_in;
++	u16 data_out;
++	u16 owner;
++};
++
+ struct tegra_xusb_soc {
+ 	const char *firmware;
+ 	const char * const *supply_names;
+@@ -160,6 +166,8 @@ struct tegra_xusb_soc {
+ 		} usb2, ulpi, hsic, usb3;
+ 	} ports;
+ 
++	struct tega_xusb_mbox_regs mbox;
++
+ 	bool scale_ss_clock;
+ 	bool has_ipfs;
+ };
+@@ -395,15 +403,15 @@ static int tegra_xusb_mbox_send(struct tegra_xusb *tegra,
+ 	 * ACK/NAK messages.
+ 	 */
+ 	if (!(msg->cmd == MBOX_CMD_ACK || msg->cmd == MBOX_CMD_NAK)) {
+-		value = fpci_readl(tegra, XUSB_CFG_ARU_MBOX_OWNER);
++		value = fpci_readl(tegra, tegra->soc->mbox.owner);
+ 		if (value != MBOX_OWNER_NONE) {
+ 			dev_err(tegra->dev, "mailbox is busy\n");
+ 			return -EBUSY;
+ 		}
+ 
+-		fpci_writel(tegra, MBOX_OWNER_SW, XUSB_CFG_ARU_MBOX_OWNER);
++		fpci_writel(tegra, MBOX_OWNER_SW, tegra->soc->mbox.owner);
+ 
+-		value = fpci_readl(tegra, XUSB_CFG_ARU_MBOX_OWNER);
++		value = fpci_readl(tegra, tegra->soc->mbox.owner);
+ 		if (value != MBOX_OWNER_SW) {
+ 			dev_err(tegra->dev, "failed to acquire mailbox\n");
+ 			return -EBUSY;
+@@ -413,17 +421,17 @@ static int tegra_xusb_mbox_send(struct tegra_xusb *tegra,
+ 	}
+ 
+ 	value = tegra_xusb_mbox_pack(msg);
+-	fpci_writel(tegra, value, XUSB_CFG_ARU_MBOX_DATA_IN);
++	fpci_writel(tegra, value, tegra->soc->mbox.data_in);
+ 
+-	value = fpci_readl(tegra, XUSB_CFG_ARU_MBOX_CMD);
++	value = fpci_readl(tegra, tegra->soc->mbox.cmd);
+ 	value |= MBOX_INT_EN | MBOX_DEST_FALC;
+-	fpci_writel(tegra, value, XUSB_CFG_ARU_MBOX_CMD);
++	fpci_writel(tegra, value, tegra->soc->mbox.cmd);
+ 
+ 	if (wait_for_idle) {
+ 		unsigned long timeout = jiffies + msecs_to_jiffies(250);
+ 
+ 		while (time_before(jiffies, timeout)) {
+-			value = fpci_readl(tegra, XUSB_CFG_ARU_MBOX_OWNER);
++			value = fpci_readl(tegra, tegra->soc->mbox.owner);
+ 			if (value == MBOX_OWNER_NONE)
+ 				break;
+ 
+@@ -431,7 +439,7 @@ static int tegra_xusb_mbox_send(struct tegra_xusb *tegra,
+ 		}
+ 
+ 		if (time_after(jiffies, timeout))
+-			value = fpci_readl(tegra, XUSB_CFG_ARU_MBOX_OWNER);
++			value = fpci_readl(tegra, tegra->soc->mbox.owner);
+ 
+ 		if (value != MBOX_OWNER_NONE)
+ 			return -ETIMEDOUT;
+@@ -598,16 +606,16 @@ static irqreturn_t tegra_xusb_mbox_thread(int irq, void *data)
+ 
+ 	mutex_lock(&tegra->lock);
+ 
+-	value = fpci_readl(tegra, XUSB_CFG_ARU_MBOX_DATA_OUT);
++	value = fpci_readl(tegra, tegra->soc->mbox.data_out);
+ 	tegra_xusb_mbox_unpack(&msg, value);
+ 
+-	value = fpci_readl(tegra, XUSB_CFG_ARU_MBOX_CMD);
++	value = fpci_readl(tegra, tegra->soc->mbox.cmd);
+ 	value &= ~MBOX_DEST_SMI;
+-	fpci_writel(tegra, value, XUSB_CFG_ARU_MBOX_CMD);
++	fpci_writel(tegra, value, tegra->soc->mbox.cmd);
+ 
+ 	/* clear mailbox owner if no ACK/NAK is required */
+ 	if (!tegra_xusb_mbox_cmd_requires_ack(msg.cmd))
+-		fpci_writel(tegra, MBOX_OWNER_NONE, XUSB_CFG_ARU_MBOX_OWNER);
++		fpci_writel(tegra, MBOX_OWNER_NONE, tegra->soc->mbox.owner);
+ 
+ 	tegra_xusb_mbox_handle(tegra, &msg);
+ 
+@@ -1374,6 +1382,12 @@ static const struct tegra_xusb_soc tegra124_soc = {
+ 	},
+ 	.scale_ss_clock = true,
+ 	.has_ipfs = true,
++	.mbox = {
++		.cmd = 0xe4,
++		.data_in = 0xe8,
++		.data_out = 0xec,
++		.owner = 0xf0,
++	},
+ };
+ MODULE_FIRMWARE("nvidia/tegra124/xusb.bin");
+ 
+@@ -1406,6 +1420,12 @@ static const struct tegra_xusb_soc tegra210_soc = {
+ 	},
+ 	.scale_ss_clock = false,
+ 	.has_ipfs = true,
++	.mbox = {
++		.cmd = 0xe4,
++		.data_in = 0xe8,
++		.data_out = 0xec,
++		.owner = 0xf0,
++	},
+ };
+ MODULE_FIRMWARE("nvidia/tegra210/xusb.bin");
+ 
+@@ -1431,6 +1451,12 @@ static const struct tegra_xusb_soc tegra186_soc = {
+ 	},
+ 	.scale_ss_clock = false,
+ 	.has_ipfs = false,
++	.mbox = {
++		.cmd = 0xe4,
++		.data_in = 0xe8,
++		.data_out = 0xec,
++		.owner = 0xf0,
++	},
+ };
+ 
+ static const struct of_device_id tegra_xusb_of_match[] = {
+
+commit 5d88ef9eead8b5756122cc799593780d15dae471
+Author: Bartosz Golaszewski <bgolaszewski@baylibre.com>
+Date:   Tue Oct 1 15:23:33 2019 +0200
+
+    usb: host: xhci-tegra: use regulator_bulk_set_supply_names()
+    
+    Use the new regulator helper instead of a for loop.
+    
+    Signed-off-by: Bartosz Golaszewski <bgolaszewski@baylibre.com>
+    Acked-by: Thierry Reding <treding@nvidia.com>
+    Link: https://lore.kernel.org/r/20191001132333.20146-4-brgl@bgdev.pl
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/usb/host/xhci-tegra.c b/drivers/usb/host/xhci-tegra.c
+index 742960adde94..111a16376087 100644
+--- a/drivers/usb/host/xhci-tegra.c
++++ b/drivers/usb/host/xhci-tegra.c
+@@ -1126,8 +1126,9 @@ static int tegra_xusb_probe(struct platform_device *pdev)
+ 		goto put_powerdomains;
+ 	}
+ 
+-	for (i = 0; i < tegra->soc->num_supplies; i++)
+-		tegra->supplies[i].supply = tegra->soc->supply_names[i];
++	regulator_bulk_set_supply_names(tegra->supplies,
++					tegra->soc->supply_names,
++					tegra->soc->num_supplies);
+ 
+ 	err = devm_regulator_bulk_get(&pdev->dev, tegra->soc->num_supplies,
+ 				      tegra->supplies);
+
+commit 55419932d2ace7af2ce76eb6bec11d36e8e27f2f
+Author: YueHaibing <yuehaibing@huawei.com>
+Date:   Wed Sep 4 17:10:04 2019 +0800
+
+    usb: host: xhci-tegra: use devm_platform_ioremap_resource() to simplify code
+    
+    Use devm_platform_ioremap_resource() to simplify the code a bit.
+    This is detected by coccinelle.
+    
+    Reported-by: Hulk Robot <hulkci@huawei.com>
+    Signed-off-by: YueHaibing <yuehaibing@huawei.com>
+    Link: https://lore.kernel.org/r/20190904091004.3808-1-yuehaibing@huawei.com
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/usb/host/xhci-tegra.c b/drivers/usb/host/xhci-tegra.c
+index 2ff7c911fbd0..742960adde94 100644
+--- a/drivers/usb/host/xhci-tegra.c
++++ b/drivers/usb/host/xhci-tegra.c
+@@ -970,7 +970,7 @@ static int tegra_xusb_powerdomain_init(struct device *dev,
+ static int tegra_xusb_probe(struct platform_device *pdev)
+ {
+ 	struct tegra_xusb_mbox_msg msg;
+-	struct resource *res, *regs;
++	struct resource *regs;
+ 	struct tegra_xusb *tegra;
+ 	struct xhci_hcd *xhci;
+ 	unsigned int i, j, k;
+@@ -992,14 +992,12 @@ static int tegra_xusb_probe(struct platform_device *pdev)
+ 	if (IS_ERR(tegra->regs))
+ 		return PTR_ERR(tegra->regs);
+ 
+-	res = platform_get_resource(pdev, IORESOURCE_MEM, 1);
+-	tegra->fpci_base = devm_ioremap_resource(&pdev->dev, res);
++	tegra->fpci_base = devm_platform_ioremap_resource(pdev, 1);
+ 	if (IS_ERR(tegra->fpci_base))
+ 		return PTR_ERR(tegra->fpci_base);
+ 
+ 	if (tegra->soc->has_ipfs) {
+-		res = platform_get_resource(pdev, IORESOURCE_MEM, 2);
+-		tegra->ipfs_base = devm_ioremap_resource(&pdev->dev, res);
++		tegra->ipfs_base = devm_platform_ioremap_resource(pdev, 2);
+ 		if (IS_ERR(tegra->ipfs_base))
+ 			return PTR_ERR(tegra->ipfs_base);
+ 	}
+
+commit 993cc8753453fccfe060a535bbe21fcf1001b626
+Author: Nagarjuna Kristam <nkristam@nvidia.com>
+Date:   Wed Aug 28 16:24:57 2019 +0530
+
+    usb: host: xhci-tegra: Set DMA mask correctly
+    
+    The Falcon microcontroller that runs the XUSB firmware and which is
+    responsible for exposing the XHCI interface can address only 40 bits of
+    memory. Typically that's not a problem because Tegra devices don't have
+    enough system memory to exceed those 40 bits.
+    
+    However, if the ARM SMMU is enable on Tegra186 and later, the addresses
+    passed to the XUSB controller can be anywhere in the 48-bit IOV address
+    space of the ARM SMMU. Since the DMA/IOMMU API starts allocating from
+    the top of the IOVA space, the Falcon microcontroller is not able to
+    load the firmware successfully.
+    
+    Fix this by setting the DMA mask to 40 bits, which will force the DMA
+    API to map the buffer for the firmware to an IOVA that is addressable by
+    the Falcon.
+    
+    Signed-off-by: Nagarjuna Kristam <nkristam@nvidia.com>
+    Signed-off-by: Thierry Reding <treding@nvidia.com>
+    Link: https://lore.kernel.org/r/1566989697-13049-1-git-send-email-nkristam@nvidia.com
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/usb/host/xhci-tegra.c b/drivers/usb/host/xhci-tegra.c
+index dafc65911fc0..2ff7c911fbd0 100644
+--- a/drivers/usb/host/xhci-tegra.c
++++ b/drivers/usb/host/xhci-tegra.c
+@@ -1194,6 +1194,16 @@ static int tegra_xusb_probe(struct platform_device *pdev)
+ 
+ 	tegra_xusb_config(tegra, regs);
+ 
++	/*
++	 * The XUSB Falcon microcontroller can only address 40 bits, so set
++	 * the DMA mask accordingly.
++	 */
++	err = dma_set_mask_and_coherent(tegra->dev, DMA_BIT_MASK(40));
++	if (err < 0) {
++		dev_err(&pdev->dev, "failed to set DMA mask: %d\n", err);
++		goto put_rpm;
++	}
++
+ 	err = tegra_xusb_load_firmware(tegra);
+ 	if (err < 0) {
+ 		dev_err(&pdev->dev, "failed to load firmware: %d\n", err);
+
+commit 1a65a03561198f38f8198650b52f55a21cbb4b6c
+Author: Nathan Huckleberry <nhuck@google.com>
+Date:   Thu Jun 13 11:58:38 2019 -0700
+
+    usb: host: xhci-tegra: Fix Wunused-const-variable
+    
+    Clang produces the following warning
+    
+    drivers/usb/host/xhci-tegra.c:357:27: warning: unused variable
+    'mbox_cmd_name' [-Wunused-const-variable]
+    static const char * const mbox_cmd_name[] = {
+    
+    Looks like it was intended for logging or debugging, but was
+    never implemented. Removing mbox_cmd_name.
+    
+    Cc: clang-built-linux@googlegroups.com
+    Link: https://github.com/ClangBuiltLinux/linux/issues/533
+    Signed-off-by: Nathan Huckleberry <nhuck@google.com>
+    Acked-by: Thierry Reding <treding@nvidia.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/usb/host/xhci-tegra.c b/drivers/usb/host/xhci-tegra.c
+index 294158113d62..dafc65911fc0 100644
+--- a/drivers/usb/host/xhci-tegra.c
++++ b/drivers/usb/host/xhci-tegra.c
+@@ -354,29 +354,6 @@ enum tegra_xusb_mbox_cmd {
+ 	MBOX_CMD_NAK
+ };
+ 
+-static const char * const mbox_cmd_name[] = {
+-	[  1] = "MSG_ENABLE",
+-	[  2] = "INC_FALCON_CLOCK",
+-	[  3] = "DEC_FALCON_CLOCK",
+-	[  4] = "INC_SSPI_CLOCK",
+-	[  5] = "DEC_SSPI_CLOCK",
+-	[  6] = "SET_BW",
+-	[  7] = "SET_SS_PWR_GATING",
+-	[  8] = "SET_SS_PWR_UNGATING",
+-	[  9] = "SAVE_DFE_CTLE_CTX",
+-	[ 10] = "AIRPLANE_MODE_ENABLED",
+-	[ 11] = "AIRPLANE_MODE_DISABLED",
+-	[ 12] = "START_HSIC_IDLE",
+-	[ 13] = "STOP_HSIC_IDLE",
+-	[ 14] = "DBC_WAKE_STACK",
+-	[ 15] = "HSIC_PRETEND_CONNECT",
+-	[ 16] = "RESET_SSPI",
+-	[ 17] = "DISABLE_SS_LFPS_DETECTION",
+-	[ 18] = "ENABLE_SS_LFPS_DETECTION",
+-	[128] = "ACK",
+-	[129] = "NAK",
+-};
+-
+ struct tegra_xusb_mbox_msg {
+ 	u32 cmd;
+ 	u32 data;
+
+commit 5f9be5f3f89921de6e3961bedf3202a383f126c9
+Author: JC Kuo <jckuo@nvidia.com>
+Date:   Mon Apr 1 12:40:47 2019 +0200
+
+    usb: host: xhci-tegra: Add Tegra186 XUSB support
+    
+    This commit adds Tegra186 XUSB host mode controller support. This is
+    very similar to the existing support for Tegra124 and Tegra210, except
+    that the number of ports and PHYs differs and the IPFS wrapper being
+    gone.
+    
+    Signed-off-by: JC Kuo <jckuo@nvidia.com>
+    Acked-by: Mathias Nyman <mathias.nyman@linux.intel.com>
+    Signed-off-by: Thierry Reding <treding@nvidia.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/usb/host/xhci-tegra.c b/drivers/usb/host/xhci-tegra.c
+index 4d133bbabdda..294158113d62 100644
+--- a/drivers/usb/host/xhci-tegra.c
++++ b/drivers/usb/host/xhci-tegra.c
+@@ -1423,9 +1423,34 @@ static const struct tegra_xusb_soc tegra210_soc = {
+ };
+ MODULE_FIRMWARE("nvidia/tegra210/xusb.bin");
+ 
++static const char * const tegra186_supply_names[] = {
++};
++
++static const struct tegra_xusb_phy_type tegra186_phy_types[] = {
++	{ .name = "usb3", .num = 3, },
++	{ .name = "usb2", .num = 3, },
++	{ .name = "hsic", .num = 1, },
++};
++
++static const struct tegra_xusb_soc tegra186_soc = {
++	.firmware = "nvidia/tegra186/xusb.bin",
++	.supply_names = tegra186_supply_names,
++	.num_supplies = ARRAY_SIZE(tegra186_supply_names),
++	.phy_types = tegra186_phy_types,
++	.num_types = ARRAY_SIZE(tegra186_phy_types),
++	.ports = {
++		.usb3 = { .offset = 0, .count = 3, },
++		.usb2 = { .offset = 3, .count = 3, },
++		.hsic = { .offset = 6, .count = 1, },
++	},
++	.scale_ss_clock = false,
++	.has_ipfs = false,
++};
++
+ static const struct of_device_id tegra_xusb_of_match[] = {
+ 	{ .compatible = "nvidia,tegra124-xusb", .data = &tegra124_soc },
+ 	{ .compatible = "nvidia,tegra210-xusb", .data = &tegra210_soc },
++	{ .compatible = "nvidia,tegra186-xusb", .data = &tegra186_soc },
+ 	{ },
+ };
+ MODULE_DEVICE_TABLE(of, tegra_xusb_of_match);
+
+commit 160fa3a1f55fd7cbab3a8347244a71a173d85cad
+Author: JC Kuo <jckuo@nvidia.com>
+Date:   Mon Apr 1 12:40:46 2019 +0200
+
+    usb: host: xhci-tegra: Selectively program IPFS
+    
+    Starting with Tegra186, the XUSB controller no longer has the IPFS
+    wrapper. This commit adds a "has_ipfs" field to struct tegra_xusb_soc
+    that can be used to declare the existence of the IPFS wrapper.
+    
+    For the existing chips (i.e. Tegra124 and Tegra210), the new field is
+    set to true. A future patch adding support for Tegra186 will set it to
+    false.
+    
+    Signed-off-by: JC Kuo <jckuo@nvidia.com>
+    Acked-by: Mathias Nyman <mathias.nyman@linux.intel.com>
+    Signed-off-by: Thierry Reding <treding@nvidia.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/usb/host/xhci-tegra.c b/drivers/usb/host/xhci-tegra.c
+index efb0cad8710e..4d133bbabdda 100644
+--- a/drivers/usb/host/xhci-tegra.c
++++ b/drivers/usb/host/xhci-tegra.c
+@@ -161,6 +161,7 @@ struct tegra_xusb_soc {
+ 	} ports;
+ 
+ 	bool scale_ss_clock;
++	bool has_ipfs;
+ };
+ 
+ struct tegra_xusb {
+@@ -637,16 +638,18 @@ static irqreturn_t tegra_xusb_mbox_thread(int irq, void *data)
+ 	return IRQ_HANDLED;
+ }
+ 
+-static void tegra_xusb_ipfs_config(struct tegra_xusb *tegra,
+-				   struct resource *regs)
++static void tegra_xusb_config(struct tegra_xusb *tegra,
++			      struct resource *regs)
+ {
+ 	u32 value;
+ 
+-	value = ipfs_readl(tegra, IPFS_XUSB_HOST_CONFIGURATION_0);
+-	value |= IPFS_EN_FPCI;
+-	ipfs_writel(tegra, value, IPFS_XUSB_HOST_CONFIGURATION_0);
++	if (tegra->soc->has_ipfs) {
++		value = ipfs_readl(tegra, IPFS_XUSB_HOST_CONFIGURATION_0);
++		value |= IPFS_EN_FPCI;
++		ipfs_writel(tegra, value, IPFS_XUSB_HOST_CONFIGURATION_0);
+ 
+-	usleep_range(10, 20);
++		usleep_range(10, 20);
++	}
+ 
+ 	/* Program BAR0 space */
+ 	value = fpci_readl(tegra, XUSB_CFG_4);
+@@ -661,13 +664,15 @@ static void tegra_xusb_ipfs_config(struct tegra_xusb *tegra,
+ 	value |= XUSB_IO_SPACE_EN | XUSB_MEM_SPACE_EN | XUSB_BUS_MASTER_EN;
+ 	fpci_writel(tegra, value, XUSB_CFG_1);
+ 
+-	/* Enable interrupt assertion */
+-	value = ipfs_readl(tegra, IPFS_XUSB_HOST_INTR_MASK_0);
+-	value |= IPFS_IP_INT_MASK;
+-	ipfs_writel(tegra, value, IPFS_XUSB_HOST_INTR_MASK_0);
++	if (tegra->soc->has_ipfs) {
++		/* Enable interrupt assertion */
++		value = ipfs_readl(tegra, IPFS_XUSB_HOST_INTR_MASK_0);
++		value |= IPFS_IP_INT_MASK;
++		ipfs_writel(tegra, value, IPFS_XUSB_HOST_INTR_MASK_0);
+ 
+-	/* Set hysteresis */
+-	ipfs_writel(tegra, 0x80, IPFS_XUSB_HOST_CLKGATE_HYSTERESIS_0);
++		/* Set hysteresis */
++		ipfs_writel(tegra, 0x80, IPFS_XUSB_HOST_CLKGATE_HYSTERESIS_0);
++	}
+ }
+ 
+ static int tegra_xusb_clk_enable(struct tegra_xusb *tegra)
+@@ -1015,10 +1020,12 @@ static int tegra_xusb_probe(struct platform_device *pdev)
+ 	if (IS_ERR(tegra->fpci_base))
+ 		return PTR_ERR(tegra->fpci_base);
+ 
+-	res = platform_get_resource(pdev, IORESOURCE_MEM, 2);
+-	tegra->ipfs_base = devm_ioremap_resource(&pdev->dev, res);
+-	if (IS_ERR(tegra->ipfs_base))
+-		return PTR_ERR(tegra->ipfs_base);
++	if (tegra->soc->has_ipfs) {
++		res = platform_get_resource(pdev, IORESOURCE_MEM, 2);
++		tegra->ipfs_base = devm_ioremap_resource(&pdev->dev, res);
++		if (IS_ERR(tegra->ipfs_base))
++			return PTR_ERR(tegra->ipfs_base);
++	}
+ 
+ 	tegra->xhci_irq = platform_get_irq(pdev, 0);
+ 	if (tegra->xhci_irq < 0)
+@@ -1208,7 +1215,7 @@ static int tegra_xusb_probe(struct platform_device *pdev)
+ 		goto disable_rpm;
+ 	}
+ 
+-	tegra_xusb_ipfs_config(tegra, regs);
++	tegra_xusb_config(tegra, regs);
+ 
+ 	err = tegra_xusb_load_firmware(tegra);
+ 	if (err < 0) {
+@@ -1380,6 +1387,7 @@ static const struct tegra_xusb_soc tegra124_soc = {
+ 		.usb3 = { .offset = 0, .count = 2, },
+ 	},
+ 	.scale_ss_clock = true,
++	.has_ipfs = true,
+ };
+ MODULE_FIRMWARE("nvidia/tegra124/xusb.bin");
+ 
+@@ -1411,6 +1419,7 @@ static const struct tegra_xusb_soc tegra210_soc = {
+ 		.usb3 = { .offset = 0, .count = 4, },
+ 	},
+ 	.scale_ss_clock = false,
++	.has_ipfs = true,
+ };
+ MODULE_FIRMWARE("nvidia/tegra210/xusb.bin");
+ 
+
+commit 0326ccb5feac6eac35ba6254260e2774277cd976
+Author: Thierry Reding <treding@nvidia.com>
+Date:   Wed Feb 20 14:48:41 2019 +0100
+
+    xhci: tegra: Prevent error pointer dereference
+    
+    During initialization, the host and super-speed power domains will
+    contain an ERR_PTR() encoded error code rather than being NULL. To
+    avoid a crash, use a !IS_ERR_OR_NULL() condition during cleanup.
+    
+    Signed-off-by: Thierry Reding <treding@nvidia.com>
+    Fixes: 6494a9ad86de ("usb: xhci: tegra: Add genpd support")
+    Cc: stable <stable@vger.kernel.org>
+    Reviewed-by: Jon Hunter <jonathanh@nvidia.com>
+    Acked-by: Mathias Nyman <mathias.nyman@linux.intel.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/usb/host/xhci-tegra.c b/drivers/usb/host/xhci-tegra.c
+index 938ff06c0349..efb0cad8710e 100644
+--- a/drivers/usb/host/xhci-tegra.c
++++ b/drivers/usb/host/xhci-tegra.c
+@@ -941,9 +941,9 @@ static void tegra_xusb_powerdomain_remove(struct device *dev,
+ 		device_link_del(tegra->genpd_dl_ss);
+ 	if (tegra->genpd_dl_host)
+ 		device_link_del(tegra->genpd_dl_host);
+-	if (tegra->genpd_dev_ss)
++	if (!IS_ERR_OR_NULL(tegra->genpd_dev_ss))
+ 		dev_pm_domain_detach(tegra->genpd_dev_ss, true);
+-	if (tegra->genpd_dev_host)
++	if (!IS_ERR_OR_NULL(tegra->genpd_dev_host))
+ 		dev_pm_domain_detach(tegra->genpd_dev_host, true);
+ }
+ 
+
+commit f068090426ea8d72c408ebd42953a82a88e2282c
+Author: Mathias Nyman <mathias.nyman@linux.intel.com>
+Date:   Fri Nov 9 17:21:17 2018 +0200
+
+    xhci: Fix leaking USB3 shared_hcd at xhci removal
+    
+    Ensure that the shared_hcd pointer is valid when calling usb_put_hcd()
+    
+    The shared_hcd is removed and freed in xhci by first calling
+    usb_remove_hcd(xhci->shared_hcd), and later
+    usb_put_hcd(xhci->shared_hcd)
+    
+    Afer commit fe190ed0d602 ("xhci: Do not halt the host until both HCD have
+    disconnected their devices.") the shared_hcd was never properly put as
+    xhci->shared_hcd was set to NULL before usb_put_hcd(xhci->shared_hcd) was
+    called.
+    
+    shared_hcd (USB3) is removed before primary hcd (USB2).
+    While removing the primary hcd we might need to handle xhci interrupts
+    to cleanly remove last USB2 devices, therefore we need to set
+    xhci->shared_hcd to NULL before removing the primary hcd to let xhci
+    interrupt handler know shared_hcd is no longer available.
+    
+    xhci-plat.c, xhci-histb.c and xhci-mtk first create both their hcd's before
+    adding them. so to keep the correct reverse removal order use a temporary
+    shared_hcd variable for them.
+    For more details see commit 4ac53087d6d4 ("usb: xhci: plat: Create both
+    HCDs before adding them")
+    
+    Fixes: fe190ed0d602 ("xhci: Do not halt the host until both HCD have disconnected their devices.")
+    Cc: Joel Stanley <joel@jms.id.au>
+    Cc: Chunfeng Yun <chunfeng.yun@mediatek.com>
+    Cc: Thierry Reding <treding@nvidia.com>
+    Cc: Jianguo Sun <sunjianguo1@huawei.com>
+    Cc: <stable@vger.kernel.org>
+    Reported-by: Jack Pham <jackp@codeaurora.org>
+    Tested-by: Jack Pham <jackp@codeaurora.org>
+    Tested-by: Peter Chen <peter.chen@nxp.com>
+    Signed-off-by: Mathias Nyman <mathias.nyman@linux.intel.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/usb/host/xhci-tegra.c b/drivers/usb/host/xhci-tegra.c
+index 6b5db344de30..938ff06c0349 100644
+--- a/drivers/usb/host/xhci-tegra.c
++++ b/drivers/usb/host/xhci-tegra.c
+@@ -1303,6 +1303,7 @@ static int tegra_xusb_remove(struct platform_device *pdev)
+ 
+ 	usb_remove_hcd(xhci->shared_hcd);
+ 	usb_put_hcd(xhci->shared_hcd);
++	xhci->shared_hcd = NULL;
+ 	usb_remove_hcd(tegra->hcd);
+ 	usb_put_hcd(tegra->hcd);
+ 
+
+commit 6494a9ad86de921766afe91066f53a794f6c52ea
+Author: Jon Hunter <jonathanh@nvidia.com>
+Date:   Tue Oct 16 14:22:43 2018 +0300
+
+    usb: xhci: tegra: Add genpd support
+    
+    The generic power-domain framework has been updated to allow devices
+    that require more than one power-domain to create a new device for
+    each power-domain required and then link these new power-domain
+    devices to the consumer device.
+    
+    Update the Tegra xHCI driver to use the new APIs provided by the
+    generic power-domain framework so we can use the generic power-domain
+    framework for managing the xHCI controllers power-domains. Please
+    note that to maintain backward compatibility with older device-tree
+    blobs these new generic power-domain APIs are only used if the
+    'power-domains' property is present and otherwise we fall back to
+    using the legacy Tegra APIs for managing the power-domains.
+    
+    Signed-off-by: Jon Hunter <jonathanh@nvidia.com>
+    Acked-by: Thierry Reding <treding@nvidia.com>
+    Reviewed-by: Ulf Hansson <ulf.hansson@linaro.org>
+    Signed-off-by: Mathias Nyman <mathias.nyman@linux.intel.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/usb/host/xhci-tegra.c b/drivers/usb/host/xhci-tegra.c
+index 920a50a54095..6b5db344de30 100644
+--- a/drivers/usb/host/xhci-tegra.c
++++ b/drivers/usb/host/xhci-tegra.c
+@@ -18,6 +18,7 @@
+ #include <linux/phy/tegra/xusb.h>
+ #include <linux/platform_device.h>
+ #include <linux/pm.h>
++#include <linux/pm_domain.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/regulator/consumer.h>
+ #include <linux/reset.h>
+@@ -194,6 +195,11 @@ struct tegra_xusb {
+ 	struct reset_control *host_rst;
+ 	struct reset_control *ss_rst;
+ 
++	struct device *genpd_dev_host;
++	struct device *genpd_dev_ss;
++	struct device_link *genpd_dl_host;
++	struct device_link *genpd_dl_ss;
++
+ 	struct phy **phys;
+ 	unsigned int num_phys;
+ 
+@@ -928,6 +934,57 @@ static int tegra_xusb_load_firmware(struct tegra_xusb *tegra)
+ 	return 0;
+ }
+ 
++static void tegra_xusb_powerdomain_remove(struct device *dev,
++					  struct tegra_xusb *tegra)
++{
++	if (tegra->genpd_dl_ss)
++		device_link_del(tegra->genpd_dl_ss);
++	if (tegra->genpd_dl_host)
++		device_link_del(tegra->genpd_dl_host);
++	if (tegra->genpd_dev_ss)
++		dev_pm_domain_detach(tegra->genpd_dev_ss, true);
++	if (tegra->genpd_dev_host)
++		dev_pm_domain_detach(tegra->genpd_dev_host, true);
++}
++
++static int tegra_xusb_powerdomain_init(struct device *dev,
++				       struct tegra_xusb *tegra)
++{
++	int err;
++
++	tegra->genpd_dev_host = dev_pm_domain_attach_by_name(dev, "xusb_host");
++	if (IS_ERR(tegra->genpd_dev_host)) {
++		err = PTR_ERR(tegra->genpd_dev_host);
++		dev_err(dev, "failed to get host pm-domain: %d\n", err);
++		return err;
++	}
++
++	tegra->genpd_dev_ss = dev_pm_domain_attach_by_name(dev, "xusb_ss");
++	if (IS_ERR(tegra->genpd_dev_ss)) {
++		err = PTR_ERR(tegra->genpd_dev_ss);
++		dev_err(dev, "failed to get superspeed pm-domain: %d\n", err);
++		return err;
++	}
++
++	tegra->genpd_dl_host = device_link_add(dev, tegra->genpd_dev_host,
++					       DL_FLAG_PM_RUNTIME |
++					       DL_FLAG_STATELESS);
++	if (!tegra->genpd_dl_host) {
++		dev_err(dev, "adding host device link failed!\n");
++		return -ENODEV;
++	}
++
++	tegra->genpd_dl_ss = device_link_add(dev, tegra->genpd_dev_ss,
++					     DL_FLAG_PM_RUNTIME |
++					     DL_FLAG_STATELESS);
++	if (!tegra->genpd_dl_ss) {
++		dev_err(dev, "adding superspeed device link failed!\n");
++		return -ENODEV;
++	}
++
++	return 0;
++}
++
+ static int tegra_xusb_probe(struct platform_device *pdev)
+ {
+ 	struct tegra_xusb_mbox_msg msg;
+@@ -1038,7 +1095,7 @@ static int tegra_xusb_probe(struct platform_device *pdev)
+ 		goto put_padctl;
+ 	}
+ 
+-	if (!pdev->dev.pm_domain) {
++	if (!of_property_read_bool(pdev->dev.of_node, "power-domains")) {
+ 		tegra->host_rst = devm_reset_control_get(&pdev->dev,
+ 							 "xusb_host");
+ 		if (IS_ERR(tegra->host_rst)) {
+@@ -1069,17 +1126,22 @@ static int tegra_xusb_probe(struct platform_device *pdev)
+ 							tegra->host_clk,
+ 							tegra->host_rst);
+ 		if (err) {
++			tegra_powergate_power_off(TEGRA_POWERGATE_XUSBA);
+ 			dev_err(&pdev->dev,
+ 				"failed to enable XUSBC domain: %d\n", err);
+-			goto disable_xusba;
++			goto put_padctl;
+ 		}
++	} else {
++		err = tegra_xusb_powerdomain_init(&pdev->dev, tegra);
++		if (err)
++			goto put_powerdomains;
+ 	}
+ 
+ 	tegra->supplies = devm_kcalloc(&pdev->dev, tegra->soc->num_supplies,
+ 				       sizeof(*tegra->supplies), GFP_KERNEL);
+ 	if (!tegra->supplies) {
+ 		err = -ENOMEM;
+-		goto disable_xusbc;
++		goto put_powerdomains;
+ 	}
+ 
+ 	for (i = 0; i < tegra->soc->num_supplies; i++)
+@@ -1089,7 +1151,7 @@ static int tegra_xusb_probe(struct platform_device *pdev)
+ 				      tegra->supplies);
+ 	if (err) {
+ 		dev_err(&pdev->dev, "failed to get regulators: %d\n", err);
+-		goto disable_xusbc;
++		goto put_powerdomains;
+ 	}
+ 
+ 	for (i = 0; i < tegra->soc->num_types; i++)
+@@ -1099,7 +1161,7 @@ static int tegra_xusb_probe(struct platform_device *pdev)
+ 				   sizeof(*tegra->phys), GFP_KERNEL);
+ 	if (!tegra->phys) {
+ 		err = -ENOMEM;
+-		goto disable_xusbc;
++		goto put_powerdomains;
+ 	}
+ 
+ 	for (i = 0, k = 0; i < tegra->soc->num_types; i++) {
+@@ -1115,7 +1177,7 @@ static int tegra_xusb_probe(struct platform_device *pdev)
+ 					"failed to get PHY %s: %ld\n", prop,
+ 					PTR_ERR(phy));
+ 				err = PTR_ERR(phy);
+-				goto disable_xusbc;
++				goto put_powerdomains;
+ 			}
+ 
+ 			tegra->phys[k++] = phy;
+@@ -1126,7 +1188,7 @@ static int tegra_xusb_probe(struct platform_device *pdev)
+ 				    dev_name(&pdev->dev));
+ 	if (!tegra->hcd) {
+ 		err = -ENOMEM;
+-		goto disable_xusbc;
++		goto put_powerdomains;
+ 	}
+ 
+ 	/*
+@@ -1222,12 +1284,13 @@ static int tegra_xusb_probe(struct platform_device *pdev)
+ disable_rpm:
+ 	pm_runtime_disable(&pdev->dev);
+ 	usb_put_hcd(tegra->hcd);
+-disable_xusbc:
+-	if (!pdev->dev.pm_domain)
++put_powerdomains:
++	if (!of_property_read_bool(pdev->dev.of_node, "power-domains")) {
+ 		tegra_powergate_power_off(TEGRA_POWERGATE_XUSBC);
+-disable_xusba:
+-	if (!pdev->dev.pm_domain)
+ 		tegra_powergate_power_off(TEGRA_POWERGATE_XUSBA);
++	} else {
++		tegra_xusb_powerdomain_remove(&pdev->dev, tegra);
++	}
+ put_padctl:
+ 	tegra_xusb_padctl_put(tegra->padctl);
+ 	return err;
+@@ -1249,9 +1312,11 @@ static int tegra_xusb_remove(struct platform_device *pdev)
+ 	pm_runtime_put_sync(&pdev->dev);
+ 	pm_runtime_disable(&pdev->dev);
+ 
+-	if (!pdev->dev.pm_domain) {
++	if (!of_property_read_bool(pdev->dev.of_node, "power-domains")) {
+ 		tegra_powergate_power_off(TEGRA_POWERGATE_XUSBC);
+ 		tegra_powergate_power_off(TEGRA_POWERGATE_XUSBA);
++	} else {
++		tegra_xusb_powerdomain_remove(&pdev->dev, tegra);
+ 	}
+ 
+ 	tegra_xusb_padctl_put(tegra->padctl);
+
+commit 8c14796b6b2485a31a50318d76d6bc4518dc9d39
+Author: Jon Hunter <jonathanh@nvidia.com>
+Date:   Tue Oct 16 14:22:42 2018 +0300
+
+    usb: xhci: tegra: Power-off power-domains on removal
+    
+    Currently the XUSB power domains used by the Tegra xHCI controller are
+    never powered off on the removal of the driver, however, they will be
+    powered off on probe failure. Update the removal code to be consistent
+    with the probe failure path to power off the XUSB power domains.
+    
+    Signed-off-by: Jon Hunter <jonathanh@nvidia.com>
+    Acked-by: Thierry Reding <treding@nvidia.com>
+    Signed-off-by: Mathias Nyman <mathias.nyman@linux.intel.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/usb/host/xhci-tegra.c b/drivers/usb/host/xhci-tegra.c
+index 4ee510a51d64..920a50a54095 100644
+--- a/drivers/usb/host/xhci-tegra.c
++++ b/drivers/usb/host/xhci-tegra.c
+@@ -1249,6 +1249,11 @@ static int tegra_xusb_remove(struct platform_device *pdev)
+ 	pm_runtime_put_sync(&pdev->dev);
+ 	pm_runtime_disable(&pdev->dev);
+ 
++	if (!pdev->dev.pm_domain) {
++		tegra_powergate_power_off(TEGRA_POWERGATE_XUSBC);
++		tegra_powergate_power_off(TEGRA_POWERGATE_XUSBA);
++	}
++
+ 	tegra_xusb_padctl_put(tegra->padctl);
+ 
+ 	return 0;
+
+commit e1c3c7e54ed3655c02248b4f1c7940aff4eecb56
+Author: Thierry Reding <treding@nvidia.com>
+Date:   Thu Sep 20 19:13:39 2018 +0300
+
+    usb: xhci: tegra: Firmware header is little endian
+    
+    The XUSB firmware header is in little endian byte order, so make the
+    fields __le32 and __le16 instead of u32 and u16 to avoid warnings from
+    sparse when the fields are used with the endian-aware __le32_to_cpu()
+    and __le16_to_cpu() accessors, respectively.
+    
+    Signed-off-by: Thierry Reding <treding@nvidia.com>
+    Signed-off-by: Mathias Nyman <mathias.nyman@linux.intel.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/usb/host/xhci-tegra.c b/drivers/usb/host/xhci-tegra.c
+index 4b463e5202a4..4ee510a51d64 100644
+--- a/drivers/usb/host/xhci-tegra.c
++++ b/drivers/usb/host/xhci-tegra.c
+@@ -107,35 +107,35 @@
+ #define IMEM_BLOCK_SIZE				256
+ 
+ struct tegra_xusb_fw_header {
+-	u32 boot_loadaddr_in_imem;
+-	u32 boot_codedfi_offset;
+-	u32 boot_codetag;
+-	u32 boot_codesize;
+-	u32 phys_memaddr;
+-	u16 reqphys_memsize;
+-	u16 alloc_phys_memsize;
+-	u32 rodata_img_offset;
+-	u32 rodata_section_start;
+-	u32 rodata_section_end;
+-	u32 main_fnaddr;
+-	u32 fwimg_cksum;
+-	u32 fwimg_created_time;
+-	u32 imem_resident_start;
+-	u32 imem_resident_end;
+-	u32 idirect_start;
+-	u32 idirect_end;
+-	u32 l2_imem_start;
+-	u32 l2_imem_end;
+-	u32 version_id;
++	__le32 boot_loadaddr_in_imem;
++	__le32 boot_codedfi_offset;
++	__le32 boot_codetag;
++	__le32 boot_codesize;
++	__le32 phys_memaddr;
++	__le16 reqphys_memsize;
++	__le16 alloc_phys_memsize;
++	__le32 rodata_img_offset;
++	__le32 rodata_section_start;
++	__le32 rodata_section_end;
++	__le32 main_fnaddr;
++	__le32 fwimg_cksum;
++	__le32 fwimg_created_time;
++	__le32 imem_resident_start;
++	__le32 imem_resident_end;
++	__le32 idirect_start;
++	__le32 idirect_end;
++	__le32 l2_imem_start;
++	__le32 l2_imem_end;
++	__le32 version_id;
+ 	u8 init_ddirect;
+ 	u8 reserved[3];
+-	u32 phys_addr_log_buffer;
+-	u32 total_log_entries;
+-	u32 dequeue_ptr;
+-	u32 dummy_var[2];
+-	u32 fwimg_len;
++	__le32 phys_addr_log_buffer;
++	__le32 total_log_entries;
++	__le32 dequeue_ptr;
++	__le32 dummy_var[2];
++	__le32 fwimg_len;
+ 	u8 magic[8];
+-	u32 ss_low_power_entry_timeout;
++	__le32 ss_low_power_entry_timeout;
+ 	u8 num_hsic_port;
+ 	u8 padding[139]; /* Pad to 256 bytes */
+ };
+
+commit 3431a150fd89bc74cd2f2aaf6977cc0e278fb445
+Author: Stefan Agner <stefan@agner.ch>
+Date:   Thu Jun 21 16:19:44 2018 +0300
+
+    usb: xhci: tegra: fix runtime PM error handling
+    
+    The address-of operator will always evaluate to true. However,
+    power should be explicitly disabled if no power domain is used.
+    
+    Remove the address-of operator.
+    
+    Fixes: 58c38116c6cc ("usb: xhci: tegra: Add support for managing powergates")
+    Signed-off-by: Stefan Agner <stefan@agner.ch>
+    Acked-by: Jon Hunter <jonathanh@nvidia.com>
+    Signed-off-by: Mathias Nyman <mathias.nyman@linux.intel.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/usb/host/xhci-tegra.c b/drivers/usb/host/xhci-tegra.c
+index d50549fedec8..4b463e5202a4 100644
+--- a/drivers/usb/host/xhci-tegra.c
++++ b/drivers/usb/host/xhci-tegra.c
+@@ -1223,10 +1223,10 @@ static int tegra_xusb_probe(struct platform_device *pdev)
+ 	pm_runtime_disable(&pdev->dev);
+ 	usb_put_hcd(tegra->hcd);
+ disable_xusbc:
+-	if (!&pdev->dev.pm_domain)
++	if (!pdev->dev.pm_domain)
+ 		tegra_powergate_power_off(TEGRA_POWERGATE_XUSBC);
+ disable_xusba:
+-	if (!&pdev->dev.pm_domain)
++	if (!pdev->dev.pm_domain)
+ 		tegra_powergate_power_off(TEGRA_POWERGATE_XUSBA);
+ put_padctl:
+ 	tegra_xusb_padctl_put(tegra->padctl);
+
+commit 36eb93509c45d0bdbd8d09a01ab9d857972f5963
+Author: Dongjiu Geng <gengdongjiu@huawei.com>
+Date:   Thu Jun 21 16:19:43 2018 +0300
+
+    usb: xhci: remove the code build warning
+    
+    Initialize the 'err' variate to remove the build warning,
+    the warning is shown as below:
+    
+    drivers/usb/host/xhci-tegra.c: In function 'tegra_xusb_mbox_thread':
+    drivers/usb/host/xhci-tegra.c:552:6: warning: 'err' may be used uninitialized in this function [-Wuninitialized]
+    drivers/usb/host/xhci-tegra.c:482:6: note: 'err' was declared here
+    
+    Fixes: e84fce0f8837 ("usb: xhci: Add NVIDIA Tegra XUSB controller driver")
+    Signed-off-by: Dongjiu Geng <gengdongjiu@huawei.com>
+    Acked-by: Thierry Reding <treding@nvidia.com>
+    Acked-by: Jon Hunter <jonathanh@nvidia.com>
+    Signed-off-by: Mathias Nyman <mathias.nyman@linux.intel.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/usb/host/xhci-tegra.c b/drivers/usb/host/xhci-tegra.c
+index a8c1d073cba0..d50549fedec8 100644
+--- a/drivers/usb/host/xhci-tegra.c
++++ b/drivers/usb/host/xhci-tegra.c
+@@ -481,7 +481,7 @@ static void tegra_xusb_mbox_handle(struct tegra_xusb *tegra,
+ 	unsigned long mask;
+ 	unsigned int port;
+ 	bool idle, enable;
+-	int err;
++	int err = 0;
+ 
+ 	memset(&rsp, 0, sizeof(rsp));
+ 
+
+commit 380375b937211376f1dba4543460a14d3df9f04d
+Author: Jon Hunter <jonathanh@nvidia.com>
+Date:   Wed May 30 16:11:42 2018 +0100
+
+    usb: xhci: tegra: Fix runtime PM support
+    
+    Fix silly mistake when enabling runtime PM support for the Tegra XHCI
+    driver. If runtime PM was enabled correctly for the XHCI device, then
+    we should call pm_runtime_get_sync() to enable the device.
+    
+    Fixes: ee9e5f4c7825 ("usb: xhci: tegra: Add runtime PM support")
+    Signed-off-by: Jon Hunter <jonathanh@nvidia.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/usb/host/xhci-tegra.c b/drivers/usb/host/xhci-tegra.c
+index c78fc2942bca..a8c1d073cba0 100644
+--- a/drivers/usb/host/xhci-tegra.c
++++ b/drivers/usb/host/xhci-tegra.c
+@@ -1136,7 +1136,7 @@ static int tegra_xusb_probe(struct platform_device *pdev)
+ 	platform_set_drvdata(pdev, tegra);
+ 
+ 	pm_runtime_enable(&pdev->dev);
+-	if (!pm_runtime_enabled(&pdev->dev))
++	if (pm_runtime_enabled(&pdev->dev))
+ 		err = pm_runtime_get_sync(&pdev->dev);
+ 	else
+ 		err = tegra_xusb_runtime_resume(&pdev->dev);
+
+commit 58c38116c6cc5bcb6d952ca72111a7a15d4604a2
+Author: Jon Hunter <jonathanh@nvidia.com>
+Date:   Wed May 16 14:48:55 2018 +0100
+
+    usb: xhci: tegra: Add support for managing powergates
+    
+    The Tegra XHCI controller requires that the XUSBA (for superspeed) and
+    XUSBC (for host) power-domains are enabled. Commit 8df127456f29
+    ("soc/tegra: pmc: Enable XUSB partitions on boot") was added to force
+    on these power-domains if the XHCI driver is enabled while proper
+    power-domain support is added, to ensure the device did not hang on
+    boot. However, rather than forcing on these power-domains in the PMC
+    driver we can use the legacy Tegra powergate APIs to turn on these
+    power-domains during the probe of the Tegra XHCI driver.
+    
+    In the near future we plan to move the Tegra XHCI driver to use the
+    generic PM domain framework for power-domains and so to prepare for
+    this only use the legacy Tegra powergate API if there is not PM
+    domain associated with device (ie. dev.pm_domain is NULL). Please
+    note that in the future the superspeed and host resets will be handled
+    by the generic PM domain provider and so these are only these are only
+    needed in the case where there is no generic PM domain.
+    
+    Signed-off-by: Jon Hunter <jonathanh@nvidia.com>
+    Acked-by: Thierry Reding <treding@nvidia.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/usb/host/xhci-tegra.c b/drivers/usb/host/xhci-tegra.c
+index 437e08010587..c78fc2942bca 100644
+--- a/drivers/usb/host/xhci-tegra.c
++++ b/drivers/usb/host/xhci-tegra.c
+@@ -22,6 +22,7 @@
+ #include <linux/regulator/consumer.h>
+ #include <linux/reset.h>
+ #include <linux/slab.h>
++#include <soc/tegra/pmc.h>
+ 
+ #include "xhci.h"
+ 
+@@ -974,20 +975,6 @@ static int tegra_xusb_probe(struct platform_device *pdev)
+ 	if (IS_ERR(tegra->padctl))
+ 		return PTR_ERR(tegra->padctl);
+ 
+-	tegra->host_rst = devm_reset_control_get(&pdev->dev, "xusb_host");
+-	if (IS_ERR(tegra->host_rst)) {
+-		err = PTR_ERR(tegra->host_rst);
+-		dev_err(&pdev->dev, "failed to get xusb_host reset: %d\n", err);
+-		goto put_padctl;
+-	}
+-
+-	tegra->ss_rst = devm_reset_control_get(&pdev->dev, "xusb_ss");
+-	if (IS_ERR(tegra->ss_rst)) {
+-		err = PTR_ERR(tegra->ss_rst);
+-		dev_err(&pdev->dev, "failed to get xusb_ss reset: %d\n", err);
+-		goto put_padctl;
+-	}
+-
+ 	tegra->host_clk = devm_clk_get(&pdev->dev, "xusb_host");
+ 	if (IS_ERR(tegra->host_clk)) {
+ 		err = PTR_ERR(tegra->host_clk);
+@@ -1051,11 +1038,48 @@ static int tegra_xusb_probe(struct platform_device *pdev)
+ 		goto put_padctl;
+ 	}
+ 
++	if (!pdev->dev.pm_domain) {
++		tegra->host_rst = devm_reset_control_get(&pdev->dev,
++							 "xusb_host");
++		if (IS_ERR(tegra->host_rst)) {
++			err = PTR_ERR(tegra->host_rst);
++			dev_err(&pdev->dev,
++				"failed to get xusb_host reset: %d\n", err);
++			goto put_padctl;
++		}
++
++		tegra->ss_rst = devm_reset_control_get(&pdev->dev, "xusb_ss");
++		if (IS_ERR(tegra->ss_rst)) {
++			err = PTR_ERR(tegra->ss_rst);
++			dev_err(&pdev->dev, "failed to get xusb_ss reset: %d\n",
++				err);
++			goto put_padctl;
++		}
++
++		err = tegra_powergate_sequence_power_up(TEGRA_POWERGATE_XUSBA,
++							tegra->ss_clk,
++							tegra->ss_rst);
++		if (err) {
++			dev_err(&pdev->dev,
++				"failed to enable XUSBA domain: %d\n", err);
++			goto put_padctl;
++		}
++
++		err = tegra_powergate_sequence_power_up(TEGRA_POWERGATE_XUSBC,
++							tegra->host_clk,
++							tegra->host_rst);
++		if (err) {
++			dev_err(&pdev->dev,
++				"failed to enable XUSBC domain: %d\n", err);
++			goto disable_xusba;
++		}
++	}
++
+ 	tegra->supplies = devm_kcalloc(&pdev->dev, tegra->soc->num_supplies,
+ 				       sizeof(*tegra->supplies), GFP_KERNEL);
+ 	if (!tegra->supplies) {
+ 		err = -ENOMEM;
+-		goto put_padctl;
++		goto disable_xusbc;
+ 	}
+ 
+ 	for (i = 0; i < tegra->soc->num_supplies; i++)
+@@ -1065,7 +1089,7 @@ static int tegra_xusb_probe(struct platform_device *pdev)
+ 				      tegra->supplies);
+ 	if (err) {
+ 		dev_err(&pdev->dev, "failed to get regulators: %d\n", err);
+-		goto put_padctl;
++		goto disable_xusbc;
+ 	}
+ 
+ 	for (i = 0; i < tegra->soc->num_types; i++)
+@@ -1075,7 +1099,7 @@ static int tegra_xusb_probe(struct platform_device *pdev)
+ 				   sizeof(*tegra->phys), GFP_KERNEL);
+ 	if (!tegra->phys) {
+ 		err = -ENOMEM;
+-		goto put_padctl;
++		goto disable_xusbc;
+ 	}
+ 
+ 	for (i = 0, k = 0; i < tegra->soc->num_types; i++) {
+@@ -1091,7 +1115,7 @@ static int tegra_xusb_probe(struct platform_device *pdev)
+ 					"failed to get PHY %s: %ld\n", prop,
+ 					PTR_ERR(phy));
+ 				err = PTR_ERR(phy);
+-				goto put_padctl;
++				goto disable_xusbc;
+ 			}
+ 
+ 			tegra->phys[k++] = phy;
+@@ -1102,7 +1126,7 @@ static int tegra_xusb_probe(struct platform_device *pdev)
+ 				    dev_name(&pdev->dev));
+ 	if (!tegra->hcd) {
+ 		err = -ENOMEM;
+-		goto put_padctl;
++		goto disable_xusbc;
+ 	}
+ 
+ 	/*
+@@ -1198,6 +1222,12 @@ static int tegra_xusb_probe(struct platform_device *pdev)
+ disable_rpm:
+ 	pm_runtime_disable(&pdev->dev);
+ 	usb_put_hcd(tegra->hcd);
++disable_xusbc:
++	if (!&pdev->dev.pm_domain)
++		tegra_powergate_power_off(TEGRA_POWERGATE_XUSBC);
++disable_xusba:
++	if (!&pdev->dev.pm_domain)
++		tegra_powergate_power_off(TEGRA_POWERGATE_XUSBA);
+ put_padctl:
+ 	tegra_xusb_padctl_put(tegra->padctl);
+ 	return err;
+
+commit ee9e5f4c78259d25dae0c813d771de6a4a203ddc
+Author: Jon Hunter <jonathanh@nvidia.com>
+Date:   Wed May 16 14:48:54 2018 +0100
+
+    usb: xhci: tegra: Add runtime PM support
+    
+    Add runtime PM support to the Tegra XHCI driver and move the function
+    calls to enable/disable the clocks, regulators and PHY into the runtime
+    PM callbacks.
+    
+    Signed-off-by: Jon Hunter <jonathanh@nvidia.com>
+    Acked-by: Thierry Reding <treding@nvidia.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/usb/host/xhci-tegra.c b/drivers/usb/host/xhci-tegra.c
+index 02b0b24faa58..437e08010587 100644
+--- a/drivers/usb/host/xhci-tegra.c
++++ b/drivers/usb/host/xhci-tegra.c
+@@ -18,6 +18,7 @@
+ #include <linux/phy/tegra/xusb.h>
+ #include <linux/platform_device.h>
+ #include <linux/pm.h>
++#include <linux/pm_runtime.h>
+ #include <linux/regulator/consumer.h>
+ #include <linux/reset.h>
+ #include <linux/slab.h>
+@@ -761,6 +762,49 @@ static void tegra_xusb_phy_disable(struct tegra_xusb *tegra)
+ 	}
+ }
+ 
++static int tegra_xusb_runtime_suspend(struct device *dev)
++{
++	struct tegra_xusb *tegra = dev_get_drvdata(dev);
++
++	tegra_xusb_phy_disable(tegra);
++	regulator_bulk_disable(tegra->soc->num_supplies, tegra->supplies);
++	tegra_xusb_clk_disable(tegra);
++
++	return 0;
++}
++
++static int tegra_xusb_runtime_resume(struct device *dev)
++{
++	struct tegra_xusb *tegra = dev_get_drvdata(dev);
++	int err;
++
++	err = tegra_xusb_clk_enable(tegra);
++	if (err) {
++		dev_err(dev, "failed to enable clocks: %d\n", err);
++		return err;
++	}
++
++	err = regulator_bulk_enable(tegra->soc->num_supplies, tegra->supplies);
++	if (err) {
++		dev_err(dev, "failed to enable regulators: %d\n", err);
++		goto disable_clk;
++	}
++
++	err = tegra_xusb_phy_enable(tegra);
++	if (err < 0) {
++		dev_err(dev, "failed to enable PHYs: %d\n", err);
++		goto disable_regulator;
++	}
++
++	return 0;
++
++disable_regulator:
++	regulator_bulk_disable(tegra->soc->num_supplies, tegra->supplies);
++disable_clk:
++	tegra_xusb_clk_disable(tegra);
++	return err;
++}
++
+ static int tegra_xusb_load_firmware(struct tegra_xusb *tegra)
+ {
+ 	unsigned int code_tag_blocks, code_size_blocks, code_blocks;
+@@ -1067,22 +1111,15 @@ static int tegra_xusb_probe(struct platform_device *pdev)
+ 	 */
+ 	platform_set_drvdata(pdev, tegra);
+ 
+-	err = tegra_xusb_clk_enable(tegra);
+-	if (err) {
+-		dev_err(&pdev->dev, "failed to enable clocks: %d\n", err);
+-		goto put_usb2;
+-	}
+-
+-	err = regulator_bulk_enable(tegra->soc->num_supplies, tegra->supplies);
+-	if (err) {
+-		dev_err(&pdev->dev, "failed to enable regulators: %d\n", err);
+-		goto disable_clk;
+-	}
++	pm_runtime_enable(&pdev->dev);
++	if (!pm_runtime_enabled(&pdev->dev))
++		err = pm_runtime_get_sync(&pdev->dev);
++	else
++		err = tegra_xusb_runtime_resume(&pdev->dev);
+ 
+-	err = tegra_xusb_phy_enable(tegra);
+ 	if (err < 0) {
+-		dev_err(&pdev->dev, "failed to enable PHYs: %d\n", err);
+-		goto disable_regulator;
++		dev_err(&pdev->dev, "failed to enable device: %d\n", err);
++		goto disable_rpm;
+ 	}
+ 
+ 	tegra_xusb_ipfs_config(tegra, regs);
+@@ -1090,7 +1127,7 @@ static int tegra_xusb_probe(struct platform_device *pdev)
+ 	err = tegra_xusb_load_firmware(tegra);
+ 	if (err < 0) {
+ 		dev_err(&pdev->dev, "failed to load firmware: %d\n", err);
+-		goto disable_phy;
++		goto put_rpm;
+ 	}
+ 
+ 	tegra->hcd->regs = tegra->regs;
+@@ -1100,7 +1137,7 @@ static int tegra_xusb_probe(struct platform_device *pdev)
+ 	err = usb_add_hcd(tegra->hcd, tegra->xhci_irq, IRQF_SHARED);
+ 	if (err < 0) {
+ 		dev_err(&pdev->dev, "failed to add USB HCD: %d\n", err);
+-		goto disable_phy;
++		goto put_rpm;
+ 	}
+ 
+ 	device_wakeup_enable(tegra->hcd->self.controller);
+@@ -1155,13 +1192,11 @@ static int tegra_xusb_probe(struct platform_device *pdev)
+ 	usb_put_hcd(xhci->shared_hcd);
+ remove_usb2:
+ 	usb_remove_hcd(tegra->hcd);
+-disable_phy:
+-	tegra_xusb_phy_disable(tegra);
+-disable_regulator:
+-	regulator_bulk_disable(tegra->soc->num_supplies, tegra->supplies);
+-disable_clk:
+-	tegra_xusb_clk_disable(tegra);
+-put_usb2:
++put_rpm:
++	if (!pm_runtime_status_suspended(&pdev->dev))
++		tegra_xusb_runtime_suspend(&pdev->dev);
++disable_rpm:
++	pm_runtime_disable(&pdev->dev);
+ 	usb_put_hcd(tegra->hcd);
+ put_padctl:
+ 	tegra_xusb_padctl_put(tegra->padctl);
+@@ -1181,9 +1216,8 @@ static int tegra_xusb_remove(struct platform_device *pdev)
+ 	dma_free_coherent(&pdev->dev, tegra->fw.size, tegra->fw.virt,
+ 			  tegra->fw.phys);
+ 
+-	tegra_xusb_phy_disable(tegra);
+-	regulator_bulk_disable(tegra->soc->num_supplies, tegra->supplies);
+-	tegra_xusb_clk_disable(tegra);
++	pm_runtime_put_sync(&pdev->dev);
++	pm_runtime_disable(&pdev->dev);
+ 
+ 	tegra_xusb_padctl_put(tegra->padctl);
+ 
+@@ -1211,6 +1245,8 @@ static int tegra_xusb_resume(struct device *dev)
+ #endif
+ 
+ static const struct dev_pm_ops tegra_xusb_pm_ops = {
++	SET_RUNTIME_PM_OPS(tegra_xusb_runtime_suspend,
++			   tegra_xusb_runtime_resume, NULL)
+ 	SET_SYSTEM_SLEEP_PM_OPS(tegra_xusb_suspend, tegra_xusb_resume)
+ };
+ 
+
+commit f468b55cb72ddd69b08ecfc791046a6db5fde7b0
+Author: Jon Hunter <jonathanh@nvidia.com>
+Date:   Wed May 16 14:48:53 2018 +0100
+
+    usb: xhci: tegra: Prepare for adding runtime PM support
+    
+    When adding runtime PM support to the Tegra XHCI driver, it is desirable
+    to move the function calls to enable the clocks, regulators and PHY from
+    the tegra_xusb_probe into the runtime PM handlers. Currently, the
+    clocks, regulators and PHY are all enabled before we call
+    usb_create_hcd() in tegra_xusb_probe(), however, we cannot call
+    pm_runtime_get_sync() at this point because the platform device data is
+    not yet initialised. Fortunately, the function usb_create_hcd() can be
+    called before we enable the clocks, regulators and PHY and so prepare
+    for adding runtime PM support, by moving the call to usb_create_hcd()
+    before we enable the hardware.
+    
+    Signed-off-by: Jon Hunter <jonathanh@nvidia.com>
+    Acked-by: Thierry Reding <treding@nvidia.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/usb/host/xhci-tegra.c b/drivers/usb/host/xhci-tegra.c
+index 2c076ea80522..02b0b24faa58 100644
+--- a/drivers/usb/host/xhci-tegra.c
++++ b/drivers/usb/host/xhci-tegra.c
+@@ -1054,10 +1054,23 @@ static int tegra_xusb_probe(struct platform_device *pdev)
+ 		}
+ 	}
+ 
++	tegra->hcd = usb_create_hcd(&tegra_xhci_hc_driver, &pdev->dev,
++				    dev_name(&pdev->dev));
++	if (!tegra->hcd) {
++		err = -ENOMEM;
++		goto put_padctl;
++	}
++
++	/*
++	 * This must happen after usb_create_hcd(), because usb_create_hcd()
++	 * will overwrite the drvdata of the device with the hcd it creates.
++	 */
++	platform_set_drvdata(pdev, tegra);
++
+ 	err = tegra_xusb_clk_enable(tegra);
+ 	if (err) {
+ 		dev_err(&pdev->dev, "failed to enable clocks: %d\n", err);
+-		goto put_padctl;
++		goto put_usb2;
+ 	}
+ 
+ 	err = regulator_bulk_enable(tegra->soc->num_supplies, tegra->supplies);
+@@ -1080,19 +1093,6 @@ static int tegra_xusb_probe(struct platform_device *pdev)
+ 		goto disable_phy;
+ 	}
+ 
+-	tegra->hcd = usb_create_hcd(&tegra_xhci_hc_driver, &pdev->dev,
+-				    dev_name(&pdev->dev));
+-	if (!tegra->hcd) {
+-		err = -ENOMEM;
+-		goto disable_phy;
+-	}
+-
+-	/*
+-	 * This must happen after usb_create_hcd(), because usb_create_hcd()
+-	 * will overwrite the drvdata of the device with the hcd it creates.
+-	 */
+-	platform_set_drvdata(pdev, tegra);
+-
+ 	tegra->hcd->regs = tegra->regs;
+ 	tegra->hcd->rsrc_start = regs->start;
+ 	tegra->hcd->rsrc_len = resource_size(regs);
+@@ -1100,7 +1100,7 @@ static int tegra_xusb_probe(struct platform_device *pdev)
+ 	err = usb_add_hcd(tegra->hcd, tegra->xhci_irq, IRQF_SHARED);
+ 	if (err < 0) {
+ 		dev_err(&pdev->dev, "failed to add USB HCD: %d\n", err);
+-		goto put_usb2;
++		goto disable_phy;
+ 	}
+ 
+ 	device_wakeup_enable(tegra->hcd->self.controller);
+@@ -1155,14 +1155,14 @@ static int tegra_xusb_probe(struct platform_device *pdev)
+ 	usb_put_hcd(xhci->shared_hcd);
+ remove_usb2:
+ 	usb_remove_hcd(tegra->hcd);
+-put_usb2:
+-	usb_put_hcd(tegra->hcd);
+ disable_phy:
+ 	tegra_xusb_phy_disable(tegra);
+ disable_regulator:
+ 	regulator_bulk_disable(tegra->soc->num_supplies, tegra->supplies);
+ disable_clk:
+ 	tegra_xusb_clk_disable(tegra);
++put_usb2:
++	usb_put_hcd(tegra->hcd);
+ put_padctl:
+ 	tegra_xusb_padctl_put(tegra->padctl);
+ 	return err;
+
+commit 9ed64195e35efa8901d20a0cd8ff3668ae68e7d6
+Author: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Date:   Mon Nov 6 15:37:23 2017 +0100
+
+    USB: host: xhci: Remove redundant license text
+    
+    Now that the SPDX tag is in all USB files, that identifies the license
+    in a specific and legally-defined manner.  So the extra GPL text wording
+    can be removed as it is no longer needed at all.
+    
+    This is done on a quest to remove the 700+ different ways that files in
+    the kernel describe the GPL license text.  And there's unneeded stuff
+    like the address (sometimes incorrect) for the FSF which is never
+    needed.
+    
+    No copyright headers or other non-license-description text was removed.
+    
+    Cc: Matthias Brugger <matthias.bgg@gmail.com>
+    Cc: Thierry Reding <thierry.reding@gmail.com>
+    Cc: Jonathan Hunter <jonathanh@nvidia.com>
+    Acked-by: Mathias Nyman <mathias.nyman@linux.intel.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/usb/host/xhci-tegra.c b/drivers/usb/host/xhci-tegra.c
+index 40e18a7ffce9..2c076ea80522 100644
+--- a/drivers/usb/host/xhci-tegra.c
++++ b/drivers/usb/host/xhci-tegra.c
+@@ -4,10 +4,6 @@
+  *
+  * Copyright (C) 2014 NVIDIA Corporation
+  * Copyright (C) 2014 Google, Inc.
+- *
+- * This program is free software; you can redistribute it and/or modify it
+- * under the terms and conditions of the GNU General Public License,
+- * version 2, as published by the Free Software Foundation.
+  */
+ 
+ #include <linux/clk.h>
+
+commit 5fd54ace4721fc5ce2bb5aef6318fcf17f421460
+Author: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Date:   Fri Nov 3 11:28:30 2017 +0100
+
+    USB: add SPDX identifiers to all remaining files in drivers/usb/
+    
+    It's good to have SPDX identifiers in all files to make it easier to
+    audit the kernel tree for correct licenses.
+    
+    Update the drivers/usb/ and include/linux/usb* files with the correct
+    SPDX license identifier based on the license text in the file itself.
+    The SPDX identifier is a legally binding shorthand, which can be used
+    instead of the full boiler plate text.
+    
+    This work is based on a script and data from Thomas Gleixner, Philippe
+    Ombredanne, and Kate Stewart.
+    
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Kate Stewart <kstewart@linuxfoundation.org>
+    Cc: Philippe Ombredanne <pombredanne@nexb.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+    Acked-by: Felipe Balbi <felipe.balbi@linux.intel.com>
+    Acked-by: Johan Hovold <johan@kernel.org>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/usb/host/xhci-tegra.c b/drivers/usb/host/xhci-tegra.c
+index 39b6e93130d3..40e18a7ffce9 100644
+--- a/drivers/usb/host/xhci-tegra.c
++++ b/drivers/usb/host/xhci-tegra.c
+@@ -1,3 +1,4 @@
++// SPDX-License-Identifier: GPL-2.0
+ /*
+  * NVIDIA Tegra xHCI host controller driver
+  *
+
+commit 9506b146fad96b2888732a12711d6a3cec5ec4d4
+Author: Arnd Bergmann <arnd@arndb.de>
+Date:   Thu Nov 2 15:34:27 2017 +0100
+
+    usb: xhci: tegra: use time64_t for printing timestamp
+    
+    The time_t type and time_to_tm() function are deprecated because
+    of y2038 problems. In this driver, they are used to pretty-print
+    the timestamp of the firmware build. This is fine as long as
+    we don't get a firmware build past 2038.
+    
+    Converting to time64_t and time64_to_tm() avoids the deprecated
+    interfaces and works until 2106, when the firmware-defined
+    data structure overflows.
+    
+    Signed-off-by: Arnd Bergmann <arnd@arndb.de>
+    Acked-by: Thierry Reding <treding@nvidia.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/usb/host/xhci-tegra.c b/drivers/usb/host/xhci-tegra.c
+index 74436f8ca538..39b6e93130d3 100644
+--- a/drivers/usb/host/xhci-tegra.c
++++ b/drivers/usb/host/xhci-tegra.c
+@@ -771,7 +771,7 @@ static int tegra_xusb_load_firmware(struct tegra_xusb *tegra)
+ 	struct device *dev = tegra->dev;
+ 	const struct firmware *fw;
+ 	unsigned long timeout;
+-	time_t timestamp;
++	time64_t timestamp;
+ 	struct tm time;
+ 	u64 address;
+ 	u32 value;
+@@ -877,7 +877,7 @@ static int tegra_xusb_load_firmware(struct tegra_xusb *tegra)
+ 	}
+ 
+ 	timestamp = le32_to_cpu(header->fwimg_created_time);
+-	time_to_tm(timestamp, 0, &time);
++	time64_to_tm(timestamp, 0, &time);
+ 
+ 	dev_info(dev, "Firmware timestamp: %ld-%02d-%02d %02d:%02d:%02d UTC\n",
+ 		 time.tm_year + 1900, time.tm_mon + 1, time.tm_mday,
+
+commit 20e4e37e4a2f1bfd43bcc8c3e666e47665036cc3
+Author: Chunfeng Yun <chunfeng.yun@mediatek.com>
+Date:   Thu Mar 9 15:39:35 2017 +0200
+
+    usb: xhci: remove dummy extra_priv_size for size of xhci_hcd struct
+    
+    because hcd_priv_size is already size of xhci_hcd struct,
+    extra_priv_size is not needed anymore for MTK and tegra drivers.
+    
+    Signed-off-by: Chunfeng Yun <chunfeng.yun@mediatek.com>
+    Tested-by: Thierry Reding <treding@nvidia.com>
+    Acked-by: Thierry Reding <treding@nvidia.com>
+    Signed-off-by: Mathias Nyman <mathias.nyman@linux.intel.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/usb/host/xhci-tegra.c b/drivers/usb/host/xhci-tegra.c
+index a59fafb4b329..74436f8ca538 100644
+--- a/drivers/usb/host/xhci-tegra.c
++++ b/drivers/usb/host/xhci-tegra.c
+@@ -1308,7 +1308,6 @@ static int tegra_xhci_setup(struct usb_hcd *hcd)
+ }
+ 
+ static const struct xhci_driver_overrides tegra_xhci_overrides __initconst = {
+-	.extra_priv_size = sizeof(struct xhci_hcd),
+ 	.reset = tegra_xhci_setup,
+ };
+ 
+
+commit b175b38a0fa6767e1eae2e94b9d5f81d7342850a
+Author: Wei Yongjun <weiyongjun1@huawei.com>
+Date:   Sat Sep 10 11:54:03 2016 +0000
+
+    usb: host: xhci-tegra: Fix error return code in tegra_xusb_probe()
+    
+    Fix to return error code -ENOMEM from the usb_create_shared_hcd()
+    error handling case instead of 0, as done elsewhere in this function.
+    
+    Signed-off-by: Wei Yongjun <weiyongjun1@huawei.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/usb/host/xhci-tegra.c b/drivers/usb/host/xhci-tegra.c
+index d39b37be71f0..a59fafb4b329 100644
+--- a/drivers/usb/host/xhci-tegra.c
++++ b/drivers/usb/host/xhci-tegra.c
+@@ -1116,6 +1116,7 @@ static int tegra_xusb_probe(struct platform_device *pdev)
+ 						 tegra->hcd);
+ 	if (!xhci->shared_hcd) {
+ 		dev_err(&pdev->dev, "failed to create shared HCD\n");
++		err = -ENOMEM;
+ 		goto remove_usb2;
+ 	}
+ 
+
+commit a35234b2a67363f0174322b9cf8b385d236e8822
+Author: Wolfram Sang <wsa-dev@sang-engineering.com>
+Date:   Thu Aug 25 19:39:09 2016 +0200
+
+    usb: host: xhci-tegra: don't print on ENOMEM
+    
+    All kmalloc-based functions print enough information on failures.
+    
+    Signed-off-by: Wolfram Sang <wsa-dev@sang-engineering.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/usb/host/xhci-tegra.c b/drivers/usb/host/xhci-tegra.c
+index 0f53ae0f464e..d39b37be71f0 100644
+--- a/drivers/usb/host/xhci-tegra.c
++++ b/drivers/usb/host/xhci-tegra.c
+@@ -1033,7 +1033,6 @@ static int tegra_xusb_probe(struct platform_device *pdev)
+ 	tegra->phys = devm_kcalloc(&pdev->dev, tegra->num_phys,
+ 				   sizeof(*tegra->phys), GFP_KERNEL);
+ 	if (!tegra->phys) {
+-		dev_err(&pdev->dev, "failed to allocate PHY array\n");
+ 		err = -ENOMEM;
+ 		goto put_padctl;
+ 	}
+
+commit ab065e969640d9afd3967266eb3193fb3ac298bd
+Author: Thierry Reding <treding@nvidia.com>
+Date:   Mon Feb 8 19:34:16 2016 +0100
+
+    usb: xhci: tegra: Add Tegra210 support
+    
+    Parameterize more parts of the driver and add support for Tegra210.
+    
+    Acked-by: Mathias Nyman <mathias.nyman@linux.intel.com>
+    Signed-off-by: Thierry Reding <treding@nvidia.com>
+
+diff --git a/drivers/usb/host/xhci-tegra.c b/drivers/usb/host/xhci-tegra.c
+index 2860a454e30a..0f53ae0f464e 100644
+--- a/drivers/usb/host/xhci-tegra.c
++++ b/drivers/usb/host/xhci-tegra.c
+@@ -159,6 +159,8 @@ struct tegra_xusb_soc {
+ 			unsigned int count;
+ 		} usb2, ulpi, hsic, usb3;
+ 	} ports;
++
++	bool scale_ss_clock;
+ };
+ 
+ struct tegra_xusb {
+@@ -497,13 +499,19 @@ static void tegra_xusb_mbox_handle(struct tegra_xusb *tegra,
+ 
+ 	case MBOX_CMD_INC_SSPI_CLOCK:
+ 	case MBOX_CMD_DEC_SSPI_CLOCK:
+-		err = tegra_xusb_set_ss_clk(tegra, msg->data * 1000);
+-		if (err < 0)
+-			rsp.cmd = MBOX_CMD_NAK;
+-		else
++		if (tegra->soc->scale_ss_clock) {
++			err = tegra_xusb_set_ss_clk(tegra, msg->data * 1000);
++			if (err < 0)
++				rsp.cmd = MBOX_CMD_NAK;
++			else
++				rsp.cmd = MBOX_CMD_ACK;
++
++			rsp.data = clk_get_rate(tegra->ss_src_clk) / 1000;
++		} else {
+ 			rsp.cmd = MBOX_CMD_ACK;
++			rsp.data = msg->data;
++		}
+ 
+-		rsp.data = clk_get_rate(tegra->ss_src_clk) / 1000;
+ 		break;
+ 
+ 	case MBOX_CMD_SET_BW:
+@@ -685,9 +693,11 @@ static int tegra_xusb_clk_enable(struct tegra_xusb *tegra)
+ 	if (err < 0)
+ 		goto disable_fs_src;
+ 
+-	err = tegra_xusb_set_ss_clk(tegra, TEGRA_XHCI_SS_HIGH_SPEED);
+-	if (err < 0)
+-		goto disable_hs_src;
++	if (tegra->soc->scale_ss_clock) {
++		err = tegra_xusb_set_ss_clk(tegra, TEGRA_XHCI_SS_HIGH_SPEED);
++		if (err < 0)
++			goto disable_hs_src;
++	}
+ 
+ 	return 0;
+ 
+@@ -1235,11 +1245,44 @@ static const struct tegra_xusb_soc tegra124_soc = {
+ 		.hsic = { .offset = 6, .count = 2, },
+ 		.usb3 = { .offset = 0, .count = 2, },
+ 	},
++	.scale_ss_clock = true,
+ };
+ MODULE_FIRMWARE("nvidia/tegra124/xusb.bin");
+ 
++static const char * const tegra210_supply_names[] = {
++	"dvddio-pex",
++	"hvddio-pex",
++	"avdd-usb",
++	"avdd-pll-utmip",
++	"avdd-pll-uerefe",
++	"dvdd-pex-pll",
++	"hvdd-pex-pll-e",
++};
++
++static const struct tegra_xusb_phy_type tegra210_phy_types[] = {
++	{ .name = "usb3", .num = 4, },
++	{ .name = "usb2", .num = 4, },
++	{ .name = "hsic", .num = 1, },
++};
++
++static const struct tegra_xusb_soc tegra210_soc = {
++	.firmware = "nvidia/tegra210/xusb.bin",
++	.supply_names = tegra210_supply_names,
++	.num_supplies = ARRAY_SIZE(tegra210_supply_names),
++	.phy_types = tegra210_phy_types,
++	.num_types = ARRAY_SIZE(tegra210_phy_types),
++	.ports = {
++		.usb2 = { .offset = 4, .count = 4, },
++		.hsic = { .offset = 8, .count = 1, },
++		.usb3 = { .offset = 0, .count = 4, },
++	},
++	.scale_ss_clock = false,
++};
++MODULE_FIRMWARE("nvidia/tegra210/xusb.bin");
++
+ static const struct of_device_id tegra_xusb_of_match[] = {
+ 	{ .compatible = "nvidia,tegra124-xusb", .data = &tegra124_soc },
++	{ .compatible = "nvidia,tegra210-xusb", .data = &tegra210_soc },
+ 	{ },
+ };
+ MODULE_DEVICE_TABLE(of, tegra_xusb_of_match);
+
+commit e84fce0f8837496a48d11086829bdbe170358b7a
+Author: Thierry Reding <treding@nvidia.com>
+Date:   Thu Feb 11 18:10:48 2016 +0100
+
+    usb: xhci: Add NVIDIA Tegra XUSB controller driver
+    
+    Add support for the on-chip XUSB controller present on Tegra SoCs. This
+    controller, when loaded with external firmware, exposes an interface
+    compliant with xHCI. This driver loads the firmware, starts the
+    controller, and is able to service host-specific messages sent by the
+    controller's firmware.
+    
+    The controller also supports USB device mode as well as powergating
+    of the SuperSpeed and host-controller logic when not in use, but
+    support for these is not yet implemented.
+    
+    Based on work by:
+      Ajay Gupta <ajayg@nvidia.com>
+      Bharath Yadav <byadav@nvidia.com>
+      Andrew Bresticker <abrestic@chromium.org>
+    
+    Cc: Mathias Nyman <mathias.nyman@intel.com>
+    Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+    Acked-by: Mathias Nyman <mathias.nyman@linux.intel.com>
+    Signed-off-by: Thierry Reding <treding@nvidia.com>
+
+diff --git a/drivers/usb/host/xhci-tegra.c b/drivers/usb/host/xhci-tegra.c
+new file mode 100644
+index 000000000000..2860a454e30a
+--- /dev/null
++++ b/drivers/usb/host/xhci-tegra.c
+@@ -0,0 +1,1288 @@
++/*
++ * NVIDIA Tegra xHCI host controller driver
++ *
++ * Copyright (C) 2014 NVIDIA Corporation
++ * Copyright (C) 2014 Google, Inc.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms and conditions of the GNU General Public License,
++ * version 2, as published by the Free Software Foundation.
++ */
++
++#include <linux/clk.h>
++#include <linux/delay.h>
++#include <linux/dma-mapping.h>
++#include <linux/firmware.h>
++#include <linux/interrupt.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/of_device.h>
++#include <linux/phy/phy.h>
++#include <linux/phy/tegra/xusb.h>
++#include <linux/platform_device.h>
++#include <linux/pm.h>
++#include <linux/regulator/consumer.h>
++#include <linux/reset.h>
++#include <linux/slab.h>
++
++#include "xhci.h"
++
++#define TEGRA_XHCI_SS_HIGH_SPEED 120000000
++#define TEGRA_XHCI_SS_LOW_SPEED   12000000
++
++/* FPCI CFG registers */
++#define XUSB_CFG_1				0x004
++#define  XUSB_IO_SPACE_EN			BIT(0)
++#define  XUSB_MEM_SPACE_EN			BIT(1)
++#define  XUSB_BUS_MASTER_EN			BIT(2)
++#define XUSB_CFG_4				0x010
++#define  XUSB_BASE_ADDR_SHIFT			15
++#define  XUSB_BASE_ADDR_MASK			0x1ffff
++#define XUSB_CFG_ARU_C11_CSBRANGE		0x41c
++#define XUSB_CFG_CSB_BASE_ADDR			0x800
++
++/* FPCI mailbox registers */
++#define XUSB_CFG_ARU_MBOX_CMD			0x0e4
++#define  MBOX_DEST_FALC				BIT(27)
++#define  MBOX_DEST_PME				BIT(28)
++#define  MBOX_DEST_SMI				BIT(29)
++#define  MBOX_DEST_XHCI				BIT(30)
++#define  MBOX_INT_EN				BIT(31)
++#define XUSB_CFG_ARU_MBOX_DATA_IN		0x0e8
++#define  CMD_DATA_SHIFT				0
++#define  CMD_DATA_MASK				0xffffff
++#define  CMD_TYPE_SHIFT				24
++#define  CMD_TYPE_MASK				0xff
++#define XUSB_CFG_ARU_MBOX_DATA_OUT		0x0ec
++#define XUSB_CFG_ARU_MBOX_OWNER			0x0f0
++#define  MBOX_OWNER_NONE			0
++#define  MBOX_OWNER_FW				1
++#define  MBOX_OWNER_SW				2
++#define XUSB_CFG_ARU_SMI_INTR			0x428
++#define  MBOX_SMI_INTR_FW_HANG			BIT(1)
++#define  MBOX_SMI_INTR_EN			BIT(3)
++
++/* IPFS registers */
++#define IPFS_XUSB_HOST_CONFIGURATION_0		0x180
++#define  IPFS_EN_FPCI				BIT(0)
++#define IPFS_XUSB_HOST_INTR_MASK_0		0x188
++#define  IPFS_IP_INT_MASK			BIT(16)
++#define IPFS_XUSB_HOST_CLKGATE_HYSTERESIS_0	0x1bc
++
++#define CSB_PAGE_SELECT_MASK			0x7fffff
++#define CSB_PAGE_SELECT_SHIFT			9
++#define CSB_PAGE_OFFSET_MASK			0x1ff
++#define CSB_PAGE_SELECT(addr)	((addr) >> (CSB_PAGE_SELECT_SHIFT) &	\
++				 CSB_PAGE_SELECT_MASK)
++#define CSB_PAGE_OFFSET(addr)	((addr) & CSB_PAGE_OFFSET_MASK)
++
++/* Falcon CSB registers */
++#define XUSB_FALC_CPUCTL			0x100
++#define  CPUCTL_STARTCPU			BIT(1)
++#define  CPUCTL_STATE_HALTED			BIT(4)
++#define  CPUCTL_STATE_STOPPED			BIT(5)
++#define XUSB_FALC_BOOTVEC			0x104
++#define XUSB_FALC_DMACTL			0x10c
++#define XUSB_FALC_IMFILLRNG1			0x154
++#define  IMFILLRNG1_TAG_MASK			0xffff
++#define  IMFILLRNG1_TAG_LO_SHIFT		0
++#define  IMFILLRNG1_TAG_HI_SHIFT		16
++#define XUSB_FALC_IMFILLCTL			0x158
++
++/* MP CSB registers */
++#define XUSB_CSB_MP_ILOAD_ATTR			0x101a00
++#define XUSB_CSB_MP_ILOAD_BASE_LO		0x101a04
++#define XUSB_CSB_MP_ILOAD_BASE_HI		0x101a08
++#define XUSB_CSB_MP_L2IMEMOP_SIZE		0x101a10
++#define  L2IMEMOP_SIZE_SRC_OFFSET_SHIFT		8
++#define  L2IMEMOP_SIZE_SRC_OFFSET_MASK		0x3ff
++#define  L2IMEMOP_SIZE_SRC_COUNT_SHIFT		24
++#define  L2IMEMOP_SIZE_SRC_COUNT_MASK		0xff
++#define XUSB_CSB_MP_L2IMEMOP_TRIG		0x101a14
++#define  L2IMEMOP_ACTION_SHIFT			24
++#define  L2IMEMOP_INVALIDATE_ALL		(0x40 << L2IMEMOP_ACTION_SHIFT)
++#define  L2IMEMOP_LOAD_LOCKED_RESULT		(0x11 << L2IMEMOP_ACTION_SHIFT)
++#define XUSB_CSB_MP_APMAP			0x10181c
++#define  APMAP_BOOTPATH				BIT(31)
++
++#define IMEM_BLOCK_SIZE				256
++
++struct tegra_xusb_fw_header {
++	u32 boot_loadaddr_in_imem;
++	u32 boot_codedfi_offset;
++	u32 boot_codetag;
++	u32 boot_codesize;
++	u32 phys_memaddr;
++	u16 reqphys_memsize;
++	u16 alloc_phys_memsize;
++	u32 rodata_img_offset;
++	u32 rodata_section_start;
++	u32 rodata_section_end;
++	u32 main_fnaddr;
++	u32 fwimg_cksum;
++	u32 fwimg_created_time;
++	u32 imem_resident_start;
++	u32 imem_resident_end;
++	u32 idirect_start;
++	u32 idirect_end;
++	u32 l2_imem_start;
++	u32 l2_imem_end;
++	u32 version_id;
++	u8 init_ddirect;
++	u8 reserved[3];
++	u32 phys_addr_log_buffer;
++	u32 total_log_entries;
++	u32 dequeue_ptr;
++	u32 dummy_var[2];
++	u32 fwimg_len;
++	u8 magic[8];
++	u32 ss_low_power_entry_timeout;
++	u8 num_hsic_port;
++	u8 padding[139]; /* Pad to 256 bytes */
++};
++
++struct tegra_xusb_phy_type {
++	const char *name;
++	unsigned int num;
++};
++
++struct tegra_xusb_soc {
++	const char *firmware;
++	const char * const *supply_names;
++	unsigned int num_supplies;
++	const struct tegra_xusb_phy_type *phy_types;
++	unsigned int num_types;
++
++	struct {
++		struct {
++			unsigned int offset;
++			unsigned int count;
++		} usb2, ulpi, hsic, usb3;
++	} ports;
++};
++
++struct tegra_xusb {
++	struct device *dev;
++	void __iomem *regs;
++	struct usb_hcd *hcd;
++
++	struct mutex lock;
++
++	int xhci_irq;
++	int mbox_irq;
++
++	void __iomem *ipfs_base;
++	void __iomem *fpci_base;
++
++	const struct tegra_xusb_soc *soc;
++
++	struct regulator_bulk_data *supplies;
++
++	struct tegra_xusb_padctl *padctl;
++
++	struct clk *host_clk;
++	struct clk *falcon_clk;
++	struct clk *ss_clk;
++	struct clk *ss_src_clk;
++	struct clk *hs_src_clk;
++	struct clk *fs_src_clk;
++	struct clk *pll_u_480m;
++	struct clk *clk_m;
++	struct clk *pll_e;
++
++	struct reset_control *host_rst;
++	struct reset_control *ss_rst;
++
++	struct phy **phys;
++	unsigned int num_phys;
++
++	/* Firmware loading related */
++	struct {
++		size_t size;
++		void *virt;
++		dma_addr_t phys;
++	} fw;
++};
++
++static struct hc_driver __read_mostly tegra_xhci_hc_driver;
++
++static inline u32 fpci_readl(struct tegra_xusb *tegra, unsigned int offset)
++{
++	return readl(tegra->fpci_base + offset);
++}
++
++static inline void fpci_writel(struct tegra_xusb *tegra, u32 value,
++			       unsigned int offset)
++{
++	writel(value, tegra->fpci_base + offset);
++}
++
++static inline u32 ipfs_readl(struct tegra_xusb *tegra, unsigned int offset)
++{
++	return readl(tegra->ipfs_base + offset);
++}
++
++static inline void ipfs_writel(struct tegra_xusb *tegra, u32 value,
++			       unsigned int offset)
++{
++	writel(value, tegra->ipfs_base + offset);
++}
++
++static u32 csb_readl(struct tegra_xusb *tegra, unsigned int offset)
++{
++	u32 page = CSB_PAGE_SELECT(offset);
++	u32 ofs = CSB_PAGE_OFFSET(offset);
++
++	fpci_writel(tegra, page, XUSB_CFG_ARU_C11_CSBRANGE);
++
++	return fpci_readl(tegra, XUSB_CFG_CSB_BASE_ADDR + ofs);
++}
++
++static void csb_writel(struct tegra_xusb *tegra, u32 value,
++		       unsigned int offset)
++{
++	u32 page = CSB_PAGE_SELECT(offset);
++	u32 ofs = CSB_PAGE_OFFSET(offset);
++
++	fpci_writel(tegra, page, XUSB_CFG_ARU_C11_CSBRANGE);
++	fpci_writel(tegra, value, XUSB_CFG_CSB_BASE_ADDR + ofs);
++}
++
++static int tegra_xusb_set_ss_clk(struct tegra_xusb *tegra,
++				 unsigned long rate)
++{
++	unsigned long new_parent_rate, old_parent_rate;
++	struct clk *clk = tegra->ss_src_clk;
++	unsigned int div;
++	int err;
++
++	if (clk_get_rate(clk) == rate)
++		return 0;
++
++	switch (rate) {
++	case TEGRA_XHCI_SS_HIGH_SPEED:
++		/*
++		 * Reparent to PLLU_480M. Set divider first to avoid
++		 * overclocking.
++		 */
++		old_parent_rate = clk_get_rate(clk_get_parent(clk));
++		new_parent_rate = clk_get_rate(tegra->pll_u_480m);
++		div = new_parent_rate / rate;
++
++		err = clk_set_rate(clk, old_parent_rate / div);
++		if (err)
++			return err;
++
++		err = clk_set_parent(clk, tegra->pll_u_480m);
++		if (err)
++			return err;
++
++		/*
++		 * The rate should already be correct, but set it again just
++		 * to be sure.
++		 */
++		err = clk_set_rate(clk, rate);
++		if (err)
++			return err;
++
++		break;
++
++	case TEGRA_XHCI_SS_LOW_SPEED:
++		/* Reparent to CLK_M */
++		err = clk_set_parent(clk, tegra->clk_m);
++		if (err)
++			return err;
++
++		err = clk_set_rate(clk, rate);
++		if (err)
++			return err;
++
++		break;
++
++	default:
++		dev_err(tegra->dev, "Invalid SS rate: %lu Hz\n", rate);
++		return -EINVAL;
++	}
++
++	if (clk_get_rate(clk) != rate) {
++		dev_err(tegra->dev, "SS clock doesn't match requested rate\n");
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static unsigned long extract_field(u32 value, unsigned int start,
++				   unsigned int count)
++{
++	return (value >> start) & ((1 << count) - 1);
++}
++
++/* Command requests from the firmware */
++enum tegra_xusb_mbox_cmd {
++	MBOX_CMD_MSG_ENABLED = 1,
++	MBOX_CMD_INC_FALC_CLOCK,
++	MBOX_CMD_DEC_FALC_CLOCK,
++	MBOX_CMD_INC_SSPI_CLOCK,
++	MBOX_CMD_DEC_SSPI_CLOCK,
++	MBOX_CMD_SET_BW, /* no ACK/NAK required */
++	MBOX_CMD_SET_SS_PWR_GATING,
++	MBOX_CMD_SET_SS_PWR_UNGATING,
++	MBOX_CMD_SAVE_DFE_CTLE_CTX,
++	MBOX_CMD_AIRPLANE_MODE_ENABLED, /* unused */
++	MBOX_CMD_AIRPLANE_MODE_DISABLED, /* unused */
++	MBOX_CMD_START_HSIC_IDLE,
++	MBOX_CMD_STOP_HSIC_IDLE,
++	MBOX_CMD_DBC_WAKE_STACK, /* unused */
++	MBOX_CMD_HSIC_PRETEND_CONNECT,
++	MBOX_CMD_RESET_SSPI,
++	MBOX_CMD_DISABLE_SS_LFPS_DETECTION,
++	MBOX_CMD_ENABLE_SS_LFPS_DETECTION,
++
++	MBOX_CMD_MAX,
++
++	/* Response message to above commands */
++	MBOX_CMD_ACK = 128,
++	MBOX_CMD_NAK
++};
++
++static const char * const mbox_cmd_name[] = {
++	[  1] = "MSG_ENABLE",
++	[  2] = "INC_FALCON_CLOCK",
++	[  3] = "DEC_FALCON_CLOCK",
++	[  4] = "INC_SSPI_CLOCK",
++	[  5] = "DEC_SSPI_CLOCK",
++	[  6] = "SET_BW",
++	[  7] = "SET_SS_PWR_GATING",
++	[  8] = "SET_SS_PWR_UNGATING",
++	[  9] = "SAVE_DFE_CTLE_CTX",
++	[ 10] = "AIRPLANE_MODE_ENABLED",
++	[ 11] = "AIRPLANE_MODE_DISABLED",
++	[ 12] = "START_HSIC_IDLE",
++	[ 13] = "STOP_HSIC_IDLE",
++	[ 14] = "DBC_WAKE_STACK",
++	[ 15] = "HSIC_PRETEND_CONNECT",
++	[ 16] = "RESET_SSPI",
++	[ 17] = "DISABLE_SS_LFPS_DETECTION",
++	[ 18] = "ENABLE_SS_LFPS_DETECTION",
++	[128] = "ACK",
++	[129] = "NAK",
++};
++
++struct tegra_xusb_mbox_msg {
++	u32 cmd;
++	u32 data;
++};
++
++static inline u32 tegra_xusb_mbox_pack(const struct tegra_xusb_mbox_msg *msg)
++{
++	return (msg->cmd & CMD_TYPE_MASK) << CMD_TYPE_SHIFT |
++	       (msg->data & CMD_DATA_MASK) << CMD_DATA_SHIFT;
++}
++static inline void tegra_xusb_mbox_unpack(struct tegra_xusb_mbox_msg *msg,
++					  u32 value)
++{
++	msg->cmd = (value >> CMD_TYPE_SHIFT) & CMD_TYPE_MASK;
++	msg->data = (value >> CMD_DATA_SHIFT) & CMD_DATA_MASK;
++}
++
++static bool tegra_xusb_mbox_cmd_requires_ack(enum tegra_xusb_mbox_cmd cmd)
++{
++	switch (cmd) {
++	case MBOX_CMD_SET_BW:
++	case MBOX_CMD_ACK:
++	case MBOX_CMD_NAK:
++		return false;
++
++	default:
++		return true;
++	}
++}
++
++static int tegra_xusb_mbox_send(struct tegra_xusb *tegra,
++				const struct tegra_xusb_mbox_msg *msg)
++{
++	bool wait_for_idle = false;
++	u32 value;
++
++	/*
++	 * Acquire the mailbox. The firmware still owns the mailbox for
++	 * ACK/NAK messages.
++	 */
++	if (!(msg->cmd == MBOX_CMD_ACK || msg->cmd == MBOX_CMD_NAK)) {
++		value = fpci_readl(tegra, XUSB_CFG_ARU_MBOX_OWNER);
++		if (value != MBOX_OWNER_NONE) {
++			dev_err(tegra->dev, "mailbox is busy\n");
++			return -EBUSY;
++		}
++
++		fpci_writel(tegra, MBOX_OWNER_SW, XUSB_CFG_ARU_MBOX_OWNER);
++
++		value = fpci_readl(tegra, XUSB_CFG_ARU_MBOX_OWNER);
++		if (value != MBOX_OWNER_SW) {
++			dev_err(tegra->dev, "failed to acquire mailbox\n");
++			return -EBUSY;
++		}
++
++		wait_for_idle = true;
++	}
++
++	value = tegra_xusb_mbox_pack(msg);
++	fpci_writel(tegra, value, XUSB_CFG_ARU_MBOX_DATA_IN);
++
++	value = fpci_readl(tegra, XUSB_CFG_ARU_MBOX_CMD);
++	value |= MBOX_INT_EN | MBOX_DEST_FALC;
++	fpci_writel(tegra, value, XUSB_CFG_ARU_MBOX_CMD);
++
++	if (wait_for_idle) {
++		unsigned long timeout = jiffies + msecs_to_jiffies(250);
++
++		while (time_before(jiffies, timeout)) {
++			value = fpci_readl(tegra, XUSB_CFG_ARU_MBOX_OWNER);
++			if (value == MBOX_OWNER_NONE)
++				break;
++
++			usleep_range(10, 20);
++		}
++
++		if (time_after(jiffies, timeout))
++			value = fpci_readl(tegra, XUSB_CFG_ARU_MBOX_OWNER);
++
++		if (value != MBOX_OWNER_NONE)
++			return -ETIMEDOUT;
++	}
++
++	return 0;
++}
++
++static irqreturn_t tegra_xusb_mbox_irq(int irq, void *data)
++{
++	struct tegra_xusb *tegra = data;
++	u32 value;
++
++	/* clear mailbox interrupts */
++	value = fpci_readl(tegra, XUSB_CFG_ARU_SMI_INTR);
++	fpci_writel(tegra, value, XUSB_CFG_ARU_SMI_INTR);
++
++	if (value & MBOX_SMI_INTR_FW_HANG)
++		dev_err(tegra->dev, "controller firmware hang\n");
++
++	return IRQ_WAKE_THREAD;
++}
++
++static void tegra_xusb_mbox_handle(struct tegra_xusb *tegra,
++				   const struct tegra_xusb_mbox_msg *msg)
++{
++	struct tegra_xusb_padctl *padctl = tegra->padctl;
++	const struct tegra_xusb_soc *soc = tegra->soc;
++	struct device *dev = tegra->dev;
++	struct tegra_xusb_mbox_msg rsp;
++	unsigned long mask;
++	unsigned int port;
++	bool idle, enable;
++	int err;
++
++	memset(&rsp, 0, sizeof(rsp));
++
++	switch (msg->cmd) {
++	case MBOX_CMD_INC_FALC_CLOCK:
++	case MBOX_CMD_DEC_FALC_CLOCK:
++		rsp.data = clk_get_rate(tegra->falcon_clk) / 1000;
++		if (rsp.data != msg->data)
++			rsp.cmd = MBOX_CMD_NAK;
++		else
++			rsp.cmd = MBOX_CMD_ACK;
++
++		break;
++
++	case MBOX_CMD_INC_SSPI_CLOCK:
++	case MBOX_CMD_DEC_SSPI_CLOCK:
++		err = tegra_xusb_set_ss_clk(tegra, msg->data * 1000);
++		if (err < 0)
++			rsp.cmd = MBOX_CMD_NAK;
++		else
++			rsp.cmd = MBOX_CMD_ACK;
++
++		rsp.data = clk_get_rate(tegra->ss_src_clk) / 1000;
++		break;
++
++	case MBOX_CMD_SET_BW:
++		/*
++		 * TODO: Request bandwidth once EMC scaling is supported.
++		 * Ignore for now since ACK/NAK is not required for SET_BW
++		 * messages.
++		 */
++		break;
++
++	case MBOX_CMD_SAVE_DFE_CTLE_CTX:
++		err = tegra_xusb_padctl_usb3_save_context(padctl, msg->data);
++		if (err < 0) {
++			dev_err(dev, "failed to save context for USB3#%u: %d\n",
++				msg->data, err);
++			rsp.cmd = MBOX_CMD_NAK;
++		} else {
++			rsp.cmd = MBOX_CMD_ACK;
++		}
++
++		rsp.data = msg->data;
++		break;
++
++	case MBOX_CMD_START_HSIC_IDLE:
++	case MBOX_CMD_STOP_HSIC_IDLE:
++		if (msg->cmd == MBOX_CMD_STOP_HSIC_IDLE)
++			idle = false;
++		else
++			idle = true;
++
++		mask = extract_field(msg->data, 1 + soc->ports.hsic.offset,
++				     soc->ports.hsic.count);
++
++		for_each_set_bit(port, &mask, 32) {
++			err = tegra_xusb_padctl_hsic_set_idle(padctl, port,
++							      idle);
++			if (err < 0)
++				break;
++		}
++
++		if (err < 0) {
++			dev_err(dev, "failed to set HSIC#%u %s: %d\n", port,
++				idle ? "idle" : "busy", err);
++			rsp.cmd = MBOX_CMD_NAK;
++		} else {
++			rsp.cmd = MBOX_CMD_ACK;
++		}
++
++		rsp.data = msg->data;
++		break;
++
++	case MBOX_CMD_DISABLE_SS_LFPS_DETECTION:
++	case MBOX_CMD_ENABLE_SS_LFPS_DETECTION:
++		if (msg->cmd == MBOX_CMD_DISABLE_SS_LFPS_DETECTION)
++			enable = false;
++		else
++			enable = true;
++
++		mask = extract_field(msg->data, 1 + soc->ports.usb3.offset,
++				     soc->ports.usb3.count);
++
++		for_each_set_bit(port, &mask, soc->ports.usb3.count) {
++			err = tegra_xusb_padctl_usb3_set_lfps_detect(padctl,
++								     port,
++								     enable);
++			if (err < 0)
++				break;
++		}
++
++		if (err < 0) {
++			dev_err(dev,
++				"failed to %s LFPS detection on USB3#%u: %d\n",
++				enable ? "enable" : "disable", port, err);
++			rsp.cmd = MBOX_CMD_NAK;
++		} else {
++			rsp.cmd = MBOX_CMD_ACK;
++		}
++
++		rsp.data = msg->data;
++		break;
++
++	default:
++		dev_warn(dev, "unknown message: %#x\n", msg->cmd);
++		break;
++	}
++
++	if (rsp.cmd) {
++		const char *cmd = (rsp.cmd == MBOX_CMD_ACK) ? "ACK" : "NAK";
++
++		err = tegra_xusb_mbox_send(tegra, &rsp);
++		if (err < 0)
++			dev_err(dev, "failed to send %s: %d\n", cmd, err);
++	}
++}
++
++static irqreturn_t tegra_xusb_mbox_thread(int irq, void *data)
++{
++	struct tegra_xusb *tegra = data;
++	struct tegra_xusb_mbox_msg msg;
++	u32 value;
++
++	mutex_lock(&tegra->lock);
++
++	value = fpci_readl(tegra, XUSB_CFG_ARU_MBOX_DATA_OUT);
++	tegra_xusb_mbox_unpack(&msg, value);
++
++	value = fpci_readl(tegra, XUSB_CFG_ARU_MBOX_CMD);
++	value &= ~MBOX_DEST_SMI;
++	fpci_writel(tegra, value, XUSB_CFG_ARU_MBOX_CMD);
++
++	/* clear mailbox owner if no ACK/NAK is required */
++	if (!tegra_xusb_mbox_cmd_requires_ack(msg.cmd))
++		fpci_writel(tegra, MBOX_OWNER_NONE, XUSB_CFG_ARU_MBOX_OWNER);
++
++	tegra_xusb_mbox_handle(tegra, &msg);
++
++	mutex_unlock(&tegra->lock);
++	return IRQ_HANDLED;
++}
++
++static void tegra_xusb_ipfs_config(struct tegra_xusb *tegra,
++				   struct resource *regs)
++{
++	u32 value;
++
++	value = ipfs_readl(tegra, IPFS_XUSB_HOST_CONFIGURATION_0);
++	value |= IPFS_EN_FPCI;
++	ipfs_writel(tegra, value, IPFS_XUSB_HOST_CONFIGURATION_0);
++
++	usleep_range(10, 20);
++
++	/* Program BAR0 space */
++	value = fpci_readl(tegra, XUSB_CFG_4);
++	value &= ~(XUSB_BASE_ADDR_MASK << XUSB_BASE_ADDR_SHIFT);
++	value |= regs->start & (XUSB_BASE_ADDR_MASK << XUSB_BASE_ADDR_SHIFT);
++	fpci_writel(tegra, value, XUSB_CFG_4);
++
++	usleep_range(100, 200);
++
++	/* Enable bus master */
++	value = fpci_readl(tegra, XUSB_CFG_1);
++	value |= XUSB_IO_SPACE_EN | XUSB_MEM_SPACE_EN | XUSB_BUS_MASTER_EN;
++	fpci_writel(tegra, value, XUSB_CFG_1);
++
++	/* Enable interrupt assertion */
++	value = ipfs_readl(tegra, IPFS_XUSB_HOST_INTR_MASK_0);
++	value |= IPFS_IP_INT_MASK;
++	ipfs_writel(tegra, value, IPFS_XUSB_HOST_INTR_MASK_0);
++
++	/* Set hysteresis */
++	ipfs_writel(tegra, 0x80, IPFS_XUSB_HOST_CLKGATE_HYSTERESIS_0);
++}
++
++static int tegra_xusb_clk_enable(struct tegra_xusb *tegra)
++{
++	int err;
++
++	err = clk_prepare_enable(tegra->pll_e);
++	if (err < 0)
++		return err;
++
++	err = clk_prepare_enable(tegra->host_clk);
++	if (err < 0)
++		goto disable_plle;
++
++	err = clk_prepare_enable(tegra->ss_clk);
++	if (err < 0)
++		goto disable_host;
++
++	err = clk_prepare_enable(tegra->falcon_clk);
++	if (err < 0)
++		goto disable_ss;
++
++	err = clk_prepare_enable(tegra->fs_src_clk);
++	if (err < 0)
++		goto disable_falc;
++
++	err = clk_prepare_enable(tegra->hs_src_clk);
++	if (err < 0)
++		goto disable_fs_src;
++
++	err = tegra_xusb_set_ss_clk(tegra, TEGRA_XHCI_SS_HIGH_SPEED);
++	if (err < 0)
++		goto disable_hs_src;
++
++	return 0;
++
++disable_hs_src:
++	clk_disable_unprepare(tegra->hs_src_clk);
++disable_fs_src:
++	clk_disable_unprepare(tegra->fs_src_clk);
++disable_falc:
++	clk_disable_unprepare(tegra->falcon_clk);
++disable_ss:
++	clk_disable_unprepare(tegra->ss_clk);
++disable_host:
++	clk_disable_unprepare(tegra->host_clk);
++disable_plle:
++	clk_disable_unprepare(tegra->pll_e);
++	return err;
++}
++
++static void tegra_xusb_clk_disable(struct tegra_xusb *tegra)
++{
++	clk_disable_unprepare(tegra->pll_e);
++	clk_disable_unprepare(tegra->host_clk);
++	clk_disable_unprepare(tegra->ss_clk);
++	clk_disable_unprepare(tegra->falcon_clk);
++	clk_disable_unprepare(tegra->fs_src_clk);
++	clk_disable_unprepare(tegra->hs_src_clk);
++}
++
++static int tegra_xusb_phy_enable(struct tegra_xusb *tegra)
++{
++	unsigned int i;
++	int err;
++
++	for (i = 0; i < tegra->num_phys; i++) {
++		err = phy_init(tegra->phys[i]);
++		if (err)
++			goto disable_phy;
++
++		err = phy_power_on(tegra->phys[i]);
++		if (err) {
++			phy_exit(tegra->phys[i]);
++			goto disable_phy;
++		}
++	}
++
++	return 0;
++
++disable_phy:
++	while (i--) {
++		phy_power_off(tegra->phys[i]);
++		phy_exit(tegra->phys[i]);
++	}
++
++	return err;
++}
++
++static void tegra_xusb_phy_disable(struct tegra_xusb *tegra)
++{
++	unsigned int i;
++
++	for (i = 0; i < tegra->num_phys; i++) {
++		phy_power_off(tegra->phys[i]);
++		phy_exit(tegra->phys[i]);
++	}
++}
++
++static int tegra_xusb_load_firmware(struct tegra_xusb *tegra)
++{
++	unsigned int code_tag_blocks, code_size_blocks, code_blocks;
++	struct tegra_xusb_fw_header *header;
++	struct device *dev = tegra->dev;
++	const struct firmware *fw;
++	unsigned long timeout;
++	time_t timestamp;
++	struct tm time;
++	u64 address;
++	u32 value;
++	int err;
++
++	err = request_firmware(&fw, tegra->soc->firmware, tegra->dev);
++	if (err < 0) {
++		dev_err(tegra->dev, "failed to request firmware: %d\n", err);
++		return err;
++	}
++
++	/* Load Falcon controller with its firmware. */
++	header = (struct tegra_xusb_fw_header *)fw->data;
++	tegra->fw.size = le32_to_cpu(header->fwimg_len);
++
++	tegra->fw.virt = dma_alloc_coherent(tegra->dev, tegra->fw.size,
++					    &tegra->fw.phys, GFP_KERNEL);
++	if (!tegra->fw.virt) {
++		dev_err(tegra->dev, "failed to allocate memory for firmware\n");
++		release_firmware(fw);
++		return -ENOMEM;
++	}
++
++	header = (struct tegra_xusb_fw_header *)tegra->fw.virt;
++	memcpy(tegra->fw.virt, fw->data, tegra->fw.size);
++	release_firmware(fw);
++
++	if (csb_readl(tegra, XUSB_CSB_MP_ILOAD_BASE_LO) != 0) {
++		dev_info(dev, "Firmware already loaded, Falcon state %#x\n",
++			 csb_readl(tegra, XUSB_FALC_CPUCTL));
++		return 0;
++	}
++
++	/* Program the size of DFI into ILOAD_ATTR. */
++	csb_writel(tegra, tegra->fw.size, XUSB_CSB_MP_ILOAD_ATTR);
++
++	/*
++	 * Boot code of the firmware reads the ILOAD_BASE registers
++	 * to get to the start of the DFI in system memory.
++	 */
++	address = tegra->fw.phys + sizeof(*header);
++	csb_writel(tegra, address >> 32, XUSB_CSB_MP_ILOAD_BASE_HI);
++	csb_writel(tegra, address, XUSB_CSB_MP_ILOAD_BASE_LO);
++
++	/* Set BOOTPATH to 1 in APMAP. */
++	csb_writel(tegra, APMAP_BOOTPATH, XUSB_CSB_MP_APMAP);
++
++	/* Invalidate L2IMEM. */
++	csb_writel(tegra, L2IMEMOP_INVALIDATE_ALL, XUSB_CSB_MP_L2IMEMOP_TRIG);
++
++	/*
++	 * Initiate fetch of bootcode from system memory into L2IMEM.
++	 * Program bootcode location and size in system memory.
++	 */
++	code_tag_blocks = DIV_ROUND_UP(le32_to_cpu(header->boot_codetag),
++				       IMEM_BLOCK_SIZE);
++	code_size_blocks = DIV_ROUND_UP(le32_to_cpu(header->boot_codesize),
++					IMEM_BLOCK_SIZE);
++	code_blocks = code_tag_blocks + code_size_blocks;
++
++	value = ((code_tag_blocks & L2IMEMOP_SIZE_SRC_OFFSET_MASK) <<
++			L2IMEMOP_SIZE_SRC_OFFSET_SHIFT) |
++		((code_size_blocks & L2IMEMOP_SIZE_SRC_COUNT_MASK) <<
++			L2IMEMOP_SIZE_SRC_COUNT_SHIFT);
++	csb_writel(tegra, value, XUSB_CSB_MP_L2IMEMOP_SIZE);
++
++	/* Trigger L2IMEM load operation. */
++	csb_writel(tegra, L2IMEMOP_LOAD_LOCKED_RESULT,
++		   XUSB_CSB_MP_L2IMEMOP_TRIG);
++
++	/* Setup Falcon auto-fill. */
++	csb_writel(tegra, code_size_blocks, XUSB_FALC_IMFILLCTL);
++
++	value = ((code_tag_blocks & IMFILLRNG1_TAG_MASK) <<
++			IMFILLRNG1_TAG_LO_SHIFT) |
++		((code_blocks & IMFILLRNG1_TAG_MASK) <<
++			IMFILLRNG1_TAG_HI_SHIFT);
++	csb_writel(tegra, value, XUSB_FALC_IMFILLRNG1);
++
++	csb_writel(tegra, 0, XUSB_FALC_DMACTL);
++
++	msleep(50);
++
++	csb_writel(tegra, le32_to_cpu(header->boot_codetag),
++		   XUSB_FALC_BOOTVEC);
++
++	/* Boot Falcon CPU and wait for it to enter the STOPPED (idle) state. */
++	timeout = jiffies + msecs_to_jiffies(5);
++
++	csb_writel(tegra, CPUCTL_STARTCPU, XUSB_FALC_CPUCTL);
++
++	while (time_before(jiffies, timeout)) {
++		if (csb_readl(tegra, XUSB_FALC_CPUCTL) == CPUCTL_STATE_STOPPED)
++			break;
++
++		usleep_range(100, 200);
++	}
++
++	if (csb_readl(tegra, XUSB_FALC_CPUCTL) != CPUCTL_STATE_STOPPED) {
++		dev_err(dev, "Falcon failed to start, state: %#x\n",
++			csb_readl(tegra, XUSB_FALC_CPUCTL));
++		return -EIO;
++	}
++
++	timestamp = le32_to_cpu(header->fwimg_created_time);
++	time_to_tm(timestamp, 0, &time);
++
++	dev_info(dev, "Firmware timestamp: %ld-%02d-%02d %02d:%02d:%02d UTC\n",
++		 time.tm_year + 1900, time.tm_mon + 1, time.tm_mday,
++		 time.tm_hour, time.tm_min, time.tm_sec);
++
++	return 0;
++}
++
++static int tegra_xusb_probe(struct platform_device *pdev)
++{
++	struct tegra_xusb_mbox_msg msg;
++	struct resource *res, *regs;
++	struct tegra_xusb *tegra;
++	struct xhci_hcd *xhci;
++	unsigned int i, j, k;
++	struct phy *phy;
++	int err;
++
++	BUILD_BUG_ON(sizeof(struct tegra_xusb_fw_header) != 256);
++
++	tegra = devm_kzalloc(&pdev->dev, sizeof(*tegra), GFP_KERNEL);
++	if (!tegra)
++		return -ENOMEM;
++
++	tegra->soc = of_device_get_match_data(&pdev->dev);
++	mutex_init(&tegra->lock);
++	tegra->dev = &pdev->dev;
++
++	regs = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	tegra->regs = devm_ioremap_resource(&pdev->dev, regs);
++	if (IS_ERR(tegra->regs))
++		return PTR_ERR(tegra->regs);
++
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 1);
++	tegra->fpci_base = devm_ioremap_resource(&pdev->dev, res);
++	if (IS_ERR(tegra->fpci_base))
++		return PTR_ERR(tegra->fpci_base);
++
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 2);
++	tegra->ipfs_base = devm_ioremap_resource(&pdev->dev, res);
++	if (IS_ERR(tegra->ipfs_base))
++		return PTR_ERR(tegra->ipfs_base);
++
++	tegra->xhci_irq = platform_get_irq(pdev, 0);
++	if (tegra->xhci_irq < 0)
++		return tegra->xhci_irq;
++
++	tegra->mbox_irq = platform_get_irq(pdev, 1);
++	if (tegra->mbox_irq < 0)
++		return tegra->mbox_irq;
++
++	tegra->padctl = tegra_xusb_padctl_get(&pdev->dev);
++	if (IS_ERR(tegra->padctl))
++		return PTR_ERR(tegra->padctl);
++
++	tegra->host_rst = devm_reset_control_get(&pdev->dev, "xusb_host");
++	if (IS_ERR(tegra->host_rst)) {
++		err = PTR_ERR(tegra->host_rst);
++		dev_err(&pdev->dev, "failed to get xusb_host reset: %d\n", err);
++		goto put_padctl;
++	}
++
++	tegra->ss_rst = devm_reset_control_get(&pdev->dev, "xusb_ss");
++	if (IS_ERR(tegra->ss_rst)) {
++		err = PTR_ERR(tegra->ss_rst);
++		dev_err(&pdev->dev, "failed to get xusb_ss reset: %d\n", err);
++		goto put_padctl;
++	}
++
++	tegra->host_clk = devm_clk_get(&pdev->dev, "xusb_host");
++	if (IS_ERR(tegra->host_clk)) {
++		err = PTR_ERR(tegra->host_clk);
++		dev_err(&pdev->dev, "failed to get xusb_host: %d\n", err);
++		goto put_padctl;
++	}
++
++	tegra->falcon_clk = devm_clk_get(&pdev->dev, "xusb_falcon_src");
++	if (IS_ERR(tegra->falcon_clk)) {
++		err = PTR_ERR(tegra->falcon_clk);
++		dev_err(&pdev->dev, "failed to get xusb_falcon_src: %d\n", err);
++		goto put_padctl;
++	}
++
++	tegra->ss_clk = devm_clk_get(&pdev->dev, "xusb_ss");
++	if (IS_ERR(tegra->ss_clk)) {
++		err = PTR_ERR(tegra->ss_clk);
++		dev_err(&pdev->dev, "failed to get xusb_ss: %d\n", err);
++		goto put_padctl;
++	}
++
++	tegra->ss_src_clk = devm_clk_get(&pdev->dev, "xusb_ss_src");
++	if (IS_ERR(tegra->ss_src_clk)) {
++		err = PTR_ERR(tegra->ss_src_clk);
++		dev_err(&pdev->dev, "failed to get xusb_ss_src: %d\n", err);
++		goto put_padctl;
++	}
++
++	tegra->hs_src_clk = devm_clk_get(&pdev->dev, "xusb_hs_src");
++	if (IS_ERR(tegra->hs_src_clk)) {
++		err = PTR_ERR(tegra->hs_src_clk);
++		dev_err(&pdev->dev, "failed to get xusb_hs_src: %d\n", err);
++		goto put_padctl;
++	}
++
++	tegra->fs_src_clk = devm_clk_get(&pdev->dev, "xusb_fs_src");
++	if (IS_ERR(tegra->fs_src_clk)) {
++		err = PTR_ERR(tegra->fs_src_clk);
++		dev_err(&pdev->dev, "failed to get xusb_fs_src: %d\n", err);
++		goto put_padctl;
++	}
++
++	tegra->pll_u_480m = devm_clk_get(&pdev->dev, "pll_u_480m");
++	if (IS_ERR(tegra->pll_u_480m)) {
++		err = PTR_ERR(tegra->pll_u_480m);
++		dev_err(&pdev->dev, "failed to get pll_u_480m: %d\n", err);
++		goto put_padctl;
++	}
++
++	tegra->clk_m = devm_clk_get(&pdev->dev, "clk_m");
++	if (IS_ERR(tegra->clk_m)) {
++		err = PTR_ERR(tegra->clk_m);
++		dev_err(&pdev->dev, "failed to get clk_m: %d\n", err);
++		goto put_padctl;
++	}
++
++	tegra->pll_e = devm_clk_get(&pdev->dev, "pll_e");
++	if (IS_ERR(tegra->pll_e)) {
++		err = PTR_ERR(tegra->pll_e);
++		dev_err(&pdev->dev, "failed to get pll_e: %d\n", err);
++		goto put_padctl;
++	}
++
++	tegra->supplies = devm_kcalloc(&pdev->dev, tegra->soc->num_supplies,
++				       sizeof(*tegra->supplies), GFP_KERNEL);
++	if (!tegra->supplies) {
++		err = -ENOMEM;
++		goto put_padctl;
++	}
++
++	for (i = 0; i < tegra->soc->num_supplies; i++)
++		tegra->supplies[i].supply = tegra->soc->supply_names[i];
++
++	err = devm_regulator_bulk_get(&pdev->dev, tegra->soc->num_supplies,
++				      tegra->supplies);
++	if (err) {
++		dev_err(&pdev->dev, "failed to get regulators: %d\n", err);
++		goto put_padctl;
++	}
++
++	for (i = 0; i < tegra->soc->num_types; i++)
++		tegra->num_phys += tegra->soc->phy_types[i].num;
++
++	tegra->phys = devm_kcalloc(&pdev->dev, tegra->num_phys,
++				   sizeof(*tegra->phys), GFP_KERNEL);
++	if (!tegra->phys) {
++		dev_err(&pdev->dev, "failed to allocate PHY array\n");
++		err = -ENOMEM;
++		goto put_padctl;
++	}
++
++	for (i = 0, k = 0; i < tegra->soc->num_types; i++) {
++		char prop[8];
++
++		for (j = 0; j < tegra->soc->phy_types[i].num; j++) {
++			snprintf(prop, sizeof(prop), "%s-%d",
++				 tegra->soc->phy_types[i].name, j);
++
++			phy = devm_phy_optional_get(&pdev->dev, prop);
++			if (IS_ERR(phy)) {
++				dev_err(&pdev->dev,
++					"failed to get PHY %s: %ld\n", prop,
++					PTR_ERR(phy));
++				err = PTR_ERR(phy);
++				goto put_padctl;
++			}
++
++			tegra->phys[k++] = phy;
++		}
++	}
++
++	err = tegra_xusb_clk_enable(tegra);
++	if (err) {
++		dev_err(&pdev->dev, "failed to enable clocks: %d\n", err);
++		goto put_padctl;
++	}
++
++	err = regulator_bulk_enable(tegra->soc->num_supplies, tegra->supplies);
++	if (err) {
++		dev_err(&pdev->dev, "failed to enable regulators: %d\n", err);
++		goto disable_clk;
++	}
++
++	err = tegra_xusb_phy_enable(tegra);
++	if (err < 0) {
++		dev_err(&pdev->dev, "failed to enable PHYs: %d\n", err);
++		goto disable_regulator;
++	}
++
++	tegra_xusb_ipfs_config(tegra, regs);
++
++	err = tegra_xusb_load_firmware(tegra);
++	if (err < 0) {
++		dev_err(&pdev->dev, "failed to load firmware: %d\n", err);
++		goto disable_phy;
++	}
++
++	tegra->hcd = usb_create_hcd(&tegra_xhci_hc_driver, &pdev->dev,
++				    dev_name(&pdev->dev));
++	if (!tegra->hcd) {
++		err = -ENOMEM;
++		goto disable_phy;
++	}
++
++	/*
++	 * This must happen after usb_create_hcd(), because usb_create_hcd()
++	 * will overwrite the drvdata of the device with the hcd it creates.
++	 */
++	platform_set_drvdata(pdev, tegra);
++
++	tegra->hcd->regs = tegra->regs;
++	tegra->hcd->rsrc_start = regs->start;
++	tegra->hcd->rsrc_len = resource_size(regs);
++
++	err = usb_add_hcd(tegra->hcd, tegra->xhci_irq, IRQF_SHARED);
++	if (err < 0) {
++		dev_err(&pdev->dev, "failed to add USB HCD: %d\n", err);
++		goto put_usb2;
++	}
++
++	device_wakeup_enable(tegra->hcd->self.controller);
++
++	xhci = hcd_to_xhci(tegra->hcd);
++
++	xhci->shared_hcd = usb_create_shared_hcd(&tegra_xhci_hc_driver,
++						 &pdev->dev,
++						 dev_name(&pdev->dev),
++						 tegra->hcd);
++	if (!xhci->shared_hcd) {
++		dev_err(&pdev->dev, "failed to create shared HCD\n");
++		goto remove_usb2;
++	}
++
++	err = usb_add_hcd(xhci->shared_hcd, tegra->xhci_irq, IRQF_SHARED);
++	if (err < 0) {
++		dev_err(&pdev->dev, "failed to add shared HCD: %d\n", err);
++		goto put_usb3;
++	}
++
++	mutex_lock(&tegra->lock);
++
++	/* Enable firmware messages from controller. */
++	msg.cmd = MBOX_CMD_MSG_ENABLED;
++	msg.data = 0;
++
++	err = tegra_xusb_mbox_send(tegra, &msg);
++	if (err < 0) {
++		dev_err(&pdev->dev, "failed to enable messages: %d\n", err);
++		mutex_unlock(&tegra->lock);
++		goto remove_usb3;
++	}
++
++	mutex_unlock(&tegra->lock);
++
++	err = devm_request_threaded_irq(&pdev->dev, tegra->mbox_irq,
++					tegra_xusb_mbox_irq,
++					tegra_xusb_mbox_thread, 0,
++					dev_name(&pdev->dev), tegra);
++	if (err < 0) {
++		dev_err(&pdev->dev, "failed to request IRQ: %d\n", err);
++		goto remove_usb3;
++	}
++
++	return 0;
++
++remove_usb3:
++	usb_remove_hcd(xhci->shared_hcd);
++put_usb3:
++	usb_put_hcd(xhci->shared_hcd);
++remove_usb2:
++	usb_remove_hcd(tegra->hcd);
++put_usb2:
++	usb_put_hcd(tegra->hcd);
++disable_phy:
++	tegra_xusb_phy_disable(tegra);
++disable_regulator:
++	regulator_bulk_disable(tegra->soc->num_supplies, tegra->supplies);
++disable_clk:
++	tegra_xusb_clk_disable(tegra);
++put_padctl:
++	tegra_xusb_padctl_put(tegra->padctl);
++	return err;
++}
++
++static int tegra_xusb_remove(struct platform_device *pdev)
++{
++	struct tegra_xusb *tegra = platform_get_drvdata(pdev);
++	struct xhci_hcd *xhci = hcd_to_xhci(tegra->hcd);
++
++	usb_remove_hcd(xhci->shared_hcd);
++	usb_put_hcd(xhci->shared_hcd);
++	usb_remove_hcd(tegra->hcd);
++	usb_put_hcd(tegra->hcd);
++
++	dma_free_coherent(&pdev->dev, tegra->fw.size, tegra->fw.virt,
++			  tegra->fw.phys);
++
++	tegra_xusb_phy_disable(tegra);
++	regulator_bulk_disable(tegra->soc->num_supplies, tegra->supplies);
++	tegra_xusb_clk_disable(tegra);
++
++	tegra_xusb_padctl_put(tegra->padctl);
++
++	return 0;
++}
++
++#ifdef CONFIG_PM_SLEEP
++static int tegra_xusb_suspend(struct device *dev)
++{
++	struct tegra_xusb *tegra = dev_get_drvdata(dev);
++	struct xhci_hcd *xhci = hcd_to_xhci(tegra->hcd);
++	bool wakeup = device_may_wakeup(dev);
++
++	/* TODO: Powergate controller across suspend/resume. */
++	return xhci_suspend(xhci, wakeup);
++}
++
++static int tegra_xusb_resume(struct device *dev)
++{
++	struct tegra_xusb *tegra = dev_get_drvdata(dev);
++	struct xhci_hcd *xhci = hcd_to_xhci(tegra->hcd);
++
++	return xhci_resume(xhci, 0);
++}
++#endif
++
++static const struct dev_pm_ops tegra_xusb_pm_ops = {
++	SET_SYSTEM_SLEEP_PM_OPS(tegra_xusb_suspend, tegra_xusb_resume)
++};
++
++static const char * const tegra124_supply_names[] = {
++	"avddio-pex",
++	"dvddio-pex",
++	"avdd-usb",
++	"avdd-pll-utmip",
++	"avdd-pll-erefe",
++	"avdd-usb-ss-pll",
++	"hvdd-usb-ss",
++	"hvdd-usb-ss-pll-e",
++};
++
++static const struct tegra_xusb_phy_type tegra124_phy_types[] = {
++	{ .name = "usb3", .num = 2, },
++	{ .name = "usb2", .num = 3, },
++	{ .name = "hsic", .num = 2, },
++};
++
++static const struct tegra_xusb_soc tegra124_soc = {
++	.firmware = "nvidia/tegra124/xusb.bin",
++	.supply_names = tegra124_supply_names,
++	.num_supplies = ARRAY_SIZE(tegra124_supply_names),
++	.phy_types = tegra124_phy_types,
++	.num_types = ARRAY_SIZE(tegra124_phy_types),
++	.ports = {
++		.usb2 = { .offset = 4, .count = 4, },
++		.hsic = { .offset = 6, .count = 2, },
++		.usb3 = { .offset = 0, .count = 2, },
++	},
++};
++MODULE_FIRMWARE("nvidia/tegra124/xusb.bin");
++
++static const struct of_device_id tegra_xusb_of_match[] = {
++	{ .compatible = "nvidia,tegra124-xusb", .data = &tegra124_soc },
++	{ },
++};
++MODULE_DEVICE_TABLE(of, tegra_xusb_of_match);
++
++static struct platform_driver tegra_xusb_driver = {
++	.probe = tegra_xusb_probe,
++	.remove = tegra_xusb_remove,
++	.driver = {
++		.name = "tegra-xusb",
++		.pm = &tegra_xusb_pm_ops,
++		.of_match_table = tegra_xusb_of_match,
++	},
++};
++
++static void tegra_xhci_quirks(struct device *dev, struct xhci_hcd *xhci)
++{
++	xhci->quirks |= XHCI_PLAT;
++}
++
++static int tegra_xhci_setup(struct usb_hcd *hcd)
++{
++	return xhci_gen_setup(hcd, tegra_xhci_quirks);
++}
++
++static const struct xhci_driver_overrides tegra_xhci_overrides __initconst = {
++	.extra_priv_size = sizeof(struct xhci_hcd),
++	.reset = tegra_xhci_setup,
++};
++
++static int __init tegra_xusb_init(void)
++{
++	xhci_init_driver(&tegra_xhci_hc_driver, &tegra_xhci_overrides);
++
++	return platform_driver_register(&tegra_xusb_driver);
++}
++module_init(tegra_xusb_init);
++
++static void __exit tegra_xusb_exit(void)
++{
++	platform_driver_unregister(&tegra_xusb_driver);
++}
++module_exit(tegra_xusb_exit);
++
++MODULE_AUTHOR("Andrew Bresticker <abrestic@chromium.org>");
++MODULE_DESCRIPTION("NVIDIA Tegra XUSB xHCI host-controller driver");
++MODULE_LICENSE("GPL v2");

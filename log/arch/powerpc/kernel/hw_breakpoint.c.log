@@ -1,0 +1,4370 @@
+commit 29da4f91c0c1fbda12b8a31be0d564930208c92e
+Author: Ravi Bangoria <ravi.bangoria@linux.ibm.com>
+Date:   Thu May 14 16:47:39 2020 +0530
+
+    powerpc/watchpoint: Don't allow concurrent perf and ptrace events
+    
+    With Book3s DAWR, ptrace and perf watchpoints on powerpc behaves
+    differently. Ptrace watchpoint works in one-shot mode and generates
+    signal before executing instruction. It's ptrace user's job to
+    single-step the instruction and re-enable the watchpoint. OTOH, in
+    case of perf watchpoint, kernel emulates/single-steps the instruction
+    and then generates event. If perf and ptrace creates two events with
+    same or overlapping address ranges, it's ambiguous to decide who
+    should single-step the instruction. Because of this issue, don't
+    allow perf and ptrace watchpoint at the same time if their address
+    range overlaps.
+    
+    Signed-off-by: Ravi Bangoria <ravi.bangoria@linux.ibm.com>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+    Reviewed-by: Michael Neuling <mikey@neuling.org>
+    Link: https://lore.kernel.org/r/20200514111741.97993-15-ravi.bangoria@linux.ibm.com
+
+diff --git a/arch/powerpc/kernel/hw_breakpoint.c b/arch/powerpc/kernel/hw_breakpoint.c
+index 5fdc6c4f14af..0000daf0e1da 100644
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@ -124,6 +124,227 @@ static bool is_ptrace_bp(struct perf_event *bp)
+ 	return bp->overflow_handler == ptrace_triggered;
+ }
+ 
++struct breakpoint {
++	struct list_head list;
++	struct perf_event *bp;
++	bool ptrace_bp;
++};
++
++static DEFINE_PER_CPU(struct breakpoint *, cpu_bps[HBP_NUM_MAX]);
++static LIST_HEAD(task_bps);
++
++static struct breakpoint *alloc_breakpoint(struct perf_event *bp)
++{
++	struct breakpoint *tmp;
++
++	tmp = kzalloc(sizeof(*tmp), GFP_KERNEL);
++	if (!tmp)
++		return ERR_PTR(-ENOMEM);
++	tmp->bp = bp;
++	tmp->ptrace_bp = is_ptrace_bp(bp);
++	return tmp;
++}
++
++static bool bp_addr_range_overlap(struct perf_event *bp1, struct perf_event *bp2)
++{
++	__u64 bp1_saddr, bp1_eaddr, bp2_saddr, bp2_eaddr;
++
++	bp1_saddr = ALIGN_DOWN(bp1->attr.bp_addr, HW_BREAKPOINT_SIZE);
++	bp1_eaddr = ALIGN(bp1->attr.bp_addr + bp1->attr.bp_len, HW_BREAKPOINT_SIZE);
++	bp2_saddr = ALIGN_DOWN(bp2->attr.bp_addr, HW_BREAKPOINT_SIZE);
++	bp2_eaddr = ALIGN(bp2->attr.bp_addr + bp2->attr.bp_len, HW_BREAKPOINT_SIZE);
++
++	return (bp1_saddr < bp2_eaddr && bp1_eaddr > bp2_saddr);
++}
++
++static bool alternate_infra_bp(struct breakpoint *b, struct perf_event *bp)
++{
++	return is_ptrace_bp(bp) ? !b->ptrace_bp : b->ptrace_bp;
++}
++
++static bool can_co_exist(struct breakpoint *b, struct perf_event *bp)
++{
++	return !(alternate_infra_bp(b, bp) && bp_addr_range_overlap(b->bp, bp));
++}
++
++static int task_bps_add(struct perf_event *bp)
++{
++	struct breakpoint *tmp;
++
++	tmp = alloc_breakpoint(bp);
++	if (IS_ERR(tmp))
++		return PTR_ERR(tmp);
++
++	list_add(&tmp->list, &task_bps);
++	return 0;
++}
++
++static void task_bps_remove(struct perf_event *bp)
++{
++	struct list_head *pos, *q;
++
++	list_for_each_safe(pos, q, &task_bps) {
++		struct breakpoint *tmp = list_entry(pos, struct breakpoint, list);
++
++		if (tmp->bp == bp) {
++			list_del(&tmp->list);
++			kfree(tmp);
++			break;
++		}
++	}
++}
++
++/*
++ * If any task has breakpoint from alternate infrastructure,
++ * return true. Otherwise return false.
++ */
++static bool all_task_bps_check(struct perf_event *bp)
++{
++	struct breakpoint *tmp;
++
++	list_for_each_entry(tmp, &task_bps, list) {
++		if (!can_co_exist(tmp, bp))
++			return true;
++	}
++	return false;
++}
++
++/*
++ * If same task has breakpoint from alternate infrastructure,
++ * return true. Otherwise return false.
++ */
++static bool same_task_bps_check(struct perf_event *bp)
++{
++	struct breakpoint *tmp;
++
++	list_for_each_entry(tmp, &task_bps, list) {
++		if (tmp->bp->hw.target == bp->hw.target &&
++		    !can_co_exist(tmp, bp))
++			return true;
++	}
++	return false;
++}
++
++static int cpu_bps_add(struct perf_event *bp)
++{
++	struct breakpoint **cpu_bp;
++	struct breakpoint *tmp;
++	int i = 0;
++
++	tmp = alloc_breakpoint(bp);
++	if (IS_ERR(tmp))
++		return PTR_ERR(tmp);
++
++	cpu_bp = per_cpu_ptr(cpu_bps, bp->cpu);
++	for (i = 0; i < nr_wp_slots(); i++) {
++		if (!cpu_bp[i]) {
++			cpu_bp[i] = tmp;
++			break;
++		}
++	}
++	return 0;
++}
++
++static void cpu_bps_remove(struct perf_event *bp)
++{
++	struct breakpoint **cpu_bp;
++	int i = 0;
++
++	cpu_bp = per_cpu_ptr(cpu_bps, bp->cpu);
++	for (i = 0; i < nr_wp_slots(); i++) {
++		if (!cpu_bp[i])
++			continue;
++
++		if (cpu_bp[i]->bp == bp) {
++			kfree(cpu_bp[i]);
++			cpu_bp[i] = NULL;
++			break;
++		}
++	}
++}
++
++static bool cpu_bps_check(int cpu, struct perf_event *bp)
++{
++	struct breakpoint **cpu_bp;
++	int i;
++
++	cpu_bp = per_cpu_ptr(cpu_bps, cpu);
++	for (i = 0; i < nr_wp_slots(); i++) {
++		if (cpu_bp[i] && !can_co_exist(cpu_bp[i], bp))
++			return true;
++	}
++	return false;
++}
++
++static bool all_cpu_bps_check(struct perf_event *bp)
++{
++	int cpu;
++
++	for_each_online_cpu(cpu) {
++		if (cpu_bps_check(cpu, bp))
++			return true;
++	}
++	return false;
++}
++
++/*
++ * We don't use any locks to serialize accesses to cpu_bps or task_bps
++ * because are already inside nr_bp_mutex.
++ */
++int arch_reserve_bp_slot(struct perf_event *bp)
++{
++	int ret;
++
++	/* ptrace breakpoint */
++	if (is_ptrace_bp(bp)) {
++		if (all_cpu_bps_check(bp))
++			return -ENOSPC;
++
++		if (same_task_bps_check(bp))
++			return -ENOSPC;
++
++		return task_bps_add(bp);
++	}
++
++	/* perf breakpoint */
++	if (is_kernel_addr(bp->attr.bp_addr))
++		return 0;
++
++	if (bp->hw.target && bp->cpu == -1) {
++		if (same_task_bps_check(bp))
++			return -ENOSPC;
++
++		return task_bps_add(bp);
++	} else if (!bp->hw.target && bp->cpu != -1) {
++		if (all_task_bps_check(bp))
++			return -ENOSPC;
++
++		return cpu_bps_add(bp);
++	}
++
++	if (same_task_bps_check(bp))
++		return -ENOSPC;
++
++	ret = cpu_bps_add(bp);
++	if (ret)
++		return ret;
++	ret = task_bps_add(bp);
++	if (ret)
++		cpu_bps_remove(bp);
++
++	return ret;
++}
++
++void arch_release_bp_slot(struct perf_event *bp)
++{
++	if (!is_kernel_addr(bp->attr.bp_addr)) {
++		if (bp->hw.target)
++			task_bps_remove(bp);
++		if (bp->cpu != -1)
++			cpu_bps_remove(bp);
++	}
++}
++
+ /*
+  * Perform cleanup of arch-specific counters during unregistration
+  * of the perf-event
+
+commit 74c6881019b7d56c327fffc268d97adb5eb1b4f9
+Author: Ravi Bangoria <ravi.bangoria@linux.ibm.com>
+Date:   Thu May 14 16:47:38 2020 +0530
+
+    powerpc/watchpoint: Prepare handler to handle more than one watchpoint
+    
+    Currently we assume that we have only one watchpoint supported by hw.
+    Get rid of that assumption and use dynamic loop instead. This should
+    make supporting more watchpoints very easy.
+    
+    With more than one watchpoint, exception handler needs to know which
+    DAWR caused the exception, and hw currently does not provide it. So
+    we need sw logic for the same. To figure out which DAWR caused the
+    exception, check all different combinations of user specified range,
+    DAWR address range, actual access range and DAWRX constrains. For ex,
+    if user specified range and actual access range overlaps but DAWRX is
+    configured for readonly watchpoint and the instruction is store, this
+    DAWR must not have caused exception.
+    
+    Signed-off-by: Ravi Bangoria <ravi.bangoria@linux.ibm.com>
+    Reviewed-by: Michael Neuling <mikey@neuling.org>
+    [mpe: Unsplit multi-line printk() strings, fix some sparse warnings]
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+    Link: https://lore.kernel.org/r/20200514111741.97993-14-ravi.bangoria@linux.ibm.com
+
+diff --git a/arch/powerpc/kernel/hw_breakpoint.c b/arch/powerpc/kernel/hw_breakpoint.c
+index 4366bd0c90c4..5fdc6c4f14af 100644
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@ -31,7 +31,7 @@
+  * Stores the breakpoints currently in use on each breakpoint address
+  * register for every cpu
+  */
+-static DEFINE_PER_CPU(struct perf_event *, bp_per_reg);
++static DEFINE_PER_CPU(struct perf_event *, bp_per_reg[HBP_NUM_MAX]);
+ 
+ /*
+  * Returns total number of data or instruction breakpoints available.
+@@ -43,6 +43,17 @@ int hw_breakpoint_slots(int type)
+ 	return 0;		/* no instruction breakpoints available */
+ }
+ 
++static bool single_step_pending(void)
++{
++	int i;
++
++	for (i = 0; i < nr_wp_slots(); i++) {
++		if (current->thread.last_hit_ubp[i])
++			return true;
++	}
++	return false;
++}
++
+ /*
+  * Install a perf counter breakpoint.
+  *
+@@ -55,16 +66,26 @@ int hw_breakpoint_slots(int type)
+ int arch_install_hw_breakpoint(struct perf_event *bp)
+ {
+ 	struct arch_hw_breakpoint *info = counter_arch_bp(bp);
+-	struct perf_event **slot = this_cpu_ptr(&bp_per_reg);
++	struct perf_event **slot;
++	int i;
++
++	for (i = 0; i < nr_wp_slots(); i++) {
++		slot = this_cpu_ptr(&bp_per_reg[i]);
++		if (!*slot) {
++			*slot = bp;
++			break;
++		}
++	}
+ 
+-	*slot = bp;
++	if (WARN_ONCE(i == nr_wp_slots(), "Can't find any breakpoint slot"))
++		return -EBUSY;
+ 
+ 	/*
+ 	 * Do not install DABR values if the instruction must be single-stepped.
+ 	 * If so, DABR will be populated in single_step_dabr_instruction().
+ 	 */
+-	if (current->thread.last_hit_ubp != bp)
+-		__set_breakpoint(0, info);
++	if (!single_step_pending())
++		__set_breakpoint(i, info);
+ 
+ 	return 0;
+ }
+@@ -80,15 +101,22 @@ int arch_install_hw_breakpoint(struct perf_event *bp)
+  */
+ void arch_uninstall_hw_breakpoint(struct perf_event *bp)
+ {
+-	struct perf_event **slot = this_cpu_ptr(&bp_per_reg);
++	struct arch_hw_breakpoint null_brk = {0};
++	struct perf_event **slot;
++	int i;
+ 
+-	if (*slot != bp) {
+-		WARN_ONCE(1, "Can't find the breakpoint");
+-		return;
++	for (i = 0; i < nr_wp_slots(); i++) {
++		slot = this_cpu_ptr(&bp_per_reg[i]);
++		if (*slot == bp) {
++			*slot = NULL;
++			break;
++		}
+ 	}
+ 
+-	*slot = NULL;
+-	hw_breakpoint_disable();
++	if (WARN_ONCE(i == nr_wp_slots(), "Can't find any breakpoint slot"))
++		return;
++
++	__set_breakpoint(i, &null_brk);
+ }
+ 
+ static bool is_ptrace_bp(struct perf_event *bp)
+@@ -108,8 +136,14 @@ void arch_unregister_hw_breakpoint(struct perf_event *bp)
+ 	 * restoration variables to prevent dangling pointers.
+ 	 * FIXME, this should not be using bp->ctx at all! Sayeth peterz.
+ 	 */
+-	if (bp->ctx && bp->ctx->task && bp->ctx->task != ((void *)-1L))
+-		bp->ctx->task->thread.last_hit_ubp = NULL;
++	if (bp->ctx && bp->ctx->task && bp->ctx->task != ((void *)-1L)) {
++		int i;
++
++		for (i = 0; i < nr_wp_slots(); i++) {
++			if (bp->ctx->task->thread.last_hit_ubp[i] == bp)
++				bp->ctx->task->thread.last_hit_ubp[i] = NULL;
++		}
++	}
+ }
+ 
+ /*
+@@ -221,90 +255,209 @@ int hw_breakpoint_arch_parse(struct perf_event *bp,
+ void thread_change_pc(struct task_struct *tsk, struct pt_regs *regs)
+ {
+ 	struct arch_hw_breakpoint *info;
++	int i;
+ 
+-	if (likely(!tsk->thread.last_hit_ubp))
+-		return;
++	for (i = 0; i < nr_wp_slots(); i++) {
++		if (unlikely(tsk->thread.last_hit_ubp[i]))
++			goto reset;
++	}
++	return;
+ 
+-	info = counter_arch_bp(tsk->thread.last_hit_ubp);
++reset:
+ 	regs->msr &= ~MSR_SE;
+-	__set_breakpoint(0, info);
+-	tsk->thread.last_hit_ubp = NULL;
++	for (i = 0; i < nr_wp_slots(); i++) {
++		info = counter_arch_bp(__this_cpu_read(bp_per_reg[i]));
++		__set_breakpoint(i, info);
++		tsk->thread.last_hit_ubp[i] = NULL;
++	}
+ }
+ 
+-static bool dar_within_range(unsigned long dar, struct arch_hw_breakpoint *info)
++static bool dar_in_user_range(unsigned long dar, struct arch_hw_breakpoint *info)
+ {
+ 	return ((info->address <= dar) && (dar - info->address < info->len));
+ }
+ 
+-static bool
+-dar_range_overlaps(unsigned long dar, int size, struct arch_hw_breakpoint *info)
++static bool dar_user_range_overlaps(unsigned long dar, int size,
++				    struct arch_hw_breakpoint *info)
++{
++	return ((dar < info->address + info->len) &&
++		(dar + size > info->address));
++}
++
++static bool dar_in_hw_range(unsigned long dar, struct arch_hw_breakpoint *info)
++{
++	unsigned long hw_start_addr, hw_end_addr;
++
++	hw_start_addr = ALIGN_DOWN(info->address, HW_BREAKPOINT_SIZE);
++	hw_end_addr = ALIGN(info->address + info->len, HW_BREAKPOINT_SIZE);
++
++	return ((hw_start_addr <= dar) && (hw_end_addr > dar));
++}
++
++static bool dar_hw_range_overlaps(unsigned long dar, int size,
++				  struct arch_hw_breakpoint *info)
+ {
+-	return ((dar <= info->address + info->len - 1) &&
+-		(dar + size - 1 >= info->address));
++	unsigned long hw_start_addr, hw_end_addr;
++
++	hw_start_addr = ALIGN_DOWN(info->address, HW_BREAKPOINT_SIZE);
++	hw_end_addr = ALIGN(info->address + info->len, HW_BREAKPOINT_SIZE);
++
++	return ((dar < hw_end_addr) && (dar + size > hw_start_addr));
+ }
+ 
+ /*
+- * Handle debug exception notifications.
++ * If hw has multiple DAWR registers, we also need to check all
++ * dawrx constraint bits to confirm this is _really_ a valid event.
+  */
+-static bool stepping_handler(struct pt_regs *regs, struct perf_event *bp,
+-			     struct arch_hw_breakpoint *info)
++static bool check_dawrx_constraints(struct pt_regs *regs, int type,
++				    struct arch_hw_breakpoint *info)
+ {
+-	struct ppc_inst instr = ppc_inst(0);
+-	int ret, type, size;
+-	struct instruction_op op;
+-	unsigned long addr = info->address;
++	if (OP_IS_LOAD(type) && !(info->type & HW_BRK_TYPE_READ))
++		return false;
+ 
+-	if (__get_user_instr_inatomic(instr, (void __user *)regs->nip))
+-		goto fail;
++	if (OP_IS_STORE(type) && !(info->type & HW_BRK_TYPE_WRITE))
++		return false;
+ 
+-	ret = analyse_instr(&op, regs, instr);
+-	type = GETTYPE(op.type);
+-	size = GETSIZE(op.type);
++	if (is_kernel_addr(regs->nip) && !(info->type & HW_BRK_TYPE_KERNEL))
++		return false;
+ 
+-	if (!ret && (type == LARX || type == STCX)) {
+-		printk_ratelimited("Breakpoint hit on instruction that can't be emulated."
+-				   " Breakpoint at 0x%lx will be disabled.\n", addr);
+-		goto disable;
+-	}
++	if (user_mode(regs) && !(info->type & HW_BRK_TYPE_USER))
++		return false;
++
++	return true;
++}
++
++/*
++ * Return true if the event is valid wrt dawr configuration,
++ * including extraneous exception. Otherwise return false.
++ */
++static bool check_constraints(struct pt_regs *regs, struct ppc_inst instr,
++			      int type, int size, struct arch_hw_breakpoint *info)
++{
++	bool in_user_range = dar_in_user_range(regs->dar, info);
++	bool dawrx_constraints;
+ 
+ 	/*
+-	 * If it's extraneous event, we still need to emulate/single-
+-	 * step the instruction, but we don't generate an event.
++	 * 8xx supports only one breakpoint and thus we can
++	 * unconditionally return true.
+ 	 */
+-	if (size && !dar_range_overlaps(regs->dar, size, info))
+-		info->type |= HW_BRK_TYPE_EXTRANEOUS_IRQ;
++	if (IS_ENABLED(CONFIG_PPC_8xx)) {
++		if (!in_user_range)
++			info->type |= HW_BRK_TYPE_EXTRANEOUS_IRQ;
++		return true;
++	}
+ 
+-	/* Do not emulate user-space instructions, instead single-step them */
+-	if (user_mode(regs)) {
+-		current->thread.last_hit_ubp = bp;
+-		regs->msr |= MSR_SE;
++	if (unlikely(ppc_inst_equal(instr, ppc_inst(0)))) {
++		if (in_user_range)
++			return true;
++
++		if (dar_in_hw_range(regs->dar, info)) {
++			info->type |= HW_BRK_TYPE_EXTRANEOUS_IRQ;
++			return true;
++		}
+ 		return false;
+ 	}
+ 
+-	if (!emulate_step(regs, instr))
+-		goto fail;
++	dawrx_constraints = check_dawrx_constraints(regs, type, info);
+ 
+-	return true;
++	if (dar_user_range_overlaps(regs->dar, size, info))
++		return dawrx_constraints;
++
++	if (dar_hw_range_overlaps(regs->dar, size, info)) {
++		if (dawrx_constraints) {
++			info->type |= HW_BRK_TYPE_EXTRANEOUS_IRQ;
++			return true;
++		}
++	}
++	return false;
++}
++
++static void get_instr_detail(struct pt_regs *regs, struct ppc_inst *instr,
++			     int *type, int *size, bool *larx_stcx)
++{
++	struct instruction_op op;
++
++	if (__get_user_instr_inatomic(*instr, (void __user *)regs->nip))
++		return;
++
++	analyse_instr(&op, regs, *instr);
+ 
+-fail:
+ 	/*
+-	 * We've failed in reliably handling the hw-breakpoint. Unregister
+-	 * it and throw a warning message to let the user know about it.
++	 * Set size = 8 if analyse_instr() fails. If it's a userspace
++	 * watchpoint(valid or extraneous), we can notify user about it.
++	 * If it's a kernel watchpoint, instruction  emulation will fail
++	 * in stepping_handler() and watchpoint will be disabled.
+ 	 */
+-	WARN(1, "Unable to handle hardware breakpoint. Breakpoint at "
+-		"0x%lx will be disabled.", addr);
++	*type = GETTYPE(op.type);
++	*size = !(*type == UNKNOWN) ? GETSIZE(op.type) : 8;
++	*larx_stcx = (*type == LARX || *type == STCX);
++}
++
++/*
++ * We've failed in reliably handling the hw-breakpoint. Unregister
++ * it and throw a warning message to let the user know about it.
++ */
++static void handler_error(struct perf_event *bp, struct arch_hw_breakpoint *info)
++{
++	WARN(1, "Unable to handle hardware breakpoint. Breakpoint at 0x%lx will be disabled.",
++	     info->address);
++	perf_event_disable_inatomic(bp);
++}
+ 
+-disable:
++static void larx_stcx_err(struct perf_event *bp, struct arch_hw_breakpoint *info)
++{
++	printk_ratelimited("Breakpoint hit on instruction that can't be emulated. Breakpoint at 0x%lx will be disabled.\n",
++			   info->address);
+ 	perf_event_disable_inatomic(bp);
+-	return false;
++}
++
++static bool stepping_handler(struct pt_regs *regs, struct perf_event **bp,
++			     struct arch_hw_breakpoint **info, int *hit,
++			     struct ppc_inst instr)
++{
++	int i;
++	int stepped;
++
++	/* Do not emulate user-space instructions, instead single-step them */
++	if (user_mode(regs)) {
++		for (i = 0; i < nr_wp_slots(); i++) {
++			if (!hit[i])
++				continue;
++			current->thread.last_hit_ubp[i] = bp[i];
++			info[i] = NULL;
++		}
++		regs->msr |= MSR_SE;
++		return false;
++	}
++
++	stepped = emulate_step(regs, instr);
++	if (!stepped) {
++		for (i = 0; i < nr_wp_slots(); i++) {
++			if (!hit[i])
++				continue;
++			handler_error(bp[i], info[i]);
++			info[i] = NULL;
++		}
++		return false;
++	}
++	return true;
+ }
+ 
+ int hw_breakpoint_handler(struct die_args *args)
+ {
++	bool err = false;
+ 	int rc = NOTIFY_STOP;
+-	struct perf_event *bp;
++	struct perf_event *bp[HBP_NUM_MAX] = { NULL };
+ 	struct pt_regs *regs = args->regs;
+-	struct arch_hw_breakpoint *info;
++	struct arch_hw_breakpoint *info[HBP_NUM_MAX] = { NULL };
++	int i;
++	int hit[HBP_NUM_MAX] = {0};
++	int nr_hit = 0;
++	bool ptrace_bp = false;
++	struct ppc_inst instr = ppc_inst(0);
++	int type = 0;
++	int size = 0;
++	bool larx_stcx = false;
+ 
+ 	/* Disable breakpoints during exception handling */
+ 	hw_breakpoint_disable();
+@@ -317,12 +470,40 @@ int hw_breakpoint_handler(struct die_args *args)
+ 	 */
+ 	rcu_read_lock();
+ 
+-	bp = __this_cpu_read(bp_per_reg);
+-	if (!bp) {
++	if (!IS_ENABLED(CONFIG_PPC_8xx))
++		get_instr_detail(regs, &instr, &type, &size, &larx_stcx);
++
++	for (i = 0; i < nr_wp_slots(); i++) {
++		bp[i] = __this_cpu_read(bp_per_reg[i]);
++		if (!bp[i])
++			continue;
++
++		info[i] = counter_arch_bp(bp[i]);
++		info[i]->type &= ~HW_BRK_TYPE_EXTRANEOUS_IRQ;
++
++		if (check_constraints(regs, instr, type, size, info[i])) {
++			if (!IS_ENABLED(CONFIG_PPC_8xx) &&
++			    ppc_inst_equal(instr, ppc_inst(0))) {
++				handler_error(bp[i], info[i]);
++				info[i] = NULL;
++				err = 1;
++				continue;
++			}
++
++			if (is_ptrace_bp(bp[i]))
++				ptrace_bp = true;
++			hit[i] = 1;
++			nr_hit++;
++		}
++	}
++
++	if (err)
++		goto reset;
++
++	if (!nr_hit) {
+ 		rc = NOTIFY_DONE;
+ 		goto out;
+ 	}
+-	info = counter_arch_bp(bp);
+ 
+ 	/*
+ 	 * Return early after invoking user-callback function without restoring
+@@ -330,29 +511,50 @@ int hw_breakpoint_handler(struct die_args *args)
+ 	 * one-shot mode. The ptrace-ed process will receive the SIGTRAP signal
+ 	 * generated in do_dabr().
+ 	 */
+-	if (is_ptrace_bp(bp)) {
+-		perf_bp_event(bp, regs);
++	if (ptrace_bp) {
++		for (i = 0; i < nr_wp_slots(); i++) {
++			if (!hit[i])
++				continue;
++			perf_bp_event(bp[i], regs);
++			info[i] = NULL;
++		}
+ 		rc = NOTIFY_DONE;
+-		goto out;
++		goto reset;
+ 	}
+ 
+-	info->type &= ~HW_BRK_TYPE_EXTRANEOUS_IRQ;
+-	if (IS_ENABLED(CONFIG_PPC_8xx)) {
+-		if (!dar_within_range(regs->dar, info))
+-			info->type |= HW_BRK_TYPE_EXTRANEOUS_IRQ;
+-	} else {
+-		if (!stepping_handler(regs, bp, info))
+-			goto out;
++	if (!IS_ENABLED(CONFIG_PPC_8xx)) {
++		if (larx_stcx) {
++			for (i = 0; i < nr_wp_slots(); i++) {
++				if (!hit[i])
++					continue;
++				larx_stcx_err(bp[i], info[i]);
++				info[i] = NULL;
++			}
++			goto reset;
++		}
++
++		if (!stepping_handler(regs, bp, info, hit, instr))
++			goto reset;
+ 	}
+ 
+ 	/*
+ 	 * As a policy, the callback is invoked in a 'trigger-after-execute'
+ 	 * fashion
+ 	 */
+-	if (!(info->type & HW_BRK_TYPE_EXTRANEOUS_IRQ))
+-		perf_bp_event(bp, regs);
++	for (i = 0; i < nr_wp_slots(); i++) {
++		if (!hit[i])
++			continue;
++		if (!(info[i]->type & HW_BRK_TYPE_EXTRANEOUS_IRQ))
++			perf_bp_event(bp[i], regs);
++	}
++
++reset:
++	for (i = 0; i < nr_wp_slots(); i++) {
++		if (!info[i])
++			continue;
++		__set_breakpoint(i, info[i]);
++	}
+ 
+-	__set_breakpoint(0, info);
+ out:
+ 	rcu_read_unlock();
+ 	return rc;
+@@ -367,26 +569,43 @@ static int single_step_dabr_instruction(struct die_args *args)
+ 	struct pt_regs *regs = args->regs;
+ 	struct perf_event *bp = NULL;
+ 	struct arch_hw_breakpoint *info;
++	int i;
++	bool found = false;
+ 
+-	bp = current->thread.last_hit_ubp;
+ 	/*
+ 	 * Check if we are single-stepping as a result of a
+ 	 * previous HW Breakpoint exception
+ 	 */
+-	if (!bp)
+-		return NOTIFY_DONE;
++	for (i = 0; i < nr_wp_slots(); i++) {
++		bp = current->thread.last_hit_ubp[i];
++
++		if (!bp)
++			continue;
++
++		found = true;
++		info = counter_arch_bp(bp);
++
++		/*
++		 * We shall invoke the user-defined callback function in the
++		 * single stepping handler to confirm to 'trigger-after-execute'
++		 * semantics
++		 */
++		if (!(info->type & HW_BRK_TYPE_EXTRANEOUS_IRQ))
++			perf_bp_event(bp, regs);
++		current->thread.last_hit_ubp[i] = NULL;
++	}
+ 
+-	info = counter_arch_bp(bp);
++	if (!found)
++		return NOTIFY_DONE;
+ 
+-	/*
+-	 * We shall invoke the user-defined callback function in the single
+-	 * stepping handler to confirm to 'trigger-after-execute' semantics
+-	 */
+-	if (!(info->type & HW_BRK_TYPE_EXTRANEOUS_IRQ))
+-		perf_bp_event(bp, regs);
++	for (i = 0; i < nr_wp_slots(); i++) {
++		bp = __this_cpu_read(bp_per_reg[i]);
++		if (!bp)
++			continue;
+ 
+-	__set_breakpoint(0, info);
+-	current->thread.last_hit_ubp = NULL;
++		info = counter_arch_bp(bp);
++		__set_breakpoint(i, info);
++	}
+ 
+ 	/*
+ 	 * If the process was being single-stepped by ptrace, let the
+
+commit e68ef121c1f4c38edf87a3354661ceb99d522729
+Author: Ravi Bangoria <ravi.bangoria@linux.ibm.com>
+Date:   Thu May 14 16:47:37 2020 +0530
+
+    powerpc/watchpoint: Use builtin ALIGN*() macros
+    
+    Currently we calculate hw aligned start and end addresses manually.
+    Replace them with builtin ALIGN_DOWN() and ALIGN() macros.
+    
+    So far end_addr was inclusive but this patch makes it exclusive (by
+    avoiding -1) for better readability.
+    
+    Suggested-by: Christophe Leroy <christophe.leroy@c-s.fr>
+    Signed-off-by: Ravi Bangoria <ravi.bangoria@linux.ibm.com>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+    Reviewed-by: Michael Neuling <mikey@neuling.org>
+    Link: https://lore.kernel.org/r/20200514111741.97993-13-ravi.bangoria@linux.ibm.com
+
+diff --git a/arch/powerpc/kernel/hw_breakpoint.c b/arch/powerpc/kernel/hw_breakpoint.c
+index 8028a2704874..4366bd0c90c4 100644
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@ -146,10 +146,10 @@ int arch_bp_generic_fields(int type, int *gen_bp_type)
+  *    <---8 bytes--->
+  *
+  * In this case, we should configure hw as:
+- *   start_addr = address & ~HW_BREAKPOINT_ALIGN
++ *   start_addr = address & ~(HW_BREAKPOINT_SIZE - 1)
+  *   len = 16 bytes
+  *
+- * @start_addr and @end_addr are inclusive.
++ * @start_addr is inclusive but @end_addr is exclusive.
+  */
+ static int hw_breakpoint_validate_len(struct arch_hw_breakpoint *hw)
+ {
+@@ -157,14 +157,14 @@ static int hw_breakpoint_validate_len(struct arch_hw_breakpoint *hw)
+ 	u16 hw_len;
+ 	unsigned long start_addr, end_addr;
+ 
+-	start_addr = hw->address & ~HW_BREAKPOINT_ALIGN;
+-	end_addr = (hw->address + hw->len - 1) | HW_BREAKPOINT_ALIGN;
+-	hw_len = end_addr - start_addr + 1;
++	start_addr = ALIGN_DOWN(hw->address, HW_BREAKPOINT_SIZE);
++	end_addr = ALIGN(hw->address + hw->len, HW_BREAKPOINT_SIZE);
++	hw_len = end_addr - start_addr;
+ 
+ 	if (dawr_enabled()) {
+ 		max_len = DAWR_MAX_LEN;
+ 		/* DAWR region can't cross 512 bytes boundary */
+-		if ((start_addr >> 9) != (end_addr >> 9))
++		if (ALIGN(start_addr, SZ_512M) != ALIGN(end_addr - 1, SZ_512M))
+ 			return -EINVAL;
+ 	} else if (IS_ENABLED(CONFIG_PPC_8xx)) {
+ 		/* 8xx can setup a range without limitation */
+
+commit c9e82aeb197df2d93b1b4234bc0c80943fa594e8
+Author: Ravi Bangoria <ravi.bangoria@linux.ibm.com>
+Date:   Thu May 14 16:47:36 2020 +0530
+
+    powerpc/watchpoint: Introduce is_ptrace_bp() function
+    
+    Introduce is_ptrace_bp() function and move the check inside the
+    function. It will be utilize more in later set of patches.
+    
+    Signed-off-by: Ravi Bangoria <ravi.bangoria@linux.ibm.com>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+    Reviewed-by: Michael Neuling <mikey@neuling.org>
+    Link: https://lore.kernel.org/r/20200514111741.97993-12-ravi.bangoria@linux.ibm.com
+
+diff --git a/arch/powerpc/kernel/hw_breakpoint.c b/arch/powerpc/kernel/hw_breakpoint.c
+index 917cca73dbc3..8028a2704874 100644
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@ -91,6 +91,11 @@ void arch_uninstall_hw_breakpoint(struct perf_event *bp)
+ 	hw_breakpoint_disable();
+ }
+ 
++static bool is_ptrace_bp(struct perf_event *bp)
++{
++	return bp->overflow_handler == ptrace_triggered;
++}
++
+ /*
+  * Perform cleanup of arch-specific counters during unregistration
+  * of the perf-event
+@@ -325,7 +330,7 @@ int hw_breakpoint_handler(struct die_args *args)
+ 	 * one-shot mode. The ptrace-ed process will receive the SIGTRAP signal
+ 	 * generated in do_dabr().
+ 	 */
+-	if (bp->overflow_handler == ptrace_triggered) {
++	if (is_ptrace_bp(bp)) {
+ 		perf_bp_event(bp, regs);
+ 		rc = NOTIFY_DONE;
+ 		goto out;
+
+commit 6b424efa119d5ea06b15ff240dddc3b4b9f9cdfb
+Author: Ravi Bangoria <ravi.bangoria@linux.ibm.com>
+Date:   Thu May 14 16:47:35 2020 +0530
+
+    powerpc/watchpoint: Use loop for thread_struct->ptrace_bps
+    
+    ptrace_bps is already an array of size HBP_NUM_MAX. But we use
+    hardcoded index 0 while fetching/updating it. Convert such code
+    to loop over array.
+    
+    ptrace interface to use multiple watchpoint remains same. eg:
+    two PPC_PTRACE_SETHWDEBUG calls will create two watchpoint if
+    underneath hw supports it.
+    
+    Signed-off-by: Ravi Bangoria <ravi.bangoria@linux.ibm.com>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+    Reviewed-by: Michael Neuling <mikey@neuling.org>
+    Link: https://lore.kernel.org/r/20200514111741.97993-11-ravi.bangoria@linux.ibm.com
+
+diff --git a/arch/powerpc/kernel/hw_breakpoint.c b/arch/powerpc/kernel/hw_breakpoint.c
+index f5472402c06d..917cca73dbc3 100644
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@ -420,10 +420,13 @@ NOKPROBE_SYMBOL(hw_breakpoint_exceptions_notify);
+  */
+ void flush_ptrace_hw_breakpoint(struct task_struct *tsk)
+ {
++	int i;
+ 	struct thread_struct *t = &tsk->thread;
+ 
+-	unregister_hw_breakpoint(t->ptrace_bps[0]);
+-	t->ptrace_bps[0] = NULL;
++	for (i = 0; i < nr_wp_slots(); i++) {
++		unregister_hw_breakpoint(t->ptrace_bps[i]);
++		t->ptrace_bps[i] = NULL;
++	}
+ }
+ 
+ void hw_breakpoint_pmu_read(struct perf_event *bp)
+
+commit 4a8a9379f2af4c9928529b3959bc2d8f7023c6bc
+Author: Ravi Bangoria <ravi.bangoria@linux.ibm.com>
+Date:   Thu May 14 16:47:31 2020 +0530
+
+    powerpc/watchpoint: Provide DAWR number to __set_breakpoint
+    
+    Introduce new parameter 'nr' to __set_breakpoint() which indicates
+    which DAWR should be programed. Also convert current_brk variable
+    to an array.
+    
+    Signed-off-by: Ravi Bangoria <ravi.bangoria@linux.ibm.com>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+    Reviewed-by: Michael Neuling <mikey@neuling.org>
+    Link: https://lore.kernel.org/r/20200514111741.97993-7-ravi.bangoria@linux.ibm.com
+
+diff --git a/arch/powerpc/kernel/hw_breakpoint.c b/arch/powerpc/kernel/hw_breakpoint.c
+index 01f07d91df70..f5472402c06d 100644
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@ -64,7 +64,7 @@ int arch_install_hw_breakpoint(struct perf_event *bp)
+ 	 * If so, DABR will be populated in single_step_dabr_instruction().
+ 	 */
+ 	if (current->thread.last_hit_ubp != bp)
+-		__set_breakpoint(info);
++		__set_breakpoint(0, info);
+ 
+ 	return 0;
+ }
+@@ -222,7 +222,7 @@ void thread_change_pc(struct task_struct *tsk, struct pt_regs *regs)
+ 
+ 	info = counter_arch_bp(tsk->thread.last_hit_ubp);
+ 	regs->msr &= ~MSR_SE;
+-	__set_breakpoint(info);
++	__set_breakpoint(0, info);
+ 	tsk->thread.last_hit_ubp = NULL;
+ }
+ 
+@@ -347,7 +347,7 @@ int hw_breakpoint_handler(struct die_args *args)
+ 	if (!(info->type & HW_BRK_TYPE_EXTRANEOUS_IRQ))
+ 		perf_bp_event(bp, regs);
+ 
+-	__set_breakpoint(info);
++	__set_breakpoint(0, info);
+ out:
+ 	rcu_read_unlock();
+ 	return rc;
+@@ -380,7 +380,7 @@ static int single_step_dabr_instruction(struct die_args *args)
+ 	if (!(info->type & HW_BRK_TYPE_EXTRANEOUS_IRQ))
+ 		perf_bp_event(bp, regs);
+ 
+-	__set_breakpoint(info);
++	__set_breakpoint(0, info);
+ 	current->thread.last_hit_ubp = NULL;
+ 
+ 	/*
+
+commit a6ba44e8799230e36c8ab06fda7f77f421e9e795
+Author: Ravi Bangoria <ravi.bangoria@linux.ibm.com>
+Date:   Thu May 14 16:47:28 2020 +0530
+
+    powerpc/watchpoint: Introduce function to get nr watchpoints dynamically
+    
+    So far we had only one watchpoint, so we have hardcoded HBP_NUM to 1.
+    But Power10 is introducing 2nd DAWR and thus kernel should be able to
+    dynamically find actual number of watchpoints supported by hw it's
+    running on. Introduce function for the same. Also convert HBP_NUM macro
+    to HBP_NUM_MAX, which will now represent maximum number of watchpoints
+    supported by Powerpc.
+    
+    Signed-off-by: Ravi Bangoria <ravi.bangoria@linux.ibm.com>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+    Reviewed-by: Michael Neuling <mikey@neuling.org>
+    Link: https://lore.kernel.org/r/20200514111741.97993-4-ravi.bangoria@linux.ibm.com
+
+diff --git a/arch/powerpc/kernel/hw_breakpoint.c b/arch/powerpc/kernel/hw_breakpoint.c
+index 423603c92c0f..01f07d91df70 100644
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@ -39,7 +39,7 @@ static DEFINE_PER_CPU(struct perf_event *, bp_per_reg);
+ int hw_breakpoint_slots(int type)
+ {
+ 	if (type == TYPE_DATA)
+-		return HBP_NUM;
++		return nr_wp_slots();
+ 	return 0;		/* no instruction breakpoints available */
+ }
+ 
+
+commit 5249385ad7f0ac178433f0ae9cc5b64612c8ff77
+Author: Jordan Niethe <jniethe5@gmail.com>
+Date:   Wed May 6 13:40:36 2020 +1000
+
+    powerpc: Define and use get_user_instr() et. al.
+    
+    Define specialised get_user_instr(), __get_user_instr() and
+    __get_user_instr_inatomic() macros for reading instructions from user
+    and/or kernel space.
+    
+    Signed-off-by: Jordan Niethe <jniethe5@gmail.com>
+    Reviewed-by: Alistair Popple <alistair@popple.id.au>
+    [mpe: Squash in addition of get_user_instr() & __user annotations]
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+    Link: https://lore.kernel.org/r/20200506034050.24806-17-jniethe5@gmail.com
+
+diff --git a/arch/powerpc/kernel/hw_breakpoint.c b/arch/powerpc/kernel/hw_breakpoint.c
+index 2db9a7ac7bcb..423603c92c0f 100644
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@ -249,7 +249,7 @@ static bool stepping_handler(struct pt_regs *regs, struct perf_event *bp,
+ 	struct instruction_op op;
+ 	unsigned long addr = info->address;
+ 
+-	if (__get_user_inatomic(instr.val, (unsigned int *)regs->nip))
++	if (__get_user_instr_inatomic(instr, (void __user *)regs->nip))
+ 		goto fail;
+ 
+ 	ret = analyse_instr(&op, regs, instr);
+
+commit 94afd069d937d84fb4f696eb9a78db4084e43d21
+Author: Jordan Niethe <jniethe5@gmail.com>
+Date:   Wed May 6 13:40:31 2020 +1000
+
+    powerpc: Use a datatype for instructions
+    
+    Currently unsigned ints are used to represent instructions on powerpc.
+    This has worked well as instructions have always been 4 byte words.
+    
+    However, ISA v3.1 introduces some changes to instructions that mean
+    this scheme will no longer work as well. This change is Prefixed
+    Instructions. A prefixed instruction is made up of a word prefix
+    followed by a word suffix to make an 8 byte double word instruction.
+    No matter the endianness of the system the prefix always comes first.
+    Prefixed instructions are only planned for powerpc64.
+    
+    Introduce a ppc_inst type to represent both prefixed and word
+    instructions on powerpc64 while keeping it possible to exclusively
+    have word instructions on powerpc32.
+    
+    Signed-off-by: Jordan Niethe <jniethe5@gmail.com>
+    [mpe: Fix compile error in emulate_spe()]
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+    Link: https://lore.kernel.org/r/20200506034050.24806-12-jniethe5@gmail.com
+
+diff --git a/arch/powerpc/kernel/hw_breakpoint.c b/arch/powerpc/kernel/hw_breakpoint.c
+index 46e09ac8b84a..2db9a7ac7bcb 100644
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@ -244,12 +244,12 @@ dar_range_overlaps(unsigned long dar, int size, struct arch_hw_breakpoint *info)
+ static bool stepping_handler(struct pt_regs *regs, struct perf_event *bp,
+ 			     struct arch_hw_breakpoint *info)
+ {
+-	unsigned int instr = ppc_inst(0);
++	struct ppc_inst instr = ppc_inst(0);
+ 	int ret, type, size;
+ 	struct instruction_op op;
+ 	unsigned long addr = info->address;
+ 
+-	if (__get_user_inatomic(instr, (unsigned int *)regs->nip))
++	if (__get_user_inatomic(instr.val, (unsigned int *)regs->nip))
+ 		goto fail;
+ 
+ 	ret = analyse_instr(&op, regs, instr);
+
+commit 753462512868674a788ecc77bb96752efb818785
+Author: Jordan Niethe <jniethe5@gmail.com>
+Date:   Wed May 6 13:40:26 2020 +1000
+
+    powerpc: Use a macro for creating instructions from u32s
+    
+    In preparation for instructions having a more complex data type start
+    using a macro, ppc_inst(), for making an instruction out of a u32.  A
+    macro is used so that instructions can be used as initializer elements.
+    Currently this does nothing, but it will allow for creating a data type
+    that can represent prefixed instructions.
+    
+    Signed-off-by: Jordan Niethe <jniethe5@gmail.com>
+    [mpe: Change include guard to _ASM_POWERPC_INST_H]
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+    Reviewed-by: Alistair Popple <alistair@popple.id.au>
+    Link: https://lore.kernel.org/r/20200506034050.24806-7-jniethe5@gmail.com
+
+diff --git a/arch/powerpc/kernel/hw_breakpoint.c b/arch/powerpc/kernel/hw_breakpoint.c
+index 72f461bd70fb..46e09ac8b84a 100644
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@ -24,6 +24,7 @@
+ #include <asm/debug.h>
+ #include <asm/debugfs.h>
+ #include <asm/hvcall.h>
++#include <asm/inst.h>
+ #include <linux/uaccess.h>
+ 
+ /*
+@@ -243,7 +244,7 @@ dar_range_overlaps(unsigned long dar, int size, struct arch_hw_breakpoint *info)
+ static bool stepping_handler(struct pt_regs *regs, struct perf_event *bp,
+ 			     struct arch_hw_breakpoint *info)
+ {
+-	unsigned int instr = 0;
++	unsigned int instr = ppc_inst(0);
+ 	int ret, type, size;
+ 	struct instruction_op op;
+ 	unsigned long addr = info->address;
+
+commit ccbed90b8207851fa759e81cc9ab083f9b6496c1
+Author: Christophe Leroy <christophe.leroy@c-s.fr>
+Date:   Fri Feb 28 00:14:49 2020 +0000
+
+    powerpc/ptrace: move ptrace_triggered() into hw_breakpoint.c
+    
+    ptrace_triggered() is declared in asm/hw_breakpoint.h and
+    only needed when CONFIG_HW_BREAKPOINT is set, so move it
+    into hw_breakpoint.c
+    
+    Signed-off-by: Christophe Leroy <christophe.leroy@c-s.fr>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+    Link: https://lore.kernel.org/r/8402c516023da1371953a65af7df2008758ea0c4.1582848567.git.christophe.leroy@c-s.fr
+
+diff --git a/arch/powerpc/kernel/hw_breakpoint.c b/arch/powerpc/kernel/hw_breakpoint.c
+index d0854320bb50..72f461bd70fb 100644
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@ -429,3 +429,19 @@ void hw_breakpoint_pmu_read(struct perf_event *bp)
+ {
+ 	/* TODO */
+ }
++
++void ptrace_triggered(struct perf_event *bp,
++		      struct perf_sample_data *data, struct pt_regs *regs)
++{
++	struct perf_event_attr attr;
++
++	/*
++	 * Disable the breakpoint request here since ptrace has defined a
++	 * one-shot behaviour for breakpoint exceptions in PPC64.
++	 * The SIGTRAP signal is generated automatically for us in do_dabr().
++	 * We don't have to do anything about that here
++	 */
++	attr = bp->attr;
++	attr.disabled = true;
++	modify_user_hw_breakpoint(bp, &attr);
++}
+
+commit e08658a657f974590809290c62e889f0fd420200
+Author: Ravi Bangoria <ravi.bangoria@linux.ibm.com>
+Date:   Sat Feb 22 13:50:49 2020 +0530
+
+    powerpc/watchpoint: Don't call dar_within_range() for Book3S
+    
+    DAR is set to the first byte of overlap between actual access and
+    watched range at DSI on Book3S processor. But actual access range
+    might or might not be within user asked range. So for Book3S, it
+    must not call dar_within_range().
+    
+    This revert portion of commit 39413ae00967 ("powerpc/hw_breakpoints:
+    Rewrite 8xx breakpoints to allow any address range size.").
+    
+    Before patch:
+      # ./tools/testing/selftests/powerpc/ptrace/perf-hwbreak
+      ...
+      TESTED: No overlap
+      FAILED: Partial overlap: 0 != 2
+      TESTED: Partial overlap
+      TESTED: No overlap
+      FAILED: Full overlap: 0 != 2
+      failure: perf_hwbreak
+    
+    After patch:
+      TESTED: No overlap
+      TESTED: Partial overlap
+      TESTED: Partial overlap
+      TESTED: No overlap
+      TESTED: Full overlap
+      success: perf_hwbreak
+    
+    Fixes: 39413ae00967 ("powerpc/hw_breakpoints: Rewrite 8xx breakpoints to allow any address range size.")
+    Reported-by: Michael Ellerman <mpe@ellerman.id.au>
+    Signed-off-by: Ravi Bangoria <ravi.bangoria@linux.ibm.com>
+    Reviewed-by: Christophe Leroy <christophe.leroy@c-s.fr>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+    Link: https://lore.kernel.org/r/20200222082049.330435-1-ravi.bangoria@linux.ibm.com
+
+diff --git a/arch/powerpc/kernel/hw_breakpoint.c b/arch/powerpc/kernel/hw_breakpoint.c
+index 2462cd7c565c..d0854320bb50 100644
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@ -331,11 +331,13 @@ int hw_breakpoint_handler(struct die_args *args)
+ 	}
+ 
+ 	info->type &= ~HW_BRK_TYPE_EXTRANEOUS_IRQ;
+-	if (!dar_within_range(regs->dar, info))
+-		info->type |= HW_BRK_TYPE_EXTRANEOUS_IRQ;
+-
+-	if (!IS_ENABLED(CONFIG_PPC_8xx) && !stepping_handler(regs, bp, info))
+-		goto out;
++	if (IS_ENABLED(CONFIG_PPC_8xx)) {
++		if (!dar_within_range(regs->dar, info))
++			info->type |= HW_BRK_TYPE_EXTRANEOUS_IRQ;
++	} else {
++		if (!stepping_handler(regs, bp, info))
++			goto out;
++	}
+ 
+ 	/*
+ 	 * As a policy, the callback is invoked in a 'trigger-after-execute'
+
+commit 39413ae009674c6ba745850515b551bbb9d6374b
+Author: Christophe Leroy <christophe.leroy@c-s.fr>
+Date:   Tue Nov 26 17:43:29 2019 +0000
+
+    powerpc/hw_breakpoints: Rewrite 8xx breakpoints to allow any address range size.
+    
+    Unlike standard powerpc, Powerpc 8xx doesn't have SPRN_DABR, but
+    it has a breakpoint support based on a set of comparators which
+    allow more flexibility.
+    
+    Commit 4ad8622dc548 ("powerpc/8xx: Implement hw_breakpoint")
+    implemented breakpoints by emulating the DABR behaviour. It did
+    this by setting one comparator the match 4 bytes at breakpoint address
+    and the other comparator to match 4 bytes at breakpoint address + 4.
+    
+    Rewrite 8xx hw_breakpoint to make breakpoints match all addresses
+    defined by the breakpoint address and length by making full use of
+    comparators.
+    
+    Now, comparator E is set to match any address greater than breakpoint
+    address minus one. Comparator F is set to match any address lower than
+    breakpoint address plus breakpoint length. Addresses are aligned
+    to 32 bits.
+    
+    When the breakpoint range starts at address 0, the breakpoint is set
+    to match comparator F only. When the breakpoint range end at address
+    0xffffffff, the breakpoint is set to match comparator E only.
+    Otherwise the breakpoint is set to match comparator E and F.
+    
+    At the same time, use registers bit names instead of hardcoded values.
+    
+    Signed-off-by: Christophe Leroy <christophe.leroy@c-s.fr>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+    Link: https://lore.kernel.org/r/05105deeaf63bc02151aea2cdeaf525534e0e9d4.1574790198.git.christophe.leroy@c-s.fr
+
+diff --git a/arch/powerpc/kernel/hw_breakpoint.c b/arch/powerpc/kernel/hw_breakpoint.c
+index 58ce3d37c2a3..2462cd7c565c 100644
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@ -160,6 +160,9 @@ static int hw_breakpoint_validate_len(struct arch_hw_breakpoint *hw)
+ 		/* DAWR region can't cross 512 bytes boundary */
+ 		if ((start_addr >> 9) != (end_addr >> 9))
+ 			return -EINVAL;
++	} else if (IS_ENABLED(CONFIG_PPC_8xx)) {
++		/* 8xx can setup a range without limitation */
++		max_len = U16_MAX;
+ 	}
+ 
+ 	if (hw_len > max_len)
+@@ -328,13 +331,11 @@ int hw_breakpoint_handler(struct die_args *args)
+ 	}
+ 
+ 	info->type &= ~HW_BRK_TYPE_EXTRANEOUS_IRQ;
+-	if (IS_ENABLED(CONFIG_PPC_8xx)) {
+-		if (!dar_within_range(regs->dar, info))
+-			info->type |= HW_BRK_TYPE_EXTRANEOUS_IRQ;
+-	} else {
+-		if (!stepping_handler(regs, bp, info))
+-			goto out;
+-	}
++	if (!dar_within_range(regs->dar, info))
++		info->type |= HW_BRK_TYPE_EXTRANEOUS_IRQ;
++
++	if (!IS_ENABLED(CONFIG_PPC_8xx) && !stepping_handler(regs, bp, info))
++		goto out;
+ 
+ 	/*
+ 	 * As a policy, the callback is invoked in a 'trigger-after-execute'
+
+commit 27985b2a640e24ce51810aadd0e93d5e0833c9b7
+Author: Ravi Bangoria <ravi.bangoria@linux.ibm.com>
+Date:   Thu Oct 17 15:02:01 2019 +0530
+
+    powerpc/watchpoint: Don't ignore extraneous exceptions blindly
+    
+    On powerpc, watchpoint match range is double-word granular. On a
+    watchpoint hit, DAR is set to the first byte of overlap between actual
+    access and watched range. And thus it's quite possible that DAR does
+    not point inside user specified range. Ex, say user creates a
+    watchpoint with address range 0x1004 to 0x1007. So hw would be
+    configured to watch from 0x1000 to 0x1007. If there is a 4 byte access
+    from 0x1002 to 0x1005, DAR will point to 0x1002 and thus interrupt
+    handler considers it as extraneous, but it's actually not, because
+    part of the access belongs to what user has asked.
+    
+    Instead of blindly ignoring the exception, get actual address range by
+    analysing an instruction, and ignore only if actual range does not
+    overlap with user specified range.
+    
+    Note: The behavior is unchanged for 8xx.
+    
+    Signed-off-by: Ravi Bangoria <ravi.bangoria@linux.ibm.com>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+    Link: https://lore.kernel.org/r/20191017093204.7511-5-ravi.bangoria@linux.ibm.com
+
+diff --git a/arch/powerpc/kernel/hw_breakpoint.c b/arch/powerpc/kernel/hw_breakpoint.c
+index f36274d426ed..58ce3d37c2a3 100644
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@ -222,33 +222,49 @@ void thread_change_pc(struct task_struct *tsk, struct pt_regs *regs)
+ 	tsk->thread.last_hit_ubp = NULL;
+ }
+ 
+-static bool is_larx_stcx_instr(struct pt_regs *regs, unsigned int instr)
++static bool dar_within_range(unsigned long dar, struct arch_hw_breakpoint *info)
+ {
+-	int ret, type;
+-	struct instruction_op op;
++	return ((info->address <= dar) && (dar - info->address < info->len));
++}
+ 
+-	ret = analyse_instr(&op, regs, instr);
+-	type = GETTYPE(op.type);
+-	return (!ret && (type == LARX || type == STCX));
++static bool
++dar_range_overlaps(unsigned long dar, int size, struct arch_hw_breakpoint *info)
++{
++	return ((dar <= info->address + info->len - 1) &&
++		(dar + size - 1 >= info->address));
+ }
+ 
+ /*
+  * Handle debug exception notifications.
+  */
+ static bool stepping_handler(struct pt_regs *regs, struct perf_event *bp,
+-			     unsigned long addr)
++			     struct arch_hw_breakpoint *info)
+ {
+ 	unsigned int instr = 0;
++	int ret, type, size;
++	struct instruction_op op;
++	unsigned long addr = info->address;
+ 
+ 	if (__get_user_inatomic(instr, (unsigned int *)regs->nip))
+ 		goto fail;
+ 
+-	if (is_larx_stcx_instr(regs, instr)) {
++	ret = analyse_instr(&op, regs, instr);
++	type = GETTYPE(op.type);
++	size = GETSIZE(op.type);
++
++	if (!ret && (type == LARX || type == STCX)) {
+ 		printk_ratelimited("Breakpoint hit on instruction that can't be emulated."
+ 				   " Breakpoint at 0x%lx will be disabled.\n", addr);
+ 		goto disable;
+ 	}
+ 
++	/*
++	 * If it's extraneous event, we still need to emulate/single-
++	 * step the instruction, but we don't generate an event.
++	 */
++	if (size && !dar_range_overlaps(regs->dar, size, info))
++		info->type |= HW_BRK_TYPE_EXTRANEOUS_IRQ;
++
+ 	/* Do not emulate user-space instructions, instead single-step them */
+ 	if (user_mode(regs)) {
+ 		current->thread.last_hit_ubp = bp;
+@@ -280,7 +296,6 @@ int hw_breakpoint_handler(struct die_args *args)
+ 	struct perf_event *bp;
+ 	struct pt_regs *regs = args->regs;
+ 	struct arch_hw_breakpoint *info;
+-	unsigned long dar = regs->dar;
+ 
+ 	/* Disable breakpoints during exception handling */
+ 	hw_breakpoint_disable();
+@@ -312,19 +327,14 @@ int hw_breakpoint_handler(struct die_args *args)
+ 		goto out;
+ 	}
+ 
+-	/*
+-	 * Verify if dar lies within the address range occupied by the symbol
+-	 * being watched to filter extraneous exceptions.  If it doesn't,
+-	 * we still need to single-step the instruction, but we don't
+-	 * generate an event.
+-	 */
+ 	info->type &= ~HW_BRK_TYPE_EXTRANEOUS_IRQ;
+-	if (!((bp->attr.bp_addr <= dar) &&
+-	      (dar - bp->attr.bp_addr < bp->attr.bp_len)))
+-		info->type |= HW_BRK_TYPE_EXTRANEOUS_IRQ;
+-
+-	if (!IS_ENABLED(CONFIG_PPC_8xx) && !stepping_handler(regs, bp, info->address))
+-		goto out;
++	if (IS_ENABLED(CONFIG_PPC_8xx)) {
++		if (!dar_within_range(regs->dar, info))
++			info->type |= HW_BRK_TYPE_EXTRANEOUS_IRQ;
++	} else {
++		if (!stepping_handler(regs, bp, info))
++			goto out;
++	}
+ 
+ 	/*
+ 	 * As a policy, the callback is invoked in a 'trigger-after-execute'
+
+commit b57aeab811db07295f646808b1b17c312d17f57d
+Author: Ravi Bangoria <ravi.bangoria@linux.ibm.com>
+Date:   Thu Oct 17 15:01:59 2019 +0530
+
+    powerpc/watchpoint: Fix length calculation for unaligned target
+    
+    Watchpoint match range is always doubleword(8 bytes) aligned on
+    powerpc. If the given range is crossing doubleword boundary, we need
+    to increase the length such that next doubleword also get
+    covered. Ex,
+    
+              address   len = 6 bytes
+                    |=========.
+       |------------v--|------v--------|
+       | | | | | | | | | | | | | | | | |
+       |---------------|---------------|
+        <---8 bytes--->
+    
+    In such case, current code configures hw as:
+      start_addr = address & ~HW_BREAKPOINT_ALIGN
+      len = 8 bytes
+    
+    And thus read/write in last 4 bytes of the given range is ignored.
+    Fix this by including next doubleword in the length.
+    
+    Signed-off-by: Ravi Bangoria <ravi.bangoria@linux.ibm.com>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+    Link: https://lore.kernel.org/r/20191017093204.7511-3-ravi.bangoria@linux.ibm.com
+
+diff --git a/arch/powerpc/kernel/hw_breakpoint.c b/arch/powerpc/kernel/hw_breakpoint.c
+index 677041cb3c3e..f36274d426ed 100644
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@ -126,6 +126,49 @@ int arch_bp_generic_fields(int type, int *gen_bp_type)
+ 	return 0;
+ }
+ 
++/*
++ * Watchpoint match range is always doubleword(8 bytes) aligned on
++ * powerpc. If the given range is crossing doubleword boundary, we
++ * need to increase the length such that next doubleword also get
++ * covered. Ex,
++ *
++ *          address   len = 6 bytes
++ *                |=========.
++ *   |------------v--|------v--------|
++ *   | | | | | | | | | | | | | | | | |
++ *   |---------------|---------------|
++ *    <---8 bytes--->
++ *
++ * In this case, we should configure hw as:
++ *   start_addr = address & ~HW_BREAKPOINT_ALIGN
++ *   len = 16 bytes
++ *
++ * @start_addr and @end_addr are inclusive.
++ */
++static int hw_breakpoint_validate_len(struct arch_hw_breakpoint *hw)
++{
++	u16 max_len = DABR_MAX_LEN;
++	u16 hw_len;
++	unsigned long start_addr, end_addr;
++
++	start_addr = hw->address & ~HW_BREAKPOINT_ALIGN;
++	end_addr = (hw->address + hw->len - 1) | HW_BREAKPOINT_ALIGN;
++	hw_len = end_addr - start_addr + 1;
++
++	if (dawr_enabled()) {
++		max_len = DAWR_MAX_LEN;
++		/* DAWR region can't cross 512 bytes boundary */
++		if ((start_addr >> 9) != (end_addr >> 9))
++			return -EINVAL;
++	}
++
++	if (hw_len > max_len)
++		return -EINVAL;
++
++	hw->hw_len = hw_len;
++	return 0;
++}
++
+ /*
+  * Validate the arch-specific HW Breakpoint register settings
+  */
+@@ -133,9 +176,9 @@ int hw_breakpoint_arch_parse(struct perf_event *bp,
+ 			     const struct perf_event_attr *attr,
+ 			     struct arch_hw_breakpoint *hw)
+ {
+-	int ret = -EINVAL, length_max;
++	int ret = -EINVAL;
+ 
+-	if (!bp)
++	if (!bp || !attr->bp_len)
+ 		return ret;
+ 
+ 	hw->type = HW_BRK_TYPE_TRANSLATE;
+@@ -155,26 +198,10 @@ int hw_breakpoint_arch_parse(struct perf_event *bp,
+ 	hw->address = attr->bp_addr;
+ 	hw->len = attr->bp_len;
+ 
+-	/*
+-	 * Since breakpoint length can be a maximum of HW_BREAKPOINT_LEN(8)
+-	 * and breakpoint addresses are aligned to nearest double-word
+-	 * HW_BREAKPOINT_ALIGN by rounding off to the lower address, the
+-	 * 'symbolsize' should satisfy the check below.
+-	 */
+ 	if (!ppc_breakpoint_available())
+ 		return -ENODEV;
+-	length_max = DABR_MAX_LEN; /* DABR */
+-	if (dawr_enabled()) {
+-		length_max = DAWR_MAX_LEN; /* 64 doublewords */
+-		/* DAWR region can't cross 512 boundary */
+-		if ((attr->bp_addr >> 9) !=
+-		    ((attr->bp_addr + attr->bp_len - 1) >> 9))
+-			return -EINVAL;
+-	}
+-	if (hw->len >
+-	    (length_max - (hw->address & HW_BREAKPOINT_ALIGN)))
+-		return -EINVAL;
+-	return 0;
++
++	return hw_breakpoint_validate_len(hw);
+ }
+ 
+ /*
+
+commit b811be615cb78c90fca42bbd5b958427d03ba7e0
+Author: Ravi Bangoria <ravi.bangoria@linux.ibm.com>
+Date:   Thu Oct 17 15:01:58 2019 +0530
+
+    powerpc/watchpoint: Introduce macros for watchpoint length
+    
+    We are hadrcoding length everywhere in the watchpoint code. Introduce
+    macros for the length and use them.
+    
+    Signed-off-by: Ravi Bangoria <ravi.bangoria@linux.ibm.com>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+    Link: https://lore.kernel.org/r/20191017093204.7511-2-ravi.bangoria@linux.ibm.com
+
+diff --git a/arch/powerpc/kernel/hw_breakpoint.c b/arch/powerpc/kernel/hw_breakpoint.c
+index 1007ec36b4cb..677041cb3c3e 100644
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@ -163,9 +163,9 @@ int hw_breakpoint_arch_parse(struct perf_event *bp,
+ 	 */
+ 	if (!ppc_breakpoint_available())
+ 		return -ENODEV;
+-	length_max = 8; /* DABR */
++	length_max = DABR_MAX_LEN; /* DABR */
+ 	if (dawr_enabled()) {
+-		length_max = 512 ; /* 64 doublewords */
++		length_max = DAWR_MAX_LEN; /* 64 doublewords */
+ 		/* DAWR region can't cross 512 boundary */
+ 		if ((attr->bp_addr >> 9) !=
+ 		    ((attr->bp_addr + attr->bp_len - 1) >> 9))
+
+commit bc01bdf6c5df5023272a7399962cf64f8fedc93e
+Author: Ravi Bangoria <ravi.bangoria@linux.ibm.com>
+Date:   Tue Sep 10 18:45:13 2019 +0530
+
+    powerpc/watchpoint: Disable watchpoint hit by larx/stcx instructions
+    
+    If watchpoint exception is generated by larx/stcx instructions, the
+    reservation created by larx gets lost while handling exception, and
+    thus stcx instruction always fails. Generally these instructions are
+    used in a while(1) loop, for example spinlocks. And because stcx
+    never succeeds, it loops forever and ultimately hangs the system.
+    
+    Note that ptrace anyway works in one-shot mode and thus for ptrace
+    we don't change the behaviour. It's up to ptrace user to take care
+    of this.
+    
+    Signed-off-by: Ravi Bangoria <ravi.bangoria@linux.ibm.com>
+    Acked-by: Naveen N. Rao <naveen.n.rao@linux.vnet.ibm.com>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+    Link: https://lore.kernel.org/r/20190910131513.30499-1-ravi.bangoria@linux.ibm.com
+
+diff --git a/arch/powerpc/kernel/hw_breakpoint.c b/arch/powerpc/kernel/hw_breakpoint.c
+index 28ad3171bb82..1007ec36b4cb 100644
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@ -195,14 +195,32 @@ void thread_change_pc(struct task_struct *tsk, struct pt_regs *regs)
+ 	tsk->thread.last_hit_ubp = NULL;
+ }
+ 
++static bool is_larx_stcx_instr(struct pt_regs *regs, unsigned int instr)
++{
++	int ret, type;
++	struct instruction_op op;
++
++	ret = analyse_instr(&op, regs, instr);
++	type = GETTYPE(op.type);
++	return (!ret && (type == LARX || type == STCX));
++}
++
+ /*
+  * Handle debug exception notifications.
+  */
+ static bool stepping_handler(struct pt_regs *regs, struct perf_event *bp,
+ 			     unsigned long addr)
+ {
+-	int stepped;
+-	unsigned int instr;
++	unsigned int instr = 0;
++
++	if (__get_user_inatomic(instr, (unsigned int *)regs->nip))
++		goto fail;
++
++	if (is_larx_stcx_instr(regs, instr)) {
++		printk_ratelimited("Breakpoint hit on instruction that can't be emulated."
++				   " Breakpoint at 0x%lx will be disabled.\n", addr);
++		goto disable;
++	}
+ 
+ 	/* Do not emulate user-space instructions, instead single-step them */
+ 	if (user_mode(regs)) {
+@@ -211,23 +229,22 @@ static bool stepping_handler(struct pt_regs *regs, struct perf_event *bp,
+ 		return false;
+ 	}
+ 
+-	stepped = 0;
+-	instr = 0;
+-	if (!__get_user_inatomic(instr, (unsigned int *)regs->nip))
+-		stepped = emulate_step(regs, instr);
++	if (!emulate_step(regs, instr))
++		goto fail;
+ 
++	return true;
++
++fail:
+ 	/*
+-	 * emulate_step() could not execute it. We've failed in reliably
+-	 * handling the hw-breakpoint. Unregister it and throw a warning
+-	 * message to let the user know about it.
++	 * We've failed in reliably handling the hw-breakpoint. Unregister
++	 * it and throw a warning message to let the user know about it.
+ 	 */
+-	if (!stepped) {
+-		WARN(1, "Unable to handle hardware breakpoint. Breakpoint at "
+-			"0x%lx will be disabled.", addr);
+-		perf_event_disable_inatomic(bp);
+-		return false;
+-	}
+-	return true;
++	WARN(1, "Unable to handle hardware breakpoint. Breakpoint at "
++		"0x%lx will be disabled.", addr);
++
++disable:
++	perf_event_disable_inatomic(bp);
++	return false;
+ }
+ 
+ int hw_breakpoint_handler(struct die_args *args)
+
+commit 658d029df0bce6472c94b724ca54d74bc6659c2e
+Author: Christophe Leroy <christophe.leroy@c-s.fr>
+Date:   Fri Jun 28 15:55:52 2019 +0000
+
+    powerpc/hw_breakpoint: move instruction stepping out of hw_breakpoint_handler()
+    
+    On 8xx, breakpoints stop after executing the instruction, so
+    stepping/emulation is not needed. Move it into a sub-function and
+    remove the #ifdefs.
+    
+    Signed-off-by: Christophe Leroy <christophe.leroy@c-s.fr>
+    Reviewed-by: Ravi Bangoria <ravi.bangoria@linux.ibm.com>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+    Link: https://lore.kernel.org/r/f8cdc3f1c66ad3c43ebc568abcc6c39ed4676284.1561737231.git.christophe.leroy@c-s.fr
+
+diff --git a/arch/powerpc/kernel/hw_breakpoint.c b/arch/powerpc/kernel/hw_breakpoint.c
+index c8d1fa2e9d53..28ad3171bb82 100644
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@ -198,15 +198,43 @@ void thread_change_pc(struct task_struct *tsk, struct pt_regs *regs)
+ /*
+  * Handle debug exception notifications.
+  */
++static bool stepping_handler(struct pt_regs *regs, struct perf_event *bp,
++			     unsigned long addr)
++{
++	int stepped;
++	unsigned int instr;
++
++	/* Do not emulate user-space instructions, instead single-step them */
++	if (user_mode(regs)) {
++		current->thread.last_hit_ubp = bp;
++		regs->msr |= MSR_SE;
++		return false;
++	}
++
++	stepped = 0;
++	instr = 0;
++	if (!__get_user_inatomic(instr, (unsigned int *)regs->nip))
++		stepped = emulate_step(regs, instr);
++
++	/*
++	 * emulate_step() could not execute it. We've failed in reliably
++	 * handling the hw-breakpoint. Unregister it and throw a warning
++	 * message to let the user know about it.
++	 */
++	if (!stepped) {
++		WARN(1, "Unable to handle hardware breakpoint. Breakpoint at "
++			"0x%lx will be disabled.", addr);
++		perf_event_disable_inatomic(bp);
++		return false;
++	}
++	return true;
++}
++
+ int hw_breakpoint_handler(struct die_args *args)
+ {
+ 	int rc = NOTIFY_STOP;
+ 	struct perf_event *bp;
+ 	struct pt_regs *regs = args->regs;
+-#ifndef CONFIG_PPC_8xx
+-	int stepped = 1;
+-	unsigned int instr;
+-#endif
+ 	struct arch_hw_breakpoint *info;
+ 	unsigned long dar = regs->dar;
+ 
+@@ -251,31 +279,9 @@ int hw_breakpoint_handler(struct die_args *args)
+ 	      (dar - bp->attr.bp_addr < bp->attr.bp_len)))
+ 		info->type |= HW_BRK_TYPE_EXTRANEOUS_IRQ;
+ 
+-#ifndef CONFIG_PPC_8xx
+-	/* Do not emulate user-space instructions, instead single-step them */
+-	if (user_mode(regs)) {
+-		current->thread.last_hit_ubp = bp;
+-		regs->msr |= MSR_SE;
++	if (!IS_ENABLED(CONFIG_PPC_8xx) && !stepping_handler(regs, bp, info->address))
+ 		goto out;
+-	}
+-
+-	stepped = 0;
+-	instr = 0;
+-	if (!__get_user_inatomic(instr, (unsigned int *) regs->nip))
+-		stepped = emulate_step(regs, instr);
+ 
+-	/*
+-	 * emulate_step() could not execute it. We've failed in reliably
+-	 * handling the hw-breakpoint. Unregister it and throw a warning
+-	 * message to let the user know about it.
+-	 */
+-	if (!stepped) {
+-		WARN(1, "Unable to handle hardware breakpoint. Breakpoint at "
+-			"0x%lx will be disabled.", info->address);
+-		perf_event_disable_inatomic(bp);
+-		goto out;
+-	}
+-#endif
+ 	/*
+ 	 * As a policy, the callback is invoked in a 'trigger-after-execute'
+ 	 * fashion
+
+commit 192f0f8e9db7efe4ac98d47f5fa4334e43c1204d
+Merge: ec9249752465 f5a9e488d623
+Author: Linus Torvalds <torvalds@linux-foundation.org>
+Date:   Sat Jul 13 16:08:36 2019 -0700
+
+    Merge tag 'powerpc-5.3-1' of git://git.kernel.org/pub/scm/linux/kernel/git/powerpc/linux
+    
+    Pull powerpc updates from Michael Ellerman:
+     "Notable changes:
+    
+       - Removal of the NPU DMA code, used by the out-of-tree Nvidia driver,
+         as well as some other functions only used by drivers that haven't
+         (yet?) made it upstream.
+    
+       - A fix for a bug in our handling of hardware watchpoints (eg. perf
+         record -e mem: ...) which could lead to register corruption and
+         kernel crashes.
+    
+       - Enable HAVE_ARCH_HUGE_VMAP, which allows us to use large pages for
+         vmalloc when using the Radix MMU.
+    
+       - A large but incremental rewrite of our exception handling code to
+         use gas macros rather than multiple levels of nested CPP macros.
+    
+      And the usual small fixes, cleanups and improvements.
+    
+      Thanks to: Alastair D'Silva, Alexey Kardashevskiy, Andreas Schwab,
+      Aneesh Kumar K.V, Anju T Sudhakar, Anton Blanchard, Arnd Bergmann,
+      Athira Rajeev, Cédric Le Goater, Christian Lamparter, Christophe
+      Leroy, Christophe Lombard, Christoph Hellwig, Daniel Axtens, Denis
+      Efremov, Enrico Weigelt, Frederic Barrat, Gautham R. Shenoy, Geert
+      Uytterhoeven, Geliang Tang, Gen Zhang, Greg Kroah-Hartman, Greg Kurz,
+      Gustavo Romero, Krzysztof Kozlowski, Madhavan Srinivasan, Masahiro
+      Yamada, Mathieu Malaterre, Michael Neuling, Nathan Lynch, Naveen N.
+      Rao, Nicholas Piggin, Nishad Kamdar, Oliver O'Halloran, Qian Cai, Ravi
+      Bangoria, Sachin Sant, Sam Bobroff, Satheesh Rajendran, Segher
+      Boessenkool, Shaokun Zhang, Shawn Anastasio, Stewart Smith, Suraj
+      Jitindar Singh, Thiago Jung Bauermann, YueHaibing"
+    
+    * tag 'powerpc-5.3-1' of git://git.kernel.org/pub/scm/linux/kernel/git/powerpc/linux: (163 commits)
+      powerpc/powernv/idle: Fix restore of SPRN_LDBAR for POWER9 stop state.
+      powerpc/eeh: Handle hugepages in ioremap space
+      ocxl: Update for AFU descriptor template version 1.1
+      powerpc/boot: pass CONFIG options in a simpler and more robust way
+      powerpc/boot: add {get, put}_unaligned_be32 to xz_config.h
+      powerpc/irq: Don't WARN continuously in arch_local_irq_restore()
+      powerpc/module64: Use symbolic instructions names.
+      powerpc/module32: Use symbolic instructions names.
+      powerpc: Move PPC_HA() PPC_HI() and PPC_LO() to ppc-opcode.h
+      powerpc/module64: Fix comment in R_PPC64_ENTRY handling
+      powerpc/boot: Add lzo support for uImage
+      powerpc/boot: Add lzma support for uImage
+      powerpc/boot: don't force gzipped uImage
+      powerpc/8xx: Add microcode patch to move SMC parameter RAM.
+      powerpc/8xx: Use IO accessors in microcode programming.
+      powerpc/8xx: replace #ifdefs by IS_ENABLED() in microcode.c
+      powerpc/8xx: refactor programming of microcode CPM params.
+      powerpc/8xx: refactor printing of microcode patch name.
+      powerpc/8xx: Refactor microcode write
+      powerpc/8xx: refactor writing of CPM microcode arrays
+      ...
+
+commit a278e7ea608bea5fe6df9b6ae91fa134655c5d2c
+Author: Michael Neuling <mikey@neuling.org>
+Date:   Tue Jun 4 13:00:37 2019 +1000
+
+    powerpc: Fix compile issue with force DAWR
+    
+    If you compile with KVM but without CONFIG_HAVE_HW_BREAKPOINT you fail
+    at linking with:
+      arch/powerpc/kvm/book3s_hv_rmhandlers.o:(.text+0x708): undefined reference to `dawr_force_enable'
+    
+    This was caused by commit c1fe190c0672 ("powerpc: Add force enable of
+    DAWR on P9 option").
+    
+    This moves a bunch of code around to fix this. It moves a lot of the
+    DAWR code in a new file and creates a new CONFIG_PPC_DAWR to enable
+    compiling it.
+    
+    Fixes: c1fe190c0672 ("powerpc: Add force enable of DAWR on P9 option")
+    Signed-off-by: Michael Neuling <mikey@neuling.org>
+    [mpe: Minor formatting in set_dawr()]
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+
+diff --git a/arch/powerpc/kernel/hw_breakpoint.c b/arch/powerpc/kernel/hw_breakpoint.c
+index ca3a2358b768..95605a9c9a1e 100644
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@ -380,64 +380,3 @@ void hw_breakpoint_pmu_read(struct perf_event *bp)
+ {
+ 	/* TODO */
+ }
+-
+-bool dawr_force_enable;
+-EXPORT_SYMBOL_GPL(dawr_force_enable);
+-
+-static void set_dawr_cb(void *info)
+-{
+-	set_dawr(info);
+-}
+-
+-static ssize_t dawr_write_file_bool(struct file *file,
+-				    const char __user *user_buf,
+-				    size_t count, loff_t *ppos)
+-{
+-	struct arch_hw_breakpoint null_brk = {0, 0, 0};
+-	size_t rc;
+-
+-	/* Send error to user if they hypervisor won't allow us to write DAWR */
+-	if ((!dawr_force_enable) &&
+-	    (firmware_has_feature(FW_FEATURE_LPAR)) &&
+-	    (set_dawr(&null_brk) != H_SUCCESS))
+-		return -1;
+-
+-	rc = debugfs_write_file_bool(file, user_buf, count, ppos);
+-	if (rc)
+-		return rc;
+-
+-	/* If we are clearing, make sure all CPUs have the DAWR cleared */
+-	if (!dawr_force_enable)
+-		smp_call_function(set_dawr_cb, &null_brk, 0);
+-
+-	return rc;
+-}
+-
+-static const struct file_operations dawr_enable_fops = {
+-	.read =		debugfs_read_file_bool,
+-	.write =	dawr_write_file_bool,
+-	.open =		simple_open,
+-	.llseek =	default_llseek,
+-};
+-
+-static int __init dawr_force_setup(void)
+-{
+-	dawr_force_enable = false;
+-
+-	if (cpu_has_feature(CPU_FTR_DAWR)) {
+-		/* Don't setup sysfs file for user control on P8 */
+-		dawr_force_enable = true;
+-		return 0;
+-	}
+-
+-	if (PVR_VER(mfspr(SPRN_PVR)) == PVR_POWER9) {
+-		/* Turn DAWR off by default, but allow admin to turn it on */
+-		dawr_force_enable = false;
+-		debugfs_create_file_unsafe("dawr_enable_dangerous", 0600,
+-					   powerpc_debugfs_root,
+-					   &dawr_force_enable,
+-					   &dawr_enable_fops);
+-	}
+-	return 0;
+-}
+-arch_initcall(dawr_force_setup);
+
+commit 548c54acba5bd1388d50727a9a126a42d0cd4ad0
+Author: Mathieu Malaterre <malat@debian.org>
+Date:   Tue Jun 4 13:00:36 2019 +1000
+
+    powerpc: silence a -Wcast-function-type warning in dawr_write_file_bool
+    
+    In commit c1fe190c0672 ("powerpc: Add force enable of DAWR on P9
+    option") the following piece of code was added:
+    
+       smp_call_function((smp_call_func_t)set_dawr, &null_brk, 0);
+    
+    Since GCC 8 this triggers the following warning about incompatible
+    function types:
+    
+      arch/powerpc/kernel/hw_breakpoint.c:408:21: error: cast between incompatible function types from 'int (*)(struct arch_hw_breakpoint *)' to 'void (*)(void *)' [-Werror=cast-function-type]
+    
+    Since the warning is there for a reason, and should not be hidden behind
+    a cast, provide an intermediate callback function to avoid the warning.
+    
+    Fixes: c1fe190c0672 ("powerpc: Add force enable of DAWR on P9 option")
+    Suggested-by: Christoph Hellwig <hch@infradead.org>
+    Signed-off-by: Mathieu Malaterre <malat@debian.org>
+    Signed-off-by: Michael Neuling <mikey@neuling.org>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+
+diff --git a/arch/powerpc/kernel/hw_breakpoint.c b/arch/powerpc/kernel/hw_breakpoint.c
+index da307dd93ee3..ca3a2358b768 100644
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@ -384,6 +384,11 @@ void hw_breakpoint_pmu_read(struct perf_event *bp)
+ bool dawr_force_enable;
+ EXPORT_SYMBOL_GPL(dawr_force_enable);
+ 
++static void set_dawr_cb(void *info)
++{
++	set_dawr(info);
++}
++
+ static ssize_t dawr_write_file_bool(struct file *file,
+ 				    const char __user *user_buf,
+ 				    size_t count, loff_t *ppos)
+@@ -403,7 +408,7 @@ static ssize_t dawr_write_file_bool(struct file *file,
+ 
+ 	/* If we are clearing, make sure all CPUs have the DAWR cleared */
+ 	if (!dawr_force_enable)
+-		smp_call_function((smp_call_func_t)set_dawr, &null_brk, 0);
++		smp_call_function(set_dawr_cb, &null_brk, 0);
+ 
+ 	return rc;
+ }
+
+commit 1a59d1b8e05ea6ab45f7e18897de1ef0e6bc3da6
+Author: Thomas Gleixner <tglx@linutronix.de>
+Date:   Mon May 27 08:55:05 2019 +0200
+
+    treewide: Replace GPLv2 boilerplate/reference with SPDX - rule 156
+    
+    Based on 1 normalized pattern(s):
+    
+      this program is free software you can redistribute it and or modify
+      it under the terms of the gnu general public license as published by
+      the free software foundation either version 2 of the license or at
+      your option any later version this program is distributed in the
+      hope that it will be useful but without any warranty without even
+      the implied warranty of merchantability or fitness for a particular
+      purpose see the gnu general public license for more details you
+      should have received a copy of the gnu general public license along
+      with this program if not write to the free software foundation inc
+      59 temple place suite 330 boston ma 02111 1307 usa
+    
+    extracted by the scancode license scanner the SPDX license identifier
+    
+      GPL-2.0-or-later
+    
+    has been chosen to replace the boilerplate/reference in 1334 file(s).
+    
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Reviewed-by: Allison Randal <allison@lohutok.net>
+    Reviewed-by: Richard Fontana <rfontana@redhat.com>
+    Cc: linux-spdx@vger.kernel.org
+    Link: https://lkml.kernel.org/r/20190527070033.113240726@linutronix.de
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/arch/powerpc/kernel/hw_breakpoint.c b/arch/powerpc/kernel/hw_breakpoint.c
+index da307dd93ee3..a293a53b4365 100644
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@ -1,25 +1,11 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
+ /*
+  * HW_breakpoint: a unified kernel/user-space hardware breakpoint facility,
+  * using the CPU's debug registers. Derived from
+  * "arch/x86/kernel/hw_breakpoint.c"
+  *
+- * This program is free software; you can redistribute it and/or modify
+- * it under the terms of the GNU General Public License as published by
+- * the Free Software Foundation; either version 2 of the License, or
+- * (at your option) any later version.
+- *
+- * This program is distributed in the hope that it will be useful,
+- * but WITHOUT ANY WARRANTY; without even the implied warranty of
+- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+- * GNU General Public License for more details.
+- *
+- * You should have received a copy of the GNU General Public License
+- * along with this program; if not, write to the Free Software
+- * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
+- *
+  * Copyright 2010 IBM Corporation
+  * Author: K.Prasad <prasad@linux.vnet.ibm.com>
+- *
+  */
+ 
+ #include <linux/hw_breakpoint.h>
+
+commit c1fe190c06723322f2dfac31d3b982c581e434ef
+Author: Michael Neuling <mikey@neuling.org>
+Date:   Mon Apr 1 17:03:12 2019 +1100
+
+    powerpc: Add force enable of DAWR on P9 option
+    
+    This adds a flag so that the DAWR can be enabled on P9 via:
+      echo Y > /sys/kernel/debug/powerpc/dawr_enable_dangerous
+    
+    The DAWR was previously force disabled on POWER9 in:
+      9654153158 powerpc: Disable DAWR in the base POWER9 CPU features
+    Also see Documentation/powerpc/DAWR-POWER9.txt
+    
+    This is a dangerous setting, USE AT YOUR OWN RISK.
+    
+    Some users may not care about a bad user crashing their box
+    (ie. single user/desktop systems) and really want the DAWR.  This
+    allows them to force enable DAWR.
+    
+    This flag can also be used to disable DAWR access. Once this is
+    cleared, all DAWR access should be cleared immediately and your
+    machine once again safe from crashing.
+    
+    Userspace may get confused by toggling this. If DAWR is force
+    enabled/disabled between getting the number of breakpoints (via
+    PTRACE_GETHWDBGINFO) and setting the breakpoint, userspace will get an
+    inconsistent view of what's available. Similarly for guests.
+    
+    For the DAWR to be enabled in a KVM guest, the DAWR needs to be force
+    enabled in the host AND the guest. For this reason, this won't work on
+    POWERVM as it doesn't allow the HCALL to work. Writes of 'Y' to the
+    dawr_enable_dangerous file will fail if the hypervisor doesn't support
+    writing the DAWR.
+    
+    To double check the DAWR is working, run this kernel selftest:
+      tools/testing/selftests/powerpc/ptrace/ptrace-hwbreak.c
+    Any errors/failures/skips mean something is wrong.
+    
+    Signed-off-by: Michael Neuling <mikey@neuling.org>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+
+diff --git a/arch/powerpc/kernel/hw_breakpoint.c b/arch/powerpc/kernel/hw_breakpoint.c
+index fec8a6773119..da307dd93ee3 100644
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@ -29,11 +29,15 @@
+ #include <linux/kernel.h>
+ #include <linux/sched.h>
+ #include <linux/smp.h>
++#include <linux/debugfs.h>
++#include <linux/init.h>
+ 
+ #include <asm/hw_breakpoint.h>
+ #include <asm/processor.h>
+ #include <asm/sstep.h>
+ #include <asm/debug.h>
++#include <asm/debugfs.h>
++#include <asm/hvcall.h>
+ #include <linux/uaccess.h>
+ 
+ /*
+@@ -174,7 +178,7 @@ int hw_breakpoint_arch_parse(struct perf_event *bp,
+ 	if (!ppc_breakpoint_available())
+ 		return -ENODEV;
+ 	length_max = 8; /* DABR */
+-	if (cpu_has_feature(CPU_FTR_DAWR)) {
++	if (dawr_enabled()) {
+ 		length_max = 512 ; /* 64 doublewords */
+ 		/* DAWR region can't cross 512 boundary */
+ 		if ((attr->bp_addr >> 9) !=
+@@ -376,3 +380,59 @@ void hw_breakpoint_pmu_read(struct perf_event *bp)
+ {
+ 	/* TODO */
+ }
++
++bool dawr_force_enable;
++EXPORT_SYMBOL_GPL(dawr_force_enable);
++
++static ssize_t dawr_write_file_bool(struct file *file,
++				    const char __user *user_buf,
++				    size_t count, loff_t *ppos)
++{
++	struct arch_hw_breakpoint null_brk = {0, 0, 0};
++	size_t rc;
++
++	/* Send error to user if they hypervisor won't allow us to write DAWR */
++	if ((!dawr_force_enable) &&
++	    (firmware_has_feature(FW_FEATURE_LPAR)) &&
++	    (set_dawr(&null_brk) != H_SUCCESS))
++		return -1;
++
++	rc = debugfs_write_file_bool(file, user_buf, count, ppos);
++	if (rc)
++		return rc;
++
++	/* If we are clearing, make sure all CPUs have the DAWR cleared */
++	if (!dawr_force_enable)
++		smp_call_function((smp_call_func_t)set_dawr, &null_brk, 0);
++
++	return rc;
++}
++
++static const struct file_operations dawr_enable_fops = {
++	.read =		debugfs_read_file_bool,
++	.write =	dawr_write_file_bool,
++	.open =		simple_open,
++	.llseek =	default_llseek,
++};
++
++static int __init dawr_force_setup(void)
++{
++	dawr_force_enable = false;
++
++	if (cpu_has_feature(CPU_FTR_DAWR)) {
++		/* Don't setup sysfs file for user control on P8 */
++		dawr_force_enable = true;
++		return 0;
++	}
++
++	if (PVR_VER(mfspr(SPRN_PVR)) == PVR_POWER9) {
++		/* Turn DAWR off by default, but allow admin to turn it on */
++		dawr_force_enable = false;
++		debugfs_create_file_unsafe("dawr_enable_dangerous", 0600,
++					   powerpc_debugfs_root,
++					   &dawr_force_enable,
++					   &dawr_enable_fops);
++	}
++	return 0;
++}
++arch_initcall(dawr_force_setup);
+
+commit 5d5176baed7abf88bb465a128d414fa8748dcab7
+Author: Frederic Weisbecker <frederic@kernel.org>
+Date:   Tue Jun 26 04:58:51 2018 +0200
+
+    perf/arch/powerpc: Implement hw_breakpoint_arch_parse()
+    
+    Migrate to the new API in order to remove arch_validate_hwbkpt_settings()
+    that clumsily mixes up architecture validation and commit
+    
+    Signed-off-by: Frederic Weisbecker <frederic@kernel.org>
+    Acked-by: Michael Ellerman <mpe@ellerman.id.au>
+    Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+    Cc: Andy Lutomirski <luto@kernel.org>
+    Cc: Arnaldo Carvalho de Melo <acme@kernel.org>
+    Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+    Cc: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+    Cc: Catalin Marinas <catalin.marinas@arm.com>
+    Cc: Chris Zankel <chris@zankel.net>
+    Cc: Jiri Olsa <jolsa@redhat.com>
+    Cc: Joel Fernandes <joel.opensrc@gmail.com>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Mark Rutland <mark.rutland@arm.com>
+    Cc: Max Filippov <jcmvbkbc@gmail.com>
+    Cc: Namhyung Kim <namhyung@kernel.org>
+    Cc: Paul Mackerras <paulus@samba.org>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Rich Felker <dalias@libc.org>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Will Deacon <will.deacon@arm.com>
+    Cc: Yoshinori Sato <ysato@users.sourceforge.jp>
+    Link: http://lkml.kernel.org/r/1529981939-8231-5-git-send-email-frederic@kernel.org
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/arch/powerpc/kernel/hw_breakpoint.c b/arch/powerpc/kernel/hw_breakpoint.c
+index 899bcec3f3c8..fec8a6773119 100644
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@ -139,30 +139,31 @@ int arch_bp_generic_fields(int type, int *gen_bp_type)
+ /*
+  * Validate the arch-specific HW Breakpoint register settings
+  */
+-int arch_validate_hwbkpt_settings(struct perf_event *bp)
++int hw_breakpoint_arch_parse(struct perf_event *bp,
++			     const struct perf_event_attr *attr,
++			     struct arch_hw_breakpoint *hw)
+ {
+ 	int ret = -EINVAL, length_max;
+-	struct arch_hw_breakpoint *info = counter_arch_bp(bp);
+ 
+ 	if (!bp)
+ 		return ret;
+ 
+-	info->type = HW_BRK_TYPE_TRANSLATE;
+-	if (bp->attr.bp_type & HW_BREAKPOINT_R)
+-		info->type |= HW_BRK_TYPE_READ;
+-	if (bp->attr.bp_type & HW_BREAKPOINT_W)
+-		info->type |= HW_BRK_TYPE_WRITE;
+-	if (info->type == HW_BRK_TYPE_TRANSLATE)
++	hw->type = HW_BRK_TYPE_TRANSLATE;
++	if (attr->bp_type & HW_BREAKPOINT_R)
++		hw->type |= HW_BRK_TYPE_READ;
++	if (attr->bp_type & HW_BREAKPOINT_W)
++		hw->type |= HW_BRK_TYPE_WRITE;
++	if (hw->type == HW_BRK_TYPE_TRANSLATE)
+ 		/* must set alteast read or write */
+ 		return ret;
+-	if (!(bp->attr.exclude_user))
+-		info->type |= HW_BRK_TYPE_USER;
+-	if (!(bp->attr.exclude_kernel))
+-		info->type |= HW_BRK_TYPE_KERNEL;
+-	if (!(bp->attr.exclude_hv))
+-		info->type |= HW_BRK_TYPE_HYP;
+-	info->address = bp->attr.bp_addr;
+-	info->len = bp->attr.bp_len;
++	if (!attr->exclude_user)
++		hw->type |= HW_BRK_TYPE_USER;
++	if (!attr->exclude_kernel)
++		hw->type |= HW_BRK_TYPE_KERNEL;
++	if (!attr->exclude_hv)
++		hw->type |= HW_BRK_TYPE_HYP;
++	hw->address = attr->bp_addr;
++	hw->len = attr->bp_len;
+ 
+ 	/*
+ 	 * Since breakpoint length can be a maximum of HW_BREAKPOINT_LEN(8)
+@@ -176,12 +177,12 @@ int arch_validate_hwbkpt_settings(struct perf_event *bp)
+ 	if (cpu_has_feature(CPU_FTR_DAWR)) {
+ 		length_max = 512 ; /* 64 doublewords */
+ 		/* DAWR region can't cross 512 boundary */
+-		if ((bp->attr.bp_addr >> 9) !=
+-		    ((bp->attr.bp_addr + bp->attr.bp_len - 1) >> 9))
++		if ((attr->bp_addr >> 9) !=
++		    ((attr->bp_addr + attr->bp_len - 1) >> 9))
+ 			return -EINVAL;
+ 	}
+-	if (info->len >
+-	    (length_max - (info->address & HW_BREAKPOINT_ALIGN)))
++	if (hw->len >
++	    (length_max - (hw->address & HW_BREAKPOINT_ALIGN)))
+ 		return -EINVAL;
+ 	return 0;
+ }
+
+commit 8e983ff9ac02a8fb454ed09c2462bdb3617006a8
+Author: Frederic Weisbecker <frederic@kernel.org>
+Date:   Tue Jun 26 04:58:49 2018 +0200
+
+    perf/hw_breakpoint: Pass arch breakpoint struct to arch_check_bp_in_kernelspace()
+    
+    We can't pass the breakpoint directly on arch_check_bp_in_kernelspace()
+    anymore because its architecture internal datas (struct arch_hw_breakpoint)
+    are not yet filled by the time we call the function, and most
+    implementation need this backend to be up to date. So arrange the
+    function to take the probing struct instead.
+    
+    Signed-off-by: Frederic Weisbecker <frederic@kernel.org>
+    Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+    Cc: Andy Lutomirski <luto@kernel.org>
+    Cc: Arnaldo Carvalho de Melo <acme@kernel.org>
+    Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+    Cc: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+    Cc: Catalin Marinas <catalin.marinas@arm.com>
+    Cc: Chris Zankel <chris@zankel.net>
+    Cc: Jiri Olsa <jolsa@redhat.com>
+    Cc: Joel Fernandes <joel.opensrc@gmail.com>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Mark Rutland <mark.rutland@arm.com>
+    Cc: Max Filippov <jcmvbkbc@gmail.com>
+    Cc: Michael Ellerman <mpe@ellerman.id.au>
+    Cc: Namhyung Kim <namhyung@kernel.org>
+    Cc: Paul Mackerras <paulus@samba.org>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Rich Felker <dalias@libc.org>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Will Deacon <will.deacon@arm.com>
+    Cc: Yoshinori Sato <ysato@users.sourceforge.jp>
+    Link: http://lkml.kernel.org/r/1529981939-8231-3-git-send-email-frederic@kernel.org
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/arch/powerpc/kernel/hw_breakpoint.c b/arch/powerpc/kernel/hw_breakpoint.c
+index 80547dad37da..899bcec3f3c8 100644
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@ -119,11 +119,9 @@ void arch_unregister_hw_breakpoint(struct perf_event *bp)
+ /*
+  * Check for virtual address in kernel space.
+  */
+-int arch_check_bp_in_kernelspace(struct perf_event *bp)
++int arch_check_bp_in_kernelspace(struct arch_hw_breakpoint *hw)
+ {
+-	struct arch_hw_breakpoint *info = counter_arch_bp(bp);
+-
+-	return is_kernel_addr(info->address);
++	return is_kernel_addr(hw->address);
+ }
+ 
+ int arch_bp_generic_fields(int type, int *gen_bp_type)
+
+commit cd6ef7eebf171bfcba7dc2df719c2a4958775040
+Author: Michael Neuling <mikey@neuling.org>
+Date:   Thu May 17 15:37:14 2018 +1000
+
+    powerpc/ptrace: Fix enforcement of DAWR constraints
+    
+    Back when we first introduced the DAWR, in commit 4ae7ebe9522a
+    ("powerpc: Change hardware breakpoint to allow longer ranges"), we
+    screwed up the constraint making it a 1024 byte boundary rather than a
+    512. This makes the check overly permissive. Fortunately GDB is the
+    only real user and it always did they right thing, so we never
+    noticed.
+    
+    This fixes the constraint to 512 bytes.
+    
+    Fixes: 4ae7ebe9522a ("powerpc: Change hardware breakpoint to allow longer ranges")
+    Cc: stable@vger.kernel.org # v3.9+
+    Signed-off-by: Michael Neuling <mikey@neuling.org>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+
+diff --git a/arch/powerpc/kernel/hw_breakpoint.c b/arch/powerpc/kernel/hw_breakpoint.c
+index 4c1012b80d3b..80547dad37da 100644
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@ -178,8 +178,8 @@ int arch_validate_hwbkpt_settings(struct perf_event *bp)
+ 	if (cpu_has_feature(CPU_FTR_DAWR)) {
+ 		length_max = 512 ; /* 64 doublewords */
+ 		/* DAWR region can't cross 512 boundary */
+-		if ((bp->attr.bp_addr >> 10) != 
+-		    ((bp->attr.bp_addr + bp->attr.bp_len - 1) >> 10))
++		if ((bp->attr.bp_addr >> 9) !=
++		    ((bp->attr.bp_addr + bp->attr.bp_len - 1) >> 9))
+ 			return -EINVAL;
+ 	}
+ 	if (info->len >
+
+commit 85ce9a5d57bec126d19610d6e77f9e6e4eaea635
+Author: Michael Neuling <mikey@neuling.org>
+Date:   Tue Mar 27 15:37:18 2018 +1100
+
+    powerpc: Update ptrace to use ppc_breakpoint_available()
+    
+    This updates the ptrace code to use ppc_breakpoint_available().
+    
+    We now advertise via PPC_PTRACE_GETHWDBGINFO zero breakpoints when the
+    DAWR is missing (ie. POWER9). This results in GDB falling back to
+    software emulation of the breakpoint (which is slow).
+    
+    For the features advertised by PPC_PTRACE_GETHWDBGINFO, we keep
+    advertising DAWR as if we don't GDB assumes 1 breakpoint irrespective
+    of the number of breakpoints advertised. GDB then fails later when
+    trying to set this one breakpoint.
+    
+    Signed-off-by: Michael Neuling <mikey@neuling.org>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+
+diff --git a/arch/powerpc/kernel/hw_breakpoint.c b/arch/powerpc/kernel/hw_breakpoint.c
+index 53b9c1dfd7d9..4c1012b80d3b 100644
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@ -33,6 +33,7 @@
+ #include <asm/hw_breakpoint.h>
+ #include <asm/processor.h>
+ #include <asm/sstep.h>
++#include <asm/debug.h>
+ #include <linux/uaccess.h>
+ 
+ /*
+@@ -171,6 +172,8 @@ int arch_validate_hwbkpt_settings(struct perf_event *bp)
+ 	 * HW_BREAKPOINT_ALIGN by rounding off to the lower address, the
+ 	 * 'symbolsize' should satisfy the check below.
+ 	 */
++	if (!ppc_breakpoint_available())
++		return -ENODEV;
+ 	length_max = 8; /* DABR */
+ 	if (cpu_has_feature(CPU_FTR_DAWR)) {
+ 		length_max = 512 ; /* 64 doublewords */
+
+commit 6c8f9ad566ddc63da5da84c3c9e6c1bb0434c64f
+Merge: d11914b21c4c 75b824727680
+Author: Michael Ellerman <mpe@ellerman.id.au>
+Date:   Sat Feb 18 21:37:14 2017 +1100
+
+    Merge branch 'next' of git://git.kernel.org/pub/scm/linux/kernel/git/scottwood/linux into next
+    
+    Freescale updates from Scott:
+    
+    "Highlights include 8xx breakpoints and perf, t1042rdb display support,
+    and board updates."
+
+commit c21a493a2b44650707d06741601894329486f2ad
+Author: Ravi Bangoria <ravi.bangoria@linux.vnet.ibm.com>
+Date:   Tue Nov 22 14:55:59 2016 +0530
+
+    powerpc/xmon: Fix data-breakpoint
+    
+    Currently xmon data-breakpoint feature is broken.
+    
+    Whenever there is a watchpoint match occurs, hw_breakpoint_handler will
+    be called by do_break via notifier chains mechanism. If watchpoint is
+    registered by xmon, hw_breakpoint_handler won't find any associated
+    perf_event and returns immediately with NOTIFY_STOP. Similarly, do_break
+    also returns without notifying to xmon.
+    
+    Solve this by returning NOTIFY_DONE when hw_breakpoint_handler does not
+    find any perf_event associated with matched watchpoint, rather than
+    NOTIFY_STOP, which tells the core code to continue calling the other
+    breakpoint handlers including the xmon one.
+    
+    Cc: stable@vger.kernel.org
+    Signed-off-by: Ravi Bangoria <ravi.bangoria@linux.vnet.ibm.com>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+
+diff --git a/arch/powerpc/kernel/hw_breakpoint.c b/arch/powerpc/kernel/hw_breakpoint.c
+index 4d3aa05e28be..53cc9270aac8 100644
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@ -228,8 +228,10 @@ int hw_breakpoint_handler(struct die_args *args)
+ 	rcu_read_lock();
+ 
+ 	bp = __this_cpu_read(bp_per_reg);
+-	if (!bp)
++	if (!bp) {
++		rc = NOTIFY_DONE;
+ 		goto out;
++	}
+ 	info = counter_arch_bp(bp);
+ 
+ 	/*
+
+commit 4ad8622dc54895c0072ddc919a83ea2a2f05605f
+Author: Christophe Leroy <christophe.leroy@c-s.fr>
+Date:   Tue Nov 29 09:52:15 2016 +0100
+
+    powerpc/8xx: Implement hw_breakpoint
+    
+    This patch implements HW breakpoint on the 8xx. The 8xx has
+    capability to manage HW breakpoints, which is slightly different
+    than BOOK3S:
+    1/ The breakpoint match doesn't trigger a DSI exception but a
+    dedicated data breakpoint exception.
+    2/ The breakpoint happens after the instruction has completed,
+    no need to single step or emulate the instruction,
+    3/ Matched address is not set in DAR but in BAR,
+    4/ DABR register doesn't exist, instead we have registers
+    LCTRL1, LCTRL2 and CMPx registers,
+    5/ The match on one comparator is not on a double word but
+    on a single word.
+    
+    The patch does:
+    1/ Prepare the dedicated registers in call to __set_dabr(). In order
+    to emulate the double word handling of BOOK3S, comparator E is set to
+    DABR address value and comparator F to address + 4. Then breakpoint 1
+    is set to match comparator E or F,
+    2/ Skip the singlestepping stage when compiled for CONFIG_PPC_8xx,
+    3/ Implement the exception. In that exception, the matched address
+    is taken from SPRN_BAR and manage as if it was from SPRN_DAR.
+    4/ I/D TLB error exception routines perform a tlbie on bad TLBs. That
+    tlbie triggers the breakpoint exception when performed on the
+    breakpoint address. For this reason, the routine returns if the match
+    is from one of those two tlbie.
+    
+    Signed-off-by: Christophe Leroy <christophe.leroy@c-s.fr>
+    Signed-off-by: Scott Wood <oss@buserror.net>
+
+diff --git a/arch/powerpc/kernel/hw_breakpoint.c b/arch/powerpc/kernel/hw_breakpoint.c
+index 4d3aa05e28be..146eaa9b350e 100644
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@ -211,9 +211,11 @@ int hw_breakpoint_handler(struct die_args *args)
+ 	int rc = NOTIFY_STOP;
+ 	struct perf_event *bp;
+ 	struct pt_regs *regs = args->regs;
++#ifndef CONFIG_PPC_8xx
+ 	int stepped = 1;
+-	struct arch_hw_breakpoint *info;
+ 	unsigned int instr;
++#endif
++	struct arch_hw_breakpoint *info;
+ 	unsigned long dar = regs->dar;
+ 
+ 	/* Disable breakpoints during exception handling */
+@@ -255,6 +257,7 @@ int hw_breakpoint_handler(struct die_args *args)
+ 	      (dar - bp->attr.bp_addr < bp->attr.bp_len)))
+ 		info->type |= HW_BRK_TYPE_EXTRANEOUS_IRQ;
+ 
++#ifndef CONFIG_PPC_8xx
+ 	/* Do not emulate user-space instructions, instead single-step them */
+ 	if (user_mode(regs)) {
+ 		current->thread.last_hit_ubp = bp;
+@@ -278,6 +281,7 @@ int hw_breakpoint_handler(struct die_args *args)
+ 		perf_event_disable_inatomic(bp);
+ 		goto out;
+ 	}
++#endif
+ 	/*
+ 	 * As a policy, the callback is invoked in a 'trigger-after-execute'
+ 	 * fashion
+
+commit 7c0f6ba682b9c7632072ffbedf8d328c8f3c42ba
+Author: Linus Torvalds <torvalds@linux-foundation.org>
+Date:   Sat Dec 24 11:46:01 2016 -0800
+
+    Replace <asm/uaccess.h> with <linux/uaccess.h> globally
+    
+    This was entirely automated, using the script by Al:
+    
+      PATT='^[[:blank:]]*#[[:blank:]]*include[[:blank:]]*<asm/uaccess.h>'
+      sed -i -e "s!$PATT!#include <linux/uaccess.h>!" \
+            $(git grep -l "$PATT"|grep -v ^include/linux/uaccess.h)
+    
+    to do the replacement at the end of the merge window.
+    
+    Requested-by: Al Viro <viro@zeniv.linux.org.uk>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/arch/powerpc/kernel/hw_breakpoint.c b/arch/powerpc/kernel/hw_breakpoint.c
+index 03d089b3ed72..4d3aa05e28be 100644
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@ -33,7 +33,7 @@
+ #include <asm/hw_breakpoint.h>
+ #include <asm/processor.h>
+ #include <asm/sstep.h>
+-#include <asm/uaccess.h>
++#include <linux/uaccess.h>
+ 
+ /*
+  * Stores the breakpoints currently in use on each breakpoint address
+
+commit 5aab90ce1ec449912a2ebc4d45e0c85dac29e9dd
+Author: Jiri Olsa <jolsa@redhat.com>
+Date:   Wed Oct 26 11:48:24 2016 +0200
+
+    perf/powerpc: Don't call perf_event_disable() from atomic context
+    
+    The trinity syscall fuzzer triggered following WARN() on powerpc:
+    
+      WARNING: CPU: 9 PID: 2998 at arch/powerpc/kernel/hw_breakpoint.c:278
+      ...
+      NIP [c00000000093aedc] .hw_breakpoint_handler+0x28c/0x2b0
+      LR [c00000000093aed8] .hw_breakpoint_handler+0x288/0x2b0
+      Call Trace:
+      [c0000002f7933580] [c00000000093aed8] .hw_breakpoint_handler+0x288/0x2b0 (unreliable)
+      [c0000002f7933630] [c0000000000f671c] .notifier_call_chain+0x7c/0xf0
+      [c0000002f79336d0] [c0000000000f6abc] .__atomic_notifier_call_chain+0xbc/0x1c0
+      [c0000002f7933780] [c0000000000f6c40] .notify_die+0x70/0xd0
+      [c0000002f7933820] [c00000000001a74c] .do_break+0x4c/0x100
+      [c0000002f7933920] [c0000000000089fc] handle_dabr_fault+0x14/0x48
+    
+    Followed by a lockdep warning:
+    
+      ===============================
+      [ INFO: suspicious RCU usage. ]
+      4.8.0-rc5+ #7 Tainted: G        W
+      -------------------------------
+      ./include/linux/rcupdate.h:556 Illegal context switch in RCU read-side critical section!
+    
+      other info that might help us debug this:
+    
+      rcu_scheduler_active = 1, debug_locks = 0
+      2 locks held by ls/2998:
+       #0:  (rcu_read_lock){......}, at: [<c0000000000f6a00>] .__atomic_notifier_call_chain+0x0/0x1c0
+       #1:  (rcu_read_lock){......}, at: [<c00000000093ac50>] .hw_breakpoint_handler+0x0/0x2b0
+    
+      stack backtrace:
+      CPU: 9 PID: 2998 Comm: ls Tainted: G        W       4.8.0-rc5+ #7
+      Call Trace:
+      [c0000002f7933150] [c00000000094b1f8] .dump_stack+0xe0/0x14c (unreliable)
+      [c0000002f79331e0] [c00000000013c468] .lockdep_rcu_suspicious+0x138/0x180
+      [c0000002f7933270] [c0000000001005d8] .___might_sleep+0x278/0x2e0
+      [c0000002f7933300] [c000000000935584] .mutex_lock_nested+0x64/0x5a0
+      [c0000002f7933410] [c00000000023084c] .perf_event_ctx_lock_nested+0x16c/0x380
+      [c0000002f7933500] [c000000000230a80] .perf_event_disable+0x20/0x60
+      [c0000002f7933580] [c00000000093aeec] .hw_breakpoint_handler+0x29c/0x2b0
+      [c0000002f7933630] [c0000000000f671c] .notifier_call_chain+0x7c/0xf0
+      [c0000002f79336d0] [c0000000000f6abc] .__atomic_notifier_call_chain+0xbc/0x1c0
+      [c0000002f7933780] [c0000000000f6c40] .notify_die+0x70/0xd0
+      [c0000002f7933820] [c00000000001a74c] .do_break+0x4c/0x100
+      [c0000002f7933920] [c0000000000089fc] handle_dabr_fault+0x14/0x48
+    
+    While it looks like the first WARN() is probably valid, the other one is
+    triggered by disabling event via perf_event_disable() from atomic context.
+    
+    The event is disabled here in case we were not able to emulate
+    the instruction that hit the breakpoint. By disabling the event
+    we unschedule the event and make sure it's not scheduled back.
+    
+    But we can't call perf_event_disable() from atomic context, instead
+    we need to use the event's pending_disable irq_work method to disable it.
+    
+    Reported-by: Jan Stancek <jstancek@redhat.com>
+    Signed-off-by: Jiri Olsa <jolsa@kernel.org>
+    Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+    Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+    Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+    Cc: Huang Ying <ying.huang@intel.com>
+    Cc: Jiri Olsa <jolsa@redhat.com>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Michael Neuling <mikey@neuling.org>
+    Cc: Paul Mackerras <paulus@samba.org>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Link: http://lkml.kernel.org/r/20161026094824.GA21397@krava
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/arch/powerpc/kernel/hw_breakpoint.c b/arch/powerpc/kernel/hw_breakpoint.c
+index 9781c69eae57..03d089b3ed72 100644
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@ -275,7 +275,7 @@ int hw_breakpoint_handler(struct die_args *args)
+ 	if (!stepped) {
+ 		WARN(1, "Unable to handle hardware breakpoint. Breakpoint at "
+ 			"0x%lx will be disabled.", info->address);
+-		perf_event_disable(bp);
++		perf_event_disable_inatomic(bp);
+ 		goto out;
+ 	}
+ 	/*
+
+commit 03465f899bdac70d34f6ca447a74d8ae9e284ce5
+Author: Nicholas Piggin <npiggin@gmail.com>
+Date:   Fri Sep 16 20:48:08 2016 +1000
+
+    powerpc: Use kprobe blacklist for exception handlers
+    
+    Currently we mark the C implementations of some exception handlers as
+    __kprobes. This has the effect of putting them in the ".kprobes.text"
+    section, which separates them from the rest of the text.
+    
+    Instead we can use the blacklist macros to add the symbols to a
+    blacklist which kprobes will check. This allows the linker to move
+    exception handler functions close to callers and avoids trampolines in
+    larger kernels.
+    
+    Signed-off-by: Nicholas Piggin <npiggin@gmail.com>
+    [mpe: Reword change log a bit]
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+
+diff --git a/arch/powerpc/kernel/hw_breakpoint.c b/arch/powerpc/kernel/hw_breakpoint.c
+index aec9a1b1d25b..9781c69eae57 100644
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@ -206,7 +206,7 @@ void thread_change_pc(struct task_struct *tsk, struct pt_regs *regs)
+ /*
+  * Handle debug exception notifications.
+  */
+-int __kprobes hw_breakpoint_handler(struct die_args *args)
++int hw_breakpoint_handler(struct die_args *args)
+ {
+ 	int rc = NOTIFY_STOP;
+ 	struct perf_event *bp;
+@@ -290,11 +290,12 @@ int __kprobes hw_breakpoint_handler(struct die_args *args)
+ 	rcu_read_unlock();
+ 	return rc;
+ }
++NOKPROBE_SYMBOL(hw_breakpoint_handler);
+ 
+ /*
+  * Handle single-step exceptions following a DABR hit.
+  */
+-static int __kprobes single_step_dabr_instruction(struct die_args *args)
++static int single_step_dabr_instruction(struct die_args *args)
+ {
+ 	struct pt_regs *regs = args->regs;
+ 	struct perf_event *bp = NULL;
+@@ -329,11 +330,12 @@ static int __kprobes single_step_dabr_instruction(struct die_args *args)
+ 
+ 	return NOTIFY_STOP;
+ }
++NOKPROBE_SYMBOL(single_step_dabr_instruction);
+ 
+ /*
+  * Handle debug exception notifications.
+  */
+-int __kprobes hw_breakpoint_exceptions_notify(
++int hw_breakpoint_exceptions_notify(
+ 		struct notifier_block *unused, unsigned long val, void *data)
+ {
+ 	int ret = NOTIFY_DONE;
+@@ -349,6 +351,7 @@ int __kprobes hw_breakpoint_exceptions_notify(
+ 
+ 	return ret;
+ }
++NOKPROBE_SYMBOL(hw_breakpoint_exceptions_notify);
+ 
+ /*
+  * Release the user breakpoints used by ptrace
+
+commit fb822e6076d972691c5dd33431c10f82dda94ae9
+Author: Ravi Bangoria <ravi.bangoria@linux.vnet.ibm.com>
+Date:   Wed Mar 2 15:25:17 2016 +0530
+
+    powerpc/hw_breakpoint: Fix oops when destroying hw_breakpoint event
+    
+    When destroying a hw_breakpoint event, the kernel oopses as follows:
+    
+      Unable to handle kernel paging request for data at address 0x00000c07
+      NIP [c0000000000291d0] arch_unregister_hw_breakpoint+0x40/0x60
+      LR [c00000000020b6b4] release_bp_slot+0x44/0x80
+    
+    Call chain:
+    
+      hw_breakpoint_event_init()
+        bp->destroy = bp_perf_event_destroy;
+    
+      do_exit()
+        perf_event_exit_task()
+          perf_event_exit_task_context()
+            WRITE_ONCE(child_ctx->task, TASK_TOMBSTONE);
+            perf_event_exit_event()
+              free_event()
+                _free_event()
+                  bp_perf_event_destroy() // event->destroy(event);
+                    release_bp_slot()
+                      arch_unregister_hw_breakpoint()
+    
+    perf_event_exit_task_context() sets child_ctx->task as TASK_TOMBSTONE
+    which is (void *)-1. arch_unregister_hw_breakpoint() tries to fetch
+    'thread' attribute of 'task' resulting in oops.
+    
+    Peterz points out that the code shouldn't be using bp->ctx anyway, but
+    fixing that will require a decent amount of rework. So for now to fix
+    the oops, check if bp->ctx->task has been set to (void *)-1, before
+    dereferencing it. We don't use TASK_TOMBSTONE, because that would
+    require exporting it and it's supposed to be an internal detail.
+    
+    Fixes: 63b6da39bb38 ("perf: Fix perf_event_exit_task() race")
+    Signed-off-by: Ravi Bangoria <ravi.bangoria@linux.vnet.ibm.com>
+    Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+
+diff --git a/arch/powerpc/kernel/hw_breakpoint.c b/arch/powerpc/kernel/hw_breakpoint.c
+index 05e804cdecaa..aec9a1b1d25b 100644
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@ -109,8 +109,9 @@ void arch_unregister_hw_breakpoint(struct perf_event *bp)
+ 	 * If the breakpoint is unregistered between a hw_breakpoint_handler()
+ 	 * and the single_step_dabr_instruction(), then cleanup the breakpoint
+ 	 * restoration variables to prevent dangling pointers.
++	 * FIXME, this should not be using bp->ctx at all! Sayeth peterz.
+ 	 */
+-	if (bp->ctx && bp->ctx->task)
++	if (bp->ctx && bp->ctx->task && bp->ctx->task != ((void *)-1L))
+ 		bp->ctx->task->thread.last_hit_ubp = NULL;
+ }
+ 
+
+commit 69111bac42f5ceacdd22e30947837ceb2c4493ed
+Author: Christoph Lameter <cl@linux.com>
+Date:   Tue Oct 21 15:23:25 2014 -0500
+
+    powerpc: Replace __get_cpu_var uses
+    
+    This still has not been merged and now powerpc is the only arch that does
+    not have this change. Sorry about missing linuxppc-dev before.
+    
+    V2->V2
+      - Fix up to work against 3.18-rc1
+    
+    __get_cpu_var() is used for multiple purposes in the kernel source. One of
+    them is address calculation via the form &__get_cpu_var(x).  This calculates
+    the address for the instance of the percpu variable of the current processor
+    based on an offset.
+    
+    Other use cases are for storing and retrieving data from the current
+    processors percpu area.  __get_cpu_var() can be used as an lvalue when
+    writing data or on the right side of an assignment.
+    
+    __get_cpu_var() is defined as :
+    
+    __get_cpu_var() always only does an address determination. However, store
+    and retrieve operations could use a segment prefix (or global register on
+    other platforms) to avoid the address calculation.
+    
+    this_cpu_write() and this_cpu_read() can directly take an offset into a
+    percpu area and use optimized assembly code to read and write per cpu
+    variables.
+    
+    This patch converts __get_cpu_var into either an explicit address
+    calculation using this_cpu_ptr() or into a use of this_cpu operations that
+    use the offset.  Thereby address calculations are avoided and less registers
+    are used when code is generated.
+    
+    At the end of the patch set all uses of __get_cpu_var have been removed so
+    the macro is removed too.
+    
+    The patch set includes passes over all arches as well. Once these operations
+    are used throughout then specialized macros can be defined in non -x86
+    arches as well in order to optimize per cpu access by f.e.  using a global
+    register that may be set to the per cpu base.
+    
+    Transformations done to __get_cpu_var()
+    
+    1. Determine the address of the percpu instance of the current processor.
+    
+            DEFINE_PER_CPU(int, y);
+            int *x = &__get_cpu_var(y);
+    
+        Converts to
+    
+            int *x = this_cpu_ptr(&y);
+    
+    2. Same as #1 but this time an array structure is involved.
+    
+            DEFINE_PER_CPU(int, y[20]);
+            int *x = __get_cpu_var(y);
+    
+        Converts to
+    
+            int *x = this_cpu_ptr(y);
+    
+    3. Retrieve the content of the current processors instance of a per cpu
+    variable.
+    
+            DEFINE_PER_CPU(int, y);
+            int x = __get_cpu_var(y)
+    
+       Converts to
+    
+            int x = __this_cpu_read(y);
+    
+    4. Retrieve the content of a percpu struct
+    
+            DEFINE_PER_CPU(struct mystruct, y);
+            struct mystruct x = __get_cpu_var(y);
+    
+       Converts to
+    
+            memcpy(&x, this_cpu_ptr(&y), sizeof(x));
+    
+    5. Assignment to a per cpu variable
+    
+            DEFINE_PER_CPU(int, y)
+            __get_cpu_var(y) = x;
+    
+       Converts to
+    
+            __this_cpu_write(y, x);
+    
+    6. Increment/Decrement etc of a per cpu variable
+    
+            DEFINE_PER_CPU(int, y);
+            __get_cpu_var(y)++
+    
+       Converts to
+    
+            __this_cpu_inc(y)
+    
+    Cc: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+    CC: Paul Mackerras <paulus@samba.org>
+    Signed-off-by: Christoph Lameter <cl@linux.com>
+    [mpe: Fix build errors caused by set/or_softirq_pending(), and rework
+          assignment in __set_breakpoint() to use memcpy().]
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+
+diff --git a/arch/powerpc/kernel/hw_breakpoint.c b/arch/powerpc/kernel/hw_breakpoint.c
+index 1f7d84e2e8b2..05e804cdecaa 100644
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@ -63,7 +63,7 @@ int hw_breakpoint_slots(int type)
+ int arch_install_hw_breakpoint(struct perf_event *bp)
+ {
+ 	struct arch_hw_breakpoint *info = counter_arch_bp(bp);
+-	struct perf_event **slot = &__get_cpu_var(bp_per_reg);
++	struct perf_event **slot = this_cpu_ptr(&bp_per_reg);
+ 
+ 	*slot = bp;
+ 
+@@ -88,7 +88,7 @@ int arch_install_hw_breakpoint(struct perf_event *bp)
+  */
+ void arch_uninstall_hw_breakpoint(struct perf_event *bp)
+ {
+-	struct perf_event **slot = &__get_cpu_var(bp_per_reg);
++	struct perf_event **slot = this_cpu_ptr(&bp_per_reg);
+ 
+ 	if (*slot != bp) {
+ 		WARN_ONCE(1, "Can't find the breakpoint");
+@@ -226,7 +226,7 @@ int __kprobes hw_breakpoint_handler(struct die_args *args)
+ 	 */
+ 	rcu_read_lock();
+ 
+-	bp = __get_cpu_var(bp_per_reg);
++	bp = __this_cpu_read(bp_per_reg);
+ 	if (!bp)
+ 		goto out;
+ 	info = counter_arch_bp(bp);
+
+commit e51df2c170efaeadce4d416e1825b0830de0a795
+Author: Anton Blanchard <anton@samba.org>
+Date:   Wed Aug 20 08:55:18 2014 +1000
+
+    powerpc: Make a bunch of things static
+    
+    Signed-off-by: Anton Blanchard <anton@samba.org>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+
+diff --git a/arch/powerpc/kernel/hw_breakpoint.c b/arch/powerpc/kernel/hw_breakpoint.c
+index 0bb5918faaaf..1f7d84e2e8b2 100644
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@ -293,7 +293,7 @@ int __kprobes hw_breakpoint_handler(struct die_args *args)
+ /*
+  * Handle single-step exceptions following a DABR hit.
+  */
+-int __kprobes single_step_dabr_instruction(struct die_args *args)
++static int __kprobes single_step_dabr_instruction(struct die_args *args)
+ {
+ 	struct pt_regs *regs = args->regs;
+ 	struct perf_event *bp = NULL;
+
+commit 21f585073d6347651f2262da187606fa1c4ee16d
+Author: Paul Gortmaker <paul.gortmaker@windriver.com>
+Date:   Tue Apr 29 15:25:17 2014 -0400
+
+    powerpc: Fix smp_processor_id() in preemptible splat in set_breakpoint
+    
+    Currently, on 8641D, which doesn't set CONFIG_HAVE_HW_BREAKPOINT
+    we get the following splat:
+    
+    BUG: using smp_processor_id() in preemptible [00000000] code: login/1382
+    caller is set_breakpoint+0x1c/0xa0
+    CPU: 0 PID: 1382 Comm: login Not tainted 3.15.0-rc3-00041-g2aafe1a4d451 #1
+    Call Trace:
+    [decd5d80] [c0008dc4] show_stack+0x50/0x158 (unreliable)
+    [decd5dc0] [c03c6fa0] dump_stack+0x7c/0xdc
+    [decd5de0] [c01f8818] check_preemption_disabled+0xf4/0x104
+    [decd5e00] [c00086b8] set_breakpoint+0x1c/0xa0
+    [decd5e10] [c00d4530] flush_old_exec+0x2bc/0x588
+    [decd5e40] [c011c468] load_elf_binary+0x2ac/0x1164
+    [decd5ec0] [c00d35f8] search_binary_handler+0xc4/0x1f8
+    [decd5ef0] [c00d4ee8] do_execve+0x3d8/0x4b8
+    [decd5f40] [c001185c] ret_from_syscall+0x0/0x38
+     --- Exception: c01 at 0xfeee554
+        LR = 0xfeee7d4
+    
+    The call path in this case is:
+    
+            flush_thread
+               --> set_debug_reg_defaults
+                 --> set_breakpoint
+                   --> __get_cpu_var
+    
+    Since preemption is enabled in the cleanup of flush thread, and
+    there is no need to disable it, introduce the distinction between
+    set_breakpoint and __set_breakpoint, leaving only the flush_thread
+    instance as the current user of set_breakpoint.
+    
+    Signed-off-by: Paul Gortmaker <paul.gortmaker@windriver.com>
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+
+diff --git a/arch/powerpc/kernel/hw_breakpoint.c b/arch/powerpc/kernel/hw_breakpoint.c
+index b0a1792279bb..0bb5918faaaf 100644
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@ -72,7 +72,7 @@ int arch_install_hw_breakpoint(struct perf_event *bp)
+ 	 * If so, DABR will be populated in single_step_dabr_instruction().
+ 	 */
+ 	if (current->thread.last_hit_ubp != bp)
+-		set_breakpoint(info);
++		__set_breakpoint(info);
+ 
+ 	return 0;
+ }
+@@ -198,7 +198,7 @@ void thread_change_pc(struct task_struct *tsk, struct pt_regs *regs)
+ 
+ 	info = counter_arch_bp(tsk->thread.last_hit_ubp);
+ 	regs->msr &= ~MSR_SE;
+-	set_breakpoint(info);
++	__set_breakpoint(info);
+ 	tsk->thread.last_hit_ubp = NULL;
+ }
+ 
+@@ -284,7 +284,7 @@ int __kprobes hw_breakpoint_handler(struct die_args *args)
+ 	if (!(info->type & HW_BRK_TYPE_EXTRANEOUS_IRQ))
+ 		perf_bp_event(bp, regs);
+ 
+-	set_breakpoint(info);
++	__set_breakpoint(info);
+ out:
+ 	rcu_read_unlock();
+ 	return rc;
+@@ -316,7 +316,7 @@ int __kprobes single_step_dabr_instruction(struct die_args *args)
+ 	if (!(info->type & HW_BRK_TYPE_EXTRANEOUS_IRQ))
+ 		perf_bp_event(bp, regs);
+ 
+-	set_breakpoint(info);
++	__set_breakpoint(info);
+ 	current->thread.last_hit_ubp = NULL;
+ 
+ 	/*
+
+commit c141611fb1ee2cfc374cf9be5327e97f361c4bed
+Author: Paul Gortmaker <paul.gortmaker@windriver.com>
+Date:   Thu Jan 9 00:44:29 2014 -0500
+
+    powerpc: Delete non-required instances of include <linux/init.h>
+    
+    None of these files are actually using any __init type directives
+    and hence don't need to include <linux/init.h>.  Most are just a
+    left over from __devinit and __cpuinit removal, or simply due to
+    code getting copied from one driver to the next.
+    
+    The one instance where we add an include for init.h covers off
+    a case where that file was implicitly getting it from another
+    header which itself didn't need it.
+    
+    Signed-off-by: Paul Gortmaker <paul.gortmaker@windriver.com>
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+
+diff --git a/arch/powerpc/kernel/hw_breakpoint.c b/arch/powerpc/kernel/hw_breakpoint.c
+index f0b47d1a6b0e..b0a1792279bb 100644
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@ -28,7 +28,6 @@
+ #include <linux/percpu.h>
+ #include <linux/kernel.h>
+ #include <linux/sched.h>
+-#include <linux/init.h>
+ #include <linux/smp.h>
+ 
+ #include <asm/hw_breakpoint.h>
+
+commit e2a800beaca1f580945773e57d1a0e7cd37b1056
+Author: Michael Neuling <mikey@neuling.org>
+Date:   Mon Jul 1 14:19:50 2013 +1000
+
+    powerpc/hw_brk: Fix off by one error when validating DAWR region end
+    
+    The Data Address Watchpoint Register (DAWR) on POWER8 can take a 512
+    byte range but this range must not cross a 512 byte boundary.
+    
+    Unfortunately we were off by one when calculating the end of the region,
+    hence we were not allowing some breakpoint regions which were actually
+    valid.  This fixes this error.
+    
+    Signed-off-by: Michael Neuling <mikey@neuling.org>
+    Reported-by: Edjunior Barbosa Machado <emachado@linux.vnet.ibm.com>
+    Cc: stable@vger.kernel.org # 3.9+
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+
+diff --git a/arch/powerpc/kernel/hw_breakpoint.c b/arch/powerpc/kernel/hw_breakpoint.c
+index 1150ae7c22c3..f0b47d1a6b0e 100644
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@ -176,7 +176,7 @@ int arch_validate_hwbkpt_settings(struct perf_event *bp)
+ 		length_max = 512 ; /* 64 doublewords */
+ 		/* DAWR region can't cross 512 boundary */
+ 		if ((bp->attr.bp_addr >> 10) != 
+-		    ((bp->attr.bp_addr + bp->attr.bp_len) >> 10))
++		    ((bp->attr.bp_addr + bp->attr.bp_len - 1) >> 10))
+ 			return -EINVAL;
+ 	}
+ 	if (info->len >
+
+commit 540e07c67efe42ef6b6be4f1956931e676d58a15
+Author: Michael Neuling <mikey@neuling.org>
+Date:   Mon Jun 24 15:47:23 2013 +1000
+
+    powerpc/hw_brk: Fix clearing of extraneous IRQ
+    
+    In 9422de3 "powerpc: Hardware breakpoints rewrite to handle non DABR breakpoint
+    registers" we changed the way we mark extraneous irqs with this:
+    
+    -       info->extraneous_interrupt = !((bp->attr.bp_addr <= dar) &&
+    -                       (dar - bp->attr.bp_addr < bp->attr.bp_len));
+    +       if (!((bp->attr.bp_addr <= dar) &&
+    +             (dar - bp->attr.bp_addr < bp->attr.bp_len)))
+    +               info->type |= HW_BRK_TYPE_EXTRANEOUS_IRQ;
+    
+    Unfortunately this is bogus as it never clears extraneous IRQ if it's already
+    set.
+    
+    This correctly clears extraneous IRQ before possibly setting it.
+    
+    Signed-off-by: Michael Neuling <mikey@neuling.org>
+    Reported-by: Edjunior Barbosa Machado <emachado@linux.vnet.ibm.com>
+    Cc: stable@vger.kernel.org
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+
+diff --git a/arch/powerpc/kernel/hw_breakpoint.c b/arch/powerpc/kernel/hw_breakpoint.c
+index a949bdfc9623..1150ae7c22c3 100644
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@ -250,6 +250,7 @@ int __kprobes hw_breakpoint_handler(struct die_args *args)
+ 	 * we still need to single-step the instruction, but we don't
+ 	 * generate an event.
+ 	 */
++	info->type &= ~HW_BRK_TYPE_EXTRANEOUS_IRQ;
+ 	if (!((bp->attr.bp_addr <= dar) &&
+ 	      (dar - bp->attr.bp_addr < bp->attr.bp_len)))
+ 		info->type |= HW_BRK_TYPE_EXTRANEOUS_IRQ;
+
+commit 4ae7ebe9522a9e3626e28b4d268dae712738573d
+Author: Michael Neuling <mikey@neuling.org>
+Date:   Thu Jan 24 15:02:59 2013 +0000
+
+    powerpc: Change hardware breakpoint to allow longer ranges
+    
+    Change the hardware breakpoint code so that we can support wider ranged
+    breakpoints.
+    
+    This means both ptrace and perf hardware breakpoints can use upto 512 byte long
+    breakpoints when using the DAWR and only 8 byte when using the DABR.
+    
+    Signed-off-by: Michael Neuling <mikey@neuling.org>
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+
+diff --git a/arch/powerpc/kernel/hw_breakpoint.c b/arch/powerpc/kernel/hw_breakpoint.c
+index 2a3e8dd547ec..a949bdfc9623 100644
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@ -142,7 +142,7 @@ int arch_bp_generic_fields(int type, int *gen_bp_type)
+  */
+ int arch_validate_hwbkpt_settings(struct perf_event *bp)
+ {
+-	int ret = -EINVAL;
++	int ret = -EINVAL, length_max;
+ 	struct arch_hw_breakpoint *info = counter_arch_bp(bp);
+ 
+ 	if (!bp)
+@@ -171,8 +171,16 @@ int arch_validate_hwbkpt_settings(struct perf_event *bp)
+ 	 * HW_BREAKPOINT_ALIGN by rounding off to the lower address, the
+ 	 * 'symbolsize' should satisfy the check below.
+ 	 */
++	length_max = 8; /* DABR */
++	if (cpu_has_feature(CPU_FTR_DAWR)) {
++		length_max = 512 ; /* 64 doublewords */
++		/* DAWR region can't cross 512 boundary */
++		if ((bp->attr.bp_addr >> 10) != 
++		    ((bp->attr.bp_addr + bp->attr.bp_len) >> 10))
++			return -EINVAL;
++	}
+ 	if (info->len >
+-	    (HW_BREAKPOINT_LEN - (info->address & HW_BREAKPOINT_ALIGN)))
++	    (length_max - (info->address & HW_BREAKPOINT_ALIGN)))
+ 		return -EINVAL;
+ 	return 0;
+ }
+
+commit b9818c3312da66f4b83a4a2e8650628be1237cb5
+Author: Michael Neuling <mikey@neuling.org>
+Date:   Thu Jan 10 14:25:34 2013 +0000
+
+    powerpc: Rename set_break to avoid naming conflict
+    
+    With allmodconfig we are getting:
+      drivers/tty/synclink_gt.c:160:12: error: conflicting types for 'set_break'
+      arch/powerpc/include/asm/debug.h:49:5: note: previous declaration of 'set_break' was here
+    
+      drivers/tty/synclinkmp.c:526:12: error: conflicting types for 'set_break'
+      arch/powerpc/include/asm/debug.h:49:5: note: previous declaration of 'set_break' was here
+    
+    This renames set_break to set_breakpoint to avoid this naming conflict
+    
+    Signed-off-by: Michael Neuling <mikey@neuling.org>
+    Reported-by: Fengguang Wu <fengguang.wu@intel.com>
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+
+diff --git a/arch/powerpc/kernel/hw_breakpoint.c b/arch/powerpc/kernel/hw_breakpoint.c
+index c7483d09fdd0..2a3e8dd547ec 100644
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@ -73,7 +73,7 @@ int arch_install_hw_breakpoint(struct perf_event *bp)
+ 	 * If so, DABR will be populated in single_step_dabr_instruction().
+ 	 */
+ 	if (current->thread.last_hit_ubp != bp)
+-		set_break(info);
++		set_breakpoint(info);
+ 
+ 	return 0;
+ }
+@@ -191,7 +191,7 @@ void thread_change_pc(struct task_struct *tsk, struct pt_regs *regs)
+ 
+ 	info = counter_arch_bp(tsk->thread.last_hit_ubp);
+ 	regs->msr &= ~MSR_SE;
+-	set_break(info);
++	set_breakpoint(info);
+ 	tsk->thread.last_hit_ubp = NULL;
+ }
+ 
+@@ -276,7 +276,7 @@ int __kprobes hw_breakpoint_handler(struct die_args *args)
+ 	if (!(info->type & HW_BRK_TYPE_EXTRANEOUS_IRQ))
+ 		perf_bp_event(bp, regs);
+ 
+-	set_break(info);
++	set_breakpoint(info);
+ out:
+ 	rcu_read_unlock();
+ 	return rc;
+@@ -308,7 +308,7 @@ int __kprobes single_step_dabr_instruction(struct die_args *args)
+ 	if (!(info->type & HW_BRK_TYPE_EXTRANEOUS_IRQ))
+ 		perf_bp_event(bp, regs);
+ 
+-	set_break(info);
++	set_breakpoint(info);
+ 	current->thread.last_hit_ubp = NULL;
+ 
+ 	/*
+
+commit 9422de3e953d0e60eb95f5430a9dd803eec1c6d7
+Author: Michael Neuling <mikey@neuling.org>
+Date:   Thu Dec 20 14:06:44 2012 +0000
+
+    powerpc: Hardware breakpoints rewrite to handle non DABR breakpoint registers
+    
+    This is a rewrite so that we don't assume we are using the DABR throughout the
+    code.  We now use the arch_hw_breakpoint to store the breakpoint in a generic
+    manner in the thread_struct, rather than storing the raw DABR value.
+    
+    The ptrace GET/SET_DEBUGREG interface currently passes the raw DABR in from
+    userspace.  We keep this functionality, so that future changes (like the POWER8
+    DAWR), will still fake the DABR to userspace.
+    
+    Signed-off-by: Michael Neuling <mikey@neuling.org>
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+
+diff --git a/arch/powerpc/kernel/hw_breakpoint.c b/arch/powerpc/kernel/hw_breakpoint.c
+index a89cae481b04..c7483d09fdd0 100644
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@ -73,7 +73,7 @@ int arch_install_hw_breakpoint(struct perf_event *bp)
+ 	 * If so, DABR will be populated in single_step_dabr_instruction().
+ 	 */
+ 	if (current->thread.last_hit_ubp != bp)
+-		set_dabr(info->address | info->type | DABR_TRANSLATION, info->dabrx);
++		set_break(info);
+ 
+ 	return 0;
+ }
+@@ -97,7 +97,7 @@ void arch_uninstall_hw_breakpoint(struct perf_event *bp)
+ 	}
+ 
+ 	*slot = NULL;
+-	set_dabr(0, 0);
++	hw_breakpoint_disable();
+ }
+ 
+ /*
+@@ -127,19 +127,13 @@ int arch_check_bp_in_kernelspace(struct perf_event *bp)
+ 
+ int arch_bp_generic_fields(int type, int *gen_bp_type)
+ {
+-	switch (type) {
+-	case DABR_DATA_READ:
+-		*gen_bp_type = HW_BREAKPOINT_R;
+-		break;
+-	case DABR_DATA_WRITE:
+-		*gen_bp_type = HW_BREAKPOINT_W;
+-		break;
+-	case (DABR_DATA_WRITE | DABR_DATA_READ):
+-		*gen_bp_type = (HW_BREAKPOINT_W | HW_BREAKPOINT_R);
+-		break;
+-	default:
++	*gen_bp_type = 0;
++	if (type & HW_BRK_TYPE_READ)
++		*gen_bp_type |= HW_BREAKPOINT_R;
++	if (type & HW_BRK_TYPE_WRITE)
++		*gen_bp_type |= HW_BREAKPOINT_W;
++	if (*gen_bp_type == 0)
+ 		return -EINVAL;
+-	}
+ 	return 0;
+ }
+ 
+@@ -154,29 +148,22 @@ int arch_validate_hwbkpt_settings(struct perf_event *bp)
+ 	if (!bp)
+ 		return ret;
+ 
+-	switch (bp->attr.bp_type) {
+-	case HW_BREAKPOINT_R:
+-		info->type = DABR_DATA_READ;
+-		break;
+-	case HW_BREAKPOINT_W:
+-		info->type = DABR_DATA_WRITE;
+-		break;
+-	case HW_BREAKPOINT_R | HW_BREAKPOINT_W:
+-		info->type = (DABR_DATA_READ | DABR_DATA_WRITE);
+-		break;
+-	default:
++	info->type = HW_BRK_TYPE_TRANSLATE;
++	if (bp->attr.bp_type & HW_BREAKPOINT_R)
++		info->type |= HW_BRK_TYPE_READ;
++	if (bp->attr.bp_type & HW_BREAKPOINT_W)
++		info->type |= HW_BRK_TYPE_WRITE;
++	if (info->type == HW_BRK_TYPE_TRANSLATE)
++		/* must set alteast read or write */
+ 		return ret;
+-	}
+-
++	if (!(bp->attr.exclude_user))
++		info->type |= HW_BRK_TYPE_USER;
++	if (!(bp->attr.exclude_kernel))
++		info->type |= HW_BRK_TYPE_KERNEL;
++	if (!(bp->attr.exclude_hv))
++		info->type |= HW_BRK_TYPE_HYP;
+ 	info->address = bp->attr.bp_addr;
+ 	info->len = bp->attr.bp_len;
+-	info->dabrx = DABRX_ALL;
+-	if (bp->attr.exclude_user)
+-		info->dabrx &= ~DABRX_USER;
+-	if (bp->attr.exclude_kernel)
+-		info->dabrx &= ~DABRX_KERNEL;
+-	if (bp->attr.exclude_hv)
+-		info->dabrx &= ~DABRX_HYP;
+ 
+ 	/*
+ 	 * Since breakpoint length can be a maximum of HW_BREAKPOINT_LEN(8)
+@@ -204,7 +191,7 @@ void thread_change_pc(struct task_struct *tsk, struct pt_regs *regs)
+ 
+ 	info = counter_arch_bp(tsk->thread.last_hit_ubp);
+ 	regs->msr &= ~MSR_SE;
+-	set_dabr(info->address | info->type | DABR_TRANSLATION, info->dabrx);
++	set_break(info);
+ 	tsk->thread.last_hit_ubp = NULL;
+ }
+ 
+@@ -222,7 +209,7 @@ int __kprobes hw_breakpoint_handler(struct die_args *args)
+ 	unsigned long dar = regs->dar;
+ 
+ 	/* Disable breakpoints during exception handling */
+-	set_dabr(0, 0);
++	hw_breakpoint_disable();
+ 
+ 	/*
+ 	 * The counter may be concurrently released but that can only
+@@ -255,8 +242,9 @@ int __kprobes hw_breakpoint_handler(struct die_args *args)
+ 	 * we still need to single-step the instruction, but we don't
+ 	 * generate an event.
+ 	 */
+-	info->extraneous_interrupt = !((bp->attr.bp_addr <= dar) &&
+-			(dar - bp->attr.bp_addr < bp->attr.bp_len));
++	if (!((bp->attr.bp_addr <= dar) &&
++	      (dar - bp->attr.bp_addr < bp->attr.bp_len)))
++		info->type |= HW_BRK_TYPE_EXTRANEOUS_IRQ;
+ 
+ 	/* Do not emulate user-space instructions, instead single-step them */
+ 	if (user_mode(regs)) {
+@@ -285,10 +273,10 @@ int __kprobes hw_breakpoint_handler(struct die_args *args)
+ 	 * As a policy, the callback is invoked in a 'trigger-after-execute'
+ 	 * fashion
+ 	 */
+-	if (!info->extraneous_interrupt)
++	if (!(info->type & HW_BRK_TYPE_EXTRANEOUS_IRQ))
+ 		perf_bp_event(bp, regs);
+ 
+-	set_dabr(info->address | info->type | DABR_TRANSLATION, info->dabrx);
++	set_break(info);
+ out:
+ 	rcu_read_unlock();
+ 	return rc;
+@@ -317,10 +305,10 @@ int __kprobes single_step_dabr_instruction(struct die_args *args)
+ 	 * We shall invoke the user-defined callback function in the single
+ 	 * stepping handler to confirm to 'trigger-after-execute' semantics
+ 	 */
+-	if (!info->extraneous_interrupt)
++	if (!(info->type & HW_BRK_TYPE_EXTRANEOUS_IRQ))
+ 		perf_bp_event(bp, regs);
+ 
+-	set_dabr(info->address | info->type | DABR_TRANSLATION, info->dabrx);
++	set_break(info);
+ 	current->thread.last_hit_ubp = NULL;
+ 
+ 	/*
+
+commit cd14457304c9d232267a3a76a2a43f1f791e545d
+Author: Michael Neuling <mikey@neuling.org>
+Date:   Thu Sep 6 21:24:57 2012 +0000
+
+    powerpc: Dynamically calculate the dabrx based on kernel/user/hypervisor
+    
+    Currently we mark the DABRX to interrupt on all matches
+    (hypervisor/kernel/user and then filter in software.  We can be a lot
+    smarter now that we can set the DABRX dynamically.
+    
+    This sets the DABRX based on the flags passed by the user.
+    
+    Signed-off-by: Michael Neuling <mikey@neuling.org>
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+
+diff --git a/arch/powerpc/kernel/hw_breakpoint.c b/arch/powerpc/kernel/hw_breakpoint.c
+index 6891d79ecef6..a89cae481b04 100644
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@ -73,7 +73,7 @@ int arch_install_hw_breakpoint(struct perf_event *bp)
+ 	 * If so, DABR will be populated in single_step_dabr_instruction().
+ 	 */
+ 	if (current->thread.last_hit_ubp != bp)
+-		set_dabr(info->address | info->type | DABR_TRANSLATION, DABRX_ALL);
++		set_dabr(info->address | info->type | DABR_TRANSLATION, info->dabrx);
+ 
+ 	return 0;
+ }
+@@ -170,6 +170,13 @@ int arch_validate_hwbkpt_settings(struct perf_event *bp)
+ 
+ 	info->address = bp->attr.bp_addr;
+ 	info->len = bp->attr.bp_len;
++	info->dabrx = DABRX_ALL;
++	if (bp->attr.exclude_user)
++		info->dabrx &= ~DABRX_USER;
++	if (bp->attr.exclude_kernel)
++		info->dabrx &= ~DABRX_KERNEL;
++	if (bp->attr.exclude_hv)
++		info->dabrx &= ~DABRX_HYP;
+ 
+ 	/*
+ 	 * Since breakpoint length can be a maximum of HW_BREAKPOINT_LEN(8)
+@@ -197,7 +204,7 @@ void thread_change_pc(struct task_struct *tsk, struct pt_regs *regs)
+ 
+ 	info = counter_arch_bp(tsk->thread.last_hit_ubp);
+ 	regs->msr &= ~MSR_SE;
+-	set_dabr(info->address | info->type | DABR_TRANSLATION, DABRX_ALL);
++	set_dabr(info->address | info->type | DABR_TRANSLATION, info->dabrx);
+ 	tsk->thread.last_hit_ubp = NULL;
+ }
+ 
+@@ -281,7 +288,7 @@ int __kprobes hw_breakpoint_handler(struct die_args *args)
+ 	if (!info->extraneous_interrupt)
+ 		perf_bp_event(bp, regs);
+ 
+-	set_dabr(info->address | info->type | DABR_TRANSLATION, DABRX_ALL);
++	set_dabr(info->address | info->type | DABR_TRANSLATION, info->dabrx);
+ out:
+ 	rcu_read_unlock();
+ 	return rc;
+@@ -313,7 +320,7 @@ int __kprobes single_step_dabr_instruction(struct die_args *args)
+ 	if (!info->extraneous_interrupt)
+ 		perf_bp_event(bp, regs);
+ 
+-	set_dabr(info->address | info->type | DABR_TRANSLATION, DABRX_ALL);
++	set_dabr(info->address | info->type | DABR_TRANSLATION, info->dabrx);
+ 	current->thread.last_hit_ubp = NULL;
+ 
+ 	/*
+
+commit 4474ef055c5d8cb8eaf002d69e49af71e3aa3a88
+Author: Michael Neuling <mikey@neuling.org>
+Date:   Thu Sep 6 21:24:56 2012 +0000
+
+    powerpc: Rework set_dabr so it can take a DABRX value as well
+    
+    Rework set_dabr to take a DABRX value as well.
+    
+    Both the pseries and PS3 hypervisors do some checks on the DABRX
+    values that are passed in the hcall.  This patch stops bogus values
+    from being passed to hypervisor.  Also, in the case where we are
+    clearing the breakpoint, where DABR and DABRX are zero, we modify the
+    DABRX value to make it valid so that the hcall won't fail.
+    
+    Signed-off-by: Michael Neuling <mikey@neuling.org>
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+
+diff --git a/arch/powerpc/kernel/hw_breakpoint.c b/arch/powerpc/kernel/hw_breakpoint.c
+index 6767445ecb45..6891d79ecef6 100644
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@ -73,7 +73,7 @@ int arch_install_hw_breakpoint(struct perf_event *bp)
+ 	 * If so, DABR will be populated in single_step_dabr_instruction().
+ 	 */
+ 	if (current->thread.last_hit_ubp != bp)
+-		set_dabr(info->address | info->type | DABR_TRANSLATION);
++		set_dabr(info->address | info->type | DABR_TRANSLATION, DABRX_ALL);
+ 
+ 	return 0;
+ }
+@@ -97,7 +97,7 @@ void arch_uninstall_hw_breakpoint(struct perf_event *bp)
+ 	}
+ 
+ 	*slot = NULL;
+-	set_dabr(0);
++	set_dabr(0, 0);
+ }
+ 
+ /*
+@@ -197,7 +197,7 @@ void thread_change_pc(struct task_struct *tsk, struct pt_regs *regs)
+ 
+ 	info = counter_arch_bp(tsk->thread.last_hit_ubp);
+ 	regs->msr &= ~MSR_SE;
+-	set_dabr(info->address | info->type | DABR_TRANSLATION);
++	set_dabr(info->address | info->type | DABR_TRANSLATION, DABRX_ALL);
+ 	tsk->thread.last_hit_ubp = NULL;
+ }
+ 
+@@ -215,7 +215,7 @@ int __kprobes hw_breakpoint_handler(struct die_args *args)
+ 	unsigned long dar = regs->dar;
+ 
+ 	/* Disable breakpoints during exception handling */
+-	set_dabr(0);
++	set_dabr(0, 0);
+ 
+ 	/*
+ 	 * The counter may be concurrently released but that can only
+@@ -281,7 +281,7 @@ int __kprobes hw_breakpoint_handler(struct die_args *args)
+ 	if (!info->extraneous_interrupt)
+ 		perf_bp_event(bp, regs);
+ 
+-	set_dabr(info->address | info->type | DABR_TRANSLATION);
++	set_dabr(info->address | info->type | DABR_TRANSLATION, DABRX_ALL);
+ out:
+ 	rcu_read_unlock();
+ 	return rc;
+@@ -313,7 +313,7 @@ int __kprobes single_step_dabr_instruction(struct die_args *args)
+ 	if (!info->extraneous_interrupt)
+ 		perf_bp_event(bp, regs);
+ 
+-	set_dabr(info->address | info->type | DABR_TRANSLATION);
++	set_dabr(info->address | info->type | DABR_TRANSLATION, DABRX_ALL);
+ 	current->thread.last_hit_ubp = NULL;
+ 
+ 	/*
+
+commit 3f4693eeeae45e9253031633adb0c7fde13a5026
+Author: Michael Neuling <mikey@neuling.org>
+Date:   Wed Sep 5 19:17:48 2012 +0000
+
+    powerpc: Use consistent name info for arch_hw_breakpoint
+    
+    Change bp_info to info to be consistent with the rest of this file.
+    
+    Signed-off-by: Michael Neuling <mikey@neuling.org>
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+
+diff --git a/arch/powerpc/kernel/hw_breakpoint.c b/arch/powerpc/kernel/hw_breakpoint.c
+index 956a4c496de9..6767445ecb45 100644
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@ -294,7 +294,7 @@ int __kprobes single_step_dabr_instruction(struct die_args *args)
+ {
+ 	struct pt_regs *regs = args->regs;
+ 	struct perf_event *bp = NULL;
+-	struct arch_hw_breakpoint *bp_info;
++	struct arch_hw_breakpoint *info;
+ 
+ 	bp = current->thread.last_hit_ubp;
+ 	/*
+@@ -304,16 +304,16 @@ int __kprobes single_step_dabr_instruction(struct die_args *args)
+ 	if (!bp)
+ 		return NOTIFY_DONE;
+ 
+-	bp_info = counter_arch_bp(bp);
++	info = counter_arch_bp(bp);
+ 
+ 	/*
+ 	 * We shall invoke the user-defined callback function in the single
+ 	 * stepping handler to confirm to 'trigger-after-execute' semantics
+ 	 */
+-	if (!bp_info->extraneous_interrupt)
++	if (!info->extraneous_interrupt)
+ 		perf_bp_event(bp, regs);
+ 
+-	set_dabr(bp_info->address | bp_info->type | DABR_TRANSLATION);
++	set_dabr(info->address | info->type | DABR_TRANSLATION);
+ 	current->thread.last_hit_ubp = NULL;
+ 
+ 	/*
+
+commit 6d9c00c67b4768105e8ae3d213484095c744eea8
+Author: Michael Neuling <mikey@neuling.org>
+Date:   Wed Aug 22 20:30:43 2012 +0000
+
+    powerpc: Fix null pointer deref in perf hardware breakpoints
+    
+    Currently if you are doing a global perf recording with hardware
+    breakpoints (ie perf record -e mem:0xdeadbeef -a), you can oops with:
+    
+      Faulting instruction address: 0xc000000000738890
+      cpu 0xc: Vector: 300 (Data Access) at [c0000003f76af8d0]
+          pc: c000000000738890: .hw_breakpoint_handler+0xa0/0x1e0
+          lr: c000000000738830: .hw_breakpoint_handler+0x40/0x1e0
+          sp: c0000003f76afb50
+         msr: 8000000000001032
+         dar: 6f0
+       dsisr: 42000000
+        current = 0xc0000003f765ac00
+        paca    = 0xc00000000f262a00   softe: 0        irq_happened: 0x01
+        pid   = 6810, comm = loop-read
+      enter ? for help
+      [c0000003f76afbe0] c00000000073cd04 .notifier_call_chain.isra.0+0x84/0xe0
+      [c0000003f76afc80] c00000000073cdbc .notify_die+0x3c/0x60
+      [c0000003f76afd20] c0000000000139f0 .do_dabr+0x40/0xf0
+      [c0000003f76afe30] c000000000005a9c handle_dabr_fault+0x14/0x48
+      --- Exception: 300 (Data Access) at 0000000010000480
+      SP (ff8679e0) is in userspace
+    
+    This is because we don't check to see if the break point is associated
+    with task before we deference the task_struct pointer.
+    
+    This changes the update to use current.
+    
+    Signed-off-by: Michael Neuling <mikey@neuling.org>
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+
+diff --git a/arch/powerpc/kernel/hw_breakpoint.c b/arch/powerpc/kernel/hw_breakpoint.c
+index f3a82dde61db..956a4c496de9 100644
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@ -253,7 +253,7 @@ int __kprobes hw_breakpoint_handler(struct die_args *args)
+ 
+ 	/* Do not emulate user-space instructions, instead single-step them */
+ 	if (user_mode(regs)) {
+-		bp->ctx->task->thread.last_hit_ubp = bp;
++		current->thread.last_hit_ubp = bp;
+ 		regs->msr |= MSR_SE;
+ 		goto out;
+ 	}
+
+commit ac84aa2b3b9b791eac45174d1966d5fdf3bbba1c
+Author: Naveen N. Rao <naveen.n.rao@linux.vnet.ibm.com>
+Date:   Fri Jul 6 01:30:58 2012 +0000
+
+    powerpc/hw_breakpoints: Fix incorrect pointer access
+    
+    If arch_validate_hwbkpt_settings() fails, bp->ctx won't be valid and the
+    kernel panics. Add a check to fix this.
+    
+    Reported-by: Edjunior Barbosa Machado <emachado@linux.vnet.ibm.com>
+    Signed-off-by: Naveen N. Rao <naveen.n.rao@linux.vnet.ibm.com>
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+
+diff --git a/arch/powerpc/kernel/hw_breakpoint.c b/arch/powerpc/kernel/hw_breakpoint.c
+index 2bc0584be81c..f3a82dde61db 100644
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@ -111,7 +111,7 @@ void arch_unregister_hw_breakpoint(struct perf_event *bp)
+ 	 * and the single_step_dabr_instruction(), then cleanup the breakpoint
+ 	 * restoration variables to prevent dangling pointers.
+ 	 */
+-	if (bp->ctx->task)
++	if (bp->ctx && bp->ctx->task)
+ 		bp->ctx->task->thread.last_hit_ubp = NULL;
+ }
+ 
+
+commit ead53f22dc646d91a1b6201b9f44dd47d7d88c34
+Author: Paul Gortmaker <paul.gortmaker@windriver.com>
+Date:   Fri Jul 22 14:24:04 2011 -0400
+
+    powerpc: remove non-required uses of include <linux/module.h>
+    
+    None of the files touched here are modules, and they are not
+    exporting any symbols either -- so there is no need to be including
+    the module.h.  Builds of all the files remains successful.
+    
+    Even kernel/module.c does not need to include it, since it includes
+    linux/moduleloader.h instead.
+    
+    Signed-off-by: Paul Gortmaker <paul.gortmaker@windriver.com>
+
+diff --git a/arch/powerpc/kernel/hw_breakpoint.c b/arch/powerpc/kernel/hw_breakpoint.c
+index 5ecd0401cdb1..2bc0584be81c 100644
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@ -27,7 +27,6 @@
+ #include <linux/kprobes.h>
+ #include <linux/percpu.h>
+ #include <linux/kernel.h>
+-#include <linux/module.h>
+ #include <linux/sched.h>
+ #include <linux/init.h>
+ #include <linux/smp.h>
+
+commit d09ec7387184eba9e3030496f0451204090ff610
+Author: Paul Mackerras <paulus@samba.org>
+Date:   Tue Jun 29 12:50:32 2010 +1000
+
+    powerpc, hw_breakpoint: Tell generic code we have no instruction breakpoints
+    
+    At present, hw_breakpoint_slots() returns 1 regardless of what
+    type of breakpoint is specified in the type argument.  Since we
+    don't define CONFIG_HAVE_MIXED_BREAKPOINTS_REGS, there are
+    separate values for TYPE_INST and TYPE_DATA, and hw_breakpoint_slots()
+    returns 1 for both, effectively advertising instruction breakpoint
+    support which doesn't exist.
+    
+    This fixes it by making hw_breakpoint_slots return 1 for TYPE_DATA
+    and 0 for TYPE_INST.  This moves hw_breakpoint_slots() from the
+    powerpc hw_breakpoint.h to hw_breakpoint.c because the definitions
+    of TYPE_INST and TYPE_DATA aren't available in <asm/hw_breakpoint.h>.
+    They are defined in <linux/hw_breakpoint.h> but we can't include
+    that header in <asm/hw_breakpoint.h>, and nor can we rely on
+    <linux/hw_breakpoint.h> being included before <asm/hw_breakpoint.h>.
+    Since hw_breakpoint_slots() is only called at boot time, there is
+    no performance impact from making it a real function rather than
+    a static inline.
+    
+    Signed-off-by: Paul Mackerras <paulus@samba.org>
+
+diff --git a/arch/powerpc/kernel/hw_breakpoint.c b/arch/powerpc/kernel/hw_breakpoint.c
+index 5a1d55d06a08..5ecd0401cdb1 100644
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@ -43,6 +43,16 @@
+  */
+ static DEFINE_PER_CPU(struct perf_event *, bp_per_reg);
+ 
++/*
++ * Returns total number of data or instruction breakpoints available.
++ */
++int hw_breakpoint_slots(int type)
++{
++	if (type == TYPE_DATA)
++		return HBP_NUM;
++	return 0;		/* no instruction breakpoints available */
++}
++
+ /*
+  * Install a perf counter breakpoint.
+  *
+
+commit 76b0f1337690d223811c852ad3a5078eb89276c5
+Author: Paul Mackerras <paulus@samba.org>
+Date:   Wed Jun 23 15:46:55 2010 +1000
+
+    powerpc, hw_breakpoint: Cooperate better with other single-steppers
+    
+    The code we had to clear the MSR_SE bit was not doing anything because
+    the caller (ultimately single_step_exception() in traps.c) had already
+    cleared.  Instead of trying to leave MSR_SE set if the TIF_SINGLESTEP
+    flag is set (which indicates that the process is being single-stepped
+    by ptrace), we instead return NOTIFY_DONE in that case, which means
+    the caller will generate a SIGTRAP for the process.
+    
+    Signed-off-by: Paul Mackerras <paulus@samba.org>
+
+diff --git a/arch/powerpc/kernel/hw_breakpoint.c b/arch/powerpc/kernel/hw_breakpoint.c
+index 241e09712314..5a1d55d06a08 100644
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@ -304,15 +304,16 @@ int __kprobes single_step_dabr_instruction(struct die_args *args)
+ 	if (!bp_info->extraneous_interrupt)
+ 		perf_bp_event(bp, regs);
+ 
++	set_dabr(bp_info->address | bp_info->type | DABR_TRANSLATION);
++	current->thread.last_hit_ubp = NULL;
++
+ 	/*
+-	 * Do not disable MSR_SE if the process was already in
+-	 * single-stepping mode.
++	 * If the process was being single-stepped by ptrace, let the
++	 * other single-step actions occur (e.g. generate SIGTRAP).
+ 	 */
+-	if (!test_thread_flag(TIF_SINGLESTEP))
+-		regs->msr &= ~MSR_SE;
++	if (test_thread_flag(TIF_SINGLESTEP))
++		return NOTIFY_DONE;
+ 
+-	set_dabr(bp_info->address | bp_info->type | DABR_TRANSLATION);
+-	current->thread.last_hit_ubp = NULL;
+ 	return NOTIFY_STOP;
+ }
+ 
+
+commit 574cb24899d35e71be1d8fb1add2c3306804e4bf
+Author: Paul Mackerras <paulus@samba.org>
+Date:   Wed Jun 23 15:42:43 2010 +1000
+
+    powerpc, hw_breakpoint: Fix off-by-one in checking access address
+    
+    The code would accept an access to an address one byte past the end
+    of the requested range as legitimate, due to having a "<=" rather than
+    a "<".  This fixes that and cleans up the code a bit.
+    
+    Signed-off-by: Paul Mackerras <paulus@samba.org>
+
+diff --git a/arch/powerpc/kernel/hw_breakpoint.c b/arch/powerpc/kernel/hw_breakpoint.c
+index ed39805a3b84..241e09712314 100644
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@ -197,7 +197,6 @@ void thread_change_pc(struct task_struct *tsk, struct pt_regs *regs)
+  */
+ int __kprobes hw_breakpoint_handler(struct die_args *args)
+ {
+-	bool is_ptrace_bp = false;
+ 	int rc = NOTIFY_STOP;
+ 	struct perf_event *bp;
+ 	struct pt_regs *regs = args->regs;
+@@ -208,6 +207,7 @@ int __kprobes hw_breakpoint_handler(struct die_args *args)
+ 
+ 	/* Disable breakpoints during exception handling */
+ 	set_dabr(0);
++
+ 	/*
+ 	 * The counter may be concurrently released but that can only
+ 	 * occur from a call_rcu() path. We can then safely fetch
+@@ -220,8 +220,6 @@ int __kprobes hw_breakpoint_handler(struct die_args *args)
+ 	if (!bp)
+ 		goto out;
+ 	info = counter_arch_bp(bp);
+-	is_ptrace_bp = (bp->overflow_handler == ptrace_triggered) ?
+-			true : false;
+ 
+ 	/*
+ 	 * Return early after invoking user-callback function without restoring
+@@ -229,7 +227,7 @@ int __kprobes hw_breakpoint_handler(struct die_args *args)
+ 	 * one-shot mode. The ptrace-ed process will receive the SIGTRAP signal
+ 	 * generated in do_dabr().
+ 	 */
+-	if (is_ptrace_bp) {
++	if (bp->overflow_handler == ptrace_triggered) {
+ 		perf_bp_event(bp, regs);
+ 		rc = NOTIFY_DONE;
+ 		goto out;
+@@ -237,19 +235,12 @@ int __kprobes hw_breakpoint_handler(struct die_args *args)
+ 
+ 	/*
+ 	 * Verify if dar lies within the address range occupied by the symbol
+-	 * being watched to filter extraneous exceptions.
++	 * being watched to filter extraneous exceptions.  If it doesn't,
++	 * we still need to single-step the instruction, but we don't
++	 * generate an event.
+ 	 */
+-	if (!((bp->attr.bp_addr <= dar) &&
+-	     (dar <= (bp->attr.bp_addr + bp->attr.bp_len)))) {
+-		/*
+-		 * This exception is triggered not because of a memory access
+-		 * on the monitored variable but in the double-word address
+-		 * range in which it is contained. We will consume this
+-		 * exception, considering it as 'noise'.
+-		 */
+-		info->extraneous_interrupt = true;
+-	} else
+-		info->extraneous_interrupt = false;
++	info->extraneous_interrupt = !((bp->attr.bp_addr <= dar) &&
++			(dar - bp->attr.bp_addr < bp->attr.bp_len));
+ 
+ 	/* Do not emulate user-space instructions, instead single-step them */
+ 	if (user_mode(regs)) {
+
+commit e3e94084adb5610987283367574ebc771e8206e1
+Author: K.Prasad <prasad@linux.vnet.ibm.com>
+Date:   Tue Jun 15 11:36:12 2010 +0530
+
+    powerpc, hw_breakpoint: Discard extraneous interrupt due to accesses outside symbol length
+    
+    Many a times, the requested breakpoint length can be less than the
+    fixed breakpoint length i.e. 8 bytes supported by PowerPC 64-bit
+    server (Book III S) processors.  This could lead to extraneous
+    interrupts resulting in false breakpoint notifications.  This
+    detects and discards such interrupts for non-ptrace requests.
+    We don't change ptrace behaviour to avoid breaking compatability.
+    
+    [Suggestion from Paul Mackerras <paulus@samba.org> to add a new flag in
+    'struct arch_hw_breakpoint' to identify extraneous interrupts]
+    
+    Signed-off-by: K.Prasad <prasad@linux.vnet.ibm.com>
+    Signed-off-by: Paul Mackerras <paulus@samba.org>
+
+diff --git a/arch/powerpc/kernel/hw_breakpoint.c b/arch/powerpc/kernel/hw_breakpoint.c
+index 7bd01a56d194..ed39805a3b84 100644
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@ -204,6 +204,7 @@ int __kprobes hw_breakpoint_handler(struct die_args *args)
+ 	int stepped = 1;
+ 	struct arch_hw_breakpoint *info;
+ 	unsigned int instr;
++	unsigned long dar = regs->dar;
+ 
+ 	/* Disable breakpoints during exception handling */
+ 	set_dabr(0);
+@@ -234,6 +235,22 @@ int __kprobes hw_breakpoint_handler(struct die_args *args)
+ 		goto out;
+ 	}
+ 
++	/*
++	 * Verify if dar lies within the address range occupied by the symbol
++	 * being watched to filter extraneous exceptions.
++	 */
++	if (!((bp->attr.bp_addr <= dar) &&
++	     (dar <= (bp->attr.bp_addr + bp->attr.bp_len)))) {
++		/*
++		 * This exception is triggered not because of a memory access
++		 * on the monitored variable but in the double-word address
++		 * range in which it is contained. We will consume this
++		 * exception, considering it as 'noise'.
++		 */
++		info->extraneous_interrupt = true;
++	} else
++		info->extraneous_interrupt = false;
++
+ 	/* Do not emulate user-space instructions, instead single-step them */
+ 	if (user_mode(regs)) {
+ 		bp->ctx->task->thread.last_hit_ubp = bp;
+@@ -261,7 +278,8 @@ int __kprobes hw_breakpoint_handler(struct die_args *args)
+ 	 * As a policy, the callback is invoked in a 'trigger-after-execute'
+ 	 * fashion
+ 	 */
+-	perf_bp_event(bp, regs);
++	if (!info->extraneous_interrupt)
++		perf_bp_event(bp, regs);
+ 
+ 	set_dabr(info->address | info->type | DABR_TRANSLATION);
+ out:
+@@ -292,7 +310,8 @@ int __kprobes single_step_dabr_instruction(struct die_args *args)
+ 	 * We shall invoke the user-defined callback function in the single
+ 	 * stepping handler to confirm to 'trigger-after-execute' semantics
+ 	 */
+-	perf_bp_event(bp, regs);
++	if (!bp_info->extraneous_interrupt)
++		perf_bp_event(bp, regs);
+ 
+ 	/*
+ 	 * Do not disable MSR_SE if the process was already in
+
+commit 06532a6743d83fac4b79389fc8c86c88cb4e3302
+Author: K.Prasad <prasad@linux.vnet.ibm.com>
+Date:   Tue Jun 15 11:35:41 2010 +0530
+
+    powerpc, hw_breakpoint: Enable hw-breakpoints while handling intervening signals
+    
+    A signal delivered between a hw_breakpoint_handler() and the
+    single_step_dabr_instruction() will not have the breakpoint active
+    while the signal handler is running -- the signal delivery will
+    set up a new MSR value which will not have MSR_SE set, so we
+    won't get the signal step interrupt until and unless the signal
+    handler returns (which it may never do).
+    
+    To fix this, we restore the breakpoint when delivering a signal --
+    we clear the MSR_SE bit and set the DABR again.  If the signal
+    handler returns, the DABR interrupt will occur again when the
+    instruction that we were originally trying to single-step gets
+    re-executed.
+    
+    [Paul Mackerras <paulus@samba.org> pointed out the need to do this.]
+    
+    Signed-off-by: K.Prasad <prasad@linux.vnet.ibm.com>
+    Signed-off-by: Paul Mackerras <paulus@samba.org>
+
+diff --git a/arch/powerpc/kernel/hw_breakpoint.c b/arch/powerpc/kernel/hw_breakpoint.c
+index 7a2ad5e84c16..7bd01a56d194 100644
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@ -174,6 +174,24 @@ int arch_validate_hwbkpt_settings(struct perf_event *bp)
+ 	return 0;
+ }
+ 
++/*
++ * Restores the breakpoint on the debug registers.
++ * Invoke this function if it is known that the execution context is
++ * about to change to cause loss of MSR_SE settings.
++ */
++void thread_change_pc(struct task_struct *tsk, struct pt_regs *regs)
++{
++	struct arch_hw_breakpoint *info;
++
++	if (likely(!tsk->thread.last_hit_ubp))
++		return;
++
++	info = counter_arch_bp(tsk->thread.last_hit_ubp);
++	regs->msr &= ~MSR_SE;
++	set_dabr(info->address | info->type | DABR_TRANSLATION);
++	tsk->thread.last_hit_ubp = NULL;
++}
++
+ /*
+  * Handle debug exception notifications.
+  */
+
+commit 5aae8a53708025d4e718f0d2e7c2f766779ddc71
+Author: K.Prasad <prasad@linux.vnet.ibm.com>
+Date:   Tue Jun 15 11:35:19 2010 +0530
+
+    powerpc, hw_breakpoints: Implement hw_breakpoints for 64-bit server processors
+    
+    Implement perf-events based hw-breakpoint interfaces for PowerPC
+    64-bit server (Book III S) processors.  This allows access to a
+    given location to be used as an event that can be counted or
+    profiled by the perf_events subsystem.
+    
+    This is done using the DABR (data breakpoint register), which can
+    also be used for process debugging via ptrace.  When perf_event
+    hw_breakpoint support is configured in, the perf_event subsystem
+    manages the DABR and arbitrates access to it, and ptrace then
+    creates a perf_event when it is requested to set a data breakpoint.
+    
+    [Adopted suggestions from Paul Mackerras <paulus@samba.org> to
+    - emulate_step() all system-wide breakpoints and single-step only the
+      per-task breakpoints
+    - perform arch-specific cleanup before unregistration through
+      arch_unregister_hw_breakpoint()
+    ]
+    
+    Signed-off-by: K.Prasad <prasad@linux.vnet.ibm.com>
+    Signed-off-by: Paul Mackerras <paulus@samba.org>
+
+diff --git a/arch/powerpc/kernel/hw_breakpoint.c b/arch/powerpc/kernel/hw_breakpoint.c
+new file mode 100644
+index 000000000000..7a2ad5e84c16
+--- /dev/null
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@ -0,0 +1,325 @@
++/*
++ * HW_breakpoint: a unified kernel/user-space hardware breakpoint facility,
++ * using the CPU's debug registers. Derived from
++ * "arch/x86/kernel/hw_breakpoint.c"
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
++ *
++ * Copyright 2010 IBM Corporation
++ * Author: K.Prasad <prasad@linux.vnet.ibm.com>
++ *
++ */
++
++#include <linux/hw_breakpoint.h>
++#include <linux/notifier.h>
++#include <linux/kprobes.h>
++#include <linux/percpu.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/sched.h>
++#include <linux/init.h>
++#include <linux/smp.h>
++
++#include <asm/hw_breakpoint.h>
++#include <asm/processor.h>
++#include <asm/sstep.h>
++#include <asm/uaccess.h>
++
++/*
++ * Stores the breakpoints currently in use on each breakpoint address
++ * register for every cpu
++ */
++static DEFINE_PER_CPU(struct perf_event *, bp_per_reg);
++
++/*
++ * Install a perf counter breakpoint.
++ *
++ * We seek a free debug address register and use it for this
++ * breakpoint.
++ *
++ * Atomic: we hold the counter->ctx->lock and we only handle variables
++ * and registers local to this cpu.
++ */
++int arch_install_hw_breakpoint(struct perf_event *bp)
++{
++	struct arch_hw_breakpoint *info = counter_arch_bp(bp);
++	struct perf_event **slot = &__get_cpu_var(bp_per_reg);
++
++	*slot = bp;
++
++	/*
++	 * Do not install DABR values if the instruction must be single-stepped.
++	 * If so, DABR will be populated in single_step_dabr_instruction().
++	 */
++	if (current->thread.last_hit_ubp != bp)
++		set_dabr(info->address | info->type | DABR_TRANSLATION);
++
++	return 0;
++}
++
++/*
++ * Uninstall the breakpoint contained in the given counter.
++ *
++ * First we search the debug address register it uses and then we disable
++ * it.
++ *
++ * Atomic: we hold the counter->ctx->lock and we only handle variables
++ * and registers local to this cpu.
++ */
++void arch_uninstall_hw_breakpoint(struct perf_event *bp)
++{
++	struct perf_event **slot = &__get_cpu_var(bp_per_reg);
++
++	if (*slot != bp) {
++		WARN_ONCE(1, "Can't find the breakpoint");
++		return;
++	}
++
++	*slot = NULL;
++	set_dabr(0);
++}
++
++/*
++ * Perform cleanup of arch-specific counters during unregistration
++ * of the perf-event
++ */
++void arch_unregister_hw_breakpoint(struct perf_event *bp)
++{
++	/*
++	 * If the breakpoint is unregistered between a hw_breakpoint_handler()
++	 * and the single_step_dabr_instruction(), then cleanup the breakpoint
++	 * restoration variables to prevent dangling pointers.
++	 */
++	if (bp->ctx->task)
++		bp->ctx->task->thread.last_hit_ubp = NULL;
++}
++
++/*
++ * Check for virtual address in kernel space.
++ */
++int arch_check_bp_in_kernelspace(struct perf_event *bp)
++{
++	struct arch_hw_breakpoint *info = counter_arch_bp(bp);
++
++	return is_kernel_addr(info->address);
++}
++
++int arch_bp_generic_fields(int type, int *gen_bp_type)
++{
++	switch (type) {
++	case DABR_DATA_READ:
++		*gen_bp_type = HW_BREAKPOINT_R;
++		break;
++	case DABR_DATA_WRITE:
++		*gen_bp_type = HW_BREAKPOINT_W;
++		break;
++	case (DABR_DATA_WRITE | DABR_DATA_READ):
++		*gen_bp_type = (HW_BREAKPOINT_W | HW_BREAKPOINT_R);
++		break;
++	default:
++		return -EINVAL;
++	}
++	return 0;
++}
++
++/*
++ * Validate the arch-specific HW Breakpoint register settings
++ */
++int arch_validate_hwbkpt_settings(struct perf_event *bp)
++{
++	int ret = -EINVAL;
++	struct arch_hw_breakpoint *info = counter_arch_bp(bp);
++
++	if (!bp)
++		return ret;
++
++	switch (bp->attr.bp_type) {
++	case HW_BREAKPOINT_R:
++		info->type = DABR_DATA_READ;
++		break;
++	case HW_BREAKPOINT_W:
++		info->type = DABR_DATA_WRITE;
++		break;
++	case HW_BREAKPOINT_R | HW_BREAKPOINT_W:
++		info->type = (DABR_DATA_READ | DABR_DATA_WRITE);
++		break;
++	default:
++		return ret;
++	}
++
++	info->address = bp->attr.bp_addr;
++	info->len = bp->attr.bp_len;
++
++	/*
++	 * Since breakpoint length can be a maximum of HW_BREAKPOINT_LEN(8)
++	 * and breakpoint addresses are aligned to nearest double-word
++	 * HW_BREAKPOINT_ALIGN by rounding off to the lower address, the
++	 * 'symbolsize' should satisfy the check below.
++	 */
++	if (info->len >
++	    (HW_BREAKPOINT_LEN - (info->address & HW_BREAKPOINT_ALIGN)))
++		return -EINVAL;
++	return 0;
++}
++
++/*
++ * Handle debug exception notifications.
++ */
++int __kprobes hw_breakpoint_handler(struct die_args *args)
++{
++	bool is_ptrace_bp = false;
++	int rc = NOTIFY_STOP;
++	struct perf_event *bp;
++	struct pt_regs *regs = args->regs;
++	int stepped = 1;
++	struct arch_hw_breakpoint *info;
++	unsigned int instr;
++
++	/* Disable breakpoints during exception handling */
++	set_dabr(0);
++	/*
++	 * The counter may be concurrently released but that can only
++	 * occur from a call_rcu() path. We can then safely fetch
++	 * the breakpoint, use its callback, touch its counter
++	 * while we are in an rcu_read_lock() path.
++	 */
++	rcu_read_lock();
++
++	bp = __get_cpu_var(bp_per_reg);
++	if (!bp)
++		goto out;
++	info = counter_arch_bp(bp);
++	is_ptrace_bp = (bp->overflow_handler == ptrace_triggered) ?
++			true : false;
++
++	/*
++	 * Return early after invoking user-callback function without restoring
++	 * DABR if the breakpoint is from ptrace which always operates in
++	 * one-shot mode. The ptrace-ed process will receive the SIGTRAP signal
++	 * generated in do_dabr().
++	 */
++	if (is_ptrace_bp) {
++		perf_bp_event(bp, regs);
++		rc = NOTIFY_DONE;
++		goto out;
++	}
++
++	/* Do not emulate user-space instructions, instead single-step them */
++	if (user_mode(regs)) {
++		bp->ctx->task->thread.last_hit_ubp = bp;
++		regs->msr |= MSR_SE;
++		goto out;
++	}
++
++	stepped = 0;
++	instr = 0;
++	if (!__get_user_inatomic(instr, (unsigned int *) regs->nip))
++		stepped = emulate_step(regs, instr);
++
++	/*
++	 * emulate_step() could not execute it. We've failed in reliably
++	 * handling the hw-breakpoint. Unregister it and throw a warning
++	 * message to let the user know about it.
++	 */
++	if (!stepped) {
++		WARN(1, "Unable to handle hardware breakpoint. Breakpoint at "
++			"0x%lx will be disabled.", info->address);
++		perf_event_disable(bp);
++		goto out;
++	}
++	/*
++	 * As a policy, the callback is invoked in a 'trigger-after-execute'
++	 * fashion
++	 */
++	perf_bp_event(bp, regs);
++
++	set_dabr(info->address | info->type | DABR_TRANSLATION);
++out:
++	rcu_read_unlock();
++	return rc;
++}
++
++/*
++ * Handle single-step exceptions following a DABR hit.
++ */
++int __kprobes single_step_dabr_instruction(struct die_args *args)
++{
++	struct pt_regs *regs = args->regs;
++	struct perf_event *bp = NULL;
++	struct arch_hw_breakpoint *bp_info;
++
++	bp = current->thread.last_hit_ubp;
++	/*
++	 * Check if we are single-stepping as a result of a
++	 * previous HW Breakpoint exception
++	 */
++	if (!bp)
++		return NOTIFY_DONE;
++
++	bp_info = counter_arch_bp(bp);
++
++	/*
++	 * We shall invoke the user-defined callback function in the single
++	 * stepping handler to confirm to 'trigger-after-execute' semantics
++	 */
++	perf_bp_event(bp, regs);
++
++	/*
++	 * Do not disable MSR_SE if the process was already in
++	 * single-stepping mode.
++	 */
++	if (!test_thread_flag(TIF_SINGLESTEP))
++		regs->msr &= ~MSR_SE;
++
++	set_dabr(bp_info->address | bp_info->type | DABR_TRANSLATION);
++	current->thread.last_hit_ubp = NULL;
++	return NOTIFY_STOP;
++}
++
++/*
++ * Handle debug exception notifications.
++ */
++int __kprobes hw_breakpoint_exceptions_notify(
++		struct notifier_block *unused, unsigned long val, void *data)
++{
++	int ret = NOTIFY_DONE;
++
++	switch (val) {
++	case DIE_DABR_MATCH:
++		ret = hw_breakpoint_handler(data);
++		break;
++	case DIE_SSTEP:
++		ret = single_step_dabr_instruction(data);
++		break;
++	}
++
++	return ret;
++}
++
++/*
++ * Release the user breakpoints used by ptrace
++ */
++void flush_ptrace_hw_breakpoint(struct task_struct *tsk)
++{
++	struct thread_struct *t = &tsk->thread;
++
++	unregister_hw_breakpoint(t->ptrace_bps[0]);
++	t->ptrace_bps[0] = NULL;
++}
++
++void hw_breakpoint_pmu_read(struct perf_event *bp)
++{
++	/* TODO */
++}

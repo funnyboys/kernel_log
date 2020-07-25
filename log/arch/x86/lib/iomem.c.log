@@ -1,0 +1,273 @@
+commit c228d294f2040c3a5f5965ff04d4947d0bf6e7da
+Author: Linus Torvalds <torvalds@linux-foundation.org>
+Date:   Thu Jan 31 11:10:20 2019 -0800
+
+    x86: explicitly align IO accesses in memcpy_{to,from}io
+    
+    In commit 170d13ca3a2f ("x86: re-introduce non-generic memcpy_{to,from}io")
+    I made our copy from IO space use a separate copy routine rather than
+    rely on the generic memcpy.  I did that because our generic memory copy
+    isn't actually well-defined when it comes to internal access ordering or
+    alignment, and will in fact depend on various CPUID flags.
+    
+    In particular, the default memcpy() for a modern Intel CPU will
+    generally be just a "rep movsb", which works reasonably well for
+    medium-sized memory copies of regular RAM, since the CPU will turn it
+    into fairly optimized microcode.
+    
+    However, for non-cached memory and IO, "rep movs" ends up being
+    horrendously slow and will just do the architectural "one byte at a
+    time" accesses implied by the movsb.
+    
+    At the other end of the spectrum, if you _don't_ end up using the "rep
+    movsb" code, you'd likely fall back to the software copy, which does
+    overlapping accesses for the tail, and may copy things backwards.
+    Again, for regular memory that's fine, for IO memory not so much.
+    
+    The thinking was that clearly nobody really cared (because things
+    worked), but some people had seen horrible performance due to the byte
+    accesses, so let's just revert back to our long ago version that dod
+    "rep movsl" for the bulk of the copy, and then fixed up the potentially
+    last few bytes of the tail with "movsw/b".
+    
+    Interestingly (and perhaps not entirely surprisingly), while that was
+    our original memory copy implementation, and had been used before for
+    IO, in the meantime many new users of memcpy_*io() had come about.  And
+    while the access patterns for the memory copy weren't well-defined (so
+    arguably _any_ access pattern should work), in practice the "rep movsb"
+    case had been very common for the last several years.
+    
+    In particular Jarkko Sakkinen reported that the memcpy_*io() change
+    resuled in weird errors from his Geminilake NUC TPM module.
+    
+    And it turns out that the TPM TCG accesses according to spec require
+    that the accesses be
+    
+     (a) done strictly sequentially
+    
+     (b) be naturally aligned
+    
+    otherwise the TPM chip will abort the PCI transaction.
+    
+    And, in fact, the tpm_crb.c driver did this:
+    
+            memcpy_fromio(buf, priv->rsp, 6);
+            ...
+            memcpy_fromio(&buf[6], &priv->rsp[6], expected - 6);
+    
+    which really should never have worked in the first place, but back
+    before commit 170d13ca3a2f it *happened* to work, because the
+    memcpy_fromio() would be expanded to a regular memcpy, and
+    
+     (a) gcc would expand the first memcpy in-line, and turn it into a
+         4-byte and a 2-byte read, and they happened to be in the right
+         order, and the alignment was right.
+    
+     (b) gcc would call "memcpy()" for the second one, and the machines that
+         had this TPM chip also apparently ended up always having ERMS
+         ("Enhanced REP MOVSB/STOSB instructions"), so we'd use the "rep
+         movbs" for that copy.
+    
+    In other words, basically by pure luck, the code happened to use the
+    right access sizes in the (two different!) memcpy() implementations to
+    make it all work.
+    
+    But after commit 170d13ca3a2f, both of the memcpy_fromio() calls
+    resulted in a call to the routine with the consistent memory accesses,
+    and in both cases it started out transferring with 4-byte accesses.
+    Which worked for the first copy, but resulted in the second copy doing a
+    32-bit read at an address that was only 2-byte aligned.
+    
+    Jarkko is actually fixing the fragile code in the TPM driver, but since
+    this is an excellent example of why we absolutely must not use a generic
+    memcpy for IO accesses, _and_ an IO-specific one really should strive to
+    align the IO accesses, let's do exactly that.
+    
+    Side note: Jarkko also noted that the driver had been used on ARM
+    platforms, and had worked.  That was because on 32-bit ARM, memcpy_*io()
+    ends up always doing byte accesses, and on 64-bit ARM it first does byte
+    accesses to align to 8-byte boundaries, and then does 8-byte accesses
+    for the bulk.
+    
+    So ARM actually worked by design, and the x86 case worked by pure luck.
+    
+    We *might* want to make x86-64 do the 8-byte case too.  That should be a
+    pretty straightforward extension, but let's do one thing at a time.  And
+    generally MMIO accesses aren't really all that performance-critical, as
+    shown by the fact that for a long time we just did them a byte at a
+    time, and very few people ever noticed.
+    
+    Reported-and-tested-by: Jarkko Sakkinen <jarkko.sakkinen@linux.intel.com>
+    Tested-by: Jerry Snitselaar <jsnitsel@redhat.com>
+    Cc: David Laight <David.Laight@aculab.com>
+    Fixes: 170d13ca3a2f ("x86: re-introduce non-generic memcpy_{to,from}io")
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/arch/x86/lib/iomem.c b/arch/x86/lib/iomem.c
+index 66894675f3c8..df50451d94ef 100644
+--- a/arch/x86/lib/iomem.c
++++ b/arch/x86/lib/iomem.c
+@@ -2,8 +2,11 @@
+ #include <linux/module.h>
+ #include <linux/io.h>
+ 
++#define movs(type,to,from) \
++	asm volatile("movs" type:"=&D" (to), "=&S" (from):"0" (to), "1" (from):"memory")
++
+ /* Originally from i386/string.h */
+-static __always_inline void __iomem_memcpy(void *to, const void *from, size_t n)
++static __always_inline void rep_movs(void *to, const void *from, size_t n)
+ {
+ 	unsigned long d0, d1, d2;
+ 	asm volatile("rep ; movsl\n\t"
+@@ -21,13 +24,37 @@ static __always_inline void __iomem_memcpy(void *to, const void *from, size_t n)
+ 
+ void memcpy_fromio(void *to, const volatile void __iomem *from, size_t n)
+ {
+-	__iomem_memcpy(to, (const void *)from, n);
++	if (unlikely(!n))
++		return;
++
++	/* Align any unaligned source IO */
++	if (unlikely(1 & (unsigned long)from)) {
++		movs("b", to, from);
++		n--;
++	}
++	if (n > 1 && unlikely(2 & (unsigned long)from)) {
++		movs("w", to, from);
++		n-=2;
++	}
++	rep_movs(to, (const void *)from, n);
+ }
+ EXPORT_SYMBOL(memcpy_fromio);
+ 
+ void memcpy_toio(volatile void __iomem *to, const void *from, size_t n)
+ {
+-	__iomem_memcpy((void *)to, (const void *) from, n);
++	if (unlikely(!n))
++		return;
++
++	/* Align any unaligned destination IO */
++	if (unlikely(1 & (unsigned long)to)) {
++		movs("b", to, from);
++		n--;
++	}
++	if (n > 1 && unlikely(2 & (unsigned long)to)) {
++		movs("w", to, from);
++		n-=2;
++	}
++	rep_movs((void *)to, (const void *) from, n);
+ }
+ EXPORT_SYMBOL(memcpy_toio);
+ 
+
+commit 170d13ca3a2fdaaa0283399247631b76b441cca2
+Author: Linus Torvalds <torvalds@linux-foundation.org>
+Date:   Fri Jan 4 17:52:49 2019 -0800
+
+    x86: re-introduce non-generic memcpy_{to,from}io
+    
+    This has been broken forever, and nobody ever really noticed because
+    it's purely a performance issue.
+    
+    Long long ago, in commit 6175ddf06b61 ("x86: Clean up mem*io functions")
+    Brian Gerst simplified the memory copies to and from iomem, since on
+    x86, the instructions to access iomem are exactly the same as the
+    regular instructions.
+    
+    That is technically true, and things worked, and nobody said anything.
+    Besides, back then the regular memcpy was pretty simple and worked fine.
+    
+    Nobody noticed except for David Laight, that is.  David has a testing a
+    TLP monitor he was writing for an FPGA, and has been occasionally
+    complaining about how memcpy_toio() writes things one byte at a time.
+    
+    Which is completely unacceptable from a performance standpoint, even if
+    it happens to technically work.
+    
+    The reason it's writing one byte at a time is because while it's
+    technically true that accesses to iomem are the same as accesses to
+    regular memory on x86, the _granularity_ (and ordering) of accesses
+    matter to iomem in ways that they don't matter to regular cached memory.
+    
+    In particular, when ERMS is set, we default to using "rep movsb" for
+    larger memory copies.  That is indeed perfectly fine for real memory,
+    since the whole point is that the CPU is going to do cacheline
+    optimizations and executes the memory copy efficiently for cached
+    memory.
+    
+    With iomem? Not so much.  With iomem, "rep movsb" will indeed work, but
+    it will copy things one byte at a time. Slowly and ponderously.
+    
+    Now, originally, back in 2010 when commit 6175ddf06b61 was done, we
+    didn't use ERMS, and this was much less noticeable.
+    
+    Our normal memcpy() was simpler in other ways too.
+    
+    Because in fact, it's not just about using the string instructions.  Our
+    memcpy() these days does things like "read and write overlapping values"
+    to handle the last bytes of the copy.  Again, for normal memory,
+    overlapping accesses isn't an issue.  For iomem? It can be.
+    
+    So this re-introduces the specialized memcpy_toio(), memcpy_fromio() and
+    memset_io() functions.  It doesn't particularly optimize them, but it
+    tries to at least not be horrid, or do overlapping accesses.  In fact,
+    this uses the existing __inline_memcpy() function that we still had
+    lying around that uses our very traditional "rep movsl" loop followed by
+    movsw/movsb for the final bytes.
+    
+    Somebody may decide to try to improve on it, but if we've gone almost a
+    decade with only one person really ever noticing and complaining, maybe
+    it's not worth worrying about further, once it's not _completely_ broken?
+    
+    Reported-by: David Laight <David.Laight@aculab.com>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/arch/x86/lib/iomem.c b/arch/x86/lib/iomem.c
+new file mode 100644
+index 000000000000..66894675f3c8
+--- /dev/null
++++ b/arch/x86/lib/iomem.c
+@@ -0,0 +1,42 @@
++#include <linux/string.h>
++#include <linux/module.h>
++#include <linux/io.h>
++
++/* Originally from i386/string.h */
++static __always_inline void __iomem_memcpy(void *to, const void *from, size_t n)
++{
++	unsigned long d0, d1, d2;
++	asm volatile("rep ; movsl\n\t"
++		     "testb $2,%b4\n\t"
++		     "je 1f\n\t"
++		     "movsw\n"
++		     "1:\ttestb $1,%b4\n\t"
++		     "je 2f\n\t"
++		     "movsb\n"
++		     "2:"
++		     : "=&c" (d0), "=&D" (d1), "=&S" (d2)
++		     : "0" (n / 4), "q" (n), "1" ((long)to), "2" ((long)from)
++		     : "memory");
++}
++
++void memcpy_fromio(void *to, const volatile void __iomem *from, size_t n)
++{
++	__iomem_memcpy(to, (const void *)from, n);
++}
++EXPORT_SYMBOL(memcpy_fromio);
++
++void memcpy_toio(volatile void __iomem *to, const void *from, size_t n)
++{
++	__iomem_memcpy((void *)to, (const void *) from, n);
++}
++EXPORT_SYMBOL(memcpy_toio);
++
++void memset_io(volatile void __iomem *a, int b, size_t c)
++{
++	/*
++	 * TODO: memset can mangle the IO patterns quite a bit.
++	 * perhaps it would be better to use a dumb one:
++	 */
++	memset((void *)a, b, c);
++}
++EXPORT_SYMBOL(memset_io);

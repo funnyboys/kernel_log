@@ -1,0 +1,2437 @@
+commit f66a6a69f97a24546664541237a82b288c2713f6
+Author: Vladimir Oltean <vladimir.oltean@nxp.com>
+Date:   Sun May 10 19:37:41 2020 +0300
+
+    net: dsa: permit cross-chip bridging between all trees in the system
+    
+    One way of utilizing DSA is by cascading switches which do not all have
+    compatible taggers. Consider the following real-life topology:
+    
+          +---------------------------------------------------------------+
+          | LS1028A                                                       |
+          |               +------------------------------+                |
+          |               |      DSA master for Felix    |                |
+          |               |(internal ENETC port 2: eno2))|                |
+          |  +------------+------------------------------+-------------+  |
+          |  | Felix embedded L2 switch                                |  |
+          |  |                                                         |  |
+          |  | +--------------+   +--------------+   +--------------+  |  |
+          |  | |DSA master for|   |DSA master for|   |DSA master for|  |  |
+          |  | |  SJA1105 1   |   |  SJA1105 2   |   |  SJA1105 3   |  |  |
+          |  | |(Felix port 1)|   |(Felix port 2)|   |(Felix port 3)|  |  |
+          +--+-+--------------+---+--------------+---+--------------+--+--+
+    
+    +-----------------------+ +-----------------------+ +-----------------------+
+    |   SJA1105 switch 1    | |   SJA1105 switch 2    | |   SJA1105 switch 3    |
+    +-----+-----+-----+-----+ +-----+-----+-----+-----+ +-----+-----+-----+-----+
+    |sw1p0|sw1p1|sw1p2|sw1p3| |sw2p0|sw2p1|sw2p2|sw2p3| |sw3p0|sw3p1|sw3p2|sw3p3|
+    +-----+-----+-----+-----+ +-----+-----+-----+-----+ +-----+-----+-----+-----+
+    
+    The above can be described in the device tree as follows (obviously not
+    complete):
+    
+    mscc_felix {
+            dsa,member = <0 0>;
+            ports {
+                    port@4 {
+                            ethernet = <&enetc_port2>;
+                    };
+            };
+    };
+    
+    sja1105_switch1 {
+            dsa,member = <1 1>;
+            ports {
+                    port@4 {
+                            ethernet = <&mscc_felix_port1>;
+                    };
+            };
+    };
+    
+    sja1105_switch2 {
+            dsa,member = <2 2>;
+            ports {
+                    port@4 {
+                            ethernet = <&mscc_felix_port2>;
+                    };
+            };
+    };
+    
+    sja1105_switch3 {
+            dsa,member = <3 3>;
+            ports {
+                    port@4 {
+                            ethernet = <&mscc_felix_port3>;
+                    };
+            };
+    };
+    
+    Basically we instantiate one DSA switch tree for every hardware switch
+    in the system, but we still give them globally unique switch IDs (will
+    come back to that later). Having 3 disjoint switch trees makes the
+    tagger drivers "just work", because net devices are registered for the
+    3 Felix DSA master ports, and they are also DSA slave ports to the ENETC
+    port. So packets received on the ENETC port are stripped of their
+    stacked DSA tags one by one.
+    
+    Currently, hardware bridging between ports on the same sja1105 chip is
+    possible, but switching between sja1105 ports on different chips is
+    handled by the software bridge. This is fine, but we can do better.
+    
+    In fact, the dsa_8021q tag used by sja1105 is compatible with cascading.
+    In other words, a sja1105 switch can correctly parse and route a packet
+    containing a dsa_8021q tag. So if we could enable hardware bridging on
+    the Felix DSA master ports, cross-chip bridging could be completely
+    offloaded.
+    
+    Such as system would be used as follows:
+    
+    ip link add dev br0 type bridge && ip link set dev br0 up
+    for port in sw0p0 sw0p1 sw0p2 sw0p3 \
+                sw1p0 sw1p1 sw1p2 sw1p3 \
+                sw2p0 sw2p1 sw2p2 sw2p3; do
+            ip link set dev $port master br0
+    done
+    
+    The above makes switching between ports on the same row be performed in
+    hardware, and between ports on different rows in software. Now assume
+    the Felix switch ports are called swp0, swp1, swp2. By running the
+    following extra commands:
+    
+    ip link add dev br1 type bridge && ip link set dev br1 up
+    for port in swp0 swp1 swp2; do
+            ip link set dev $port master br1
+    done
+    
+    the CPU no longer sees packets which traverse sja1105 switch boundaries
+    and can be forwarded directly by Felix. The br1 bridge would not be used
+    for any sort of traffic termination.
+    
+    For this to work, we need to give drivers an opportunity to listen for
+    bridging events on DSA trees other than their own, and pass that other
+    tree index as argument. I have made the assumption, for the moment, that
+    the other existing DSA notifiers don't need to be broadcast to other
+    trees. That assumption might turn out to be incorrect. But in the
+    meantime, introduce a dsa_broadcast function, similar in purpose to
+    dsa_port_notify, which is used only by the bridging notifiers.
+    
+    Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+    Reviewed-by: Florian Fainelli <f.fainelli@gmail.com>
+    Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+
+diff --git a/net/dsa/switch.c b/net/dsa/switch.c
+index f3c32ff552b3..86c8dc5c32a0 100644
+--- a/net/dsa/switch.c
++++ b/net/dsa/switch.c
+@@ -89,11 +89,16 @@ static int dsa_switch_mtu(struct dsa_switch *ds,
+ static int dsa_switch_bridge_join(struct dsa_switch *ds,
+ 				  struct dsa_notifier_bridge_info *info)
+ {
+-	if (ds->index == info->sw_index && ds->ops->port_bridge_join)
++	struct dsa_switch_tree *dst = ds->dst;
++
++	if (dst->index == info->tree_index && ds->index == info->sw_index &&
++	    ds->ops->port_bridge_join)
+ 		return ds->ops->port_bridge_join(ds, info->port, info->br);
+ 
+-	if (ds->index != info->sw_index && ds->ops->crosschip_bridge_join)
+-		return ds->ops->crosschip_bridge_join(ds, info->sw_index,
++	if ((dst->index != info->tree_index || ds->index != info->sw_index) &&
++	    ds->ops->crosschip_bridge_join)
++		return ds->ops->crosschip_bridge_join(ds, info->tree_index,
++						      info->sw_index,
+ 						      info->port, info->br);
+ 
+ 	return 0;
+@@ -103,13 +108,17 @@ static int dsa_switch_bridge_leave(struct dsa_switch *ds,
+ 				   struct dsa_notifier_bridge_info *info)
+ {
+ 	bool unset_vlan_filtering = br_vlan_enabled(info->br);
++	struct dsa_switch_tree *dst = ds->dst;
+ 	int err, i;
+ 
+-	if (ds->index == info->sw_index && ds->ops->port_bridge_leave)
++	if (dst->index == info->tree_index && ds->index == info->sw_index &&
++	    ds->ops->port_bridge_join)
+ 		ds->ops->port_bridge_leave(ds, info->port, info->br);
+ 
+-	if (ds->index != info->sw_index && ds->ops->crosschip_bridge_leave)
+-		ds->ops->crosschip_bridge_leave(ds, info->sw_index, info->port,
++	if ((dst->index != info->tree_index || ds->index != info->sw_index) &&
++	    ds->ops->crosschip_bridge_join)
++		ds->ops->crosschip_bridge_leave(ds, info->tree_index,
++						info->sw_index, info->port,
+ 						info->br);
+ 
+ 	/* If the bridge was vlan_filtering, the bridge core doesn't trigger an
+
+commit bfcb813203e619a8960a819bf533ad2a108d8105
+Author: Vladimir Oltean <vladimir.oltean@nxp.com>
+Date:   Fri Mar 27 21:55:42 2020 +0200
+
+    net: dsa: configure the MTU for switch ports
+    
+    It is useful be able to configure port policers on a switch to accept
+    frames of various sizes:
+    
+    - Increase the MTU for better throughput from the default of 1500 if it
+      is known that there is no 10/100 Mbps device in the network.
+    - Decrease the MTU to limit the latency of high-priority frames under
+      congestion, or work around various network segments that add extra
+      headers to packets which can't be fragmented.
+    
+    For DSA slave ports, this is mostly a pass-through callback, called
+    through the regular ndo ops and at probe time (to ensure consistency
+    across all supported switches).
+    
+    The CPU port is called with an MTU equal to the largest configured MTU
+    of the slave ports. The assumption is that the user might want to
+    sustain a bidirectional conversation with a partner over any switch
+    port.
+    
+    The DSA master is configured the same as the CPU port, plus the tagger
+    overhead. Since the MTU is by definition L2 payload (sans Ethernet
+    header), it is up to each individual driver to figure out if it needs to
+    do anything special for its frame tags on the CPU port (it shouldn't
+    except in special cases). So the MTU does not contain the tagger
+    overhead on the CPU port.
+    However the MTU of the DSA master, minus the tagger overhead, is used as
+    a proxy for the MTU of the CPU port, which does not have a net device.
+    This is to avoid uselessly calling the .change_mtu function on the CPU
+    port when nothing should change.
+    
+    So it is safe to assume that the DSA master and the CPU port MTUs are
+    apart by exactly the tagger's overhead in bytes.
+    
+    Some changes were made around dsa_master_set_mtu(), function which was
+    now removed, for 2 reasons:
+      - dev_set_mtu() already calls dev_validate_mtu(), so it's redundant to
+        do the same thing in DSA
+      - __dev_set_mtu() returns 0 if ops->ndo_change_mtu is an absent method
+    That is to say, there's no need for this function in DSA, we can safely
+    call dev_set_mtu() directly, take the rtnl lock when necessary, and just
+    propagate whatever errors get reported (since the user probably wants to
+    be informed).
+    
+    Some inspiration (mainly in the MTU DSA notifier) was taken from a
+    vaguely similar patch from Murali and Florian, who are credited as
+    co-developers down below.
+    
+    Co-developed-by: Murali Krishna Policharla <murali.policharla@broadcom.com>
+    Signed-off-by: Murali Krishna Policharla <murali.policharla@broadcom.com>
+    Co-developed-by: Florian Fainelli <f.fainelli@gmail.com>
+    Signed-off-by: Florian Fainelli <f.fainelli@gmail.com>
+    Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/dsa/switch.c b/net/dsa/switch.c
+index df4abe897ed6..f3c32ff552b3 100644
+--- a/net/dsa/switch.c
++++ b/net/dsa/switch.c
+@@ -52,6 +52,40 @@ static int dsa_switch_ageing_time(struct dsa_switch *ds,
+ 	return 0;
+ }
+ 
++static bool dsa_switch_mtu_match(struct dsa_switch *ds, int port,
++				 struct dsa_notifier_mtu_info *info)
++{
++	if (ds->index == info->sw_index)
++		return (port == info->port) || dsa_is_dsa_port(ds, port);
++
++	if (!info->propagate_upstream)
++		return false;
++
++	if (dsa_is_dsa_port(ds, port) || dsa_is_cpu_port(ds, port))
++		return true;
++
++	return false;
++}
++
++static int dsa_switch_mtu(struct dsa_switch *ds,
++			  struct dsa_notifier_mtu_info *info)
++{
++	int port, ret;
++
++	if (!ds->ops->port_change_mtu)
++		return -EOPNOTSUPP;
++
++	for (port = 0; port < ds->num_ports; port++) {
++		if (dsa_switch_mtu_match(ds, port, info)) {
++			ret = ds->ops->port_change_mtu(ds, port, info->mtu);
++			if (ret)
++				return ret;
++		}
++	}
++
++	return 0;
++}
++
+ static int dsa_switch_bridge_join(struct dsa_switch *ds,
+ 				  struct dsa_notifier_bridge_info *info)
+ {
+@@ -328,6 +362,9 @@ static int dsa_switch_event(struct notifier_block *nb,
+ 	case DSA_NOTIFIER_VLAN_DEL:
+ 		err = dsa_switch_vlan_del(ds, info);
+ 		break;
++	case DSA_NOTIFIER_MTU:
++		err = dsa_switch_mtu(ds, info);
++		break;
+ 	default:
+ 		err = -EOPNOTSUPP;
+ 		break;
+
+commit 68bb8ea8ad0d497c28ed47423246b1ab20f26976
+Author: Vivien Didelot <vivien.didelot@gmail.com>
+Date:   Mon Oct 21 16:51:15 2019 -0400
+
+    net: dsa: use dsa_to_port helper everywhere
+    
+    Do not let the drivers access the ds->ports static array directly
+    while there is a dsa_to_port helper for this purpose.
+    
+    At the same time, un-const this helper since the SJA1105 driver
+    assigns the priv member of the returned dsa_port structure.
+    
+    Signed-off-by: Vivien Didelot <vivien.didelot@gmail.com>
+    Reviewed-by: Florian Fainelli <f.fainelli@gmail.com>
+    Reviewed-by: Andrew Lunn <andrew@lunn.ch>
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+
+diff --git a/net/dsa/switch.c b/net/dsa/switch.c
+index 6a9607518823..df4abe897ed6 100644
+--- a/net/dsa/switch.c
++++ b/net/dsa/switch.c
+@@ -20,7 +20,7 @@ static unsigned int dsa_switch_fastest_ageing_time(struct dsa_switch *ds,
+ 	int i;
+ 
+ 	for (i = 0; i < ds->num_ports; ++i) {
+-		struct dsa_port *dp = &ds->ports[i];
++		struct dsa_port *dp = dsa_to_port(ds, i);
+ 
+ 		if (dp->ageing_time && dp->ageing_time < ageing_time)
+ 			ageing_time = dp->ageing_time;
+@@ -98,7 +98,7 @@ static int dsa_switch_bridge_leave(struct dsa_switch *ds,
+ 	if (unset_vlan_filtering) {
+ 		struct switchdev_trans trans = {0};
+ 
+-		err = dsa_port_vlan_filtering(&ds->ports[info->port],
++		err = dsa_port_vlan_filtering(dsa_to_port(ds, info->port),
+ 					      false, &trans);
+ 		if (err && err != EOPNOTSUPP)
+ 			return err;
+
+commit 7e1741b47f2441e7c570284d60ba936e3d41529a
+Author: Vivien Didelot <vivien.didelot@gmail.com>
+Date:   Sun Aug 25 13:25:19 2019 -0400
+
+    net: dsa: program VLAN on CPU port from slave
+    
+    DSA currently programs a VLAN on the CPU port implicitly after the
+    related notifier is received by a switch.
+    
+    While we still need to do this transparent programmation of the DSA
+    links in the fabric, programming the CPU port this way may cause
+    problems in some corners such as the tag_8021q driver.
+    
+    Because the dedicated CPU port is specific to a slave, make their
+    programmation explicit a few layers up, in the slave code.
+    
+    Note that technically, DSA links have a dedicated CPU port as well,
+    but since they are only used as conduit between interconnected switches
+    of a fabric, programming them transparently this way is what we want.
+    
+    Signed-off-by: Vivien Didelot <vivien.didelot@gmail.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/dsa/switch.c b/net/dsa/switch.c
+index 489eb7b430a4..6a9607518823 100644
+--- a/net/dsa/switch.c
++++ b/net/dsa/switch.c
+@@ -232,7 +232,7 @@ static bool dsa_switch_vlan_match(struct dsa_switch *ds, int port,
+ 	if (ds->index == info->sw_index && port == info->port)
+ 		return true;
+ 
+-	if (dsa_is_cpu_port(ds, port) || dsa_is_dsa_port(ds, port))
++	if (dsa_is_dsa_port(ds, port))
+ 		return true;
+ 
+ 	return false;
+@@ -288,6 +288,9 @@ static int dsa_switch_vlan_del(struct dsa_switch *ds,
+ 	if (ds->index == info->sw_index)
+ 		return ds->ops->port_vlan_del(ds, info->port, info->vlan);
+ 
++	/* Do not deprogram the DSA links as they may be used as conduit
++	 * for other VLAN members in the fabric.
++	 */
+ 	return 0;
+ }
+ 
+
+commit e65d45cc351ac5f1c11e6bac5669e536df753664
+Author: Vivien Didelot <vivien.didelot@gmail.com>
+Date:   Sun Aug 25 13:25:15 2019 -0400
+
+    net: dsa: remove bitmap operations
+    
+    The bitmap operations were introduced to simplify the switch drivers
+    in the future, since most of them could implement the common VLAN and
+    MDB operations (add, del, dump) with simple functions taking all target
+    ports at once, and thus limiting the number of hardware accesses.
+    
+    Programming an MDB or VLAN this way in a single operation would clearly
+    simplify the drivers a lot but would require a new get-set interface
+    in DSA. The usage of such bitmap from the stack also raised concerned
+    in the past, leading to the dynamic allocation of a new ds->_bitmap
+    member in the dsa_switch structure. So let's get rid of them for now.
+    
+    This commit nicely wraps the ds->ops->port_{mdb,vlan}_{prepare,add}
+    switch operations into new dsa_switch_{mdb,vlan}_{prepare,add}
+    variants not using any bitmap argument anymore.
+    
+    New dsa_switch_{mdb,vlan}_match helpers have been introduced to make
+    clear which local port of a switch must be programmed with the target
+    object. While the targeted user port is an obvious candidate, the
+    DSA links must also be programmed, as well as the CPU port for VLANs.
+    
+    While at it, also remove local variables that are only used once.
+    
+    Signed-off-by: Vivien Didelot <vivien.didelot@gmail.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/dsa/switch.c b/net/dsa/switch.c
+index 09d9286b27cc..489eb7b430a4 100644
+--- a/net/dsa/switch.c
++++ b/net/dsa/switch.c
+@@ -128,57 +128,51 @@ static int dsa_switch_fdb_del(struct dsa_switch *ds,
+ 	return ds->ops->port_fdb_del(ds, port, info->addr, info->vid);
+ }
+ 
+-static int
+-dsa_switch_mdb_prepare_bitmap(struct dsa_switch *ds,
+-			      const struct switchdev_obj_port_mdb *mdb,
+-			      const unsigned long *bitmap)
++static bool dsa_switch_mdb_match(struct dsa_switch *ds, int port,
++				 struct dsa_notifier_mdb_info *info)
++{
++	if (ds->index == info->sw_index && port == info->port)
++		return true;
++
++	if (dsa_is_dsa_port(ds, port))
++		return true;
++
++	return false;
++}
++
++static int dsa_switch_mdb_prepare(struct dsa_switch *ds,
++				  struct dsa_notifier_mdb_info *info)
+ {
+ 	int port, err;
+ 
+ 	if (!ds->ops->port_mdb_prepare || !ds->ops->port_mdb_add)
+ 		return -EOPNOTSUPP;
+ 
+-	for_each_set_bit(port, bitmap, ds->num_ports) {
+-		err = ds->ops->port_mdb_prepare(ds, port, mdb);
+-		if (err)
+-			return err;
++	for (port = 0; port < ds->num_ports; port++) {
++		if (dsa_switch_mdb_match(ds, port, info)) {
++			err = ds->ops->port_mdb_prepare(ds, port, info->mdb);
++			if (err)
++				return err;
++		}
+ 	}
+ 
+ 	return 0;
+ }
+ 
+-static void dsa_switch_mdb_add_bitmap(struct dsa_switch *ds,
+-				      const struct switchdev_obj_port_mdb *mdb,
+-				      const unsigned long *bitmap)
+-{
+-	int port;
+-
+-	if (!ds->ops->port_mdb_add)
+-		return;
+-
+-	for_each_set_bit(port, bitmap, ds->num_ports)
+-		ds->ops->port_mdb_add(ds, port, mdb);
+-}
+-
+ static int dsa_switch_mdb_add(struct dsa_switch *ds,
+ 			      struct dsa_notifier_mdb_info *info)
+ {
+-	const struct switchdev_obj_port_mdb *mdb = info->mdb;
+-	struct switchdev_trans *trans = info->trans;
+ 	int port;
+ 
+-	/* Build a mask of Multicast group members */
+-	bitmap_zero(ds->bitmap, ds->num_ports);
+-	if (ds->index == info->sw_index)
+-		set_bit(info->port, ds->bitmap);
+-	for (port = 0; port < ds->num_ports; port++)
+-		if (dsa_is_dsa_port(ds, port))
+-			set_bit(port, ds->bitmap);
++	if (switchdev_trans_ph_prepare(info->trans))
++		return dsa_switch_mdb_prepare(ds, info);
+ 
+-	if (switchdev_trans_ph_prepare(trans))
+-		return dsa_switch_mdb_prepare_bitmap(ds, mdb, ds->bitmap);
++	if (!ds->ops->port_mdb_add)
++		return 0;
+ 
+-	dsa_switch_mdb_add_bitmap(ds, mdb, ds->bitmap);
++	for (port = 0; port < ds->num_ports; port++)
++		if (dsa_switch_mdb_match(ds, port, info))
++			ds->ops->port_mdb_add(ds, port, info->mdb);
+ 
+ 	return 0;
+ }
+@@ -186,13 +180,11 @@ static int dsa_switch_mdb_add(struct dsa_switch *ds,
+ static int dsa_switch_mdb_del(struct dsa_switch *ds,
+ 			      struct dsa_notifier_mdb_info *info)
+ {
+-	const struct switchdev_obj_port_mdb *mdb = info->mdb;
+-
+ 	if (!ds->ops->port_mdb_del)
+ 		return -EOPNOTSUPP;
+ 
+ 	if (ds->index == info->sw_index)
+-		return ds->ops->port_mdb_del(ds, info->port, mdb);
++		return ds->ops->port_mdb_del(ds, info->port, info->mdb);
+ 
+ 	return 0;
+ }
+@@ -234,59 +226,55 @@ static int dsa_port_vlan_check(struct dsa_switch *ds, int port,
+ 			     (void *)vlan);
+ }
+ 
+-static int
+-dsa_switch_vlan_prepare_bitmap(struct dsa_switch *ds,
+-			       const struct switchdev_obj_port_vlan *vlan,
+-			       const unsigned long *bitmap)
++static bool dsa_switch_vlan_match(struct dsa_switch *ds, int port,
++				  struct dsa_notifier_vlan_info *info)
++{
++	if (ds->index == info->sw_index && port == info->port)
++		return true;
++
++	if (dsa_is_cpu_port(ds, port) || dsa_is_dsa_port(ds, port))
++		return true;
++
++	return false;
++}
++
++static int dsa_switch_vlan_prepare(struct dsa_switch *ds,
++				   struct dsa_notifier_vlan_info *info)
+ {
+ 	int port, err;
+ 
+ 	if (!ds->ops->port_vlan_prepare || !ds->ops->port_vlan_add)
+ 		return -EOPNOTSUPP;
+ 
+-	for_each_set_bit(port, bitmap, ds->num_ports) {
+-		err = dsa_port_vlan_check(ds, port, vlan);
+-		if (err)
+-			return err;
++	for (port = 0; port < ds->num_ports; port++) {
++		if (dsa_switch_vlan_match(ds, port, info)) {
++			err = dsa_port_vlan_check(ds, port, info->vlan);
++			if (err)
++				return err;
+ 
+-		err = ds->ops->port_vlan_prepare(ds, port, vlan);
+-		if (err)
+-			return err;
++			err = ds->ops->port_vlan_prepare(ds, port, info->vlan);
++			if (err)
++				return err;
++		}
+ 	}
+ 
+ 	return 0;
+ }
+ 
+-static void
+-dsa_switch_vlan_add_bitmap(struct dsa_switch *ds,
+-			   const struct switchdev_obj_port_vlan *vlan,
+-			   const unsigned long *bitmap)
+-{
+-	int port;
+-
+-	for_each_set_bit(port, bitmap, ds->num_ports)
+-		ds->ops->port_vlan_add(ds, port, vlan);
+-}
+-
+ static int dsa_switch_vlan_add(struct dsa_switch *ds,
+ 			       struct dsa_notifier_vlan_info *info)
+ {
+-	const struct switchdev_obj_port_vlan *vlan = info->vlan;
+-	struct switchdev_trans *trans = info->trans;
+ 	int port;
+ 
+-	/* Build a mask of VLAN members */
+-	bitmap_zero(ds->bitmap, ds->num_ports);
+-	if (ds->index == info->sw_index)
+-		set_bit(info->port, ds->bitmap);
+-	for (port = 0; port < ds->num_ports; port++)
+-		if (dsa_is_cpu_port(ds, port) || dsa_is_dsa_port(ds, port))
+-			set_bit(port, ds->bitmap);
++	if (switchdev_trans_ph_prepare(info->trans))
++		return dsa_switch_vlan_prepare(ds, info);
+ 
+-	if (switchdev_trans_ph_prepare(trans))
+-		return dsa_switch_vlan_prepare_bitmap(ds, vlan, ds->bitmap);
++	if (!ds->ops->port_vlan_add)
++		return 0;
+ 
+-	dsa_switch_vlan_add_bitmap(ds, vlan, ds->bitmap);
++	for (port = 0; port < ds->num_ports; port++)
++		if (dsa_switch_vlan_match(ds, port, info))
++			ds->ops->port_vlan_add(ds, port, info->vlan);
+ 
+ 	return 0;
+ }
+@@ -294,13 +282,11 @@ static int dsa_switch_vlan_add(struct dsa_switch *ds,
+ static int dsa_switch_vlan_del(struct dsa_switch *ds,
+ 			       struct dsa_notifier_vlan_info *info)
+ {
+-	const struct switchdev_obj_port_vlan *vlan = info->vlan;
+-
+ 	if (!ds->ops->port_vlan_del)
+ 		return -EOPNOTSUPP;
+ 
+ 	if (ds->index == info->sw_index)
+-		return ds->ops->port_vlan_del(ds, info->port, vlan);
++		return ds->ops->port_vlan_del(ds, info->port, info->vlan);
+ 
+ 	return 0;
+ }
+
+commit 58799865be84e2a895dab72de0e1b996ed943f22
+Author: Chen-Yu Tsai <wens@csie.org>
+Date:   Sun Aug 11 22:18:25 2019 +0800
+
+    net: dsa: Check existence of .port_mdb_add callback before calling it
+    
+    The dsa framework has optional .port_mdb_{prepare,add,del} callback fields
+    for drivers to handle multicast database entries. When adding an entry, the
+    framework goes through a prepare phase, then a commit phase. Drivers not
+    providing these callbacks should be detected in the prepare phase.
+    
+    DSA core may still bypass the bridge layer and call the dsa_port_mdb_add
+    function directly with no prepare phase or no switchdev trans object,
+    and the framework ends up calling an undefined .port_mdb_add callback.
+    This results in a NULL pointer dereference, as shown in the log below.
+    
+    The other functions seem to be properly guarded. Do the same for
+    .port_mdb_add in dsa_switch_mdb_add_bitmap() as well.
+    
+        8<--- cut here ---
+        Unable to handle kernel NULL pointer dereference at virtual address 00000000
+        pgd = (ptrval)
+        [00000000] *pgd=00000000
+        Internal error: Oops: 80000005 [#1] SMP ARM
+        Modules linked in: rtl8xxxu rtl8192cu rtl_usb rtl8192c_common rtlwifi mac80211 cfg80211
+        CPU: 1 PID: 134 Comm: kworker/1:2 Not tainted 5.3.0-rc1-00247-gd3519030752a #1
+        Hardware name: Allwinner sun7i (A20) Family
+        Workqueue: events switchdev_deferred_process_work
+        PC is at 0x0
+        LR is at dsa_switch_event+0x570/0x620
+        pc : [<00000000>]    lr : [<c08533ec>]    psr: 80070013
+        sp : ee871db8  ip : 00000000  fp : ee98d0a4
+        r10: 0000000c  r9 : 00000008  r8 : ee89f710
+        r7 : ee98d040  r6 : ee98d088  r5 : c0f04c48  r4 : ee98d04c
+        r3 : 00000000  r2 : ee89f710  r1 : 00000008  r0 : ee98d040
+        Flags: Nzcv  IRQs on  FIQs on  Mode SVC_32  ISA ARM  Segment none
+        Control: 10c5387d  Table: 6deb406a  DAC: 00000051
+        Process kworker/1:2 (pid: 134, stack limit = 0x(ptrval))
+        Stack: (0xee871db8 to 0xee872000)
+        1da0:                                                       ee871e14 103ace2d
+        1dc0: 00000000 ffffffff 00000000 ee871e14 00000005 00000000 c08524a0 00000000
+        1de0: ffffe000 c014bdfc c0f04c48 ee871e98 c0f04c48 ee9e5000 c0851120 c014bef0
+        1e00: 00000000 b643aea2 ee9b4068 c08509a8 ee2bf940 ee89f710 ee871ecb 00000000
+        1e20: 00000008 103ace2d 00000000 c087e248 ee29c868 103ace2d 00000001 ffffffff
+        1e40: 00000000 ee871e98 00000006 00000000 c0fb2a50 c087e2d0 ffffffff c08523c4
+        1e60: ffffffff c014bdfc 00000006 c0fad2d0 ee871e98 ee89f710 00000000 c014c500
+        1e80: 00000000 ee89f3c0 c0f04c48 00000000 ee9e5000 c087dfb4 ee9e5000 00000000
+        1ea0: ee89f710 ee871ecb 00000001 103ace2d 00000000 c0f04c48 00000000 c087e0a8
+        1ec0: 00000000 efd9a3e0 0089f3c0 103ace2d ee89f700 ee89f710 ee9e5000 00000122
+        1ee0: 00000100 c087e130 ee89f700 c0fad2c8 c1003ef0 c087de4c 2e928000 c0fad2ec
+        1f00: c0fad2ec ee839580 ef7a62c0 ef7a9400 00000000 c087def8 c0fad2ec c01447dc
+        1f20: ef315640 ef7a62c0 00000008 ee839580 ee839594 ef7a62c0 00000008 c0f03d00
+        1f40: ef7a62d8 ef7a62c0 ffffe000 c0145b84 ffffe000 c0fb2420 c0bfaa8c 00000000
+        1f60: ffffe000 ee84b600 ee84b5c0 00000000 ee870000 ee839580 c0145b40 ef0e5ea4
+        1f80: ee84b61c c014a6f8 00000001 ee84b5c0 c014a5b0 00000000 00000000 00000000
+        1fa0: 00000000 00000000 00000000 c01010e8 00000000 00000000 00000000 00000000
+        1fc0: 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+        1fe0: 00000000 00000000 00000000 00000000 00000013 00000000 00000000 00000000
+        [<c08533ec>] (dsa_switch_event) from [<c014bdfc>] (notifier_call_chain+0x48/0x84)
+        [<c014bdfc>] (notifier_call_chain) from [<c014bef0>] (raw_notifier_call_chain+0x18/0x20)
+        [<c014bef0>] (raw_notifier_call_chain) from [<c08509a8>] (dsa_port_mdb_add+0x48/0x74)
+        [<c08509a8>] (dsa_port_mdb_add) from [<c087e248>] (__switchdev_handle_port_obj_add+0x54/0xd4)
+        [<c087e248>] (__switchdev_handle_port_obj_add) from [<c087e2d0>] (switchdev_handle_port_obj_add+0x8/0x14)
+        [<c087e2d0>] (switchdev_handle_port_obj_add) from [<c08523c4>] (dsa_slave_switchdev_blocking_event+0x94/0xa4)
+        [<c08523c4>] (dsa_slave_switchdev_blocking_event) from [<c014bdfc>] (notifier_call_chain+0x48/0x84)
+        [<c014bdfc>] (notifier_call_chain) from [<c014c500>] (blocking_notifier_call_chain+0x50/0x68)
+        [<c014c500>] (blocking_notifier_call_chain) from [<c087dfb4>] (switchdev_port_obj_notify+0x44/0xa8)
+        [<c087dfb4>] (switchdev_port_obj_notify) from [<c087e0a8>] (switchdev_port_obj_add_now+0x90/0x104)
+        [<c087e0a8>] (switchdev_port_obj_add_now) from [<c087e130>] (switchdev_port_obj_add_deferred+0x14/0x5c)
+        [<c087e130>] (switchdev_port_obj_add_deferred) from [<c087de4c>] (switchdev_deferred_process+0x64/0x104)
+        [<c087de4c>] (switchdev_deferred_process) from [<c087def8>] (switchdev_deferred_process_work+0xc/0x14)
+        [<c087def8>] (switchdev_deferred_process_work) from [<c01447dc>] (process_one_work+0x218/0x50c)
+        [<c01447dc>] (process_one_work) from [<c0145b84>] (worker_thread+0x44/0x5bc)
+        [<c0145b84>] (worker_thread) from [<c014a6f8>] (kthread+0x148/0x150)
+        [<c014a6f8>] (kthread) from [<c01010e8>] (ret_from_fork+0x14/0x2c)
+        Exception stack(0xee871fb0 to 0xee871ff8)
+        1fa0:                                     00000000 00000000 00000000 00000000
+        1fc0: 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+        1fe0: 00000000 00000000 00000000 00000000 00000013 00000000
+        Code: bad PC value
+        ---[ end trace 1292c61abd17b130 ]---
+    
+        [<c08533ec>] (dsa_switch_event) from [<c014bdfc>] (notifier_call_chain+0x48/0x84)
+        corresponds to
+    
+            $ arm-linux-gnueabihf-addr2line -C -i -e vmlinux c08533ec
+    
+            linux/net/dsa/switch.c:156
+            linux/net/dsa/switch.c:178
+            linux/net/dsa/switch.c:328
+    
+    Fixes: e6db98db8a95 ("net: dsa: add switch mdb bitmap functions")
+    Signed-off-by: Chen-Yu Tsai <wens@csie.org>
+    Reviewed-by: Vivien Didelot <vivien.didelot@gmail.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/dsa/switch.c b/net/dsa/switch.c
+index 4ec5b7f85d51..09d9286b27cc 100644
+--- a/net/dsa/switch.c
++++ b/net/dsa/switch.c
+@@ -153,6 +153,9 @@ static void dsa_switch_mdb_add_bitmap(struct dsa_switch *ds,
+ {
+ 	int port;
+ 
++	if (!ds->ops->port_mdb_add)
++		return;
++
+ 	for_each_set_bit(port, bitmap, ds->num_ports)
+ 		ds->ops->port_mdb_add(ds, port, mdb);
+ }
+
+commit 2874c5fd284268364ece81a7bd936f3c8168e567
+Author: Thomas Gleixner <tglx@linutronix.de>
+Date:   Mon May 27 08:55:01 2019 +0200
+
+    treewide: Replace GPLv2 boilerplate/reference with SPDX - rule 152
+    
+    Based on 1 normalized pattern(s):
+    
+      this program is free software you can redistribute it and or modify
+      it under the terms of the gnu general public license as published by
+      the free software foundation either version 2 of the license or at
+      your option any later version
+    
+    extracted by the scancode license scanner the SPDX license identifier
+    
+      GPL-2.0-or-later
+    
+    has been chosen to replace the boilerplate/reference in 3029 file(s).
+    
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Reviewed-by: Allison Randal <allison@lohutok.net>
+    Cc: linux-spdx@vger.kernel.org
+    Link: https://lkml.kernel.org/r/20190527070032.746973796@linutronix.de
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/net/dsa/switch.c b/net/dsa/switch.c
+index 7d8cd9bc0ecc..4ec5b7f85d51 100644
+--- a/net/dsa/switch.c
++++ b/net/dsa/switch.c
+@@ -1,13 +1,9 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
+ /*
+  * Handling of a single switch chip, part of a switch fabric
+  *
+  * Copyright (c) 2017 Savoir-faire Linux Inc.
+  *	Vivien Didelot <vivien.didelot@savoirfairelinux.com>
+- *
+- * This program is free software; you can redistribute it and/or modify
+- * it under the terms of the GNU General Public License as published by
+- * the Free Software Foundation; either version 2 of the License, or
+- * (at your option) any later version.
+  */
+ 
+ #include <linux/if_bridge.h>
+
+commit d371b7c92d190448f3ccbf082c90bf929285f648
+Author: Vladimir Oltean <olteanv@gmail.com>
+Date:   Sun Apr 28 21:45:46 2019 +0300
+
+    net: dsa: Unset vlan_filtering when ports leave the bridge
+    
+    When ports are standalone (after they left the bridge), they should have
+    no VLAN filtering semantics (they should pass all traffic to the CPU).
+    Currently this is not true for switchdev drivers, because the bridge
+    "forgets" to unset that.
+    
+    Normally one would think that doing this at the bridge layer would be a
+    better idea, i.e. call br_vlan_filter_toggle() from br_del_if(), similar
+    to how nbp_vlan_init() is called from br_add_if().
+    
+    However what complicates that approach, and makes this one preferable,
+    is the fact that for the bridge core, vlan_filtering is a per-bridge
+    setting, whereas for switchdev/DSA it is per-port. Also there are
+    switches where the setting is per the entire device, and unsetting
+    vlan_filtering one by one, for each leaving port, would not be possible
+    from the bridge core without a certain level of awareness. So do this in
+    DSA and let drivers be unaware of it.
+    
+    Signed-off-by: Vladimir Oltean <olteanv@gmail.com>
+    Reviewed-by: Andrew Lunn <andrew@lunn.ch>
+    Reviewed-by: Florian Fainelli <f.fainelli@gmail.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/dsa/switch.c b/net/dsa/switch.c
+index fde4e9195709..7d8cd9bc0ecc 100644
+--- a/net/dsa/switch.c
++++ b/net/dsa/switch.c
+@@ -10,6 +10,7 @@
+  * (at your option) any later version.
+  */
+ 
++#include <linux/if_bridge.h>
+ #include <linux/netdevice.h>
+ #include <linux/notifier.h>
+ #include <linux/if_vlan.h>
+@@ -71,6 +72,9 @@ static int dsa_switch_bridge_join(struct dsa_switch *ds,
+ static int dsa_switch_bridge_leave(struct dsa_switch *ds,
+ 				   struct dsa_notifier_bridge_info *info)
+ {
++	bool unset_vlan_filtering = br_vlan_enabled(info->br);
++	int err, i;
++
+ 	if (ds->index == info->sw_index && ds->ops->port_bridge_leave)
+ 		ds->ops->port_bridge_leave(ds, info->port, info->br);
+ 
+@@ -78,6 +82,31 @@ static int dsa_switch_bridge_leave(struct dsa_switch *ds,
+ 		ds->ops->crosschip_bridge_leave(ds, info->sw_index, info->port,
+ 						info->br);
+ 
++	/* If the bridge was vlan_filtering, the bridge core doesn't trigger an
++	 * event for changing vlan_filtering setting upon slave ports leaving
++	 * it. That is a good thing, because that lets us handle it and also
++	 * handle the case where the switch's vlan_filtering setting is global
++	 * (not per port). When that happens, the correct moment to trigger the
++	 * vlan_filtering callback is only when the last port left this bridge.
++	 */
++	if (unset_vlan_filtering && ds->vlan_filtering_is_global) {
++		for (i = 0; i < ds->num_ports; i++) {
++			if (i == info->port)
++				continue;
++			if (dsa_to_port(ds, i)->bridge_dev == info->br) {
++				unset_vlan_filtering = false;
++				break;
++			}
++		}
++	}
++	if (unset_vlan_filtering) {
++		struct switchdev_trans trans = {0};
++
++		err = dsa_port_vlan_filtering(&ds->ports[info->port],
++					      false, &trans);
++		if (err && err != EOPNOTSUPP)
++			return err;
++	}
+ 	return 0;
+ }
+ 
+
+commit 85478d73c911e3991c14c6d88b91b77455d2722d
+Author: Vladimir Oltean <olteanv@gmail.com>
+Date:   Sun Apr 28 21:45:42 2019 +0300
+
+    net: dsa: Fix pharse -> phase typo
+    
+    Signed-off-by: Vladimir Oltean <olteanv@gmail.com>
+    Reviewed-by: Andrew Lunn <andrew@lunn.ch>
+    Reviewed-by: Florian Fainelli <f.fainelli@gmail.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/dsa/switch.c b/net/dsa/switch.c
+index e1fae969aa73..fde4e9195709 100644
+--- a/net/dsa/switch.c
++++ b/net/dsa/switch.c
+@@ -196,7 +196,7 @@ static int dsa_port_vlan_check(struct dsa_switch *ds, int port,
+ 	if (!dp->bridge_dev)
+ 		return err;
+ 
+-	/* dsa_slave_vlan_rx_{add,kill}_vid() cannot use the prepare pharse and
++	/* dsa_slave_vlan_rx_{add,kill}_vid() cannot use the prepare phase and
+ 	 * already checks whether there is an overlapping bridge VLAN entry
+ 	 * with the same VID, so here we only need to check that if we are
+ 	 * adding a bridge VLAN entry there is not an overlapping VLAN device
+
+commit 061f6a505ac33659eab007731c0f6374df39ab55
+Author: Florian Fainelli <f.fainelli@gmail.com>
+Date:   Wed Feb 20 14:35:39 2019 -0800
+
+    net: dsa: Add ndo_vlan_rx_{add, kill}_vid implementation
+    
+    In order to properly support VLAN filtering being enabled/disabled on a
+    bridge, while having other ports being non bridge port members, we need
+    to support the ndo_vlan_rx_{add,kill}_vid callbacks in order to make
+    sure the non-bridge ports can continue receiving VLAN tags, even when
+    the switch is globally configured to do ingress/egress VID checking.
+    
+    Since we can call dsa_port_vlan_{add,del} with a bridge_dev pointer
+    NULL, we now need to check that in these two functions.
+    
+    We specifically deal with two possibly problematic cases:
+    
+    - creating a bridge VLAN entry while there is an existing VLAN device
+      claiming that same VID
+    
+    - creating a VLAN device while there is an existing bridge VLAN entry
+      with that VID
+    
+    Those are both resolved with returning -EBUSY back to user-space.
+    
+    Signed-off-by: Florian Fainelli <f.fainelli@gmail.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/dsa/switch.c b/net/dsa/switch.c
+index 142b294d3446..e1fae969aa73 100644
+--- a/net/dsa/switch.c
++++ b/net/dsa/switch.c
+@@ -12,6 +12,7 @@
+ 
+ #include <linux/netdevice.h>
+ #include <linux/notifier.h>
++#include <linux/if_vlan.h>
+ #include <net/switchdev.h>
+ 
+ #include "dsa_priv.h"
+@@ -168,6 +169,43 @@ static int dsa_switch_mdb_del(struct dsa_switch *ds,
+ 	return 0;
+ }
+ 
++static int dsa_port_vlan_device_check(struct net_device *vlan_dev,
++				      int vlan_dev_vid,
++				      void *arg)
++{
++	struct switchdev_obj_port_vlan *vlan = arg;
++	u16 vid;
++
++	for (vid = vlan->vid_begin; vid <= vlan->vid_end; ++vid) {
++		if (vid == vlan_dev_vid)
++			return -EBUSY;
++	}
++
++	return 0;
++}
++
++static int dsa_port_vlan_check(struct dsa_switch *ds, int port,
++			       const struct switchdev_obj_port_vlan *vlan)
++{
++	const struct dsa_port *dp = dsa_to_port(ds, port);
++	int err = 0;
++
++	/* Device is not bridged, let it proceed with the VLAN device
++	 * creation.
++	 */
++	if (!dp->bridge_dev)
++		return err;
++
++	/* dsa_slave_vlan_rx_{add,kill}_vid() cannot use the prepare pharse and
++	 * already checks whether there is an overlapping bridge VLAN entry
++	 * with the same VID, so here we only need to check that if we are
++	 * adding a bridge VLAN entry there is not an overlapping VLAN device
++	 * claiming that VID.
++	 */
++	return vlan_for_each(dp->slave, dsa_port_vlan_device_check,
++			     (void *)vlan);
++}
++
+ static int
+ dsa_switch_vlan_prepare_bitmap(struct dsa_switch *ds,
+ 			       const struct switchdev_obj_port_vlan *vlan,
+@@ -179,6 +217,10 @@ dsa_switch_vlan_prepare_bitmap(struct dsa_switch *ds,
+ 		return -EOPNOTSUPP;
+ 
+ 	for_each_set_bit(port, bitmap, ds->num_ports) {
++		err = dsa_port_vlan_check(ds, port, vlan);
++		if (err)
++			return err;
++
+ 		err = ds->ops->port_vlan_prepare(ds, port, vlan);
+ 		if (err)
+ 			return err;
+
+commit 0015b80abccecca82622d9e9d48eb210572a0c3b
+Author: Salvatore Mesoraca <s.mesoraca16@gmail.com>
+Date:   Mon Jul 16 21:10:34 2018 -0700
+
+    net: dsa: Remove VLA usage
+    
+    We avoid 2 VLAs by using a pre-allocated field in dsa_switch. We also
+    try to avoid dynamic allocation whenever possible (when using fewer than
+    bits-per-long ports, which is the common case).
+    
+    Link: http://lkml.kernel.org/r/CA+55aFzCG-zNmZwX4A2FQpadafLfEzK6CC=qPXydAacU1RqZWA@mail.gmail.com
+    Link: http://lkml.kernel.org/r/20180505185145.GB32630@lunn.ch
+    Signed-off-by: Salvatore Mesoraca <s.mesoraca16@gmail.com>
+    [kees: tweak commit subject and message slightly]
+    Signed-off-by: Kees Cook <keescook@chromium.org>
+    Reviewed-by: Andrew Lunn <andrew@lunn.ch>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/dsa/switch.c b/net/dsa/switch.c
+index b93511726069..142b294d3446 100644
+--- a/net/dsa/switch.c
++++ b/net/dsa/switch.c
+@@ -136,21 +136,20 @@ static int dsa_switch_mdb_add(struct dsa_switch *ds,
+ {
+ 	const struct switchdev_obj_port_mdb *mdb = info->mdb;
+ 	struct switchdev_trans *trans = info->trans;
+-	DECLARE_BITMAP(group, ds->num_ports);
+ 	int port;
+ 
+ 	/* Build a mask of Multicast group members */
+-	bitmap_zero(group, ds->num_ports);
++	bitmap_zero(ds->bitmap, ds->num_ports);
+ 	if (ds->index == info->sw_index)
+-		set_bit(info->port, group);
++		set_bit(info->port, ds->bitmap);
+ 	for (port = 0; port < ds->num_ports; port++)
+ 		if (dsa_is_dsa_port(ds, port))
+-			set_bit(port, group);
++			set_bit(port, ds->bitmap);
+ 
+ 	if (switchdev_trans_ph_prepare(trans))
+-		return dsa_switch_mdb_prepare_bitmap(ds, mdb, group);
++		return dsa_switch_mdb_prepare_bitmap(ds, mdb, ds->bitmap);
+ 
+-	dsa_switch_mdb_add_bitmap(ds, mdb, group);
++	dsa_switch_mdb_add_bitmap(ds, mdb, ds->bitmap);
+ 
+ 	return 0;
+ }
+@@ -204,21 +203,20 @@ static int dsa_switch_vlan_add(struct dsa_switch *ds,
+ {
+ 	const struct switchdev_obj_port_vlan *vlan = info->vlan;
+ 	struct switchdev_trans *trans = info->trans;
+-	DECLARE_BITMAP(members, ds->num_ports);
+ 	int port;
+ 
+ 	/* Build a mask of VLAN members */
+-	bitmap_zero(members, ds->num_ports);
++	bitmap_zero(ds->bitmap, ds->num_ports);
+ 	if (ds->index == info->sw_index)
+-		set_bit(info->port, members);
++		set_bit(info->port, ds->bitmap);
+ 	for (port = 0; port < ds->num_ports; port++)
+ 		if (dsa_is_cpu_port(ds, port) || dsa_is_dsa_port(ds, port))
+-			set_bit(port, members);
++			set_bit(port, ds->bitmap);
+ 
+ 	if (switchdev_trans_ph_prepare(trans))
+-		return dsa_switch_vlan_prepare_bitmap(ds, vlan, members);
++		return dsa_switch_vlan_prepare_bitmap(ds, vlan, ds->bitmap);
+ 
+-	dsa_switch_vlan_add_bitmap(ds, vlan, members);
++	dsa_switch_vlan_add_bitmap(ds, vlan, ds->bitmap);
+ 
+ 	return 0;
+ }
+
+commit 3169241f55e194278294c7a4c43ef558c75cb0b7
+Author: Vivien Didelot <vivien.didelot@savoirfairelinux.com>
+Date:   Thu Nov 30 12:56:43 2017 -0500
+
+    net: dsa: support cross-chip FDB operations
+    
+    When a MAC address is added to or removed from a switch port in the
+    fabric, the target switch must program its port and adjacent switches
+    must program their local DSA port used to reach the target switch.
+    
+    For this purpose, use the dsa_towards_port() helper to identify the
+    local switch port which must be programmed.
+    
+    Signed-off-by: Vivien Didelot <vivien.didelot@savoirfairelinux.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/dsa/switch.c b/net/dsa/switch.c
+index 9a01514ea9f3..b93511726069 100644
+--- a/net/dsa/switch.c
++++ b/net/dsa/switch.c
+@@ -83,29 +83,23 @@ static int dsa_switch_bridge_leave(struct dsa_switch *ds,
+ static int dsa_switch_fdb_add(struct dsa_switch *ds,
+ 			      struct dsa_notifier_fdb_info *info)
+ {
+-	/* Do not care yet about other switch chips of the fabric */
+-	if (ds->index != info->sw_index)
+-		return 0;
++	int port = dsa_towards_port(ds, info->sw_index, info->port);
+ 
+ 	if (!ds->ops->port_fdb_add)
+ 		return -EOPNOTSUPP;
+ 
+-	return ds->ops->port_fdb_add(ds, info->port, info->addr,
+-				     info->vid);
++	return ds->ops->port_fdb_add(ds, port, info->addr, info->vid);
+ }
+ 
+ static int dsa_switch_fdb_del(struct dsa_switch *ds,
+ 			      struct dsa_notifier_fdb_info *info)
+ {
+-	/* Do not care yet about other switch chips of the fabric */
+-	if (ds->index != info->sw_index)
+-		return 0;
++	int port = dsa_towards_port(ds, info->sw_index, info->port);
+ 
+ 	if (!ds->ops->port_fdb_del)
+ 		return -EOPNOTSUPP;
+ 
+-	return ds->ops->port_fdb_del(ds, info->port, info->addr,
+-				     info->vid);
++	return ds->ops->port_fdb_del(ds, port, info->addr, info->vid);
+ }
+ 
+ static int
+
+commit e6db98db8a9595f8001958e489ff07ed97a15a54
+Author: Vivien Didelot <vivien.didelot@savoirfairelinux.com>
+Date:   Thu Nov 30 11:24:00 2017 -0500
+
+    net: dsa: add switch mdb bitmap functions
+    
+    This patch brings no functional changes.
+    It moves out the MDB code iterating on a multicast group into new
+    dsa_switch_mdb_{prepare,add}_bitmap() functions.
+    
+    This gives us a better isolation of the two switchdev phases.
+    
+    Signed-off-by: Vivien Didelot <vivien.didelot@savoirfairelinux.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/dsa/switch.c b/net/dsa/switch.c
+index 17cd03d6bc7d..9a01514ea9f3 100644
+--- a/net/dsa/switch.c
++++ b/net/dsa/switch.c
+@@ -108,13 +108,42 @@ static int dsa_switch_fdb_del(struct dsa_switch *ds,
+ 				     info->vid);
+ }
+ 
++static int
++dsa_switch_mdb_prepare_bitmap(struct dsa_switch *ds,
++			      const struct switchdev_obj_port_mdb *mdb,
++			      const unsigned long *bitmap)
++{
++	int port, err;
++
++	if (!ds->ops->port_mdb_prepare || !ds->ops->port_mdb_add)
++		return -EOPNOTSUPP;
++
++	for_each_set_bit(port, bitmap, ds->num_ports) {
++		err = ds->ops->port_mdb_prepare(ds, port, mdb);
++		if (err)
++			return err;
++	}
++
++	return 0;
++}
++
++static void dsa_switch_mdb_add_bitmap(struct dsa_switch *ds,
++				      const struct switchdev_obj_port_mdb *mdb,
++				      const unsigned long *bitmap)
++{
++	int port;
++
++	for_each_set_bit(port, bitmap, ds->num_ports)
++		ds->ops->port_mdb_add(ds, port, mdb);
++}
++
+ static int dsa_switch_mdb_add(struct dsa_switch *ds,
+ 			      struct dsa_notifier_mdb_info *info)
+ {
+ 	const struct switchdev_obj_port_mdb *mdb = info->mdb;
+ 	struct switchdev_trans *trans = info->trans;
+ 	DECLARE_BITMAP(group, ds->num_ports);
+-	int port, err;
++	int port;
+ 
+ 	/* Build a mask of Multicast group members */
+ 	bitmap_zero(group, ds->num_ports);
+@@ -124,21 +153,10 @@ static int dsa_switch_mdb_add(struct dsa_switch *ds,
+ 		if (dsa_is_dsa_port(ds, port))
+ 			set_bit(port, group);
+ 
+-	if (switchdev_trans_ph_prepare(trans)) {
+-		if (!ds->ops->port_mdb_prepare || !ds->ops->port_mdb_add)
+-			return -EOPNOTSUPP;
+-
+-		for_each_set_bit(port, group, ds->num_ports) {
+-			err = ds->ops->port_mdb_prepare(ds, port, mdb);
+-			if (err)
+-				return err;
+-		}
+-
+-		return 0;
+-	}
++	if (switchdev_trans_ph_prepare(trans))
++		return dsa_switch_mdb_prepare_bitmap(ds, mdb, group);
+ 
+-	for_each_set_bit(port, group, ds->num_ports)
+-		ds->ops->port_mdb_add(ds, port, mdb);
++	dsa_switch_mdb_add_bitmap(ds, mdb, group);
+ 
+ 	return 0;
+ }
+
+commit 9c428c593fb7533595c439b510e5eb5e94aec65e
+Author: Vivien Didelot <vivien.didelot@savoirfairelinux.com>
+Date:   Thu Nov 30 11:23:59 2017 -0500
+
+    net: dsa: add switch vlan bitmap functions
+    
+    This patch brings no functional changes.
+    It moves out the VLAN code iterating on a list of VLAN members into new
+    dsa_switch_vlan_{prepare,add}_bitmap() functions.
+    
+    This gives us a better isolation of the two switchdev phases.
+    
+    Signed-off-by: Vivien Didelot <vivien.didelot@savoirfairelinux.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/dsa/switch.c b/net/dsa/switch.c
+index 5ee04e9b5796..17cd03d6bc7d 100644
+--- a/net/dsa/switch.c
++++ b/net/dsa/switch.c
+@@ -157,13 +157,43 @@ static int dsa_switch_mdb_del(struct dsa_switch *ds,
+ 	return 0;
+ }
+ 
++static int
++dsa_switch_vlan_prepare_bitmap(struct dsa_switch *ds,
++			       const struct switchdev_obj_port_vlan *vlan,
++			       const unsigned long *bitmap)
++{
++	int port, err;
++
++	if (!ds->ops->port_vlan_prepare || !ds->ops->port_vlan_add)
++		return -EOPNOTSUPP;
++
++	for_each_set_bit(port, bitmap, ds->num_ports) {
++		err = ds->ops->port_vlan_prepare(ds, port, vlan);
++		if (err)
++			return err;
++	}
++
++	return 0;
++}
++
++static void
++dsa_switch_vlan_add_bitmap(struct dsa_switch *ds,
++			   const struct switchdev_obj_port_vlan *vlan,
++			   const unsigned long *bitmap)
++{
++	int port;
++
++	for_each_set_bit(port, bitmap, ds->num_ports)
++		ds->ops->port_vlan_add(ds, port, vlan);
++}
++
+ static int dsa_switch_vlan_add(struct dsa_switch *ds,
+ 			       struct dsa_notifier_vlan_info *info)
+ {
+ 	const struct switchdev_obj_port_vlan *vlan = info->vlan;
+ 	struct switchdev_trans *trans = info->trans;
+ 	DECLARE_BITMAP(members, ds->num_ports);
+-	int port, err;
++	int port;
+ 
+ 	/* Build a mask of VLAN members */
+ 	bitmap_zero(members, ds->num_ports);
+@@ -173,21 +203,10 @@ static int dsa_switch_vlan_add(struct dsa_switch *ds,
+ 		if (dsa_is_cpu_port(ds, port) || dsa_is_dsa_port(ds, port))
+ 			set_bit(port, members);
+ 
+-	if (switchdev_trans_ph_prepare(trans)) {
+-		if (!ds->ops->port_vlan_prepare || !ds->ops->port_vlan_add)
+-			return -EOPNOTSUPP;
++	if (switchdev_trans_ph_prepare(trans))
++		return dsa_switch_vlan_prepare_bitmap(ds, vlan, members);
+ 
+-		for_each_set_bit(port, members, ds->num_ports) {
+-			err = ds->ops->port_vlan_prepare(ds, port, vlan);
+-			if (err)
+-				return err;
+-		}
+-
+-		return 0;
+-	}
+-
+-	for_each_set_bit(port, members, ds->num_ports)
+-		ds->ops->port_vlan_add(ds, port, vlan);
++	dsa_switch_vlan_add_bitmap(ds, vlan, members);
+ 
+ 	return 0;
+ }
+
+commit 3709aadc8375a1b0c42da5b12e38eddf8133dd4e
+Author: Vivien Didelot <vivien.didelot@savoirfairelinux.com>
+Date:   Thu Nov 30 11:23:58 2017 -0500
+
+    net: dsa: remove trans argument from mdb ops
+    
+    The DSA switch MDB ops pass the switchdev_trans structure down to the
+    drivers, but no one is using them and they aren't supposed to anyway.
+    
+    Remove the trans argument from MDB prepare and add operations.
+    
+    Signed-off-by: Vivien Didelot <vivien.didelot@savoirfairelinux.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/dsa/switch.c b/net/dsa/switch.c
+index 205f074fa524..5ee04e9b5796 100644
+--- a/net/dsa/switch.c
++++ b/net/dsa/switch.c
+@@ -129,7 +129,7 @@ static int dsa_switch_mdb_add(struct dsa_switch *ds,
+ 			return -EOPNOTSUPP;
+ 
+ 		for_each_set_bit(port, group, ds->num_ports) {
+-			err = ds->ops->port_mdb_prepare(ds, port, mdb, trans);
++			err = ds->ops->port_mdb_prepare(ds, port, mdb);
+ 			if (err)
+ 				return err;
+ 		}
+@@ -138,7 +138,7 @@ static int dsa_switch_mdb_add(struct dsa_switch *ds,
+ 	}
+ 
+ 	for_each_set_bit(port, group, ds->num_ports)
+-		ds->ops->port_mdb_add(ds, port, mdb, trans);
++		ds->ops->port_mdb_add(ds, port, mdb);
+ 
+ 	return 0;
+ }
+
+commit 80e023607982faa6245507c45acf93bb0feb0ded
+Author: Vivien Didelot <vivien.didelot@savoirfairelinux.com>
+Date:   Thu Nov 30 11:23:57 2017 -0500
+
+    net: dsa: remove trans argument from vlan ops
+    
+    The DSA switch VLAN ops pass the switchdev_trans structure down to the
+    drivers, but no one is using them and they aren't supposed to anyway.
+    
+    Remove the trans argument from VLAN prepare and add operations.
+    
+    At the same time, fix the following checkpatch warning:
+    
+        WARNING: line over 80 characters
+        #74: FILE: drivers/net/dsa/dsa_loop.c:177:
+        +                                 const struct switchdev_obj_port_vlan *vlan)
+    
+    Signed-off-by: Vivien Didelot <vivien.didelot@savoirfairelinux.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/dsa/switch.c b/net/dsa/switch.c
+index 29608d087a7c..205f074fa524 100644
+--- a/net/dsa/switch.c
++++ b/net/dsa/switch.c
+@@ -178,7 +178,7 @@ static int dsa_switch_vlan_add(struct dsa_switch *ds,
+ 			return -EOPNOTSUPP;
+ 
+ 		for_each_set_bit(port, members, ds->num_ports) {
+-			err = ds->ops->port_vlan_prepare(ds, port, vlan, trans);
++			err = ds->ops->port_vlan_prepare(ds, port, vlan);
+ 			if (err)
+ 				return err;
+ 		}
+@@ -187,7 +187,7 @@ static int dsa_switch_vlan_add(struct dsa_switch *ds,
+ 	}
+ 
+ 	for_each_set_bit(port, members, ds->num_ports)
+-		ds->ops->port_vlan_add(ds, port, vlan, trans);
++		ds->ops->port_vlan_add(ds, port, vlan);
+ 
+ 	return 0;
+ }
+
+commit fdae5f37a88caed9d2105f5a1ff609322f9e5416
+Merge: 7c5556decd0a b39545684a90
+Author: David S. Miller <davem@davemloft.net>
+Date:   Sun Nov 12 09:17:05 2017 +0900
+
+    Merge git://git.kernel.org/pub/scm/linux/kernel/git/davem/net
+
+commit 2118df93b5e1742931da358c2b8804c46fd64490
+Author: Vivien Didelot <vivien.didelot@savoirfairelinux.com>
+Date:   Wed Nov 8 10:50:10 2017 -0500
+
+    net: dsa: return after vlan prepare phase
+    
+    The current code does not return after successfully preparing the VLAN
+    addition on every ports member of a it. Fix this.
+    
+    Fixes: 1ca4aa9cd4cc ("net: dsa: check VLAN capability of every switch")
+    Signed-off-by: Vivien Didelot <vivien.didelot@savoirfairelinux.com>
+    Reviewed-by: Andrew Lunn <andrew@lunn.ch>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/dsa/switch.c b/net/dsa/switch.c
+index 73746fa148f1..1e2929f4290a 100644
+--- a/net/dsa/switch.c
++++ b/net/dsa/switch.c
+@@ -182,6 +182,8 @@ static int dsa_switch_vlan_add(struct dsa_switch *ds,
+ 			if (err)
+ 				return err;
+ 		}
++
++		return 0;
+ 	}
+ 
+ 	for_each_set_bit(port, members, ds->num_ports)
+
+commit b0b38a1c6684b10dd0462bef4fef038917115012
+Author: Vivien Didelot <vivien.didelot@savoirfairelinux.com>
+Date:   Wed Nov 8 10:49:56 2017 -0500
+
+    net: dsa: return after mdb prepare phase
+    
+    The current code does not return after successfully preparing the MDB
+    addition on every ports member of a multicast group. Fix this.
+    
+    Fixes: a1a6b7ea7f2d ("net: dsa: add cross-chip multicast support")
+    Reported-by: Egil Hjelmeland <privat@egil-hjelmeland.no>
+    Signed-off-by: Vivien Didelot <vivien.didelot@savoirfairelinux.com>
+    Reviewed-by: Andrew Lunn <andrew@lunn.ch>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/dsa/switch.c b/net/dsa/switch.c
+index e6c06aa349a6..73746fa148f1 100644
+--- a/net/dsa/switch.c
++++ b/net/dsa/switch.c
+@@ -133,6 +133,8 @@ static int dsa_switch_mdb_add(struct dsa_switch *ds,
+ 			if (err)
+ 				return err;
+ 		}
++
++		return 0;
+ 	}
+ 
+ 	for_each_set_bit(port, group, ds->num_ports)
+
+commit ae45102c9d247516e52f41b3381e195bbc25a362
+Author: Andrew Lunn <andrew@lunn.ch>
+Date:   Thu Nov 9 23:11:02 2017 +0100
+
+    net: dsa: switch: Don't add CPU port to an mdb by default
+    
+    Now that the host indicates when a multicast group should be forwarded
+    from the switch to the host, don't do it by default.
+    
+    Signed-off-by: Andrew Lunn <andrew@lunn.ch>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/dsa/switch.c b/net/dsa/switch.c
+index e6c06aa349a6..1155e43c157f 100644
+--- a/net/dsa/switch.c
++++ b/net/dsa/switch.c
+@@ -121,7 +121,7 @@ static int dsa_switch_mdb_add(struct dsa_switch *ds,
+ 	if (ds->index == info->sw_index)
+ 		set_bit(info->port, group);
+ 	for (port = 0; port < ds->num_ports; port++)
+-		if (dsa_is_cpu_port(ds, port) || dsa_is_dsa_port(ds, port))
++		if (dsa_is_dsa_port(ds, port))
+ 			set_bit(port, group);
+ 
+ 	if (switchdev_trans_ph_prepare(trans)) {
+
+commit 2acf4e6a890b0228ed19b228063d69666f61ee19
+Author: Arkadi Sharshevsky <arkadis@mellanox.com>
+Date:   Sun Aug 6 16:15:41 2017 +0300
+
+    net: dsa: Remove switchdev dependency from DSA switch notifier chain
+    
+    Currently, the switchdev objects are embedded inside the DSA notifier
+    info. This patch removes this dependency. This is done as a preparation
+    stage before adding support for learning FDB through the switchdev
+    notification chain.
+    
+    Signed-off-by: Arkadi Sharshevsky <arkadis@mellanox.com>
+    Reviewed-by: Florian Fainelli <f.fainelli@gmail.com>
+    Reviewed-by: Vivien Didelot <vivien.didelot@savoirfairelinux.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/dsa/switch.c b/net/dsa/switch.c
+index eb20e0fee0e1..e6c06aa349a6 100644
+--- a/net/dsa/switch.c
++++ b/net/dsa/switch.c
+@@ -83,8 +83,6 @@ static int dsa_switch_bridge_leave(struct dsa_switch *ds,
+ static int dsa_switch_fdb_add(struct dsa_switch *ds,
+ 			      struct dsa_notifier_fdb_info *info)
+ {
+-	const struct switchdev_obj_port_fdb *fdb = info->fdb;
+-
+ 	/* Do not care yet about other switch chips of the fabric */
+ 	if (ds->index != info->sw_index)
+ 		return 0;
+@@ -92,14 +90,13 @@ static int dsa_switch_fdb_add(struct dsa_switch *ds,
+ 	if (!ds->ops->port_fdb_add)
+ 		return -EOPNOTSUPP;
+ 
+-	return ds->ops->port_fdb_add(ds, info->port, fdb->addr, fdb->vid);
++	return ds->ops->port_fdb_add(ds, info->port, info->addr,
++				     info->vid);
+ }
+ 
+ static int dsa_switch_fdb_del(struct dsa_switch *ds,
+ 			      struct dsa_notifier_fdb_info *info)
+ {
+-	const struct switchdev_obj_port_fdb *fdb = info->fdb;
+-
+ 	/* Do not care yet about other switch chips of the fabric */
+ 	if (ds->index != info->sw_index)
+ 		return 0;
+@@ -107,8 +104,8 @@ static int dsa_switch_fdb_del(struct dsa_switch *ds,
+ 	if (!ds->ops->port_fdb_del)
+ 		return -EOPNOTSUPP;
+ 
+-	return ds->ops->port_fdb_del(ds, info->port, fdb->addr,
+-				     fdb->vid);
++	return ds->ops->port_fdb_del(ds, info->port, info->addr,
++				     info->vid);
+ }
+ 
+ static int dsa_switch_mdb_add(struct dsa_switch *ds,
+
+commit 1b6dd556c3045ca5fa31cc1e98a4a43afa680e1e
+Author: Arkadi Sharshevsky <arkadis@mellanox.com>
+Date:   Sun Aug 6 16:15:40 2017 +0300
+
+    net: dsa: Remove prepare phase for FDB
+    
+    The prepare phase for FDB add is unneeded because most of DSA devices
+    can have failures during bus transactions (SPI, I2C, etc.), thus, the
+    prepare phase cannot guarantee success of the commit stage.
+    
+    The support for learning FDB through notification chain, which will be
+    introduced in the following patches, will provide the ability to notify
+    back the bridge about successful offload.
+    
+    Signed-off-by: Arkadi Sharshevsky <arkadis@mellanox.com>
+    Reviewed-by: Vivien Didelot <vivien.didelot@savoirfairelinux.com>
+    Reviewed-by: Florian Fainelli <f.fainelli@gmail.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/dsa/switch.c b/net/dsa/switch.c
+index a9edfbad3889..eb20e0fee0e1 100644
+--- a/net/dsa/switch.c
++++ b/net/dsa/switch.c
+@@ -84,23 +84,15 @@ static int dsa_switch_fdb_add(struct dsa_switch *ds,
+ 			      struct dsa_notifier_fdb_info *info)
+ {
+ 	const struct switchdev_obj_port_fdb *fdb = info->fdb;
+-	struct switchdev_trans *trans = info->trans;
+ 
+ 	/* Do not care yet about other switch chips of the fabric */
+ 	if (ds->index != info->sw_index)
+ 		return 0;
+ 
+-	if (switchdev_trans_ph_prepare(trans)) {
+-		if (!ds->ops->port_fdb_prepare || !ds->ops->port_fdb_add)
+-			return -EOPNOTSUPP;
+-
+-		return ds->ops->port_fdb_prepare(ds, info->port, fdb->addr,
+-						 fdb->vid);
+-	}
+-
+-	ds->ops->port_fdb_add(ds, info->port, fdb->addr, fdb->vid);
++	if (!ds->ops->port_fdb_add)
++		return -EOPNOTSUPP;
+ 
+-	return 0;
++	return ds->ops->port_fdb_add(ds, info->port, fdb->addr, fdb->vid);
+ }
+ 
+ static int dsa_switch_fdb_del(struct dsa_switch *ds,
+
+commit 6c2c1dcb185f1e44e1c895781dbaba40195234f9
+Author: Arkadi Sharshevsky <arkadis@mellanox.com>
+Date:   Sun Aug 6 16:15:39 2017 +0300
+
+    net: dsa: Change DSA slave FDB API to be switchdev independent
+    
+    In order to support FDB add/del to be on a notifier chain the slave
+    API need to be changed to be switchdev independent.
+    
+    Signed-off-by: Arkadi Sharshevsky <arkadis@mellanox.com>
+    Reviewed-by: Vivien Didelot <vivien.didelot@savoirfairelinux.com>
+    Reviewed-by: Florian Fainelli <f.fainelli@gmail.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/dsa/switch.c b/net/dsa/switch.c
+index 97e2e9c8cf3f..a9edfbad3889 100644
+--- a/net/dsa/switch.c
++++ b/net/dsa/switch.c
+@@ -94,10 +94,11 @@ static int dsa_switch_fdb_add(struct dsa_switch *ds,
+ 		if (!ds->ops->port_fdb_prepare || !ds->ops->port_fdb_add)
+ 			return -EOPNOTSUPP;
+ 
+-		return ds->ops->port_fdb_prepare(ds, info->port, fdb, trans);
++		return ds->ops->port_fdb_prepare(ds, info->port, fdb->addr,
++						 fdb->vid);
+ 	}
+ 
+-	ds->ops->port_fdb_add(ds, info->port, fdb, trans);
++	ds->ops->port_fdb_add(ds, info->port, fdb->addr, fdb->vid);
+ 
+ 	return 0;
+ }
+@@ -114,7 +115,8 @@ static int dsa_switch_fdb_del(struct dsa_switch *ds,
+ 	if (!ds->ops->port_fdb_del)
+ 		return -EOPNOTSUPP;
+ 
+-	return ds->ops->port_fdb_del(ds, info->port, fdb);
++	return ds->ops->port_fdb_del(ds, info->port, fdb->addr,
++				     fdb->vid);
+ }
+ 
+ static int dsa_switch_mdb_add(struct dsa_switch *ds,
+
+commit a1a6b7ea7f2de270a51360cc48e7c49f7a283dda
+Author: Vivien Didelot <vivien.didelot@savoirfairelinux.com>
+Date:   Thu Jun 15 16:14:48 2017 -0400
+
+    net: dsa: add cross-chip multicast support
+    
+    Similarly to how cross-chip VLAN works, define a bitmap of multicast
+    group members for a switch, now including its DSA ports, so that
+    multicast traffic can be sent to all switches of the fabric.
+    
+    A switch may drop the frames if no user port is a member.
+    
+    This brings support for multicast in a multi-chip environment.
+    As of now, all switches of the fabric must support the multicast
+    operations in order to program a single fabric port.
+    
+    Reported-by: Jason Cobham <jcobham@questertangent.com>
+    Signed-off-by: Vivien Didelot <vivien.didelot@savoirfairelinux.com>
+    Tested-by: Jason Cobham <jcobham@questertangent.com>
+    Reviewed-by: Florian Fainelli <f.fainelli@gmail.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/dsa/switch.c b/net/dsa/switch.c
+index f1029a8d0e20..97e2e9c8cf3f 100644
+--- a/net/dsa/switch.c
++++ b/net/dsa/switch.c
+@@ -122,19 +122,30 @@ static int dsa_switch_mdb_add(struct dsa_switch *ds,
+ {
+ 	const struct switchdev_obj_port_mdb *mdb = info->mdb;
+ 	struct switchdev_trans *trans = info->trans;
++	DECLARE_BITMAP(group, ds->num_ports);
++	int port, err;
+ 
+-	/* Do not care yet about other switch chips of the fabric */
+-	if (ds->index != info->sw_index)
+-		return 0;
++	/* Build a mask of Multicast group members */
++	bitmap_zero(group, ds->num_ports);
++	if (ds->index == info->sw_index)
++		set_bit(info->port, group);
++	for (port = 0; port < ds->num_ports; port++)
++		if (dsa_is_cpu_port(ds, port) || dsa_is_dsa_port(ds, port))
++			set_bit(port, group);
+ 
+ 	if (switchdev_trans_ph_prepare(trans)) {
+ 		if (!ds->ops->port_mdb_prepare || !ds->ops->port_mdb_add)
+ 			return -EOPNOTSUPP;
+ 
+-		return ds->ops->port_mdb_prepare(ds, info->port, mdb, trans);
++		for_each_set_bit(port, group, ds->num_ports) {
++			err = ds->ops->port_mdb_prepare(ds, port, mdb, trans);
++			if (err)
++				return err;
++		}
+ 	}
+ 
+-	ds->ops->port_mdb_add(ds, info->port, mdb, trans);
++	for_each_set_bit(port, group, ds->num_ports)
++		ds->ops->port_mdb_add(ds, port, mdb, trans);
+ 
+ 	return 0;
+ }
+@@ -144,14 +155,13 @@ static int dsa_switch_mdb_del(struct dsa_switch *ds,
+ {
+ 	const struct switchdev_obj_port_mdb *mdb = info->mdb;
+ 
+-	/* Do not care yet about other switch chips of the fabric */
+-	if (ds->index != info->sw_index)
+-		return 0;
+-
+ 	if (!ds->ops->port_mdb_del)
+ 		return -EOPNOTSUPP;
+ 
+-	return ds->ops->port_mdb_del(ds, info->port, mdb);
++	if (ds->index == info->sw_index)
++		return ds->ops->port_mdb_del(ds, info->port, mdb);
++
++	return 0;
+ }
+ 
+ static int dsa_switch_vlan_add(struct dsa_switch *ds,
+
+commit b2f81d304cee0e027c666890f52644a92062cce0
+Author: Vivien Didelot <vivien.didelot@savoirfairelinux.com>
+Date:   Wed Jun 7 18:12:15 2017 -0400
+
+    net: dsa: add CPU and DSA ports as VLAN members
+    
+    In a multi-chip switch fabric, it is currently the responsibility of the
+    driver to add the CPU or DSA (interconnecting chips together) ports as
+    members of a new VLAN entry. This makes the drivers more complicated.
+    
+    We want the DSA drivers to be stupid and the DSA core being the one
+    responsible for caring about the abstracted switch logic and topology.
+    
+    Make the DSA core program the CPU and DSA ports as part of the VLAN.
+    
+    This makes all chips of the data path to be aware of VIDs spanning the
+    the whole fabric and thus, seamlessly add support for cross-chip VLAN.
+    
+    Reviewed-by: Florian Fainelli <f.fainelli@gmail.com>
+    Signed-off-by: Vivien Didelot <vivien.didelot@savoirfairelinux.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/dsa/switch.c b/net/dsa/switch.c
+index f235ae1e9777..f1029a8d0e20 100644
+--- a/net/dsa/switch.c
++++ b/net/dsa/switch.c
+@@ -166,6 +166,9 @@ static int dsa_switch_vlan_add(struct dsa_switch *ds,
+ 	bitmap_zero(members, ds->num_ports);
+ 	if (ds->index == info->sw_index)
+ 		set_bit(info->port, members);
++	for (port = 0; port < ds->num_ports; port++)
++		if (dsa_is_cpu_port(ds, port) || dsa_is_dsa_port(ds, port))
++			set_bit(port, members);
+ 
+ 	if (switchdev_trans_ph_prepare(trans)) {
+ 		if (!ds->ops->port_vlan_prepare || !ds->ops->port_vlan_add)
+
+commit 1ca4aa9cd4cc075e3fddbba80fd2ed2f479bfb22
+Author: Vivien Didelot <vivien.didelot@savoirfairelinux.com>
+Date:   Wed Jun 7 18:12:14 2017 -0400
+
+    net: dsa: check VLAN capability of every switch
+    
+    Now that the VLAN object is propagated to every switch chip of the
+    switch fabric, we can easily ensure that they all support the required
+    VLAN operations before modifying an entry on a single switch.
+    
+    To achieve that, remove the condition skipping other target switches,
+    and add a bitmap of VLAN members, eventually containing the target port,
+    if we are programming the switch target.
+    
+    This will allow us to easily add other VLAN members, such as the DSA or
+    CPU ports (to introduce cross-chip VLAN support) or the other port
+    members if we want to reduce hardware accesses later.
+    
+    Reviewed-by: Florian Fainelli <f.fainelli@gmail.com>
+    Signed-off-by: Vivien Didelot <vivien.didelot@savoirfairelinux.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/dsa/switch.c b/net/dsa/switch.c
+index d8e5c311ee7c..f235ae1e9777 100644
+--- a/net/dsa/switch.c
++++ b/net/dsa/switch.c
+@@ -159,19 +159,27 @@ static int dsa_switch_vlan_add(struct dsa_switch *ds,
+ {
+ 	const struct switchdev_obj_port_vlan *vlan = info->vlan;
+ 	struct switchdev_trans *trans = info->trans;
++	DECLARE_BITMAP(members, ds->num_ports);
++	int port, err;
+ 
+-	/* Do not care yet about other switch chips of the fabric */
+-	if (ds->index != info->sw_index)
+-		return 0;
++	/* Build a mask of VLAN members */
++	bitmap_zero(members, ds->num_ports);
++	if (ds->index == info->sw_index)
++		set_bit(info->port, members);
+ 
+ 	if (switchdev_trans_ph_prepare(trans)) {
+ 		if (!ds->ops->port_vlan_prepare || !ds->ops->port_vlan_add)
+ 			return -EOPNOTSUPP;
+ 
+-		return ds->ops->port_vlan_prepare(ds, info->port, vlan, trans);
++		for_each_set_bit(port, members, ds->num_ports) {
++			err = ds->ops->port_vlan_prepare(ds, port, vlan, trans);
++			if (err)
++				return err;
++		}
+ 	}
+ 
+-	ds->ops->port_vlan_add(ds, info->port, vlan, trans);
++	for_each_set_bit(port, members, ds->num_ports)
++		ds->ops->port_vlan_add(ds, port, vlan, trans);
+ 
+ 	return 0;
+ }
+@@ -181,14 +189,13 @@ static int dsa_switch_vlan_del(struct dsa_switch *ds,
+ {
+ 	const struct switchdev_obj_port_vlan *vlan = info->vlan;
+ 
+-	/* Do not care yet about other switch chips of the fabric */
+-	if (ds->index != info->sw_index)
+-		return 0;
+-
+ 	if (!ds->ops->port_vlan_del)
+ 		return -EOPNOTSUPP;
+ 
+-	return ds->ops->port_vlan_del(ds, info->port, vlan);
++	if (ds->index == info->sw_index)
++		return ds->ops->port_vlan_del(ds, info->port, vlan);
++
++	return 0;
+ }
+ 
+ static int dsa_switch_event(struct notifier_block *nb,
+
+commit 64dba236a15770af1e07f90f23a54789c9f9a3ba
+Author: Vivien Didelot <vivien.didelot@savoirfairelinux.com>
+Date:   Tue May 23 15:20:59 2017 -0400
+
+    net: dsa: support cross-chip ageing time
+    
+    Now that the switchdev bridge ageing time attribute is propagated to all
+    switch chips of the fabric, each switch can check if the requested value
+    is valid and program itself, so that the whole fabric shares a common
+    ageing time setting.
+    
+    This is especially needed for switch chips in between others, containing
+    no bridge port members but evidently used in the data path.
+    
+    To achieve that, remove the condition which skips the other switches. We
+    also don't need to identify the target switch anymore, thus remove the
+    sw_index member of the dsa_notifier_ageing_time_info notifier structure.
+    
+    On ZII Dev Rev B (with two 88E6352 and one 88E6185) and ZII Dev Rev C
+    (with two 88E6390X), we have the following hardware configuration:
+    
+        # ip link add name br0 type bridge
+        # ip link set master br0 dev lan6
+        br0: port 1(lan6) entered blocking state
+        br0: port 1(lan6) entered disabled state
+        # echo 2000 > /sys/class/net/br0/bridge/ageing_time
+    
+    Before this patch:
+    
+        zii-rev-b# cat /sys/kernel/debug/mv88e6xxx/sw*/age_time
+        300000
+        300000
+        15000
+    
+        zii-rev-c# cat /sys/kernel/debug/mv88e6xxx/sw*/age_time
+        300000
+        18750
+    
+    After this patch:
+    
+        zii-rev-b# cat /sys/kernel/debug/mv88e6xxx/sw*/age_time
+        15000
+        15000
+        15000
+    
+        zii-rev-c# cat /sys/kernel/debug/mv88e6xxx/sw*/age_time
+        18750
+        18750
+    
+    Signed-off-by: Vivien Didelot <vivien.didelot@savoirfairelinux.com>
+    Reviewed-by: Andrew Lunn <andrew@lunn.ch>
+    Reviewed-by: Florian Fainelli <f.fainelli@gmail.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/dsa/switch.c b/net/dsa/switch.c
+index c1e4b2d5a3ae..d8e5c311ee7c 100644
+--- a/net/dsa/switch.c
++++ b/net/dsa/switch.c
+@@ -37,10 +37,6 @@ static int dsa_switch_ageing_time(struct dsa_switch *ds,
+ 	unsigned int ageing_time = info->ageing_time;
+ 	struct switchdev_trans *trans = info->trans;
+ 
+-	/* Do not care yet about other switch chips of the fabric */
+-	if (ds->index != info->sw_index)
+-		return 0;
+-
+ 	if (switchdev_trans_ph_prepare(trans)) {
+ 		if (ds->ageing_time_min && ageing_time < ds->ageing_time_min)
+ 			return -ERANGE;
+
+commit d0c627b8740ca6243054263fbc98981a36ac5618
+Author: Vivien Didelot <vivien.didelot@savoirfairelinux.com>
+Date:   Fri May 19 17:00:55 2017 -0400
+
+    net: dsa: add VLAN notifier
+    
+    Add two new DSA_NOTIFIER_VLAN_ADD and DSA_NOTIFIER_VLAN_DEL events to
+    notify not only a single switch, but all switches of a the fabric when
+    an VLAN entry is added or removed.
+    
+    For the moment, keep the current behavior and ignore other switches.
+    
+    Signed-off-by: Vivien Didelot <vivien.didelot@savoirfairelinux.com>
+    Reviewed-by: Florian Fainelli <f.fainelli@gmail.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/dsa/switch.c b/net/dsa/switch.c
+index b7e8e45869fc..c1e4b2d5a3ae 100644
+--- a/net/dsa/switch.c
++++ b/net/dsa/switch.c
+@@ -158,6 +158,43 @@ static int dsa_switch_mdb_del(struct dsa_switch *ds,
+ 	return ds->ops->port_mdb_del(ds, info->port, mdb);
+ }
+ 
++static int dsa_switch_vlan_add(struct dsa_switch *ds,
++			       struct dsa_notifier_vlan_info *info)
++{
++	const struct switchdev_obj_port_vlan *vlan = info->vlan;
++	struct switchdev_trans *trans = info->trans;
++
++	/* Do not care yet about other switch chips of the fabric */
++	if (ds->index != info->sw_index)
++		return 0;
++
++	if (switchdev_trans_ph_prepare(trans)) {
++		if (!ds->ops->port_vlan_prepare || !ds->ops->port_vlan_add)
++			return -EOPNOTSUPP;
++
++		return ds->ops->port_vlan_prepare(ds, info->port, vlan, trans);
++	}
++
++	ds->ops->port_vlan_add(ds, info->port, vlan, trans);
++
++	return 0;
++}
++
++static int dsa_switch_vlan_del(struct dsa_switch *ds,
++			       struct dsa_notifier_vlan_info *info)
++{
++	const struct switchdev_obj_port_vlan *vlan = info->vlan;
++
++	/* Do not care yet about other switch chips of the fabric */
++	if (ds->index != info->sw_index)
++		return 0;
++
++	if (!ds->ops->port_vlan_del)
++		return -EOPNOTSUPP;
++
++	return ds->ops->port_vlan_del(ds, info->port, vlan);
++}
++
+ static int dsa_switch_event(struct notifier_block *nb,
+ 			    unsigned long event, void *info)
+ {
+@@ -186,6 +223,12 @@ static int dsa_switch_event(struct notifier_block *nb,
+ 	case DSA_NOTIFIER_MDB_DEL:
+ 		err = dsa_switch_mdb_del(ds, info);
+ 		break;
++	case DSA_NOTIFIER_VLAN_ADD:
++		err = dsa_switch_vlan_add(ds, info);
++		break;
++	case DSA_NOTIFIER_VLAN_DEL:
++		err = dsa_switch_vlan_del(ds, info);
++		break;
+ 	default:
+ 		err = -EOPNOTSUPP;
+ 		break;
+
+commit 8ae5bcdc5d98a99e59f194101e7acd2e9d055758
+Author: Vivien Didelot <vivien.didelot@savoirfairelinux.com>
+Date:   Fri May 19 17:00:54 2017 -0400
+
+    net: dsa: add MDB notifier
+    
+    Add two new DSA_NOTIFIER_MDB_ADD and DSA_NOTIFIER_MDB_DEL events to
+    notify not only a single switch, but all switches of a the fabric when
+    an MDB entry is added or removed.
+    
+    For the moment, keep the current behavior and ignore other switches.
+    
+    Signed-off-by: Vivien Didelot <vivien.didelot@savoirfairelinux.com>
+    Reviewed-by: Florian Fainelli <f.fainelli@gmail.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/dsa/switch.c b/net/dsa/switch.c
+index e71cc860d32c..b7e8e45869fc 100644
+--- a/net/dsa/switch.c
++++ b/net/dsa/switch.c
+@@ -121,6 +121,43 @@ static int dsa_switch_fdb_del(struct dsa_switch *ds,
+ 	return ds->ops->port_fdb_del(ds, info->port, fdb);
+ }
+ 
++static int dsa_switch_mdb_add(struct dsa_switch *ds,
++			      struct dsa_notifier_mdb_info *info)
++{
++	const struct switchdev_obj_port_mdb *mdb = info->mdb;
++	struct switchdev_trans *trans = info->trans;
++
++	/* Do not care yet about other switch chips of the fabric */
++	if (ds->index != info->sw_index)
++		return 0;
++
++	if (switchdev_trans_ph_prepare(trans)) {
++		if (!ds->ops->port_mdb_prepare || !ds->ops->port_mdb_add)
++			return -EOPNOTSUPP;
++
++		return ds->ops->port_mdb_prepare(ds, info->port, mdb, trans);
++	}
++
++	ds->ops->port_mdb_add(ds, info->port, mdb, trans);
++
++	return 0;
++}
++
++static int dsa_switch_mdb_del(struct dsa_switch *ds,
++			      struct dsa_notifier_mdb_info *info)
++{
++	const struct switchdev_obj_port_mdb *mdb = info->mdb;
++
++	/* Do not care yet about other switch chips of the fabric */
++	if (ds->index != info->sw_index)
++		return 0;
++
++	if (!ds->ops->port_mdb_del)
++		return -EOPNOTSUPP;
++
++	return ds->ops->port_mdb_del(ds, info->port, mdb);
++}
++
+ static int dsa_switch_event(struct notifier_block *nb,
+ 			    unsigned long event, void *info)
+ {
+@@ -143,6 +180,12 @@ static int dsa_switch_event(struct notifier_block *nb,
+ 	case DSA_NOTIFIER_FDB_DEL:
+ 		err = dsa_switch_fdb_del(ds, info);
+ 		break;
++	case DSA_NOTIFIER_MDB_ADD:
++		err = dsa_switch_mdb_add(ds, info);
++		break;
++	case DSA_NOTIFIER_MDB_DEL:
++		err = dsa_switch_mdb_del(ds, info);
++		break;
+ 	default:
+ 		err = -EOPNOTSUPP;
+ 		break;
+
+commit 685fb6a40ddace10a0bc8a680ab6ba65c6cdfdaf
+Author: Vivien Didelot <vivien.didelot@savoirfairelinux.com>
+Date:   Fri May 19 17:00:53 2017 -0400
+
+    net: dsa: add FDB notifier
+    
+    Add two new DSA_NOTIFIER_FDB_ADD and DSA_NOTIFIER_FDB_DEL events to
+    notify not only a single switch, but all switches of a the fabric when
+    an FDB entry is added or removed.
+    
+    For the moment, keep the current behavior and ignore other switches.
+    
+    Signed-off-by: Vivien Didelot <vivien.didelot@savoirfairelinux.com>
+    Reviewed-by: Florian Fainelli <f.fainelli@gmail.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/dsa/switch.c b/net/dsa/switch.c
+index 540770ecc8b0..e71cc860d32c 100644
+--- a/net/dsa/switch.c
++++ b/net/dsa/switch.c
+@@ -84,6 +84,43 @@ static int dsa_switch_bridge_leave(struct dsa_switch *ds,
+ 	return 0;
+ }
+ 
++static int dsa_switch_fdb_add(struct dsa_switch *ds,
++			      struct dsa_notifier_fdb_info *info)
++{
++	const struct switchdev_obj_port_fdb *fdb = info->fdb;
++	struct switchdev_trans *trans = info->trans;
++
++	/* Do not care yet about other switch chips of the fabric */
++	if (ds->index != info->sw_index)
++		return 0;
++
++	if (switchdev_trans_ph_prepare(trans)) {
++		if (!ds->ops->port_fdb_prepare || !ds->ops->port_fdb_add)
++			return -EOPNOTSUPP;
++
++		return ds->ops->port_fdb_prepare(ds, info->port, fdb, trans);
++	}
++
++	ds->ops->port_fdb_add(ds, info->port, fdb, trans);
++
++	return 0;
++}
++
++static int dsa_switch_fdb_del(struct dsa_switch *ds,
++			      struct dsa_notifier_fdb_info *info)
++{
++	const struct switchdev_obj_port_fdb *fdb = info->fdb;
++
++	/* Do not care yet about other switch chips of the fabric */
++	if (ds->index != info->sw_index)
++		return 0;
++
++	if (!ds->ops->port_fdb_del)
++		return -EOPNOTSUPP;
++
++	return ds->ops->port_fdb_del(ds, info->port, fdb);
++}
++
+ static int dsa_switch_event(struct notifier_block *nb,
+ 			    unsigned long event, void *info)
+ {
+@@ -100,6 +137,12 @@ static int dsa_switch_event(struct notifier_block *nb,
+ 	case DSA_NOTIFIER_BRIDGE_LEAVE:
+ 		err = dsa_switch_bridge_leave(ds, info);
+ 		break;
++	case DSA_NOTIFIER_FDB_ADD:
++		err = dsa_switch_fdb_add(ds, info);
++		break;
++	case DSA_NOTIFIER_FDB_DEL:
++		err = dsa_switch_fdb_del(ds, info);
++		break;
+ 	default:
+ 		err = -EOPNOTSUPP;
+ 		break;
+
+commit 1faabf7440f17999f41973e91878c13ad9f080b2
+Author: Vivien Didelot <vivien.didelot@savoirfairelinux.com>
+Date:   Fri May 19 17:00:52 2017 -0400
+
+    net: dsa: add notifier for ageing time
+    
+    This patch keeps the port-wide ageing time handling code in
+    dsa_port_ageing_time, pushes the requested ageing time value in a new
+    switch fabric notification, and moves the switch-wide ageing time
+    handling code in dsa_switch_ageing_time.
+    
+    This has the effect that now not only the switch that the target port
+    belongs to can be programmed, but all switches composing the switch
+    fabric. For the moment, keep the current behavior and ignore other
+    switches.
+    
+    Signed-off-by: Vivien Didelot <vivien.didelot@savoirfairelinux.com>
+    Reviewed-by: Florian Fainelli <f.fainelli@gmail.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/dsa/switch.c b/net/dsa/switch.c
+index f477053308d2..540770ecc8b0 100644
+--- a/net/dsa/switch.c
++++ b/net/dsa/switch.c
+@@ -12,9 +12,52 @@
+ 
+ #include <linux/netdevice.h>
+ #include <linux/notifier.h>
++#include <net/switchdev.h>
+ 
+ #include "dsa_priv.h"
+ 
++static unsigned int dsa_switch_fastest_ageing_time(struct dsa_switch *ds,
++						   unsigned int ageing_time)
++{
++	int i;
++
++	for (i = 0; i < ds->num_ports; ++i) {
++		struct dsa_port *dp = &ds->ports[i];
++
++		if (dp->ageing_time && dp->ageing_time < ageing_time)
++			ageing_time = dp->ageing_time;
++	}
++
++	return ageing_time;
++}
++
++static int dsa_switch_ageing_time(struct dsa_switch *ds,
++				  struct dsa_notifier_ageing_time_info *info)
++{
++	unsigned int ageing_time = info->ageing_time;
++	struct switchdev_trans *trans = info->trans;
++
++	/* Do not care yet about other switch chips of the fabric */
++	if (ds->index != info->sw_index)
++		return 0;
++
++	if (switchdev_trans_ph_prepare(trans)) {
++		if (ds->ageing_time_min && ageing_time < ds->ageing_time_min)
++			return -ERANGE;
++		if (ds->ageing_time_max && ageing_time > ds->ageing_time_max)
++			return -ERANGE;
++		return 0;
++	}
++
++	/* Program the fastest ageing time in case of multiple bridges */
++	ageing_time = dsa_switch_fastest_ageing_time(ds, ageing_time);
++
++	if (ds->ops->set_ageing_time)
++		return ds->ops->set_ageing_time(ds, ageing_time);
++
++	return 0;
++}
++
+ static int dsa_switch_bridge_join(struct dsa_switch *ds,
+ 				  struct dsa_notifier_bridge_info *info)
+ {
+@@ -48,6 +91,9 @@ static int dsa_switch_event(struct notifier_block *nb,
+ 	int err;
+ 
+ 	switch (event) {
++	case DSA_NOTIFIER_AGEING_TIME:
++		err = dsa_switch_ageing_time(ds, info);
++		break;
+ 	case DSA_NOTIFIER_BRIDGE_JOIN:
+ 		err = dsa_switch_bridge_join(ds, info);
+ 		break;
+
+commit ea5dd34be1cfb2400587a24d1de75e538e77ce74
+Author: Vivien Didelot <vivien.didelot@savoirfairelinux.com>
+Date:   Wed May 17 15:46:03 2017 -0400
+
+    net: dsa: include dsa.h only once
+    
+    The public include/net/dsa.h file is meant for DSA drivers, while all
+    DSA core files share a common private header net/dsa/dsa_priv.h file.
+    
+    Ensure that dsa_priv.h is the only DSA core file to include net/dsa.h,
+    and add a new line to separate absolute and relative headers at the same
+    time.
+    
+    Signed-off-by: Vivien Didelot <vivien.didelot@savoirfairelinux.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/dsa/switch.c b/net/dsa/switch.c
+index ca6e26e514f0..f477053308d2 100644
+--- a/net/dsa/switch.c
++++ b/net/dsa/switch.c
+@@ -12,7 +12,8 @@
+ 
+ #include <linux/netdevice.h>
+ #include <linux/notifier.h>
+-#include <net/dsa.h>
++
++#include "dsa_priv.h"
+ 
+ static int dsa_switch_bridge_join(struct dsa_switch *ds,
+ 				  struct dsa_notifier_bridge_info *info)
+
+commit 40ef2c93395fcd25051643707d0956ce9120de41
+Author: Vivien Didelot <vivien.didelot@savoirfairelinux.com>
+Date:   Thu Mar 30 17:37:14 2017 -0400
+
+    net: dsa: add cross-chip bridging operations
+    
+    Introduce crosschip_bridge_{join,leave} operations in the dsa_switch_ops
+    structure, which can be used by switches supporting interconnection.
+    
+    Signed-off-by: Vivien Didelot <vivien.didelot@savoirfairelinux.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/dsa/switch.c b/net/dsa/switch.c
+index 7b6f38e5fef6..ca6e26e514f0 100644
+--- a/net/dsa/switch.c
++++ b/net/dsa/switch.c
+@@ -20,9 +20,9 @@ static int dsa_switch_bridge_join(struct dsa_switch *ds,
+ 	if (ds->index == info->sw_index && ds->ops->port_bridge_join)
+ 		return ds->ops->port_bridge_join(ds, info->port, info->br);
+ 
+-	if (ds->index != info->sw_index)
+-		dev_dbg(ds->dev, "crosschip DSA port %d.%d bridged to %s\n",
+-			info->sw_index, info->port, netdev_name(info->br));
++	if (ds->index != info->sw_index && ds->ops->crosschip_bridge_join)
++		return ds->ops->crosschip_bridge_join(ds, info->sw_index,
++						      info->port, info->br);
+ 
+ 	return 0;
+ }
+@@ -33,9 +33,9 @@ static int dsa_switch_bridge_leave(struct dsa_switch *ds,
+ 	if (ds->index == info->sw_index && ds->ops->port_bridge_leave)
+ 		ds->ops->port_bridge_leave(ds, info->port, info->br);
+ 
+-	if (ds->index != info->sw_index)
+-		dev_dbg(ds->dev, "crosschip DSA port %d.%d unbridged from %s\n",
+-			info->sw_index, info->port, netdev_name(info->br));
++	if (ds->index != info->sw_index && ds->ops->crosschip_bridge_leave)
++		ds->ops->crosschip_bridge_leave(ds, info->sw_index, info->port,
++						info->br);
+ 
+ 	return 0;
+ }
+
+commit 4333d619f9e30592426bc1315243fa0754e62c39
+Author: Vivien Didelot <vivien.didelot@savoirfairelinux.com>
+Date:   Tue Mar 28 15:10:36 2017 -0400
+
+    net: dsa: fix copyright holder
+    
+    I do not hold the copyright of the DSA core and drivers source files,
+    since these changes have been written as an initiative of my day job.
+    Fix this.
+    
+    Signed-off-by: Vivien Didelot <vivien.didelot@savoirfairelinux.com>
+    Reviewed-by: Andrew Lunn <andrew@lunn.ch>
+    Acked-by: Florian Fainelli <f.fainelli@gmail.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/dsa/switch.c b/net/dsa/switch.c
+index 6456dacf9ae9..7b6f38e5fef6 100644
+--- a/net/dsa/switch.c
++++ b/net/dsa/switch.c
+@@ -1,7 +1,8 @@
+ /*
+  * Handling of a single switch chip, part of a switch fabric
+  *
+- * Copyright (c) 2017 Vivien Didelot <vivien.didelot@savoirfairelinux.com>
++ * Copyright (c) 2017 Savoir-faire Linux Inc.
++ *	Vivien Didelot <vivien.didelot@savoirfairelinux.com>
+  *
+  * This program is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License as published by
+
+commit 04d3a4c6af52a58370795bc9f70dc15f51f8bb84
+Author: Vivien Didelot <vivien.didelot@savoirfairelinux.com>
+Date:   Fri Feb 3 13:20:21 2017 -0500
+
+    net: dsa: introduce bridge notifier
+    
+    A slave device will now notify the switch fabric once its port is
+    bridged or unbridged, instead of calling directly its switch operations.
+    
+    This code allows propagating cross-chip bridging events in the fabric.
+    
+    Signed-off-by: Vivien Didelot <vivien.didelot@savoirfairelinux.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/dsa/switch.c b/net/dsa/switch.c
+index e22fa7633d03..6456dacf9ae9 100644
+--- a/net/dsa/switch.c
++++ b/net/dsa/switch.c
+@@ -13,6 +13,32 @@
+ #include <linux/notifier.h>
+ #include <net/dsa.h>
+ 
++static int dsa_switch_bridge_join(struct dsa_switch *ds,
++				  struct dsa_notifier_bridge_info *info)
++{
++	if (ds->index == info->sw_index && ds->ops->port_bridge_join)
++		return ds->ops->port_bridge_join(ds, info->port, info->br);
++
++	if (ds->index != info->sw_index)
++		dev_dbg(ds->dev, "crosschip DSA port %d.%d bridged to %s\n",
++			info->sw_index, info->port, netdev_name(info->br));
++
++	return 0;
++}
++
++static int dsa_switch_bridge_leave(struct dsa_switch *ds,
++				   struct dsa_notifier_bridge_info *info)
++{
++	if (ds->index == info->sw_index && ds->ops->port_bridge_leave)
++		ds->ops->port_bridge_leave(ds, info->port, info->br);
++
++	if (ds->index != info->sw_index)
++		dev_dbg(ds->dev, "crosschip DSA port %d.%d unbridged from %s\n",
++			info->sw_index, info->port, netdev_name(info->br));
++
++	return 0;
++}
++
+ static int dsa_switch_event(struct notifier_block *nb,
+ 			    unsigned long event, void *info)
+ {
+@@ -20,6 +46,12 @@ static int dsa_switch_event(struct notifier_block *nb,
+ 	int err;
+ 
+ 	switch (event) {
++	case DSA_NOTIFIER_BRIDGE_JOIN:
++		err = dsa_switch_bridge_join(ds, info);
++		break;
++	case DSA_NOTIFIER_BRIDGE_LEAVE:
++		err = dsa_switch_bridge_leave(ds, info);
++		break;
+ 	default:
+ 		err = -EOPNOTSUPP;
+ 		break;
+
+commit f515f192ab4f45bb695146b82432d63d98775787
+Author: Vivien Didelot <vivien.didelot@savoirfairelinux.com>
+Date:   Fri Feb 3 13:20:20 2017 -0500
+
+    net: dsa: add switch notifier
+    
+    Add a notifier block per DSA switch, registered against a notifier head
+    in the switch fabric they belong to.
+    
+    This infrastructure will allow to propagate fabric-wide events such as
+    port bridging, VLAN configuration, etc. If a DSA switch driver cares
+    about cross-chip configuration, such events can be caught.
+    
+    Signed-off-by: Vivien Didelot <vivien.didelot@savoirfairelinux.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/dsa/switch.c b/net/dsa/switch.c
+new file mode 100644
+index 000000000000..e22fa7633d03
+--- /dev/null
++++ b/net/dsa/switch.c
+@@ -0,0 +1,53 @@
++/*
++ * Handling of a single switch chip, part of a switch fabric
++ *
++ * Copyright (c) 2017 Vivien Didelot <vivien.didelot@savoirfairelinux.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++
++#include <linux/netdevice.h>
++#include <linux/notifier.h>
++#include <net/dsa.h>
++
++static int dsa_switch_event(struct notifier_block *nb,
++			    unsigned long event, void *info)
++{
++	struct dsa_switch *ds = container_of(nb, struct dsa_switch, nb);
++	int err;
++
++	switch (event) {
++	default:
++		err = -EOPNOTSUPP;
++		break;
++	}
++
++	/* Non-switchdev operations cannot be rolled back. If a DSA driver
++	 * returns an error during the chained call, switch chips may be in an
++	 * inconsistent state.
++	 */
++	if (err)
++		dev_dbg(ds->dev, "breaking chain for DSA event %lu (%d)\n",
++			event, err);
++
++	return notifier_from_errno(err);
++}
++
++int dsa_switch_register_notifier(struct dsa_switch *ds)
++{
++	ds->nb.notifier_call = dsa_switch_event;
++
++	return raw_notifier_chain_register(&ds->dst->nh, &ds->nb);
++}
++
++void dsa_switch_unregister_notifier(struct dsa_switch *ds)
++{
++	int err;
++
++	err = raw_notifier_chain_unregister(&ds->dst->nh, &ds->nb);
++	if (err)
++		dev_err(ds->dev, "failed to unregister notifier (%d)\n", err);
++}

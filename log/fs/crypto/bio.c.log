@@ -1,0 +1,1206 @@
+commit 796f12d742653028a1520cce3a76035c86e2ebf9
+Author: Eric Biggers <ebiggers@google.com>
+Date:   Thu Dec 26 10:08:13 2019 -0600
+
+    fscrypt: optimize fscrypt_zeroout_range()
+    
+    Currently fscrypt_zeroout_range() issues and waits on a bio for each
+    block it writes, which makes it very slow.
+    
+    Optimize it to write up to 16 pages at a time instead.
+    
+    Also add a function comment, and improve reliability by allowing the
+    allocations of the bio and the first ciphertext page to wait on the
+    corresponding mempools.
+    
+    Link: https://lore.kernel.org/r/20191226160813.53182-1-ebiggers@kernel.org
+    Reviewed-by: Theodore Ts'o <tytso@mit.edu>
+    Signed-off-by: Eric Biggers <ebiggers@google.com>
+
+diff --git a/fs/crypto/bio.c b/fs/crypto/bio.c
+index b88d417e186e..4fa18fff9c4e 100644
+--- a/fs/crypto/bio.c
++++ b/fs/crypto/bio.c
+@@ -41,51 +41,101 @@ void fscrypt_decrypt_bio(struct bio *bio)
+ }
+ EXPORT_SYMBOL(fscrypt_decrypt_bio);
+ 
++/**
++ * fscrypt_zeroout_range() - zero out a range of blocks in an encrypted file
++ * @inode: the file's inode
++ * @lblk: the first file logical block to zero out
++ * @pblk: the first filesystem physical block to zero out
++ * @len: number of blocks to zero out
++ *
++ * Zero out filesystem blocks in an encrypted regular file on-disk, i.e. write
++ * ciphertext blocks which decrypt to the all-zeroes block.  The blocks must be
++ * both logically and physically contiguous.  It's also assumed that the
++ * filesystem only uses a single block device, ->s_bdev.
++ *
++ * Note that since each block uses a different IV, this involves writing a
++ * different ciphertext to each block; we can't simply reuse the same one.
++ *
++ * Return: 0 on success; -errno on failure.
++ */
+ int fscrypt_zeroout_range(const struct inode *inode, pgoff_t lblk,
+-				sector_t pblk, unsigned int len)
++			  sector_t pblk, unsigned int len)
+ {
+ 	const unsigned int blockbits = inode->i_blkbits;
+ 	const unsigned int blocksize = 1 << blockbits;
+-	struct page *ciphertext_page;
++	const unsigned int blocks_per_page_bits = PAGE_SHIFT - blockbits;
++	const unsigned int blocks_per_page = 1 << blocks_per_page_bits;
++	struct page *pages[16]; /* write up to 16 pages at a time */
++	unsigned int nr_pages;
++	unsigned int i;
++	unsigned int offset;
+ 	struct bio *bio;
+-	int ret, err = 0;
++	int ret, err;
+ 
+-	ciphertext_page = fscrypt_alloc_bounce_page(GFP_NOWAIT);
+-	if (!ciphertext_page)
+-		return -ENOMEM;
++	if (len == 0)
++		return 0;
+ 
+-	while (len--) {
+-		err = fscrypt_crypt_block(inode, FS_ENCRYPT, lblk,
+-					  ZERO_PAGE(0), ciphertext_page,
+-					  blocksize, 0, GFP_NOFS);
+-		if (err)
+-			goto errout;
++	BUILD_BUG_ON(ARRAY_SIZE(pages) > BIO_MAX_PAGES);
++	nr_pages = min_t(unsigned int, ARRAY_SIZE(pages),
++			 (len + blocks_per_page - 1) >> blocks_per_page_bits);
+ 
+-		bio = bio_alloc(GFP_NOWAIT, 1);
+-		if (!bio) {
+-			err = -ENOMEM;
+-			goto errout;
+-		}
++	/*
++	 * We need at least one page for ciphertext.  Allocate the first one
++	 * from a mempool, with __GFP_DIRECT_RECLAIM set so that it can't fail.
++	 *
++	 * Any additional page allocations are allowed to fail, as they only
++	 * help performance, and waiting on the mempool for them could deadlock.
++	 */
++	for (i = 0; i < nr_pages; i++) {
++		pages[i] = fscrypt_alloc_bounce_page(i == 0 ? GFP_NOFS :
++						     GFP_NOWAIT | __GFP_NOWARN);
++		if (!pages[i])
++			break;
++	}
++	nr_pages = i;
++	if (WARN_ON(nr_pages <= 0))
++		return -EINVAL;
++
++	/* This always succeeds since __GFP_DIRECT_RECLAIM is set. */
++	bio = bio_alloc(GFP_NOFS, nr_pages);
++
++	do {
+ 		bio_set_dev(bio, inode->i_sb->s_bdev);
+ 		bio->bi_iter.bi_sector = pblk << (blockbits - 9);
+ 		bio_set_op_attrs(bio, REQ_OP_WRITE, 0);
+-		ret = bio_add_page(bio, ciphertext_page, blocksize, 0);
+-		if (WARN_ON(ret != blocksize)) {
+-			/* should never happen! */
+-			bio_put(bio);
+-			err = -EIO;
+-			goto errout;
+-		}
++
++		i = 0;
++		offset = 0;
++		do {
++			err = fscrypt_crypt_block(inode, FS_ENCRYPT, lblk,
++						  ZERO_PAGE(0), pages[i],
++						  blocksize, offset, GFP_NOFS);
++			if (err)
++				goto out;
++			lblk++;
++			pblk++;
++			len--;
++			offset += blocksize;
++			if (offset == PAGE_SIZE || len == 0) {
++				ret = bio_add_page(bio, pages[i++], offset, 0);
++				if (WARN_ON(ret != offset)) {
++					err = -EIO;
++					goto out;
++				}
++				offset = 0;
++			}
++		} while (i != nr_pages && len != 0);
++
+ 		err = submit_bio_wait(bio);
+-		bio_put(bio);
+ 		if (err)
+-			goto errout;
+-		lblk++;
+-		pblk++;
+-	}
++			goto out;
++		bio_reset(bio);
++	} while (len != 0);
+ 	err = 0;
+-errout:
+-	fscrypt_free_bounce_page(ciphertext_page);
++out:
++	bio_put(bio);
++	for (i = 0; i < nr_pages; i++)
++		fscrypt_free_bounce_page(pages[i]);
+ 	return err;
+ }
+ EXPORT_SYMBOL(fscrypt_zeroout_range);
+
+commit f4a0b08b39ae9c81c827c06550579f4580bd82ac
+Author: Eric Biggers <ebiggers@google.com>
+Date:   Mon Dec 9 12:45:09 2019 -0800
+
+    fscrypt: remove redundant bi_status check
+    
+    submit_bio_wait() already returns bi_status translated to an errno.
+    So the additional check of bi_status is redundant and can be removed.
+    
+    Link: https://lore.kernel.org/r/20191209204509.228942-1-ebiggers@kernel.org
+    Signed-off-by: Eric Biggers <ebiggers@google.com>
+
+diff --git a/fs/crypto/bio.c b/fs/crypto/bio.c
+index 1f4b8a277060..b88d417e186e 100644
+--- a/fs/crypto/bio.c
++++ b/fs/crypto/bio.c
+@@ -77,8 +77,6 @@ int fscrypt_zeroout_range(const struct inode *inode, pgoff_t lblk,
+ 			goto errout;
+ 		}
+ 		err = submit_bio_wait(bio);
+-		if (err == 0 && bio->bi_status)
+-			err = -EIO;
+ 		bio_put(bio);
+ 		if (err)
+ 			goto errout;
+
+commit 1565bdad59e97f31cfc7b065bc0fc77e9549e62d
+Author: Eric Biggers <ebiggers@google.com>
+Date:   Wed Oct 9 16:34:17 2019 -0700
+
+    fscrypt: remove struct fscrypt_ctx
+    
+    Now that ext4 and f2fs implement their own post-read workflow that
+    supports both fscrypt and fsverity, the fscrypt-only workflow based
+    around struct fscrypt_ctx is no longer used.  So remove the unused code.
+    
+    This is based on a patch from Chandan Rajendra's "Consolidate FS read
+    I/O callbacks code" patchset, but rebased onto the latest kernel, folded
+    __fscrypt_decrypt_bio() into fscrypt_decrypt_bio(), cleaned up
+    fscrypt_initialize(), and updated the commit message.
+    
+    Originally-from: Chandan Rajendra <chandan@linux.ibm.com>
+    Signed-off-by: Eric Biggers <ebiggers@google.com>
+
+diff --git a/fs/crypto/bio.c b/fs/crypto/bio.c
+index 82da2510721f..1f4b8a277060 100644
+--- a/fs/crypto/bio.c
++++ b/fs/crypto/bio.c
+@@ -26,7 +26,7 @@
+ #include <linux/namei.h>
+ #include "fscrypt_private.h"
+ 
+-static void __fscrypt_decrypt_bio(struct bio *bio, bool done)
++void fscrypt_decrypt_bio(struct bio *bio)
+ {
+ 	struct bio_vec *bv;
+ 	struct bvec_iter_all iter_all;
+@@ -37,37 +37,10 @@ static void __fscrypt_decrypt_bio(struct bio *bio, bool done)
+ 							   bv->bv_offset);
+ 		if (ret)
+ 			SetPageError(page);
+-		else if (done)
+-			SetPageUptodate(page);
+-		if (done)
+-			unlock_page(page);
+ 	}
+ }
+-
+-void fscrypt_decrypt_bio(struct bio *bio)
+-{
+-	__fscrypt_decrypt_bio(bio, false);
+-}
+ EXPORT_SYMBOL(fscrypt_decrypt_bio);
+ 
+-static void completion_pages(struct work_struct *work)
+-{
+-	struct fscrypt_ctx *ctx = container_of(work, struct fscrypt_ctx, work);
+-	struct bio *bio = ctx->bio;
+-
+-	__fscrypt_decrypt_bio(bio, true);
+-	fscrypt_release_ctx(ctx);
+-	bio_put(bio);
+-}
+-
+-void fscrypt_enqueue_decrypt_bio(struct fscrypt_ctx *ctx, struct bio *bio)
+-{
+-	INIT_WORK(&ctx->work, completion_pages);
+-	ctx->bio = bio;
+-	fscrypt_enqueue_decrypt_work(&ctx->work);
+-}
+-EXPORT_SYMBOL(fscrypt_enqueue_decrypt_bio);
+-
+ int fscrypt_zeroout_range(const struct inode *inode, pgoff_t lblk,
+ 				sector_t pblk, unsigned int len)
+ {
+
+commit ffceeefb337b3ba9da36633072490caa96289345
+Author: Eric Biggers <ebiggers@google.com>
+Date:   Mon May 20 09:29:48 2019 -0700
+
+    fscrypt: decrypt only the needed blocks in __fscrypt_decrypt_bio()
+    
+    In __fscrypt_decrypt_bio(), only decrypt the blocks that actually
+    comprise the bio, rather than assuming blocksize == PAGE_SIZE and
+    decrypting the entirety of every page used in the bio.
+    
+    This is in preparation for allowing encryption on ext4 filesystems with
+    blocksize != PAGE_SIZE.
+    
+    This is based on work by Chandan Rajendra.
+    
+    Reviewed-by: Chandan Rajendra <chandan@linux.ibm.com>
+    Signed-off-by: Eric Biggers <ebiggers@google.com>
+
+diff --git a/fs/crypto/bio.c b/fs/crypto/bio.c
+index 61da06fda45c..82da2510721f 100644
+--- a/fs/crypto/bio.c
++++ b/fs/crypto/bio.c
+@@ -33,8 +33,8 @@ static void __fscrypt_decrypt_bio(struct bio *bio, bool done)
+ 
+ 	bio_for_each_segment_all(bv, bio, iter_all) {
+ 		struct page *page = bv->bv_page;
+-		int ret = fscrypt_decrypt_pagecache_blocks(page, PAGE_SIZE, 0);
+-
++		int ret = fscrypt_decrypt_pagecache_blocks(page, bv->bv_len,
++							   bv->bv_offset);
+ 		if (ret)
+ 			SetPageError(page);
+ 		else if (done)
+
+commit aa8bc1ac6ef32a332671ca25e06cfd277a3839a5
+Author: Eric Biggers <ebiggers@google.com>
+Date:   Mon May 20 09:29:47 2019 -0700
+
+    fscrypt: support decrypting multiple filesystem blocks per page
+    
+    Rename fscrypt_decrypt_page() to fscrypt_decrypt_pagecache_blocks() and
+    redefine its behavior to decrypt all filesystem blocks in the given
+    region of the given page, rather than assuming that the region consists
+    of just one filesystem block.  Also remove the 'inode' and 'lblk_num'
+    parameters, since they can be retrieved from the page as it's already
+    assumed to be a pagecache page.
+    
+    This is in preparation for allowing encryption on ext4 filesystems with
+    blocksize != PAGE_SIZE.
+    
+    This is based on work by Chandan Rajendra.
+    
+    Reviewed-by: Chandan Rajendra <chandan@linux.ibm.com>
+    Signed-off-by: Eric Biggers <ebiggers@google.com>
+
+diff --git a/fs/crypto/bio.c b/fs/crypto/bio.c
+index f9111ffa12ff..61da06fda45c 100644
+--- a/fs/crypto/bio.c
++++ b/fs/crypto/bio.c
+@@ -33,8 +33,7 @@ static void __fscrypt_decrypt_bio(struct bio *bio, bool done)
+ 
+ 	bio_for_each_segment_all(bv, bio, iter_all) {
+ 		struct page *page = bv->bv_page;
+-		int ret = fscrypt_decrypt_page(page->mapping->host, page,
+-				PAGE_SIZE, 0, page->index);
++		int ret = fscrypt_decrypt_pagecache_blocks(page, PAGE_SIZE, 0);
+ 
+ 		if (ret)
+ 			SetPageError(page);
+
+commit 930d453995bdf4a0000bd162dfd4b70c6d7329f8
+Author: Eric Biggers <ebiggers@google.com>
+Date:   Mon May 20 09:29:45 2019 -0700
+
+    fscrypt: handle blocksize < PAGE_SIZE in fscrypt_zeroout_range()
+    
+    Adjust fscrypt_zeroout_range() to encrypt a block at a time rather than
+    a page at a time, so that it works when blocksize < PAGE_SIZE.
+    
+    This isn't optimized for performance, but then again this function
+    already wasn't optimized for performance.  As a future optimization, we
+    could submit much larger bios here.
+    
+    This is in preparation for allowing encryption on ext4 filesystems with
+    blocksize != PAGE_SIZE.
+    
+    This is based on work by Chandan Rajendra.
+    
+    Reviewed-by: Chandan Rajendra <chandan@linux.ibm.com>
+    Signed-off-by: Eric Biggers <ebiggers@google.com>
+
+diff --git a/fs/crypto/bio.c b/fs/crypto/bio.c
+index 92b2d5da5d8e..f9111ffa12ff 100644
+--- a/fs/crypto/bio.c
++++ b/fs/crypto/bio.c
+@@ -72,12 +72,12 @@ EXPORT_SYMBOL(fscrypt_enqueue_decrypt_bio);
+ int fscrypt_zeroout_range(const struct inode *inode, pgoff_t lblk,
+ 				sector_t pblk, unsigned int len)
+ {
++	const unsigned int blockbits = inode->i_blkbits;
++	const unsigned int blocksize = 1 << blockbits;
+ 	struct page *ciphertext_page;
+ 	struct bio *bio;
+ 	int ret, err = 0;
+ 
+-	BUG_ON(inode->i_sb->s_blocksize != PAGE_SIZE);
+-
+ 	ciphertext_page = fscrypt_alloc_bounce_page(GFP_NOWAIT);
+ 	if (!ciphertext_page)
+ 		return -ENOMEM;
+@@ -85,7 +85,7 @@ int fscrypt_zeroout_range(const struct inode *inode, pgoff_t lblk,
+ 	while (len--) {
+ 		err = fscrypt_crypt_block(inode, FS_ENCRYPT, lblk,
+ 					  ZERO_PAGE(0), ciphertext_page,
+-					  PAGE_SIZE, 0, GFP_NOFS);
++					  blocksize, 0, GFP_NOFS);
+ 		if (err)
+ 			goto errout;
+ 
+@@ -95,14 +95,11 @@ int fscrypt_zeroout_range(const struct inode *inode, pgoff_t lblk,
+ 			goto errout;
+ 		}
+ 		bio_set_dev(bio, inode->i_sb->s_bdev);
+-		bio->bi_iter.bi_sector =
+-			pblk << (inode->i_sb->s_blocksize_bits - 9);
++		bio->bi_iter.bi_sector = pblk << (blockbits - 9);
+ 		bio_set_op_attrs(bio, REQ_OP_WRITE, 0);
+-		ret = bio_add_page(bio, ciphertext_page,
+-					inode->i_sb->s_blocksize, 0);
+-		if (ret != inode->i_sb->s_blocksize) {
++		ret = bio_add_page(bio, ciphertext_page, blocksize, 0);
++		if (WARN_ON(ret != blocksize)) {
+ 			/* should never happen! */
+-			WARN_ON(1);
+ 			bio_put(bio);
+ 			err = -EIO;
+ 			goto errout;
+
+commit f47fcbb2b578bdb213d9ac5875aab56a2034d466
+Author: Eric Biggers <ebiggers@google.com>
+Date:   Mon May 20 09:29:41 2019 -0700
+
+    fscrypt: rename fscrypt_do_page_crypto() to fscrypt_crypt_block()
+    
+    fscrypt_do_page_crypto() only does a single encryption or decryption
+    operation, with a single logical block number (single IV).  So it
+    actually operates on a filesystem block, not a "page" per se.  To
+    reflect this, rename it to fscrypt_crypt_block().
+    
+    Reviewed-by: Chandan Rajendra <chandan@linux.ibm.com>
+    Signed-off-by: Eric Biggers <ebiggers@google.com>
+
+diff --git a/fs/crypto/bio.c b/fs/crypto/bio.c
+index c53425348387..92b2d5da5d8e 100644
+--- a/fs/crypto/bio.c
++++ b/fs/crypto/bio.c
+@@ -83,9 +83,9 @@ int fscrypt_zeroout_range(const struct inode *inode, pgoff_t lblk,
+ 		return -ENOMEM;
+ 
+ 	while (len--) {
+-		err = fscrypt_do_page_crypto(inode, FS_ENCRYPT, lblk,
+-					     ZERO_PAGE(0), ciphertext_page,
+-					     PAGE_SIZE, 0, GFP_NOFS);
++		err = fscrypt_crypt_block(inode, FS_ENCRYPT, lblk,
++					  ZERO_PAGE(0), ciphertext_page,
++					  PAGE_SIZE, 0, GFP_NOFS);
+ 		if (err)
+ 			goto errout;
+ 
+
+commit 2a415a0257314cb2e49fb9ac4c6770837112f261
+Author: Eric Biggers <ebiggers@google.com>
+Date:   Mon May 20 09:29:40 2019 -0700
+
+    fscrypt: remove the "write" part of struct fscrypt_ctx
+    
+    Now that fscrypt_ctx is not used for writes, remove the 'w' fields.
+    
+    Reviewed-by: Chandan Rajendra <chandan@linux.ibm.com>
+    Signed-off-by: Eric Biggers <ebiggers@google.com>
+
+diff --git a/fs/crypto/bio.c b/fs/crypto/bio.c
+index c857b70b5328..c53425348387 100644
+--- a/fs/crypto/bio.c
++++ b/fs/crypto/bio.c
+@@ -53,9 +53,8 @@ EXPORT_SYMBOL(fscrypt_decrypt_bio);
+ 
+ static void completion_pages(struct work_struct *work)
+ {
+-	struct fscrypt_ctx *ctx =
+-		container_of(work, struct fscrypt_ctx, r.work);
+-	struct bio *bio = ctx->r.bio;
++	struct fscrypt_ctx *ctx = container_of(work, struct fscrypt_ctx, work);
++	struct bio *bio = ctx->bio;
+ 
+ 	__fscrypt_decrypt_bio(bio, true);
+ 	fscrypt_release_ctx(ctx);
+@@ -64,9 +63,9 @@ static void completion_pages(struct work_struct *work)
+ 
+ void fscrypt_enqueue_decrypt_bio(struct fscrypt_ctx *ctx, struct bio *bio)
+ {
+-	INIT_WORK(&ctx->r.work, completion_pages);
+-	ctx->r.bio = bio;
+-	fscrypt_enqueue_decrypt_work(&ctx->r.work);
++	INIT_WORK(&ctx->work, completion_pages);
++	ctx->bio = bio;
++	fscrypt_enqueue_decrypt_work(&ctx->work);
+ }
+ EXPORT_SYMBOL(fscrypt_enqueue_decrypt_bio);
+ 
+
+commit d2d0727b1654e11563f181f4d3d48b9275514480
+Author: Eric Biggers <ebiggers@google.com>
+Date:   Mon May 20 09:29:39 2019 -0700
+
+    fscrypt: simplify bounce page handling
+    
+    Currently, bounce page handling for writes to encrypted files is
+    unnecessarily complicated.  A fscrypt_ctx is allocated along with each
+    bounce page, page_private(bounce_page) points to this fscrypt_ctx, and
+    fscrypt_ctx::w::control_page points to the original pagecache page.
+    
+    However, because writes don't use the fscrypt_ctx for anything else,
+    there's no reason why page_private(bounce_page) can't just point to the
+    original pagecache page directly.
+    
+    Therefore, this patch makes this change.  In the process, it also cleans
+    up the API exposed to filesystems that allows testing whether a page is
+    a bounce page, getting the pagecache page from a bounce page, and
+    freeing a bounce page.
+    
+    Reviewed-by: Chandan Rajendra <chandan@linux.ibm.com>
+    Signed-off-by: Eric Biggers <ebiggers@google.com>
+
+diff --git a/fs/crypto/bio.c b/fs/crypto/bio.c
+index b46021ebde85..c857b70b5328 100644
+--- a/fs/crypto/bio.c
++++ b/fs/crypto/bio.c
+@@ -70,46 +70,18 @@ void fscrypt_enqueue_decrypt_bio(struct fscrypt_ctx *ctx, struct bio *bio)
+ }
+ EXPORT_SYMBOL(fscrypt_enqueue_decrypt_bio);
+ 
+-void fscrypt_pullback_bio_page(struct page **page, bool restore)
+-{
+-	struct fscrypt_ctx *ctx;
+-	struct page *bounce_page;
+-
+-	/* The bounce data pages are unmapped. */
+-	if ((*page)->mapping)
+-		return;
+-
+-	/* The bounce data page is unmapped. */
+-	bounce_page = *page;
+-	ctx = (struct fscrypt_ctx *)page_private(bounce_page);
+-
+-	/* restore control page */
+-	*page = ctx->w.control_page;
+-
+-	if (restore)
+-		fscrypt_restore_control_page(bounce_page);
+-}
+-EXPORT_SYMBOL(fscrypt_pullback_bio_page);
+-
+ int fscrypt_zeroout_range(const struct inode *inode, pgoff_t lblk,
+ 				sector_t pblk, unsigned int len)
+ {
+-	struct fscrypt_ctx *ctx;
+-	struct page *ciphertext_page = NULL;
++	struct page *ciphertext_page;
+ 	struct bio *bio;
+ 	int ret, err = 0;
+ 
+ 	BUG_ON(inode->i_sb->s_blocksize != PAGE_SIZE);
+ 
+-	ctx = fscrypt_get_ctx(GFP_NOFS);
+-	if (IS_ERR(ctx))
+-		return PTR_ERR(ctx);
+-
+-	ciphertext_page = fscrypt_alloc_bounce_page(ctx, GFP_NOWAIT);
+-	if (IS_ERR(ciphertext_page)) {
+-		err = PTR_ERR(ciphertext_page);
+-		goto errout;
+-	}
++	ciphertext_page = fscrypt_alloc_bounce_page(GFP_NOWAIT);
++	if (!ciphertext_page)
++		return -ENOMEM;
+ 
+ 	while (len--) {
+ 		err = fscrypt_do_page_crypto(inode, FS_ENCRYPT, lblk,
+@@ -147,7 +119,7 @@ int fscrypt_zeroout_range(const struct inode *inode, pgoff_t lblk,
+ 	}
+ 	err = 0;
+ errout:
+-	fscrypt_release_ctx(ctx);
++	fscrypt_free_bounce_page(ciphertext_page);
+ 	return err;
+ }
+ EXPORT_SYMBOL(fscrypt_zeroout_range);
+
+commit a9fbcd6728837268784439ad0b02ede2c024c516
+Merge: 5abe37954e9a 2c58d548f570
+Author: Linus Torvalds <torvalds@linux-foundation.org>
+Date:   Tue May 7 21:28:04 2019 -0700
+
+    Merge tag 'fscrypt_for_linus' of git://git.kernel.org/pub/scm/fs/fscrypt/fscrypt
+    
+    Pull fscrypt updates from Ted Ts'o:
+     "Clean up fscrypt's dcache revalidation support, and other
+      miscellaneous cleanups"
+    
+    * tag 'fscrypt_for_linus' of git://git.kernel.org/pub/scm/fs/fscrypt/fscrypt:
+      fscrypt: cache decrypted symlink target in ->i_link
+      vfs: use READ_ONCE() to access ->i_link
+      fscrypt: fix race where ->lookup() marks plaintext dentry as ciphertext
+      fscrypt: only set dentry_operations on ciphertext dentries
+      fs, fscrypt: clear DCACHE_ENCRYPTED_NAME when unaliasing directory
+      fscrypt: fix race allowing rename() and link() of ciphertext dentries
+      fscrypt: clean up and improve dentry revalidation
+      fscrypt: use READ_ONCE() to access ->i_crypt_info
+      fscrypt: remove WARN_ON_ONCE() when decryption fails
+      fscrypt: drop inode argument from fscrypt_get_ctx()
+
+commit 2b070cfe582b8e99fec6ada57d2e59e194aae202
+Author: Christoph Hellwig <hch@lst.de>
+Date:   Thu Apr 25 09:03:00 2019 +0200
+
+    block: remove the i argument to bio_for_each_segment_all
+    
+    We only have two callers that need the integer loop iterator, and they
+    can easily maintain it themselves.
+    
+    Suggested-by: Matthew Wilcox <willy@infradead.org>
+    Reviewed-by: Johannes Thumshirn <jthumshirn@suse.de>
+    Acked-by: David Sterba <dsterba@suse.com>
+    Reviewed-by: Hannes Reinecke <hare@suse.com>
+    Acked-by: Coly Li <colyli@suse.de>
+    Reviewed-by: Matthew Wilcox <willy@infradead.org>
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Signed-off-by: Jens Axboe <axboe@kernel.dk>
+
+diff --git a/fs/crypto/bio.c b/fs/crypto/bio.c
+index 5759bcd018cd..8f3a8bc15d98 100644
+--- a/fs/crypto/bio.c
++++ b/fs/crypto/bio.c
+@@ -29,10 +29,9 @@
+ static void __fscrypt_decrypt_bio(struct bio *bio, bool done)
+ {
+ 	struct bio_vec *bv;
+-	int i;
+ 	struct bvec_iter_all iter_all;
+ 
+-	bio_for_each_segment_all(bv, bio, i, iter_all) {
++	bio_for_each_segment_all(bv, bio, iter_all) {
+ 		struct page *page = bv->bv_page;
+ 		int ret = fscrypt_decrypt_page(page->mapping->host, page,
+ 				PAGE_SIZE, 0, page->index);
+
+commit ff5d3a97075c65731a46453d36e75b9cf925e165
+Author: Eric Biggers <ebiggers@google.com>
+Date:   Fri Mar 15 14:16:32 2019 -0700
+
+    fscrypt: remove WARN_ON_ONCE() when decryption fails
+    
+    If decrypting a block fails, fscrypt did a WARN_ON_ONCE().  But WARN is
+    meant for kernel bugs, which this isn't; this could be hit by fuzzers
+    using fault injection, for example.  Also, there is already a proper
+    warning message logged in fscrypt_do_page_crypto(), so the WARN doesn't
+    add much.
+    
+    Just remove the unnessary WARN.
+    
+    Signed-off-by: Eric Biggers <ebiggers@google.com>
+    Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+
+diff --git a/fs/crypto/bio.c b/fs/crypto/bio.c
+index f5b69b9531f6..41dde4578f3b 100644
+--- a/fs/crypto/bio.c
++++ b/fs/crypto/bio.c
+@@ -37,12 +37,10 @@ static void __fscrypt_decrypt_bio(struct bio *bio, bool done)
+ 		int ret = fscrypt_decrypt_page(page->mapping->host, page,
+ 				PAGE_SIZE, 0, page->index);
+ 
+-		if (ret) {
+-			WARN_ON_ONCE(1);
++		if (ret)
+ 			SetPageError(page);
+-		} else if (done) {
++		else if (done)
+ 			SetPageUptodate(page);
+-		}
+ 		if (done)
+ 			unlock_page(page);
+ 	}
+
+commit cd0265fcd2eae9004c68ef2123a9dac0dc5a666a
+Author: Eric Biggers <ebiggers@google.com>
+Date:   Mon Mar 18 10:23:33 2019 -0700
+
+    fscrypt: drop inode argument from fscrypt_get_ctx()
+    
+    The only reason the inode is being passed to fscrypt_get_ctx() is to
+    verify that the encryption key is available.  However, all callers
+    already ensure this because if we get as far as trying to do I/O to an
+    encrypted file without the key, there's already a bug.
+    
+    Therefore, remove this unnecessary argument.
+    
+    Signed-off-by: Eric Biggers <ebiggers@google.com>
+    Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+
+diff --git a/fs/crypto/bio.c b/fs/crypto/bio.c
+index 5759bcd018cd..f5b69b9531f6 100644
+--- a/fs/crypto/bio.c
++++ b/fs/crypto/bio.c
+@@ -104,7 +104,7 @@ int fscrypt_zeroout_range(const struct inode *inode, pgoff_t lblk,
+ 
+ 	BUG_ON(inode->i_sb->s_blocksize != PAGE_SIZE);
+ 
+-	ctx = fscrypt_get_ctx(inode, GFP_NOFS);
++	ctx = fscrypt_get_ctx(GFP_NOFS);
+ 	if (IS_ERR(ctx))
+ 		return PTR_ERR(ctx);
+ 
+
+commit 6dc4f100c175dd0511ae8674786e7c9006cdfbfa
+Author: Ming Lei <ming.lei@redhat.com>
+Date:   Fri Feb 15 19:13:19 2019 +0800
+
+    block: allow bio_for_each_segment_all() to iterate over multi-page bvec
+    
+    This patch introduces one extra iterator variable to bio_for_each_segment_all(),
+    then we can allow bio_for_each_segment_all() to iterate over multi-page bvec.
+    
+    Given it is just one mechannical & simple change on all bio_for_each_segment_all()
+    users, this patch does tree-wide change in one single patch, so that we can
+    avoid to use a temporary helper for this conversion.
+    
+    Reviewed-by: Omar Sandoval <osandov@fb.com>
+    Reviewed-by: Christoph Hellwig <hch@lst.de>
+    Signed-off-by: Ming Lei <ming.lei@redhat.com>
+    Signed-off-by: Jens Axboe <axboe@kernel.dk>
+
+diff --git a/fs/crypto/bio.c b/fs/crypto/bio.c
+index 0959044c5cee..5759bcd018cd 100644
+--- a/fs/crypto/bio.c
++++ b/fs/crypto/bio.c
+@@ -30,8 +30,9 @@ static void __fscrypt_decrypt_bio(struct bio *bio, bool done)
+ {
+ 	struct bio_vec *bv;
+ 	int i;
++	struct bvec_iter_all iter_all;
+ 
+-	bio_for_each_segment_all(bv, bio, i) {
++	bio_for_each_segment_all(bv, bio, i, iter_all) {
+ 		struct page *page = bv->bv_page;
+ 		int ret = fscrypt_decrypt_page(page->mapping->host, page,
+ 				PAGE_SIZE, 0, page->index);
+
+commit 0cb8dae4a0df2a977847c2dc6766a7783ce50f9d
+Author: Eric Biggers <ebiggers@google.com>
+Date:   Wed Apr 18 11:09:47 2018 -0700
+
+    fscrypt: allow synchronous bio decryption
+    
+    Currently, fscrypt provides fscrypt_decrypt_bio_pages() which decrypts a
+    bio's pages asynchronously, then unlocks them afterwards.  But, this
+    assumes that decryption is the last "postprocessing step" for the bio,
+    so it's incompatible with additional postprocessing steps such as
+    authenticity verification after decryption.
+    
+    Therefore, rename the existing fscrypt_decrypt_bio_pages() to
+    fscrypt_enqueue_decrypt_bio().  Then, add fscrypt_decrypt_bio() which
+    decrypts the pages in the bio synchronously without unlocking the pages,
+    nor setting them Uptodate; and add fscrypt_enqueue_decrypt_work(), which
+    enqueues work on the fscrypt_read_workqueue.  The new functions will be
+    used by filesystems that support both fscrypt and fs-verity.
+    
+    Signed-off-by: Eric Biggers <ebiggers@google.com>
+    Signed-off-by: Jaegeuk Kim <jaegeuk@kernel.org>
+
+diff --git a/fs/crypto/bio.c b/fs/crypto/bio.c
+index 0d5e6a569d58..0959044c5cee 100644
+--- a/fs/crypto/bio.c
++++ b/fs/crypto/bio.c
+@@ -26,15 +26,8 @@
+ #include <linux/namei.h>
+ #include "fscrypt_private.h"
+ 
+-/*
+- * Call fscrypt_decrypt_page on every single page, reusing the encryption
+- * context.
+- */
+-static void completion_pages(struct work_struct *work)
++static void __fscrypt_decrypt_bio(struct bio *bio, bool done)
+ {
+-	struct fscrypt_ctx *ctx =
+-		container_of(work, struct fscrypt_ctx, r.work);
+-	struct bio *bio = ctx->r.bio;
+ 	struct bio_vec *bv;
+ 	int i;
+ 
+@@ -46,22 +39,38 @@ static void completion_pages(struct work_struct *work)
+ 		if (ret) {
+ 			WARN_ON_ONCE(1);
+ 			SetPageError(page);
+-		} else {
++		} else if (done) {
+ 			SetPageUptodate(page);
+ 		}
+-		unlock_page(page);
++		if (done)
++			unlock_page(page);
+ 	}
++}
++
++void fscrypt_decrypt_bio(struct bio *bio)
++{
++	__fscrypt_decrypt_bio(bio, false);
++}
++EXPORT_SYMBOL(fscrypt_decrypt_bio);
++
++static void completion_pages(struct work_struct *work)
++{
++	struct fscrypt_ctx *ctx =
++		container_of(work, struct fscrypt_ctx, r.work);
++	struct bio *bio = ctx->r.bio;
++
++	__fscrypt_decrypt_bio(bio, true);
+ 	fscrypt_release_ctx(ctx);
+ 	bio_put(bio);
+ }
+ 
+-void fscrypt_decrypt_bio_pages(struct fscrypt_ctx *ctx, struct bio *bio)
++void fscrypt_enqueue_decrypt_bio(struct fscrypt_ctx *ctx, struct bio *bio)
+ {
+ 	INIT_WORK(&ctx->r.work, completion_pages);
+ 	ctx->r.bio = bio;
+-	queue_work(fscrypt_read_workqueue, &ctx->r.work);
++	fscrypt_enqueue_decrypt_work(&ctx->r.work);
+ }
+-EXPORT_SYMBOL(fscrypt_decrypt_bio_pages);
++EXPORT_SYMBOL(fscrypt_enqueue_decrypt_bio);
+ 
+ void fscrypt_pullback_bio_page(struct page **page, bool restore)
+ {
+
+commit b24413180f5600bcb3bb70fbed5cf186b60864bd
+Author: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Date:   Wed Nov 1 15:07:57 2017 +0100
+
+    License cleanup: add SPDX GPL-2.0 license identifier to files with no license
+    
+    Many source files in the tree are missing licensing information, which
+    makes it harder for compliance tools to determine the correct license.
+    
+    By default all files without license information are under the default
+    license of the kernel, which is GPL version 2.
+    
+    Update the files which contain no license information with the 'GPL-2.0'
+    SPDX license identifier.  The SPDX identifier is a legally binding
+    shorthand, which can be used instead of the full boiler plate text.
+    
+    This patch is based on work done by Thomas Gleixner and Kate Stewart and
+    Philippe Ombredanne.
+    
+    How this work was done:
+    
+    Patches were generated and checked against linux-4.14-rc6 for a subset of
+    the use cases:
+     - file had no licensing information it it.
+     - file was a */uapi/* one with no licensing information in it,
+     - file was a */uapi/* one with existing licensing information,
+    
+    Further patches will be generated in subsequent months to fix up cases
+    where non-standard license headers were used, and references to license
+    had to be inferred by heuristics based on keywords.
+    
+    The analysis to determine which SPDX License Identifier to be applied to
+    a file was done in a spreadsheet of side by side results from of the
+    output of two independent scanners (ScanCode & Windriver) producing SPDX
+    tag:value files created by Philippe Ombredanne.  Philippe prepared the
+    base worksheet, and did an initial spot review of a few 1000 files.
+    
+    The 4.13 kernel was the starting point of the analysis with 60,537 files
+    assessed.  Kate Stewart did a file by file comparison of the scanner
+    results in the spreadsheet to determine which SPDX license identifier(s)
+    to be applied to the file. She confirmed any determination that was not
+    immediately clear with lawyers working with the Linux Foundation.
+    
+    Criteria used to select files for SPDX license identifier tagging was:
+     - Files considered eligible had to be source code files.
+     - Make and config files were included as candidates if they contained >5
+       lines of source
+     - File already had some variant of a license header in it (even if <5
+       lines).
+    
+    All documentation files were explicitly excluded.
+    
+    The following heuristics were used to determine which SPDX license
+    identifiers to apply.
+    
+     - when both scanners couldn't find any license traces, file was
+       considered to have no license information in it, and the top level
+       COPYING file license applied.
+    
+       For non */uapi/* files that summary was:
+    
+       SPDX license identifier                            # files
+       ---------------------------------------------------|-------
+       GPL-2.0                                              11139
+    
+       and resulted in the first patch in this series.
+    
+       If that file was a */uapi/* path one, it was "GPL-2.0 WITH
+       Linux-syscall-note" otherwise it was "GPL-2.0".  Results of that was:
+    
+       SPDX license identifier                            # files
+       ---------------------------------------------------|-------
+       GPL-2.0 WITH Linux-syscall-note                        930
+    
+       and resulted in the second patch in this series.
+    
+     - if a file had some form of licensing information in it, and was one
+       of the */uapi/* ones, it was denoted with the Linux-syscall-note if
+       any GPL family license was found in the file or had no licensing in
+       it (per prior point).  Results summary:
+    
+       SPDX license identifier                            # files
+       ---------------------------------------------------|------
+       GPL-2.0 WITH Linux-syscall-note                       270
+       GPL-2.0+ WITH Linux-syscall-note                      169
+       ((GPL-2.0 WITH Linux-syscall-note) OR BSD-2-Clause)    21
+       ((GPL-2.0 WITH Linux-syscall-note) OR BSD-3-Clause)    17
+       LGPL-2.1+ WITH Linux-syscall-note                      15
+       GPL-1.0+ WITH Linux-syscall-note                       14
+       ((GPL-2.0+ WITH Linux-syscall-note) OR BSD-3-Clause)    5
+       LGPL-2.0+ WITH Linux-syscall-note                       4
+       LGPL-2.1 WITH Linux-syscall-note                        3
+       ((GPL-2.0 WITH Linux-syscall-note) OR MIT)              3
+       ((GPL-2.0 WITH Linux-syscall-note) AND MIT)             1
+    
+       and that resulted in the third patch in this series.
+    
+     - when the two scanners agreed on the detected license(s), that became
+       the concluded license(s).
+    
+     - when there was disagreement between the two scanners (one detected a
+       license but the other didn't, or they both detected different
+       licenses) a manual inspection of the file occurred.
+    
+     - In most cases a manual inspection of the information in the file
+       resulted in a clear resolution of the license that should apply (and
+       which scanner probably needed to revisit its heuristics).
+    
+     - When it was not immediately clear, the license identifier was
+       confirmed with lawyers working with the Linux Foundation.
+    
+     - If there was any question as to the appropriate license identifier,
+       the file was flagged for further research and to be revisited later
+       in time.
+    
+    In total, over 70 hours of logged manual review was done on the
+    spreadsheet to determine the SPDX license identifiers to apply to the
+    source files by Kate, Philippe, Thomas and, in some cases, confirmation
+    by lawyers working with the Linux Foundation.
+    
+    Kate also obtained a third independent scan of the 4.13 code base from
+    FOSSology, and compared selected files where the other two scanners
+    disagreed against that SPDX file, to see if there was new insights.  The
+    Windriver scanner is based on an older version of FOSSology in part, so
+    they are related.
+    
+    Thomas did random spot checks in about 500 files from the spreadsheets
+    for the uapi headers and agreed with SPDX license identifier in the
+    files he inspected. For the non-uapi files Thomas did random spot checks
+    in about 15000 files.
+    
+    In initial set of patches against 4.14-rc6, 3 files were found to have
+    copy/paste license identifier errors, and have been fixed to reflect the
+    correct identifier.
+    
+    Additionally Philippe spent 10 hours this week doing a detailed manual
+    inspection and review of the 12,461 patched files from the initial patch
+    version early this week with:
+     - a full scancode scan run, collecting the matched texts, detected
+       license ids and scores
+     - reviewing anything where there was a license detected (about 500+
+       files) to ensure that the applied SPDX license was correct
+     - reviewing anything where there was no detection but the patch license
+       was not GPL-2.0 WITH Linux-syscall-note to ensure that the applied
+       SPDX license was correct
+    
+    This produced a worksheet with 20 files needing minor correction.  This
+    worksheet was then exported into 3 different .csv files for the
+    different types of files to be modified.
+    
+    These .csv files were then reviewed by Greg.  Thomas wrote a script to
+    parse the csv files and add the proper SPDX tag to the file, in the
+    format that the file expected.  This script was further refined by Greg
+    based on the output to detect more types of files automatically and to
+    distinguish between header and source .c files (which need different
+    comment types.)  Finally Greg ran the script using the .csv files to
+    generate the patches.
+    
+    Reviewed-by: Kate Stewart <kstewart@linuxfoundation.org>
+    Reviewed-by: Philippe Ombredanne <pombredanne@nexb.com>
+    Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/fs/crypto/bio.c b/fs/crypto/bio.c
+index 483784d5eb73..0d5e6a569d58 100644
+--- a/fs/crypto/bio.c
++++ b/fs/crypto/bio.c
+@@ -1,3 +1,4 @@
++// SPDX-License-Identifier: GPL-2.0
+ /*
+  * This contains encryption functions for per-file encryption.
+  *
+
+commit 74d46992e0d9dee7f1f376de0d56d31614c8a17a
+Author: Christoph Hellwig <hch@lst.de>
+Date:   Wed Aug 23 19:10:32 2017 +0200
+
+    block: replace bi_bdev with a gendisk pointer and partitions index
+    
+    This way we don't need a block_device structure to submit I/O.  The
+    block_device has different life time rules from the gendisk and
+    request_queue and is usually only available when the block device node
+    is open.  Other callers need to explicitly create one (e.g. the lightnvm
+    passthrough code, or the new nvme multipathing code).
+    
+    For the actual I/O path all that we need is the gendisk, which exists
+    once per block device.  But given that the block layer also does
+    partition remapping we additionally need a partition index, which is
+    used for said remapping in generic_make_request.
+    
+    Note that all the block drivers generally want request_queue or
+    sometimes the gendisk, so this removes a layer of indirection all
+    over the stack.
+    
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Signed-off-by: Jens Axboe <axboe@kernel.dk>
+
+diff --git a/fs/crypto/bio.c b/fs/crypto/bio.c
+index 6181e9526860..483784d5eb73 100644
+--- a/fs/crypto/bio.c
++++ b/fs/crypto/bio.c
+@@ -115,7 +115,7 @@ int fscrypt_zeroout_range(const struct inode *inode, pgoff_t lblk,
+ 			err = -ENOMEM;
+ 			goto errout;
+ 		}
+-		bio->bi_bdev = inode->i_sb->s_bdev;
++		bio_set_dev(bio, inode->i_sb->s_bdev);
+ 		bio->bi_iter.bi_sector =
+ 			pblk << (inode->i_sb->s_blocksize_bits - 9);
+ 		bio_set_op_attrs(bio, REQ_OP_WRITE, 0);
+
+commit 4e4cbee93d56137ebff722be022cae5f70ef84fb
+Author: Christoph Hellwig <hch@lst.de>
+Date:   Sat Jun 3 09:38:06 2017 +0200
+
+    block: switch bios to blk_status_t
+    
+    Replace bi_error with a new bi_status to allow for a clear conversion.
+    Note that device mapper overloaded bi_error with a private value, which
+    we'll have to keep arround at least for now and thus propagate to a
+    proper blk_status_t value.
+    
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Signed-off-by: Jens Axboe <axboe@fb.com>
+
+diff --git a/fs/crypto/bio.c b/fs/crypto/bio.c
+index a409a84f1bca..6181e9526860 100644
+--- a/fs/crypto/bio.c
++++ b/fs/crypto/bio.c
+@@ -129,7 +129,7 @@ int fscrypt_zeroout_range(const struct inode *inode, pgoff_t lblk,
+ 			goto errout;
+ 		}
+ 		err = submit_bio_wait(bio);
+-		if ((err == 0) && bio->bi_error)
++		if (err == 0 && bio->bi_status)
+ 			err = -EIO;
+ 		bio_put(bio);
+ 		if (err)
+
+commit 58ae74683ae2c07cd717a91799edb50231061938
+Author: Richard Weinberger <richard@nod.at>
+Date:   Mon Dec 19 12:25:32 2016 +0100
+
+    fscrypt: factor out bio specific functions
+    
+    That way we can get rid of the direct dependency on CONFIG_BLOCK.
+    
+    Fixes: d475a507457b ("ubifs: Add skeleton for fscrypto")
+    Reported-by: Arnd Bergmann <arnd@arndb.de>
+    Reported-by: Randy Dunlap <rdunlap@infradead.org>
+    Reviewed-by: Eric Biggers <ebiggers@google.com>
+    Reviewed-by: Christoph Hellwig <hch@lst.de>
+    Reviewed-by: David Gstir <david@sigma-star.at>
+    Signed-off-by: Richard Weinberger <richard@nod.at>
+    Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+
+diff --git a/fs/crypto/bio.c b/fs/crypto/bio.c
+new file mode 100644
+index 000000000000..a409a84f1bca
+--- /dev/null
++++ b/fs/crypto/bio.c
+@@ -0,0 +1,145 @@
++/*
++ * This contains encryption functions for per-file encryption.
++ *
++ * Copyright (C) 2015, Google, Inc.
++ * Copyright (C) 2015, Motorola Mobility
++ *
++ * Written by Michael Halcrow, 2014.
++ *
++ * Filename encryption additions
++ *	Uday Savagaonkar, 2014
++ * Encryption policy handling additions
++ *	Ildar Muslukhov, 2014
++ * Add fscrypt_pullback_bio_page()
++ *	Jaegeuk Kim, 2015.
++ *
++ * This has not yet undergone a rigorous security audit.
++ *
++ * The usage of AES-XTS should conform to recommendations in NIST
++ * Special Publication 800-38E and IEEE P1619/D16.
++ */
++
++#include <linux/pagemap.h>
++#include <linux/module.h>
++#include <linux/bio.h>
++#include <linux/namei.h>
++#include "fscrypt_private.h"
++
++/*
++ * Call fscrypt_decrypt_page on every single page, reusing the encryption
++ * context.
++ */
++static void completion_pages(struct work_struct *work)
++{
++	struct fscrypt_ctx *ctx =
++		container_of(work, struct fscrypt_ctx, r.work);
++	struct bio *bio = ctx->r.bio;
++	struct bio_vec *bv;
++	int i;
++
++	bio_for_each_segment_all(bv, bio, i) {
++		struct page *page = bv->bv_page;
++		int ret = fscrypt_decrypt_page(page->mapping->host, page,
++				PAGE_SIZE, 0, page->index);
++
++		if (ret) {
++			WARN_ON_ONCE(1);
++			SetPageError(page);
++		} else {
++			SetPageUptodate(page);
++		}
++		unlock_page(page);
++	}
++	fscrypt_release_ctx(ctx);
++	bio_put(bio);
++}
++
++void fscrypt_decrypt_bio_pages(struct fscrypt_ctx *ctx, struct bio *bio)
++{
++	INIT_WORK(&ctx->r.work, completion_pages);
++	ctx->r.bio = bio;
++	queue_work(fscrypt_read_workqueue, &ctx->r.work);
++}
++EXPORT_SYMBOL(fscrypt_decrypt_bio_pages);
++
++void fscrypt_pullback_bio_page(struct page **page, bool restore)
++{
++	struct fscrypt_ctx *ctx;
++	struct page *bounce_page;
++
++	/* The bounce data pages are unmapped. */
++	if ((*page)->mapping)
++		return;
++
++	/* The bounce data page is unmapped. */
++	bounce_page = *page;
++	ctx = (struct fscrypt_ctx *)page_private(bounce_page);
++
++	/* restore control page */
++	*page = ctx->w.control_page;
++
++	if (restore)
++		fscrypt_restore_control_page(bounce_page);
++}
++EXPORT_SYMBOL(fscrypt_pullback_bio_page);
++
++int fscrypt_zeroout_range(const struct inode *inode, pgoff_t lblk,
++				sector_t pblk, unsigned int len)
++{
++	struct fscrypt_ctx *ctx;
++	struct page *ciphertext_page = NULL;
++	struct bio *bio;
++	int ret, err = 0;
++
++	BUG_ON(inode->i_sb->s_blocksize != PAGE_SIZE);
++
++	ctx = fscrypt_get_ctx(inode, GFP_NOFS);
++	if (IS_ERR(ctx))
++		return PTR_ERR(ctx);
++
++	ciphertext_page = fscrypt_alloc_bounce_page(ctx, GFP_NOWAIT);
++	if (IS_ERR(ciphertext_page)) {
++		err = PTR_ERR(ciphertext_page);
++		goto errout;
++	}
++
++	while (len--) {
++		err = fscrypt_do_page_crypto(inode, FS_ENCRYPT, lblk,
++					     ZERO_PAGE(0), ciphertext_page,
++					     PAGE_SIZE, 0, GFP_NOFS);
++		if (err)
++			goto errout;
++
++		bio = bio_alloc(GFP_NOWAIT, 1);
++		if (!bio) {
++			err = -ENOMEM;
++			goto errout;
++		}
++		bio->bi_bdev = inode->i_sb->s_bdev;
++		bio->bi_iter.bi_sector =
++			pblk << (inode->i_sb->s_blocksize_bits - 9);
++		bio_set_op_attrs(bio, REQ_OP_WRITE, 0);
++		ret = bio_add_page(bio, ciphertext_page,
++					inode->i_sb->s_blocksize, 0);
++		if (ret != inode->i_sb->s_blocksize) {
++			/* should never happen! */
++			WARN_ON(1);
++			bio_put(bio);
++			err = -EIO;
++			goto errout;
++		}
++		err = submit_bio_wait(bio);
++		if ((err == 0) && bio->bi_error)
++			err = -EIO;
++		bio_put(bio);
++		if (err)
++			goto errout;
++		lblk++;
++		pblk++;
++	}
++	err = 0;
++errout:
++	fscrypt_release_ctx(ctx);
++	return err;
++}
++EXPORT_SYMBOL(fscrypt_zeroout_range);

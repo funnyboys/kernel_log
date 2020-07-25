@@ -1,0 +1,3073 @@
+commit cd0ed03a8903a0b0c6fc36e32d133d1ddfe70cd6
+Author: Ionela Voinescu <ionela.voinescu@arm.com>
+Date:   Thu Mar 5 09:06:26 2020 +0000
+
+    arm64: use activity monitors for frequency invariance
+    
+    The Frequency Invariance Engine (FIE) is providing a frequency
+    scaling correction factor that helps achieve more accurate
+    load-tracking.
+    
+    So far, for arm and arm64 platforms, this scale factor has been
+    obtained based on the ratio between the current frequency and the
+    maximum supported frequency recorded by the cpufreq policy. The
+    setting of this scale factor is triggered from cpufreq drivers by
+    calling arch_set_freq_scale. The current frequency used in computation
+    is the frequency requested by a governor, but it may not be the
+    frequency that was implemented by the platform.
+    
+    This correction factor can also be obtained using a core counter and a
+    constant counter to get information on the performance (frequency based
+    only) obtained in a period of time. This will more accurately reflect
+    the actual current frequency of the CPU, compared with the alternative
+    implementation that reflects the request of a performance level from
+    the OS.
+    
+    Therefore, implement arch_scale_freq_tick to use activity monitors, if
+    present, for the computation of the frequency scale factor.
+    
+    The use of AMU counters depends on:
+     - CONFIG_ARM64_AMU_EXTN - depents on the AMU extension being present
+     - CONFIG_CPU_FREQ - the current frequency obtained using counter
+       information is divided by the maximum frequency obtained from the
+       cpufreq policy.
+    
+    While it is possible to have a combination of CPUs in the system with
+    and without support for activity monitors, the use of counters for
+    frequency invariance is only enabled for a CPU if all related CPUs
+    (CPUs in the same frequency domain) support and have enabled the core
+    and constant activity monitor counters. In this way, there is a clear
+    separation between the policies for which arch_set_freq_scale (cpufreq
+    based FIE) is used, and the policies for which arch_scale_freq_tick
+    (counter based FIE) is used to set the frequency scale factor. For
+    this purpose, a late_initcall_sync is registered to trigger validation
+    work for policies that will enable or disable the use of AMU counters
+    for frequency invariance. If CONFIG_CPU_FREQ is not defined, the use
+    of counters is enabled on all CPUs only if all possible CPUs correctly
+    support the necessary counters.
+    
+    Signed-off-by: Ionela Voinescu <ionela.voinescu@arm.com>
+    Reviewed-by: Lukasz Luba <lukasz.luba@arm.com>
+    Acked-by: Sudeep Holla <sudeep.holla@arm.com>
+    Cc: Sudeep Holla <sudeep.holla@arm.com>
+    Cc: Will Deacon <will@kernel.org>
+    Cc: Catalin Marinas <catalin.marinas@arm.com>
+    Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+
+diff --git a/arch/arm64/kernel/topology.c b/arch/arm64/kernel/topology.c
+index fa9528dfd0ce..0801a0f3c156 100644
+--- a/arch/arm64/kernel/topology.c
++++ b/arch/arm64/kernel/topology.c
+@@ -14,6 +14,7 @@
+ #include <linux/acpi.h>
+ #include <linux/arch_topology.h>
+ #include <linux/cacheinfo.h>
++#include <linux/cpufreq.h>
+ #include <linux/init.h>
+ #include <linux/percpu.h>
+ 
+@@ -120,4 +121,183 @@ int __init parse_acpi_topology(void)
+ }
+ #endif
+ 
++#ifdef CONFIG_ARM64_AMU_EXTN
+ 
++#undef pr_fmt
++#define pr_fmt(fmt) "AMU: " fmt
++
++static DEFINE_PER_CPU_READ_MOSTLY(unsigned long, arch_max_freq_scale);
++static DEFINE_PER_CPU(u64, arch_const_cycles_prev);
++static DEFINE_PER_CPU(u64, arch_core_cycles_prev);
++static cpumask_var_t amu_fie_cpus;
++
++/* Initialize counter reference per-cpu variables for the current CPU */
++void init_cpu_freq_invariance_counters(void)
++{
++	this_cpu_write(arch_core_cycles_prev,
++		       read_sysreg_s(SYS_AMEVCNTR0_CORE_EL0));
++	this_cpu_write(arch_const_cycles_prev,
++		       read_sysreg_s(SYS_AMEVCNTR0_CONST_EL0));
++}
++
++static int validate_cpu_freq_invariance_counters(int cpu)
++{
++	u64 max_freq_hz, ratio;
++
++	if (!cpu_has_amu_feat(cpu)) {
++		pr_debug("CPU%d: counters are not supported.\n", cpu);
++		return -EINVAL;
++	}
++
++	if (unlikely(!per_cpu(arch_const_cycles_prev, cpu) ||
++		     !per_cpu(arch_core_cycles_prev, cpu))) {
++		pr_debug("CPU%d: cycle counters are not enabled.\n", cpu);
++		return -EINVAL;
++	}
++
++	/* Convert maximum frequency from KHz to Hz and validate */
++	max_freq_hz = cpufreq_get_hw_max_freq(cpu) * 1000;
++	if (unlikely(!max_freq_hz)) {
++		pr_debug("CPU%d: invalid maximum frequency.\n", cpu);
++		return -EINVAL;
++	}
++
++	/*
++	 * Pre-compute the fixed ratio between the frequency of the constant
++	 * counter and the maximum frequency of the CPU.
++	 *
++	 *			      const_freq
++	 * arch_max_freq_scale =   ---------------- * SCHED_CAPACITY_SCALE²
++	 *			   cpuinfo_max_freq
++	 *
++	 * We use a factor of 2 * SCHED_CAPACITY_SHIFT -> SCHED_CAPACITY_SCALE²
++	 * in order to ensure a good resolution for arch_max_freq_scale for
++	 * very low arch timer frequencies (down to the KHz range which should
++	 * be unlikely).
++	 */
++	ratio = (u64)arch_timer_get_rate() << (2 * SCHED_CAPACITY_SHIFT);
++	ratio = div64_u64(ratio, max_freq_hz);
++	if (!ratio) {
++		WARN_ONCE(1, "System timer frequency too low.\n");
++		return -EINVAL;
++	}
++
++	per_cpu(arch_max_freq_scale, cpu) = (unsigned long)ratio;
++
++	return 0;
++}
++
++static inline bool
++enable_policy_freq_counters(int cpu, cpumask_var_t valid_cpus)
++{
++	struct cpufreq_policy *policy = cpufreq_cpu_get(cpu);
++
++	if (!policy) {
++		pr_debug("CPU%d: No cpufreq policy found.\n", cpu);
++		return false;
++	}
++
++	if (cpumask_subset(policy->related_cpus, valid_cpus))
++		cpumask_or(amu_fie_cpus, policy->related_cpus,
++			   amu_fie_cpus);
++
++	cpufreq_cpu_put(policy);
++
++	return true;
++}
++
++static DEFINE_STATIC_KEY_FALSE(amu_fie_key);
++#define amu_freq_invariant() static_branch_unlikely(&amu_fie_key)
++
++static int __init init_amu_fie(void)
++{
++	cpumask_var_t valid_cpus;
++	bool have_policy = false;
++	int ret = 0;
++	int cpu;
++
++	if (!zalloc_cpumask_var(&valid_cpus, GFP_KERNEL))
++		return -ENOMEM;
++
++	if (!zalloc_cpumask_var(&amu_fie_cpus, GFP_KERNEL)) {
++		ret = -ENOMEM;
++		goto free_valid_mask;
++	}
++
++	for_each_present_cpu(cpu) {
++		if (validate_cpu_freq_invariance_counters(cpu))
++			continue;
++		cpumask_set_cpu(cpu, valid_cpus);
++		have_policy |= enable_policy_freq_counters(cpu, valid_cpus);
++	}
++
++	/*
++	 * If we are not restricted by cpufreq policies, we only enable
++	 * the use of the AMU feature for FIE if all CPUs support AMU.
++	 * Otherwise, enable_policy_freq_counters has already enabled
++	 * policy cpus.
++	 */
++	if (!have_policy && cpumask_equal(valid_cpus, cpu_present_mask))
++		cpumask_or(amu_fie_cpus, amu_fie_cpus, valid_cpus);
++
++	if (!cpumask_empty(amu_fie_cpus)) {
++		pr_info("CPUs[%*pbl]: counters will be used for FIE.",
++			cpumask_pr_args(amu_fie_cpus));
++		static_branch_enable(&amu_fie_key);
++	}
++
++free_valid_mask:
++	free_cpumask_var(valid_cpus);
++
++	return ret;
++}
++late_initcall_sync(init_amu_fie);
++
++bool arch_freq_counters_available(struct cpumask *cpus)
++{
++	return amu_freq_invariant() &&
++	       cpumask_subset(cpus, amu_fie_cpus);
++}
++
++void topology_scale_freq_tick(void)
++{
++	u64 prev_core_cnt, prev_const_cnt;
++	u64 core_cnt, const_cnt, scale;
++	int cpu = smp_processor_id();
++
++	if (!amu_freq_invariant())
++		return;
++
++	if (!cpumask_test_cpu(cpu, amu_fie_cpus))
++		return;
++
++	const_cnt = read_sysreg_s(SYS_AMEVCNTR0_CONST_EL0);
++	core_cnt = read_sysreg_s(SYS_AMEVCNTR0_CORE_EL0);
++	prev_const_cnt = this_cpu_read(arch_const_cycles_prev);
++	prev_core_cnt = this_cpu_read(arch_core_cycles_prev);
++
++	if (unlikely(core_cnt <= prev_core_cnt ||
++		     const_cnt <= prev_const_cnt))
++		goto store_and_exit;
++
++	/*
++	 *	    /\core    arch_max_freq_scale
++	 * scale =  ------- * --------------------
++	 *	    /\const   SCHED_CAPACITY_SCALE
++	 *
++	 * See validate_cpu_freq_invariance_counters() for details on
++	 * arch_max_freq_scale and the use of SCHED_CAPACITY_SHIFT.
++	 */
++	scale = core_cnt - prev_core_cnt;
++	scale *= this_cpu_read(arch_max_freq_scale);
++	scale = div64_u64(scale >> SCHED_CAPACITY_SHIFT,
++			  const_cnt - prev_const_cnt);
++
++	scale = min_t(unsigned long, scale, SCHED_CAPACITY_SCALE);
++	this_cpu_write(freq_scale, (unsigned long)scale);
++
++store_and_exit:
++	this_cpu_write(arch_core_cycles_prev, core_cnt);
++	this_cpu_write(arch_const_cycles_prev, const_cnt);
++}
++#endif /* CONFIG_ARM64_AMU_EXTN */
+
+commit d06fa5a118f17d00d0fb7efbe61e990266276792
+Merge: 98dc19902a0b f51edcec5288
+Author: Will Deacon <will@kernel.org>
+Date:   Wed Aug 14 10:07:00 2019 +0100
+
+    Merge tag 'common/for-v5.4-rc1/cpu-topology' of git://git.kernel.org/pub/scm/linux/kernel/git/riscv/linux into for-next/cpu-topology
+    
+    Pull in generic CPU topology changes from Paul Walmsley (RISC-V).
+    
+    * tag 'common/for-v5.4-rc1/cpu-topology' of git://git.kernel.org/pub/scm/linux/kernel/git/riscv/linux:
+      MAINTAINERS: Add an entry for generic architecture topology
+      base: arch_topology: update Kconfig help description
+      RISC-V: Parse cpu topology during boot.
+      arm: Use common cpu_topology structure and functions.
+      cpu-topology: Move cpu topology code to common code.
+      dt-binding: cpu-topology: Move cpu-map to a common binding.
+      Documentation: DT: arm: add support for sockets defining package boundaries
+
+commit 98dc19902a0b2e5348e43d6a2c39a0a7d0fc639e
+Author: Jeremy Linton <jeremy.linton@arm.com>
+Date:   Thu Aug 8 15:40:07 2019 -0500
+
+    arm64: topology: Use PPTT to determine if PE is a thread
+    
+    ACPI 6.3 adds a thread flag to represent if a CPU/PE is
+    actually a thread. Given that the MPIDR_MT bit may not
+    represent this information consistently on homogeneous machines
+    we should prefer the PPTT flag if its available.
+    
+    Signed-off-by: Jeremy Linton <jeremy.linton@arm.com>
+    Reviewed-by: Sudeep Holla <sudeep.holla@arm.com>
+    Reviewed-by: Robert Richter <rrichter@marvell.com>
+    [will: made acpi_cpu_is_threaded() return 'bool']
+    Signed-off-by: Will Deacon <will@kernel.org>
+
+diff --git a/arch/arm64/kernel/topology.c b/arch/arm64/kernel/topology.c
+index 0825c4a856e3..6106c49f84bc 100644
+--- a/arch/arm64/kernel/topology.c
++++ b/arch/arm64/kernel/topology.c
+@@ -340,17 +340,28 @@ void remove_cpu_topology(unsigned int cpu)
+ }
+ 
+ #ifdef CONFIG_ACPI
++static bool __init acpi_cpu_is_threaded(int cpu)
++{
++	int is_threaded = acpi_pptt_cpu_is_thread(cpu);
++
++	/*
++	 * if the PPTT doesn't have thread information, assume a homogeneous
++	 * machine and return the current CPU's thread state.
++	 */
++	if (is_threaded < 0)
++		is_threaded = read_cpuid_mpidr() & MPIDR_MT_BITMASK;
++
++	return !!is_threaded;
++}
++
+ /*
+  * Propagate the topology information of the processor_topology_node tree to the
+  * cpu_topology array.
+  */
+ static int __init parse_acpi_topology(void)
+ {
+-	bool is_threaded;
+ 	int cpu, topology_id;
+ 
+-	is_threaded = read_cpuid_mpidr() & MPIDR_MT_BITMASK;
+-
+ 	for_each_possible_cpu(cpu) {
+ 		int i, cache_id;
+ 
+@@ -358,7 +369,7 @@ static int __init parse_acpi_topology(void)
+ 		if (topology_id < 0)
+ 			return topology_id;
+ 
+-		if (is_threaded) {
++		if (acpi_cpu_is_threaded(cpu)) {
+ 			cpu_topology[cpu].thread_id = topology_id;
+ 			topology_id = find_acpi_cpu_topology(cpu, 1);
+ 			cpu_topology[cpu].core_id   = topology_id;
+
+commit 60c1b220d8bc6baeaf837cd60f94a331b25c26bc
+Author: Atish Patra <atish.patra@wdc.com>
+Date:   Thu Jun 27 12:52:58 2019 -0700
+
+    cpu-topology: Move cpu topology code to common code.
+    
+    Both RISC-V & ARM64 are using cpu-map device tree to describe
+    their cpu topology. It's better to move the relevant code to
+    a common place instead of duplicate code.
+    
+    To: Will Deacon <will.deacon@arm.com>
+    To: Catalin Marinas <catalin.marinas@arm.com>
+    Signed-off-by: Atish Patra <atish.patra@wdc.com>
+    [Tested on QDF2400]
+    Tested-by: Jeffrey Hugo <jhugo@codeaurora.org>
+    [Tested on Juno and other embedded platforms.]
+    Tested-by: Sudeep Holla <sudeep.holla@arm.com>
+    Reviewed-by: Sudeep Holla <sudeep.holla@arm.com>
+    Acked-by: Will Deacon <will.deacon@arm.com>
+    Acked-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+    Signed-off-by: Paul Walmsley <paul.walmsley@sifive.com>
+
+diff --git a/arch/arm64/kernel/topology.c b/arch/arm64/kernel/topology.c
+index 0825c4a856e3..6b95c91e7d67 100644
+--- a/arch/arm64/kernel/topology.c
++++ b/arch/arm64/kernel/topology.c
+@@ -14,250 +14,13 @@
+ #include <linux/acpi.h>
+ #include <linux/arch_topology.h>
+ #include <linux/cacheinfo.h>
+-#include <linux/cpu.h>
+-#include <linux/cpumask.h>
+ #include <linux/init.h>
+ #include <linux/percpu.h>
+-#include <linux/node.h>
+-#include <linux/nodemask.h>
+-#include <linux/of.h>
+-#include <linux/sched.h>
+-#include <linux/sched/topology.h>
+-#include <linux/slab.h>
+-#include <linux/smp.h>
+-#include <linux/string.h>
+ 
+ #include <asm/cpu.h>
+ #include <asm/cputype.h>
+ #include <asm/topology.h>
+ 
+-static int __init get_cpu_for_node(struct device_node *node)
+-{
+-	struct device_node *cpu_node;
+-	int cpu;
+-
+-	cpu_node = of_parse_phandle(node, "cpu", 0);
+-	if (!cpu_node)
+-		return -1;
+-
+-	cpu = of_cpu_node_to_id(cpu_node);
+-	if (cpu >= 0)
+-		topology_parse_cpu_capacity(cpu_node, cpu);
+-	else
+-		pr_crit("Unable to find CPU node for %pOF\n", cpu_node);
+-
+-	of_node_put(cpu_node);
+-	return cpu;
+-}
+-
+-static int __init parse_core(struct device_node *core, int package_id,
+-			     int core_id)
+-{
+-	char name[10];
+-	bool leaf = true;
+-	int i = 0;
+-	int cpu;
+-	struct device_node *t;
+-
+-	do {
+-		snprintf(name, sizeof(name), "thread%d", i);
+-		t = of_get_child_by_name(core, name);
+-		if (t) {
+-			leaf = false;
+-			cpu = get_cpu_for_node(t);
+-			if (cpu >= 0) {
+-				cpu_topology[cpu].package_id = package_id;
+-				cpu_topology[cpu].core_id = core_id;
+-				cpu_topology[cpu].thread_id = i;
+-			} else {
+-				pr_err("%pOF: Can't get CPU for thread\n",
+-				       t);
+-				of_node_put(t);
+-				return -EINVAL;
+-			}
+-			of_node_put(t);
+-		}
+-		i++;
+-	} while (t);
+-
+-	cpu = get_cpu_for_node(core);
+-	if (cpu >= 0) {
+-		if (!leaf) {
+-			pr_err("%pOF: Core has both threads and CPU\n",
+-			       core);
+-			return -EINVAL;
+-		}
+-
+-		cpu_topology[cpu].package_id = package_id;
+-		cpu_topology[cpu].core_id = core_id;
+-	} else if (leaf) {
+-		pr_err("%pOF: Can't get CPU for leaf core\n", core);
+-		return -EINVAL;
+-	}
+-
+-	return 0;
+-}
+-
+-static int __init parse_cluster(struct device_node *cluster, int depth)
+-{
+-	char name[10];
+-	bool leaf = true;
+-	bool has_cores = false;
+-	struct device_node *c;
+-	static int package_id __initdata;
+-	int core_id = 0;
+-	int i, ret;
+-
+-	/*
+-	 * First check for child clusters; we currently ignore any
+-	 * information about the nesting of clusters and present the
+-	 * scheduler with a flat list of them.
+-	 */
+-	i = 0;
+-	do {
+-		snprintf(name, sizeof(name), "cluster%d", i);
+-		c = of_get_child_by_name(cluster, name);
+-		if (c) {
+-			leaf = false;
+-			ret = parse_cluster(c, depth + 1);
+-			of_node_put(c);
+-			if (ret != 0)
+-				return ret;
+-		}
+-		i++;
+-	} while (c);
+-
+-	/* Now check for cores */
+-	i = 0;
+-	do {
+-		snprintf(name, sizeof(name), "core%d", i);
+-		c = of_get_child_by_name(cluster, name);
+-		if (c) {
+-			has_cores = true;
+-
+-			if (depth == 0) {
+-				pr_err("%pOF: cpu-map children should be clusters\n",
+-				       c);
+-				of_node_put(c);
+-				return -EINVAL;
+-			}
+-
+-			if (leaf) {
+-				ret = parse_core(c, package_id, core_id++);
+-			} else {
+-				pr_err("%pOF: Non-leaf cluster with core %s\n",
+-				       cluster, name);
+-				ret = -EINVAL;
+-			}
+-
+-			of_node_put(c);
+-			if (ret != 0)
+-				return ret;
+-		}
+-		i++;
+-	} while (c);
+-
+-	if (leaf && !has_cores)
+-		pr_warn("%pOF: empty cluster\n", cluster);
+-
+-	if (leaf)
+-		package_id++;
+-
+-	return 0;
+-}
+-
+-static int __init parse_dt_topology(void)
+-{
+-	struct device_node *cn, *map;
+-	int ret = 0;
+-	int cpu;
+-
+-	cn = of_find_node_by_path("/cpus");
+-	if (!cn) {
+-		pr_err("No CPU information found in DT\n");
+-		return 0;
+-	}
+-
+-	/*
+-	 * When topology is provided cpu-map is essentially a root
+-	 * cluster with restricted subnodes.
+-	 */
+-	map = of_get_child_by_name(cn, "cpu-map");
+-	if (!map)
+-		goto out;
+-
+-	ret = parse_cluster(map, 0);
+-	if (ret != 0)
+-		goto out_map;
+-
+-	topology_normalize_cpu_scale();
+-
+-	/*
+-	 * Check that all cores are in the topology; the SMP code will
+-	 * only mark cores described in the DT as possible.
+-	 */
+-	for_each_possible_cpu(cpu)
+-		if (cpu_topology[cpu].package_id == -1)
+-			ret = -EINVAL;
+-
+-out_map:
+-	of_node_put(map);
+-out:
+-	of_node_put(cn);
+-	return ret;
+-}
+-
+-/*
+- * cpu topology table
+- */
+-struct cpu_topology cpu_topology[NR_CPUS];
+-EXPORT_SYMBOL_GPL(cpu_topology);
+-
+-const struct cpumask *cpu_coregroup_mask(int cpu)
+-{
+-	const cpumask_t *core_mask = cpumask_of_node(cpu_to_node(cpu));
+-
+-	/* Find the smaller of NUMA, core or LLC siblings */
+-	if (cpumask_subset(&cpu_topology[cpu].core_sibling, core_mask)) {
+-		/* not numa in package, lets use the package siblings */
+-		core_mask = &cpu_topology[cpu].core_sibling;
+-	}
+-	if (cpu_topology[cpu].llc_id != -1) {
+-		if (cpumask_subset(&cpu_topology[cpu].llc_sibling, core_mask))
+-			core_mask = &cpu_topology[cpu].llc_sibling;
+-	}
+-
+-	return core_mask;
+-}
+-
+-static void update_siblings_masks(unsigned int cpuid)
+-{
+-	struct cpu_topology *cpu_topo, *cpuid_topo = &cpu_topology[cpuid];
+-	int cpu;
+-
+-	/* update core and thread sibling masks */
+-	for_each_online_cpu(cpu) {
+-		cpu_topo = &cpu_topology[cpu];
+-
+-		if (cpuid_topo->llc_id == cpu_topo->llc_id) {
+-			cpumask_set_cpu(cpu, &cpuid_topo->llc_sibling);
+-			cpumask_set_cpu(cpuid, &cpu_topo->llc_sibling);
+-		}
+-
+-		if (cpuid_topo->package_id != cpu_topo->package_id)
+-			continue;
+-
+-		cpumask_set_cpu(cpuid, &cpu_topo->core_sibling);
+-		cpumask_set_cpu(cpu, &cpuid_topo->core_sibling);
+-
+-		if (cpuid_topo->core_id != cpu_topo->core_id)
+-			continue;
+-
+-		cpumask_set_cpu(cpuid, &cpu_topo->thread_sibling);
+-		cpumask_set_cpu(cpu, &cpuid_topo->thread_sibling);
+-	}
+-}
+-
+ void store_cpu_topology(unsigned int cpuid)
+ {
+ 	struct cpu_topology *cpuid_topo = &cpu_topology[cpuid];
+@@ -296,59 +59,19 @@ void store_cpu_topology(unsigned int cpuid)
+ 	update_siblings_masks(cpuid);
+ }
+ 
+-static void clear_cpu_topology(int cpu)
+-{
+-	struct cpu_topology *cpu_topo = &cpu_topology[cpu];
+-
+-	cpumask_clear(&cpu_topo->llc_sibling);
+-	cpumask_set_cpu(cpu, &cpu_topo->llc_sibling);
+-
+-	cpumask_clear(&cpu_topo->core_sibling);
+-	cpumask_set_cpu(cpu, &cpu_topo->core_sibling);
+-	cpumask_clear(&cpu_topo->thread_sibling);
+-	cpumask_set_cpu(cpu, &cpu_topo->thread_sibling);
+-}
+-
+-static void __init reset_cpu_topology(void)
+-{
+-	unsigned int cpu;
+-
+-	for_each_possible_cpu(cpu) {
+-		struct cpu_topology *cpu_topo = &cpu_topology[cpu];
+-
+-		cpu_topo->thread_id = -1;
+-		cpu_topo->core_id = 0;
+-		cpu_topo->package_id = -1;
+-		cpu_topo->llc_id = -1;
+-
+-		clear_cpu_topology(cpu);
+-	}
+-}
+-
+-void remove_cpu_topology(unsigned int cpu)
+-{
+-	int sibling;
+-
+-	for_each_cpu(sibling, topology_core_cpumask(cpu))
+-		cpumask_clear_cpu(cpu, topology_core_cpumask(sibling));
+-	for_each_cpu(sibling, topology_sibling_cpumask(cpu))
+-		cpumask_clear_cpu(cpu, topology_sibling_cpumask(sibling));
+-	for_each_cpu(sibling, topology_llc_cpumask(cpu))
+-		cpumask_clear_cpu(cpu, topology_llc_cpumask(sibling));
+-
+-	clear_cpu_topology(cpu);
+-}
+-
+ #ifdef CONFIG_ACPI
+ /*
+  * Propagate the topology information of the processor_topology_node tree to the
+  * cpu_topology array.
+  */
+-static int __init parse_acpi_topology(void)
++int __init parse_acpi_topology(void)
+ {
+ 	bool is_threaded;
+ 	int cpu, topology_id;
+ 
++	if (acpi_disabled)
++		return 0;
++
+ 	is_threaded = read_cpuid_mpidr() & MPIDR_MT_BITMASK;
+ 
+ 	for_each_possible_cpu(cpu) {
+@@ -384,24 +107,6 @@ static int __init parse_acpi_topology(void)
+ 
+ 	return 0;
+ }
+-
+-#else
+-static inline int __init parse_acpi_topology(void)
+-{
+-	return -EINVAL;
+-}
+ #endif
+ 
+-void __init init_cpu_topology(void)
+-{
+-	reset_cpu_topology();
+ 
+-	/*
+-	 * Discard anything that was parsed if we hit an error so we
+-	 * don't use partial information.
+-	 */
+-	if (!acpi_disabled && parse_acpi_topology())
+-		reset_cpu_topology();
+-	else if (of_have_populated_dt() && parse_dt_topology())
+-		reset_cpu_topology();
+-}
+
+commit e67ecf647020d31342d37e73c3766ae02434ed24
+Author: Sudeep Holla <sudeep.holla@arm.com>
+Date:   Fri Jul 6 12:02:48 2018 +0100
+
+    arm64: topology: re-introduce numa mask check for scheduler MC selection
+    
+    Commit 37c3ec2d810f ("arm64: topology: divorce MC scheduling domain from
+    core_siblings") selected the smallest of LLC, socket siblings, and NUMA
+    node siblings to ensure that the sched domain we build for the MC layer
+    isn't larger than the DIE above it or it's shrunk to the socket or NUMA
+    node if LLC exist acrosis NUMA node/chiplets.
+    
+    Commit acd32e52e4e0 ("arm64: topology: Avoid checking numa mask for
+    scheduler MC selection") reverted the NUMA siblings checks since the
+    CPU topology masks weren't updated on hotplug at that time.
+    
+    This patch re-introduces numa mask check as the CPU and NUMA topology
+    is now updated in hotplug paths. Effectively, this patch does the
+    partial revert of commit acd32e52e4e0.
+    
+    Cc: Catalin Marinas <catalin.marinas@arm.com>
+    Cc: Will Deacon <will.deacon@arm.com>
+    Tested-by: Ganapatrao Kulkarni <ganapatrao.kulkarni@cavium.com>
+    Tested-by: Hanjun Guo <hanjun.guo@linaro.org>
+    Signed-off-by: Sudeep Holla <sudeep.holla@arm.com>
+    Signed-off-by: Will Deacon <will.deacon@arm.com>
+
+diff --git a/arch/arm64/kernel/topology.c b/arch/arm64/kernel/topology.c
+index 03b0ed2480aa..0825c4a856e3 100644
+--- a/arch/arm64/kernel/topology.c
++++ b/arch/arm64/kernel/topology.c
+@@ -215,8 +215,13 @@ EXPORT_SYMBOL_GPL(cpu_topology);
+ 
+ const struct cpumask *cpu_coregroup_mask(int cpu)
+ {
+-	const cpumask_t *core_mask = &cpu_topology[cpu].core_sibling;
++	const cpumask_t *core_mask = cpumask_of_node(cpu_to_node(cpu));
+ 
++	/* Find the smaller of NUMA, core or LLC siblings */
++	if (cpumask_subset(&cpu_topology[cpu].core_sibling, core_mask)) {
++		/* not numa in package, lets use the package siblings */
++		core_mask = &cpu_topology[cpu].core_sibling;
++	}
+ 	if (cpu_topology[cpu].llc_id != -1) {
+ 		if (cpumask_subset(&cpu_topology[cpu].llc_sibling, core_mask))
+ 			core_mask = &cpu_topology[cpu].llc_sibling;
+
+commit f70ff1271378b12570aa3c4ebe2ad07f35a4ec51
+Author: Sudeep Holla <sudeep.holla@arm.com>
+Date:   Fri Jul 6 12:02:47 2018 +0100
+
+    arm64: topology: rename llc_siblings to align with other struct members
+    
+    Similar to core_sibling and thread_sibling, it's better to align and
+    rename llc_siblings to llc_sibling.
+    
+    Cc: Catalin Marinas <catalin.marinas@arm.com>
+    Cc: Will Deacon <will.deacon@arm.com>
+    Tested-by: Ganapatrao Kulkarni <ganapatrao.kulkarni@cavium.com>
+    Tested-by: Hanjun Guo <hanjun.guo@linaro.org>
+    Signed-off-by: Sudeep Holla <sudeep.holla@arm.com>
+    Signed-off-by: Will Deacon <will.deacon@arm.com>
+
+diff --git a/arch/arm64/kernel/topology.c b/arch/arm64/kernel/topology.c
+index 1a3f8ab455d0..03b0ed2480aa 100644
+--- a/arch/arm64/kernel/topology.c
++++ b/arch/arm64/kernel/topology.c
+@@ -218,8 +218,8 @@ const struct cpumask *cpu_coregroup_mask(int cpu)
+ 	const cpumask_t *core_mask = &cpu_topology[cpu].core_sibling;
+ 
+ 	if (cpu_topology[cpu].llc_id != -1) {
+-		if (cpumask_subset(&cpu_topology[cpu].llc_siblings, core_mask))
+-			core_mask = &cpu_topology[cpu].llc_siblings;
++		if (cpumask_subset(&cpu_topology[cpu].llc_sibling, core_mask))
++			core_mask = &cpu_topology[cpu].llc_sibling;
+ 	}
+ 
+ 	return core_mask;
+@@ -235,8 +235,8 @@ static void update_siblings_masks(unsigned int cpuid)
+ 		cpu_topo = &cpu_topology[cpu];
+ 
+ 		if (cpuid_topo->llc_id == cpu_topo->llc_id) {
+-			cpumask_set_cpu(cpu, &cpuid_topo->llc_siblings);
+-			cpumask_set_cpu(cpuid, &cpu_topo->llc_siblings);
++			cpumask_set_cpu(cpu, &cpuid_topo->llc_sibling);
++			cpumask_set_cpu(cpuid, &cpu_topo->llc_sibling);
+ 		}
+ 
+ 		if (cpuid_topo->package_id != cpu_topo->package_id)
+@@ -295,8 +295,8 @@ static void clear_cpu_topology(int cpu)
+ {
+ 	struct cpu_topology *cpu_topo = &cpu_topology[cpu];
+ 
+-	cpumask_clear(&cpu_topo->llc_siblings);
+-	cpumask_set_cpu(cpu, &cpu_topo->llc_siblings);
++	cpumask_clear(&cpu_topo->llc_sibling);
++	cpumask_set_cpu(cpu, &cpu_topo->llc_sibling);
+ 
+ 	cpumask_clear(&cpu_topo->core_sibling);
+ 	cpumask_set_cpu(cpu, &cpu_topo->core_sibling);
+
+commit 5ec8b59172b4e8d26a12952ce3a2914b30128538
+Author: Sudeep Holla <sudeep.holla@arm.com>
+Date:   Fri Jul 6 12:02:45 2018 +0100
+
+    arm64: topology: restrict updating siblings_masks to online cpus only
+    
+    It's incorrect to iterate over all the possible CPUs to update the
+    sibling masks when any CPU is hotplugged in. In case the topology
+    siblings masks of the CPU is removed when is it hotplugged out, we
+    end up updating those masks when one of it's sibling is powered up
+    again. This will provide inconsistent view.
+    
+    Further, since the CPU calling update_sibling_masks is yet to be set
+    online, there's no need to compare itself with each online CPU when
+    updating the siblings masks.
+    
+    This patch restricts updation of sibling masks only for CPUs that are
+    already online. It also the drops the unnecessary cpuid check.
+    
+    Cc: Catalin Marinas <catalin.marinas@arm.com>
+    Cc: Will Deacon <will.deacon@arm.com>
+    Tested-by: Ganapatrao Kulkarni <ganapatrao.kulkarni@cavium.com>
+    Tested-by: Hanjun Guo <hanjun.guo@linaro.org>
+    Signed-off-by: Sudeep Holla <sudeep.holla@arm.com>
+    Signed-off-by: Will Deacon <will.deacon@arm.com>
+
+diff --git a/arch/arm64/kernel/topology.c b/arch/arm64/kernel/topology.c
+index cb81df545359..1a3f8ab455d0 100644
+--- a/arch/arm64/kernel/topology.c
++++ b/arch/arm64/kernel/topology.c
+@@ -231,7 +231,7 @@ static void update_siblings_masks(unsigned int cpuid)
+ 	int cpu;
+ 
+ 	/* update core and thread sibling masks */
+-	for_each_possible_cpu(cpu) {
++	for_each_online_cpu(cpu) {
+ 		cpu_topo = &cpu_topology[cpu];
+ 
+ 		if (cpuid_topo->llc_id == cpu_topo->llc_id) {
+@@ -243,15 +243,13 @@ static void update_siblings_masks(unsigned int cpuid)
+ 			continue;
+ 
+ 		cpumask_set_cpu(cpuid, &cpu_topo->core_sibling);
+-		if (cpu != cpuid)
+-			cpumask_set_cpu(cpu, &cpuid_topo->core_sibling);
++		cpumask_set_cpu(cpu, &cpuid_topo->core_sibling);
+ 
+ 		if (cpuid_topo->core_id != cpu_topo->core_id)
+ 			continue;
+ 
+ 		cpumask_set_cpu(cpuid, &cpu_topo->thread_sibling);
+-		if (cpu != cpuid)
+-			cpumask_set_cpu(cpu, &cpuid_topo->thread_sibling);
++		cpumask_set_cpu(cpu, &cpuid_topo->thread_sibling);
+ 	}
+ }
+ 
+
+commit 5bdd2b3f0f8830f281bb568e65df6eabf655dd0d
+Author: Sudeep Holla <sudeep.holla@arm.com>
+Date:   Fri Jul 6 12:02:44 2018 +0100
+
+    arm64: topology: add support to remove cpu topology sibling masks
+    
+    This patch adds support to remove all the CPU topology information using
+    clear_cpu_topology and also resetting the sibling information on other
+    sibling CPUs. This will be used in cpu_disable so that all the topology
+    sibling information is removed on CPU hotplug out.
+    
+    Cc: Catalin Marinas <catalin.marinas@arm.com>
+    Cc: Will Deacon <will.deacon@arm.com>
+    Tested-by: Ganapatrao Kulkarni <ganapatrao.kulkarni@cavium.com>
+    Tested-by: Hanjun Guo <hanjun.guo@linaro.org>
+    Signed-off-by: Sudeep Holla <sudeep.holla@arm.com>
+    Signed-off-by: Will Deacon <will.deacon@arm.com>
+
+diff --git a/arch/arm64/kernel/topology.c b/arch/arm64/kernel/topology.c
+index b64733c5ea28..cb81df545359 100644
+--- a/arch/arm64/kernel/topology.c
++++ b/arch/arm64/kernel/topology.c
+@@ -322,6 +322,20 @@ static void __init reset_cpu_topology(void)
+ 	}
+ }
+ 
++void remove_cpu_topology(unsigned int cpu)
++{
++	int sibling;
++
++	for_each_cpu(sibling, topology_core_cpumask(cpu))
++		cpumask_clear_cpu(cpu, topology_core_cpumask(sibling));
++	for_each_cpu(sibling, topology_sibling_cpumask(cpu))
++		cpumask_clear_cpu(cpu, topology_sibling_cpumask(sibling));
++	for_each_cpu(sibling, topology_llc_cpumask(cpu))
++		cpumask_clear_cpu(cpu, topology_llc_cpumask(sibling));
++
++	clear_cpu_topology(cpu);
++}
++
+ #ifdef CONFIG_ACPI
+ /*
+  * Propagate the topology information of the processor_topology_node tree to the
+
+commit 31b46035576d405ca9a98be95945986c91986368
+Author: Sudeep Holla <sudeep.holla@arm.com>
+Date:   Fri Jul 6 12:02:42 2018 +0100
+
+    arm64: topology: refactor reset_cpu_topology to add support for removing topology
+    
+    Currently reset_cpu_topology clears all the CPU topology information
+    and resets to default values. However we may need to just clear the
+    information when we hotplug out the CPU. In preparation to add the
+    support the same, let's refactor reset_cpu_topology to just reset
+    the information and move clearing out the topology information to
+    clear_cpu_topology.
+    
+    Cc: Catalin Marinas <catalin.marinas@arm.com>
+    Cc: Will Deacon <will.deacon@arm.com>
+    Tested-by: Ganapatrao Kulkarni <ganapatrao.kulkarni@cavium.com>
+    Tested-by: Hanjun Guo <hanjun.guo@linaro.org>
+    Signed-off-by: Sudeep Holla <sudeep.holla@arm.com>
+    Signed-off-by: Will Deacon <will.deacon@arm.com>
+
+diff --git a/arch/arm64/kernel/topology.c b/arch/arm64/kernel/topology.c
+index f845a8617812..b64733c5ea28 100644
+--- a/arch/arm64/kernel/topology.c
++++ b/arch/arm64/kernel/topology.c
+@@ -293,6 +293,19 @@ void store_cpu_topology(unsigned int cpuid)
+ 	update_siblings_masks(cpuid);
+ }
+ 
++static void clear_cpu_topology(int cpu)
++{
++	struct cpu_topology *cpu_topo = &cpu_topology[cpu];
++
++	cpumask_clear(&cpu_topo->llc_siblings);
++	cpumask_set_cpu(cpu, &cpu_topo->llc_siblings);
++
++	cpumask_clear(&cpu_topo->core_sibling);
++	cpumask_set_cpu(cpu, &cpu_topo->core_sibling);
++	cpumask_clear(&cpu_topo->thread_sibling);
++	cpumask_set_cpu(cpu, &cpu_topo->thread_sibling);
++}
++
+ static void __init reset_cpu_topology(void)
+ {
+ 	unsigned int cpu;
+@@ -303,15 +316,9 @@ static void __init reset_cpu_topology(void)
+ 		cpu_topo->thread_id = -1;
+ 		cpu_topo->core_id = 0;
+ 		cpu_topo->package_id = -1;
+-
+ 		cpu_topo->llc_id = -1;
+-		cpumask_clear(&cpu_topo->llc_siblings);
+-		cpumask_set_cpu(cpu, &cpu_topo->llc_siblings);
+ 
+-		cpumask_clear(&cpu_topo->core_sibling);
+-		cpumask_set_cpu(cpu, &cpu_topo->core_sibling);
+-		cpumask_clear(&cpu_topo->thread_sibling);
+-		cpumask_set_cpu(cpu, &cpu_topo->thread_sibling);
++		clear_cpu_topology(cpu);
+ 	}
+ }
+ 
+
+commit e156ab71a974737c279530e3b868131291fe677e
+Author: Jeremy Linton <jeremy.linton@arm.com>
+Date:   Wed Jun 6 11:38:46 2018 -0500
+
+    arm64: topology: Avoid checking numa mask for scheduler MC selection
+    
+    The numa mask subset check can often lead to system hang or crash during
+    CPU hotplug and system suspend operation if NUMA is disabled. This is
+    mostly observed on HMP systems where the CPU compute capacities are
+    different and ends up in different scheduler domains. Since
+    cpumask_of_node is returned instead core_sibling, the scheduler is
+    confused with incorrect cpumasks(e.g. one CPU in two different sched
+    domains at the same time) on CPU hotplug.
+    
+    Lets disable the NUMA siblings checks for the time being, as NUMA in
+    socket machines have LLC's that will assure that the scheduler topology
+    isn't "borken".
+    
+    The NUMA check exists to assure that if a LLC within a socket crosses
+    NUMA nodes/chiplets the scheduler domains remain consistent. This code will
+    likely have to be re-enabled in the near future once the NUMA mask story
+    is sorted.  At the moment its not necessary because the NUMA in socket
+    machines LLC's are contained within the NUMA domains.
+    
+    Further, as a defensive mechanism during hot-plug, lets assure that the
+    LLC siblings are also masked.
+    
+    Reported-by: Geert Uytterhoeven <geert@linux-m68k.org>
+    Reviewed-by: Sudeep Holla <sudeep.holla@arm.com>
+    Tested-by: Geert Uytterhoeven <geert+renesas@glider.be>
+    Signed-off-by: Jeremy Linton <jeremy.linton@arm.com>
+    Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+
+diff --git a/arch/arm64/kernel/topology.c b/arch/arm64/kernel/topology.c
+index 7415c166281f..f845a8617812 100644
+--- a/arch/arm64/kernel/topology.c
++++ b/arch/arm64/kernel/topology.c
+@@ -215,13 +215,8 @@ EXPORT_SYMBOL_GPL(cpu_topology);
+ 
+ const struct cpumask *cpu_coregroup_mask(int cpu)
+ {
+-	const cpumask_t *core_mask = cpumask_of_node(cpu_to_node(cpu));
++	const cpumask_t *core_mask = &cpu_topology[cpu].core_sibling;
+ 
+-	/* Find the smaller of NUMA, core or LLC siblings */
+-	if (cpumask_subset(&cpu_topology[cpu].core_sibling, core_mask)) {
+-		/* not numa in package, lets use the package siblings */
+-		core_mask = &cpu_topology[cpu].core_sibling;
+-	}
+ 	if (cpu_topology[cpu].llc_id != -1) {
+ 		if (cpumask_subset(&cpu_topology[cpu].llc_siblings, core_mask))
+ 			core_mask = &cpu_topology[cpu].llc_siblings;
+@@ -239,8 +234,10 @@ static void update_siblings_masks(unsigned int cpuid)
+ 	for_each_possible_cpu(cpu) {
+ 		cpu_topo = &cpu_topology[cpu];
+ 
+-		if (cpuid_topo->llc_id == cpu_topo->llc_id)
++		if (cpuid_topo->llc_id == cpu_topo->llc_id) {
+ 			cpumask_set_cpu(cpu, &cpuid_topo->llc_siblings);
++			cpumask_set_cpu(cpuid, &cpu_topo->llc_siblings);
++		}
+ 
+ 		if (cpuid_topo->package_id != cpu_topo->package_id)
+ 			continue;
+
+commit 37c3ec2d810f87eac73822f76b30391a83bded19
+Author: Jeremy Linton <jeremy.linton@arm.com>
+Date:   Fri May 11 18:58:07 2018 -0500
+
+    arm64: topology: divorce MC scheduling domain from core_siblings
+    
+    Now that we have an accurate view of the physical topology
+    we need to represent it correctly to the scheduler. Generally MC
+    should equal the LLC in the system, but there are a number of
+    special cases that need to be dealt with.
+    
+    In the case of NUMA in socket, we need to assure that the sched
+    domain we build for the MC layer isn't larger than the DIE above it.
+    Similarly for LLC's that might exist in cross socket interconnect or
+    directory hardware we need to assure that MC is shrunk to the socket
+    or NUMA node.
+    
+    This patch builds a sibling mask for the LLC, and then picks the
+    smallest of LLC, socket siblings, or NUMA node siblings, which
+    gives us the behavior described above. This is ever so slightly
+    different than the similar alternative where we look for a cache
+    layer less than or equal to the socket/NUMA siblings.
+    
+    The logic to pick the MC layer affects all arm64 machines, but
+    only changes the behavior for DT/MPIDR systems if the NUMA domain
+    is smaller than the core siblings (generally set to the cluster).
+    Potentially this fixes a possible bug in DT systems, but really
+    it only affects ACPI systems where the core siblings is correctly
+    set to the socket siblings. Thus all currently available ACPI
+    systems should have MC equal to LLC, including the NUMA in socket
+    machines where the LLC is partitioned between the NUMA nodes.
+    
+    Tested-by: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+    Tested-by: Vijaya Kumar K <vkilari@codeaurora.org>
+    Tested-by: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+    Tested-by: Tomasz Nowicki <Tomasz.Nowicki@cavium.com>
+    Acked-by: Sudeep Holla <sudeep.holla@arm.com>
+    Acked-by: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+    Acked-by: Morten Rasmussen <morten.rasmussen@arm.com>
+    Signed-off-by: Jeremy Linton <jeremy.linton@arm.com>
+    Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+
+diff --git a/arch/arm64/kernel/topology.c b/arch/arm64/kernel/topology.c
+index 047d98e68502..7415c166281f 100644
+--- a/arch/arm64/kernel/topology.c
++++ b/arch/arm64/kernel/topology.c
+@@ -13,6 +13,7 @@
+ 
+ #include <linux/acpi.h>
+ #include <linux/arch_topology.h>
++#include <linux/cacheinfo.h>
+ #include <linux/cpu.h>
+ #include <linux/cpumask.h>
+ #include <linux/init.h>
+@@ -214,7 +215,19 @@ EXPORT_SYMBOL_GPL(cpu_topology);
+ 
+ const struct cpumask *cpu_coregroup_mask(int cpu)
+ {
+-	return &cpu_topology[cpu].core_sibling;
++	const cpumask_t *core_mask = cpumask_of_node(cpu_to_node(cpu));
++
++	/* Find the smaller of NUMA, core or LLC siblings */
++	if (cpumask_subset(&cpu_topology[cpu].core_sibling, core_mask)) {
++		/* not numa in package, lets use the package siblings */
++		core_mask = &cpu_topology[cpu].core_sibling;
++	}
++	if (cpu_topology[cpu].llc_id != -1) {
++		if (cpumask_subset(&cpu_topology[cpu].llc_siblings, core_mask))
++			core_mask = &cpu_topology[cpu].llc_siblings;
++	}
++
++	return core_mask;
+ }
+ 
+ static void update_siblings_masks(unsigned int cpuid)
+@@ -226,6 +239,9 @@ static void update_siblings_masks(unsigned int cpuid)
+ 	for_each_possible_cpu(cpu) {
+ 		cpu_topo = &cpu_topology[cpu];
+ 
++		if (cpuid_topo->llc_id == cpu_topo->llc_id)
++			cpumask_set_cpu(cpu, &cpuid_topo->llc_siblings);
++
+ 		if (cpuid_topo->package_id != cpu_topo->package_id)
+ 			continue;
+ 
+@@ -291,6 +307,10 @@ static void __init reset_cpu_topology(void)
+ 		cpu_topo->core_id = 0;
+ 		cpu_topo->package_id = -1;
+ 
++		cpu_topo->llc_id = -1;
++		cpumask_clear(&cpu_topo->llc_siblings);
++		cpumask_set_cpu(cpu, &cpu_topo->llc_siblings);
++
+ 		cpumask_clear(&cpu_topo->core_sibling);
+ 		cpumask_set_cpu(cpu, &cpu_topo->core_sibling);
+ 		cpumask_clear(&cpu_topo->thread_sibling);
+@@ -311,6 +331,8 @@ static int __init parse_acpi_topology(void)
+ 	is_threaded = read_cpuid_mpidr() & MPIDR_MT_BITMASK;
+ 
+ 	for_each_possible_cpu(cpu) {
++		int i, cache_id;
++
+ 		topology_id = find_acpi_cpu_topology(cpu, 0);
+ 		if (topology_id < 0)
+ 			return topology_id;
+@@ -325,6 +347,18 @@ static int __init parse_acpi_topology(void)
+ 		}
+ 		topology_id = find_acpi_cpu_topology_package(cpu);
+ 		cpu_topology[cpu].package_id = topology_id;
++
++		i = acpi_find_last_cache_level(cpu);
++
++		if (i > 0) {
++			/*
++			 * this is the only part of cpu_topology that has
++			 * a direct relationship with the cache topology
++			 */
++			cache_id = find_acpi_cpu_cache_topology(cpu, i);
++			if (cache_id > 0)
++				cpu_topology[cpu].llc_id = cache_id;
++		}
+ 	}
+ 
+ 	return 0;
+
+commit 2f0a5d107e1fd6250a3a0469892a6c47a8ca933b
+Author: Jeremy Linton <jeremy.linton@arm.com>
+Date:   Fri May 11 18:58:05 2018 -0500
+
+    arm64: topology: enable ACPI/PPTT based CPU topology
+    
+    Propagate the topology information from the PPTT tree to the
+    cpu_topology array. We can get the thread id and core_id by assuming
+    certain levels of the PPTT tree correspond to those concepts.
+    The package_id is flagged in the tree and can be found by calling
+    find_acpi_cpu_topology_package() which terminates
+    its search when it finds an ACPI node flagged as the physical
+    package. If the tree doesn't contain enough levels to represent
+    all of the requested levels then the root node will be returned
+    for all subsequent levels.
+    
+    Tested-by: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+    Tested-by: Vijaya Kumar K <vkilari@codeaurora.org>
+    Tested-by: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+    Tested-by: Tomasz Nowicki <Tomasz.Nowicki@cavium.com>
+    Acked-by: Sudeep Holla <sudeep.holla@arm.com>
+    Acked-by: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+    Acked-by: Morten Rasmussen <morten.rasmussen@arm.com>
+    Signed-off-by: Jeremy Linton <jeremy.linton@arm.com>
+    Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+
+diff --git a/arch/arm64/kernel/topology.c b/arch/arm64/kernel/topology.c
+index dc18b1e53194..047d98e68502 100644
+--- a/arch/arm64/kernel/topology.c
++++ b/arch/arm64/kernel/topology.c
+@@ -11,6 +11,7 @@
+  * for more details.
+  */
+ 
++#include <linux/acpi.h>
+ #include <linux/arch_topology.h>
+ #include <linux/cpu.h>
+ #include <linux/cpumask.h>
+@@ -22,6 +23,7 @@
+ #include <linux/sched.h>
+ #include <linux/sched/topology.h>
+ #include <linux/slab.h>
++#include <linux/smp.h>
+ #include <linux/string.h>
+ 
+ #include <asm/cpu.h>
+@@ -296,6 +298,45 @@ static void __init reset_cpu_topology(void)
+ 	}
+ }
+ 
++#ifdef CONFIG_ACPI
++/*
++ * Propagate the topology information of the processor_topology_node tree to the
++ * cpu_topology array.
++ */
++static int __init parse_acpi_topology(void)
++{
++	bool is_threaded;
++	int cpu, topology_id;
++
++	is_threaded = read_cpuid_mpidr() & MPIDR_MT_BITMASK;
++
++	for_each_possible_cpu(cpu) {
++		topology_id = find_acpi_cpu_topology(cpu, 0);
++		if (topology_id < 0)
++			return topology_id;
++
++		if (is_threaded) {
++			cpu_topology[cpu].thread_id = topology_id;
++			topology_id = find_acpi_cpu_topology(cpu, 1);
++			cpu_topology[cpu].core_id   = topology_id;
++		} else {
++			cpu_topology[cpu].thread_id  = -1;
++			cpu_topology[cpu].core_id    = topology_id;
++		}
++		topology_id = find_acpi_cpu_topology_package(cpu);
++		cpu_topology[cpu].package_id = topology_id;
++	}
++
++	return 0;
++}
++
++#else
++static inline int __init parse_acpi_topology(void)
++{
++	return -EINVAL;
++}
++#endif
++
+ void __init init_cpu_topology(void)
+ {
+ 	reset_cpu_topology();
+@@ -304,6 +345,8 @@ void __init init_cpu_topology(void)
+ 	 * Discard anything that was parsed if we hit an error so we
+ 	 * don't use partial information.
+ 	 */
+-	if (of_have_populated_dt() && parse_dt_topology())
++	if (!acpi_disabled && parse_acpi_topology())
++		reset_cpu_topology();
++	else if (of_have_populated_dt() && parse_dt_topology())
+ 		reset_cpu_topology();
+ }
+
+commit 868abc07680c2c8b7f85ae883f9f1b90bf4ef4bf
+Author: Jeremy Linton <jeremy.linton@arm.com>
+Date:   Fri May 11 18:58:04 2018 -0500
+
+    arm64: topology: rename cluster_id
+    
+    The cluster concept isn't architecturally defined for arm64.
+    Lets match the name of the arm64 topology field to the kernel macro
+    that uses it.
+    
+    Tested-by: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+    Tested-by: Vijaya Kumar K <vkilari@codeaurora.org>
+    Tested-by: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+    Tested-by: Tomasz Nowicki <Tomasz.Nowicki@cavium.com>
+    Acked-by: Sudeep Holla <sudeep.holla@arm.com>
+    Acked-by: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+    Acked-by: Morten Rasmussen <morten.rasmussen@arm.com>
+    Signed-off-by: Jeremy Linton <jeremy.linton@arm.com>
+    Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+
+diff --git a/arch/arm64/kernel/topology.c b/arch/arm64/kernel/topology.c
+index 21868530018e..dc18b1e53194 100644
+--- a/arch/arm64/kernel/topology.c
++++ b/arch/arm64/kernel/topology.c
+@@ -47,7 +47,7 @@ static int __init get_cpu_for_node(struct device_node *node)
+ 	return cpu;
+ }
+ 
+-static int __init parse_core(struct device_node *core, int cluster_id,
++static int __init parse_core(struct device_node *core, int package_id,
+ 			     int core_id)
+ {
+ 	char name[10];
+@@ -63,7 +63,7 @@ static int __init parse_core(struct device_node *core, int cluster_id,
+ 			leaf = false;
+ 			cpu = get_cpu_for_node(t);
+ 			if (cpu >= 0) {
+-				cpu_topology[cpu].cluster_id = cluster_id;
++				cpu_topology[cpu].package_id = package_id;
+ 				cpu_topology[cpu].core_id = core_id;
+ 				cpu_topology[cpu].thread_id = i;
+ 			} else {
+@@ -85,7 +85,7 @@ static int __init parse_core(struct device_node *core, int cluster_id,
+ 			return -EINVAL;
+ 		}
+ 
+-		cpu_topology[cpu].cluster_id = cluster_id;
++		cpu_topology[cpu].package_id = package_id;
+ 		cpu_topology[cpu].core_id = core_id;
+ 	} else if (leaf) {
+ 		pr_err("%pOF: Can't get CPU for leaf core\n", core);
+@@ -101,7 +101,7 @@ static int __init parse_cluster(struct device_node *cluster, int depth)
+ 	bool leaf = true;
+ 	bool has_cores = false;
+ 	struct device_node *c;
+-	static int cluster_id __initdata;
++	static int package_id __initdata;
+ 	int core_id = 0;
+ 	int i, ret;
+ 
+@@ -140,7 +140,7 @@ static int __init parse_cluster(struct device_node *cluster, int depth)
+ 			}
+ 
+ 			if (leaf) {
+-				ret = parse_core(c, cluster_id, core_id++);
++				ret = parse_core(c, package_id, core_id++);
+ 			} else {
+ 				pr_err("%pOF: Non-leaf cluster with core %s\n",
+ 				       cluster, name);
+@@ -158,7 +158,7 @@ static int __init parse_cluster(struct device_node *cluster, int depth)
+ 		pr_warn("%pOF: empty cluster\n", cluster);
+ 
+ 	if (leaf)
+-		cluster_id++;
++		package_id++;
+ 
+ 	return 0;
+ }
+@@ -194,7 +194,7 @@ static int __init parse_dt_topology(void)
+ 	 * only mark cores described in the DT as possible.
+ 	 */
+ 	for_each_possible_cpu(cpu)
+-		if (cpu_topology[cpu].cluster_id == -1)
++		if (cpu_topology[cpu].package_id == -1)
+ 			ret = -EINVAL;
+ 
+ out_map:
+@@ -224,7 +224,7 @@ static void update_siblings_masks(unsigned int cpuid)
+ 	for_each_possible_cpu(cpu) {
+ 		cpu_topo = &cpu_topology[cpu];
+ 
+-		if (cpuid_topo->cluster_id != cpu_topo->cluster_id)
++		if (cpuid_topo->package_id != cpu_topo->package_id)
+ 			continue;
+ 
+ 		cpumask_set_cpu(cpuid, &cpu_topo->core_sibling);
+@@ -245,7 +245,7 @@ void store_cpu_topology(unsigned int cpuid)
+ 	struct cpu_topology *cpuid_topo = &cpu_topology[cpuid];
+ 	u64 mpidr;
+ 
+-	if (cpuid_topo->cluster_id != -1)
++	if (cpuid_topo->package_id != -1)
+ 		goto topology_populated;
+ 
+ 	mpidr = read_cpuid_mpidr();
+@@ -259,19 +259,19 @@ void store_cpu_topology(unsigned int cpuid)
+ 		/* Multiprocessor system : Multi-threads per core */
+ 		cpuid_topo->thread_id  = MPIDR_AFFINITY_LEVEL(mpidr, 0);
+ 		cpuid_topo->core_id    = MPIDR_AFFINITY_LEVEL(mpidr, 1);
+-		cpuid_topo->cluster_id = MPIDR_AFFINITY_LEVEL(mpidr, 2) |
++		cpuid_topo->package_id = MPIDR_AFFINITY_LEVEL(mpidr, 2) |
+ 					 MPIDR_AFFINITY_LEVEL(mpidr, 3) << 8;
+ 	} else {
+ 		/* Multiprocessor system : Single-thread per core */
+ 		cpuid_topo->thread_id  = -1;
+ 		cpuid_topo->core_id    = MPIDR_AFFINITY_LEVEL(mpidr, 0);
+-		cpuid_topo->cluster_id = MPIDR_AFFINITY_LEVEL(mpidr, 1) |
++		cpuid_topo->package_id = MPIDR_AFFINITY_LEVEL(mpidr, 1) |
+ 					 MPIDR_AFFINITY_LEVEL(mpidr, 2) << 8 |
+ 					 MPIDR_AFFINITY_LEVEL(mpidr, 3) << 16;
+ 	}
+ 
+ 	pr_debug("CPU%u: cluster %d core %d thread %d mpidr %#016llx\n",
+-		 cpuid, cpuid_topo->cluster_id, cpuid_topo->core_id,
++		 cpuid, cpuid_topo->package_id, cpuid_topo->core_id,
+ 		 cpuid_topo->thread_id, mpidr);
+ 
+ topology_populated:
+@@ -287,7 +287,7 @@ static void __init reset_cpu_topology(void)
+ 
+ 		cpu_topo->thread_id = -1;
+ 		cpu_topo->core_id = 0;
+-		cpu_topo->cluster_id = -1;
++		cpu_topo->package_id = -1;
+ 
+ 		cpumask_clear(&cpu_topo->core_sibling);
+ 		cpumask_set_cpu(cpu, &cpu_topo->core_sibling);
+
+commit 52cac1103af3283c7e4386b796da9cc92c3320e0
+Author: Suzuki K Poulose <suzuki.poulose@arm.com>
+Date:   Tue Jan 2 11:25:30 2018 +0000
+
+    arm64: Use of_cpu_node_to_id helper for CPU topology parsing
+    
+    Make use of the new generic helper to convert an of_node of a CPU
+    to the logical CPU id in parsing the topology.
+    
+    Cc: Catalin Marinas <catalin.marinas@arm.com>
+    Cc: Leo Yan <leo.yan@linaro.org>
+    Cc: Will Deacon <will.deacon@arm.com>
+    Acked-by: Mark Rutland <mark.rutland@arm.com>
+    Signed-off-by: Suzuki K Poulose <suzuki.poulose@arm.com>
+    Signed-off-by: Will Deacon <will.deacon@arm.com>
+
+diff --git a/arch/arm64/kernel/topology.c b/arch/arm64/kernel/topology.c
+index 8d48b233e6ce..21868530018e 100644
+--- a/arch/arm64/kernel/topology.c
++++ b/arch/arm64/kernel/topology.c
+@@ -37,18 +37,14 @@ static int __init get_cpu_for_node(struct device_node *node)
+ 	if (!cpu_node)
+ 		return -1;
+ 
+-	for_each_possible_cpu(cpu) {
+-		if (of_get_cpu_node(cpu, NULL) == cpu_node) {
+-			topology_parse_cpu_capacity(cpu_node, cpu);
+-			of_node_put(cpu_node);
+-			return cpu;
+-		}
+-	}
+-
+-	pr_crit("Unable to find CPU node for %pOF\n", cpu_node);
++	cpu = of_cpu_node_to_id(cpu_node);
++	if (cpu >= 0)
++		topology_parse_cpu_capacity(cpu_node, cpu);
++	else
++		pr_crit("Unable to find CPU node for %pOF\n", cpu_node);
+ 
+ 	of_node_put(cpu_node);
+-	return -1;
++	return cpu;
+ }
+ 
+ static int __init parse_core(struct device_node *core, int cluster_id,
+
+commit a270f32735a20affe325c351c359f13603537d05
+Author: Rob Herring <robh@kernel.org>
+Date:   Tue Jul 18 16:42:42 2017 -0500
+
+    arm64: Convert to using %pOF instead of full_name
+    
+    Now that we have a custom printf format specifier, convert users of
+    full_name to use %pOF instead. This is preparation to remove storing
+    of the full path string for each node.
+    
+    Signed-off-by: Rob Herring <robh@kernel.org>
+    Cc: Catalin Marinas <catalin.marinas@arm.com>
+    Cc: Will Deacon <will.deacon@arm.com>
+    Cc: linux-arm-kernel@lists.infradead.org
+    Signed-off-by: Will Deacon <will.deacon@arm.com>
+
+diff --git a/arch/arm64/kernel/topology.c b/arch/arm64/kernel/topology.c
+index 79244c75eaec..8d48b233e6ce 100644
+--- a/arch/arm64/kernel/topology.c
++++ b/arch/arm64/kernel/topology.c
+@@ -45,7 +45,7 @@ static int __init get_cpu_for_node(struct device_node *node)
+ 		}
+ 	}
+ 
+-	pr_crit("Unable to find CPU node for %s\n", cpu_node->full_name);
++	pr_crit("Unable to find CPU node for %pOF\n", cpu_node);
+ 
+ 	of_node_put(cpu_node);
+ 	return -1;
+@@ -71,8 +71,8 @@ static int __init parse_core(struct device_node *core, int cluster_id,
+ 				cpu_topology[cpu].core_id = core_id;
+ 				cpu_topology[cpu].thread_id = i;
+ 			} else {
+-				pr_err("%s: Can't get CPU for thread\n",
+-				       t->full_name);
++				pr_err("%pOF: Can't get CPU for thread\n",
++				       t);
+ 				of_node_put(t);
+ 				return -EINVAL;
+ 			}
+@@ -84,15 +84,15 @@ static int __init parse_core(struct device_node *core, int cluster_id,
+ 	cpu = get_cpu_for_node(core);
+ 	if (cpu >= 0) {
+ 		if (!leaf) {
+-			pr_err("%s: Core has both threads and CPU\n",
+-			       core->full_name);
++			pr_err("%pOF: Core has both threads and CPU\n",
++			       core);
+ 			return -EINVAL;
+ 		}
+ 
+ 		cpu_topology[cpu].cluster_id = cluster_id;
+ 		cpu_topology[cpu].core_id = core_id;
+ 	} else if (leaf) {
+-		pr_err("%s: Can't get CPU for leaf core\n", core->full_name);
++		pr_err("%pOF: Can't get CPU for leaf core\n", core);
+ 		return -EINVAL;
+ 	}
+ 
+@@ -137,8 +137,8 @@ static int __init parse_cluster(struct device_node *cluster, int depth)
+ 			has_cores = true;
+ 
+ 			if (depth == 0) {
+-				pr_err("%s: cpu-map children should be clusters\n",
+-				       c->full_name);
++				pr_err("%pOF: cpu-map children should be clusters\n",
++				       c);
+ 				of_node_put(c);
+ 				return -EINVAL;
+ 			}
+@@ -146,8 +146,8 @@ static int __init parse_cluster(struct device_node *cluster, int depth)
+ 			if (leaf) {
+ 				ret = parse_core(c, cluster_id, core_id++);
+ 			} else {
+-				pr_err("%s: Non-leaf cluster with core %s\n",
+-				       cluster->full_name, name);
++				pr_err("%pOF: Non-leaf cluster with core %s\n",
++				       cluster, name);
+ 				ret = -EINVAL;
+ 			}
+ 
+@@ -159,7 +159,7 @@ static int __init parse_cluster(struct device_node *cluster, int depth)
+ 	} while (c);
+ 
+ 	if (leaf && !has_cores)
+-		pr_warn("%s: empty cluster\n", cluster->full_name);
++		pr_warn("%pOF: empty cluster\n", cluster);
+ 
+ 	if (leaf)
+ 		cluster_id++;
+
+commit 4ca4f26a9c66103ca158689b7554f07f4968a32c
+Author: Juri Lelli <juri.lelli@arm.com>
+Date:   Wed May 31 17:59:31 2017 +0100
+
+    arm,arm64,drivers: add a prefix to drivers arch_topology interfaces
+    
+    Now that some functions that deal with arch topology information live
+    under drivers, there is a clash of naming that might create confusion.
+    
+    Tidy things up by creating a topology namespace for interfaces used by
+    arch code; achieve this by prepending a 'topology_' prefix to driver
+    interfaces.
+    
+    Signed-off-by: Juri Lelli <juri.lelli@arm.com>
+    Acked-by: Russell King <rmk+kernel@armlinux.org.uk>
+    Acked-by: Catalin Marinas <catalin.marinas@arm.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/arch/arm64/kernel/topology.c b/arch/arm64/kernel/topology.c
+index 255230c3e835..79244c75eaec 100644
+--- a/arch/arm64/kernel/topology.c
++++ b/arch/arm64/kernel/topology.c
+@@ -39,7 +39,7 @@ static int __init get_cpu_for_node(struct device_node *node)
+ 
+ 	for_each_possible_cpu(cpu) {
+ 		if (of_get_cpu_node(cpu, NULL) == cpu_node) {
+-			parse_cpu_capacity(cpu_node, cpu);
++			topology_parse_cpu_capacity(cpu_node, cpu);
+ 			of_node_put(cpu_node);
+ 			return cpu;
+ 		}
+@@ -191,7 +191,7 @@ static int __init parse_dt_topology(void)
+ 	if (ret != 0)
+ 		goto out_map;
+ 
+-	normalize_cpu_capacity();
++	topology_normalize_cpu_scale();
+ 
+ 	/*
+ 	 * Check that all cores are in the topology; the SMP code will
+
+commit 615ffd63149117aa5693d6672944966b490cdb66
+Author: Juri Lelli <juri.lelli@arm.com>
+Date:   Wed May 31 17:59:30 2017 +0100
+
+    arm,arm64,drivers: move externs in a new header file
+    
+    Create a new header file (include/linux/arch_topology.h) and put there
+    declarations of interfaces used by arm, arm64 and drivers code.
+    
+    Signed-off-by: Juri Lelli <juri.lelli@arm.com>
+    Acked-by: Russell King <rmk+kernel@armlinux.org.uk>
+    Acked-by: Catalin Marinas <catalin.marinas@arm.com>
+    Acked-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/arch/arm64/kernel/topology.c b/arch/arm64/kernel/topology.c
+index 7e1f6f75185b..255230c3e835 100644
+--- a/arch/arm64/kernel/topology.c
++++ b/arch/arm64/kernel/topology.c
+@@ -11,6 +11,7 @@
+  * for more details.
+  */
+ 
++#include <linux/arch_topology.h>
+ #include <linux/cpu.h>
+ #include <linux/cpumask.h>
+ #include <linux/init.h>
+@@ -27,9 +28,6 @@
+ #include <asm/cputype.h>
+ #include <asm/topology.h>
+ 
+-extern void normalize_cpu_capacity(void);
+-extern int __init parse_cpu_capacity(struct device_node *cpu_node, int cpu);
+-
+ static int __init get_cpu_for_node(struct device_node *node)
+ {
+ 	struct device_node *cpu_node;
+
+commit c105aa31183a6ebec395681b6df47c8b65259322
+Author: Juri Lelli <juri.lelli@arm.com>
+Date:   Wed May 31 17:59:29 2017 +0100
+
+    arm,arm64,drivers: reduce scope of cap_parsing_failed
+    
+    Reduce the scope of cap_parsing_failed (making it static in
+    drivers/base/arch_topology.c) by slightly changing {arm,arm64} DT
+    parsing code.
+    
+    For arm checking for !cap_parsing_failed before calling normalize_
+    cpu_capacity() is superfluous, as returning an error from parse_
+    cpu_capacity() (above) means cap_from _dt is set to false.
+    
+    For arm64 we can simply check if raw_capacity points to something,
+    which is not if capacity parsing has failed.
+    
+    Suggested-by: Morten Rasmussen <morten.rasmussen@arm.com>
+    Signed-off-by: Juri Lelli <juri.lelli@arm.com>
+    Acked-by: Russell King <rmk+kernel@armlinux.org.uk>
+    Acked-by: Catalin Marinas <catalin.marinas@arm.com>
+    Acked-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/arch/arm64/kernel/topology.c b/arch/arm64/kernel/topology.c
+index c5bc31eb97e8..7e1f6f75185b 100644
+--- a/arch/arm64/kernel/topology.c
++++ b/arch/arm64/kernel/topology.c
+@@ -27,7 +27,6 @@
+ #include <asm/cputype.h>
+ #include <asm/topology.h>
+ 
+-extern bool cap_parsing_failed;
+ extern void normalize_cpu_capacity(void);
+ extern int __init parse_cpu_capacity(struct device_node *cpu_node, int cpu);
+ 
+@@ -187,10 +186,8 @@ static int __init parse_dt_topology(void)
+ 	 * cluster with restricted subnodes.
+ 	 */
+ 	map = of_get_child_by_name(cn, "cpu-map");
+-	if (!map) {
+-		cap_parsing_failed = true;
++	if (!map)
+ 		goto out;
+-	}
+ 
+ 	ret = parse_cluster(map, 0);
+ 	if (ret != 0)
+
+commit 2ef7a2953c81ee6b341e3ffb33570adc894cf4a5
+Author: Juri Lelli <juri.lelli@arm.com>
+Date:   Wed May 31 17:59:28 2017 +0100
+
+    arm, arm64: factorize common cpu capacity default code
+    
+    arm and arm64 share lot of code relative to parsing CPU capacity
+    information from DT, using that information for appropriate scaling and
+    exposing a sysfs interface for chaging such values at runtime.
+    
+    Factorize such code in a common place (driver/base/arch_topology.c) in
+    preparation for further additions.
+    
+    Suggested-by: Will Deacon <will.deacon@arm.com>
+    Suggested-by: Mark Rutland <mark.rutland@arm.com>
+    Suggested-by: Catalin Marinas <catalin.marinas@arm.com>
+    Cc: Russell King <linux@armlinux.org.uk>
+    Cc: Catalin Marinas <catalin.marinas@arm.com>
+    Cc: Will Deacon <will.deacon@arm.com>
+    Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+    Signed-off-by: Juri Lelli <juri.lelli@arm.com>
+    Acked-by: Russell King <rmk+kernel@armlinux.org.uk>
+    Acked-by: Catalin Marinas <catalin.marinas@arm.com>
+    Acked-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/arch/arm64/kernel/topology.c b/arch/arm64/kernel/topology.c
+index 08243533e5ee..c5bc31eb97e8 100644
+--- a/arch/arm64/kernel/topology.c
++++ b/arch/arm64/kernel/topology.c
+@@ -11,7 +11,6 @@
+  * for more details.
+  */
+ 
+-#include <linux/acpi.h>
+ #include <linux/cpu.h>
+ #include <linux/cpumask.h>
+ #include <linux/init.h>
+@@ -23,226 +22,14 @@
+ #include <linux/sched/topology.h>
+ #include <linux/slab.h>
+ #include <linux/string.h>
+-#include <linux/cpufreq.h>
+ 
+ #include <asm/cpu.h>
+ #include <asm/cputype.h>
+ #include <asm/topology.h>
+ 
+-static DEFINE_PER_CPU(unsigned long, cpu_scale) = SCHED_CAPACITY_SCALE;
+-static DEFINE_MUTEX(cpu_scale_mutex);
+-
+-unsigned long arch_scale_cpu_capacity(struct sched_domain *sd, int cpu)
+-{
+-	return per_cpu(cpu_scale, cpu);
+-}
+-
+-static void set_capacity_scale(unsigned int cpu, unsigned long capacity)
+-{
+-	per_cpu(cpu_scale, cpu) = capacity;
+-}
+-
+-static ssize_t cpu_capacity_show(struct device *dev,
+-				 struct device_attribute *attr,
+-				 char *buf)
+-{
+-	struct cpu *cpu = container_of(dev, struct cpu, dev);
+-
+-	return sprintf(buf, "%lu\n",
+-			arch_scale_cpu_capacity(NULL, cpu->dev.id));
+-}
+-
+-static ssize_t cpu_capacity_store(struct device *dev,
+-				  struct device_attribute *attr,
+-				  const char *buf,
+-				  size_t count)
+-{
+-	struct cpu *cpu = container_of(dev, struct cpu, dev);
+-	int this_cpu = cpu->dev.id, i;
+-	unsigned long new_capacity;
+-	ssize_t ret;
+-
+-	if (count) {
+-		ret = kstrtoul(buf, 0, &new_capacity);
+-		if (ret)
+-			return ret;
+-		if (new_capacity > SCHED_CAPACITY_SCALE)
+-			return -EINVAL;
+-
+-		mutex_lock(&cpu_scale_mutex);
+-		for_each_cpu(i, &cpu_topology[this_cpu].core_sibling)
+-			set_capacity_scale(i, new_capacity);
+-		mutex_unlock(&cpu_scale_mutex);
+-	}
+-
+-	return count;
+-}
+-
+-static DEVICE_ATTR_RW(cpu_capacity);
+-
+-static int register_cpu_capacity_sysctl(void)
+-{
+-	int i;
+-	struct device *cpu;
+-
+-	for_each_possible_cpu(i) {
+-		cpu = get_cpu_device(i);
+-		if (!cpu) {
+-			pr_err("%s: too early to get CPU%d device!\n",
+-			       __func__, i);
+-			continue;
+-		}
+-		device_create_file(cpu, &dev_attr_cpu_capacity);
+-	}
+-
+-	return 0;
+-}
+-subsys_initcall(register_cpu_capacity_sysctl);
+-
+-static u32 capacity_scale;
+-static u32 *raw_capacity;
+-static bool cap_parsing_failed;
+-
+-static void __init parse_cpu_capacity(struct device_node *cpu_node, int cpu)
+-{
+-	int ret;
+-	u32 cpu_capacity;
+-
+-	if (cap_parsing_failed)
+-		return;
+-
+-	ret = of_property_read_u32(cpu_node,
+-				   "capacity-dmips-mhz",
+-				   &cpu_capacity);
+-	if (!ret) {
+-		if (!raw_capacity) {
+-			raw_capacity = kcalloc(num_possible_cpus(),
+-					       sizeof(*raw_capacity),
+-					       GFP_KERNEL);
+-			if (!raw_capacity) {
+-				pr_err("cpu_capacity: failed to allocate memory for raw capacities\n");
+-				cap_parsing_failed = true;
+-				return;
+-			}
+-		}
+-		capacity_scale = max(cpu_capacity, capacity_scale);
+-		raw_capacity[cpu] = cpu_capacity;
+-		pr_debug("cpu_capacity: %s cpu_capacity=%u (raw)\n",
+-			cpu_node->full_name, raw_capacity[cpu]);
+-	} else {
+-		if (raw_capacity) {
+-			pr_err("cpu_capacity: missing %s raw capacity\n",
+-				cpu_node->full_name);
+-			pr_err("cpu_capacity: partial information: fallback to 1024 for all CPUs\n");
+-		}
+-		cap_parsing_failed = true;
+-		kfree(raw_capacity);
+-	}
+-}
+-
+-static void normalize_cpu_capacity(void)
+-{
+-	u64 capacity;
+-	int cpu;
+-
+-	if (!raw_capacity || cap_parsing_failed)
+-		return;
+-
+-	pr_debug("cpu_capacity: capacity_scale=%u\n", capacity_scale);
+-	mutex_lock(&cpu_scale_mutex);
+-	for_each_possible_cpu(cpu) {
+-		pr_debug("cpu_capacity: cpu=%d raw_capacity=%u\n",
+-			 cpu, raw_capacity[cpu]);
+-		capacity = (raw_capacity[cpu] << SCHED_CAPACITY_SHIFT)
+-			/ capacity_scale;
+-		set_capacity_scale(cpu, capacity);
+-		pr_debug("cpu_capacity: CPU%d cpu_capacity=%lu\n",
+-			cpu, arch_scale_cpu_capacity(NULL, cpu));
+-	}
+-	mutex_unlock(&cpu_scale_mutex);
+-}
+-
+-#ifdef CONFIG_CPU_FREQ
+-static cpumask_var_t cpus_to_visit;
+-static bool cap_parsing_done;
+-static void parsing_done_workfn(struct work_struct *work);
+-static DECLARE_WORK(parsing_done_work, parsing_done_workfn);
+-
+-static int
+-init_cpu_capacity_callback(struct notifier_block *nb,
+-			   unsigned long val,
+-			   void *data)
+-{
+-	struct cpufreq_policy *policy = data;
+-	int cpu;
+-
+-	if (cap_parsing_failed || cap_parsing_done)
+-		return 0;
+-
+-	switch (val) {
+-	case CPUFREQ_NOTIFY:
+-		pr_debug("cpu_capacity: init cpu capacity for CPUs [%*pbl] (to_visit=%*pbl)\n",
+-				cpumask_pr_args(policy->related_cpus),
+-				cpumask_pr_args(cpus_to_visit));
+-		cpumask_andnot(cpus_to_visit,
+-			       cpus_to_visit,
+-			       policy->related_cpus);
+-		for_each_cpu(cpu, policy->related_cpus) {
+-			raw_capacity[cpu] = arch_scale_cpu_capacity(NULL, cpu) *
+-					    policy->cpuinfo.max_freq / 1000UL;
+-			capacity_scale = max(raw_capacity[cpu], capacity_scale);
+-		}
+-		if (cpumask_empty(cpus_to_visit)) {
+-			normalize_cpu_capacity();
+-			kfree(raw_capacity);
+-			pr_debug("cpu_capacity: parsing done\n");
+-			cap_parsing_done = true;
+-			schedule_work(&parsing_done_work);
+-		}
+-	}
+-	return 0;
+-}
+-
+-static struct notifier_block init_cpu_capacity_notifier = {
+-	.notifier_call = init_cpu_capacity_callback,
+-};
+-
+-static int __init register_cpufreq_notifier(void)
+-{
+-	/*
+-	 * on ACPI-based systems we need to use the default cpu capacity
+-	 * until we have the necessary code to parse the cpu capacity, so
+-	 * skip registering cpufreq notifier.
+-	 */
+-	if (!acpi_disabled || cap_parsing_failed)
+-		return -EINVAL;
+-
+-	if (!alloc_cpumask_var(&cpus_to_visit, GFP_KERNEL)) {
+-		pr_err("cpu_capacity: failed to allocate memory for cpus_to_visit\n");
+-		return -ENOMEM;
+-	}
+-	cpumask_copy(cpus_to_visit, cpu_possible_mask);
+-
+-	return cpufreq_register_notifier(&init_cpu_capacity_notifier,
+-					 CPUFREQ_POLICY_NOTIFIER);
+-}
+-core_initcall(register_cpufreq_notifier);
+-
+-static void parsing_done_workfn(struct work_struct *work)
+-{
+-	cpufreq_unregister_notifier(&init_cpu_capacity_notifier,
+-					 CPUFREQ_POLICY_NOTIFIER);
+-}
+-
+-#else
+-static int __init free_raw_capacity(void)
+-{
+-	kfree(raw_capacity);
+-
+-	return 0;
+-}
+-core_initcall(free_raw_capacity);
+-#endif
++extern bool cap_parsing_failed;
++extern void normalize_cpu_capacity(void);
++extern int __init parse_cpu_capacity(struct device_node *cpu_node, int cpu);
+ 
+ static int __init get_cpu_for_node(struct device_node *node)
+ {
+
+commit 105ab3d8ce7269887d24d224054677125e18037c
+Author: Ingo Molnar <mingo@kernel.org>
+Date:   Wed Feb 1 16:36:40 2017 +0100
+
+    sched/headers: Prepare for new header dependencies before moving code to <linux/sched/topology.h>
+    
+    We are going to split <linux/sched/topology.h> out of <linux/sched.h>, which
+    will have to be picked up from other headers and a couple of .c files.
+    
+    Create a trivial placeholder <linux/sched/topology.h> file that just
+    maps to <linux/sched.h> to make this patch obviously correct and
+    bisectable.
+    
+    Include the new header in the files that are going to need it.
+    
+    Acked-by: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Mike Galbraith <efault@gmx.de>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: linux-kernel@vger.kernel.org
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/arch/arm64/kernel/topology.c b/arch/arm64/kernel/topology.c
+index 565dd69888cc..08243533e5ee 100644
+--- a/arch/arm64/kernel/topology.c
++++ b/arch/arm64/kernel/topology.c
+@@ -20,6 +20,7 @@
+ #include <linux/nodemask.h>
+ #include <linux/of.h>
+ #include <linux/sched.h>
++#include <linux/sched/topology.h>
+ #include <linux/slab.h>
+ #include <linux/string.h>
+ #include <linux/cpufreq.h>
+
+commit ca78d3173cff3503bcd15723b049757f75762d15
+Merge: a4ee7bacd6c0 ffe7afd17135
+Author: Linus Torvalds <torvalds@linux-foundation.org>
+Date:   Wed Feb 22 10:46:44 2017 -0800
+
+    Merge tag 'arm64-upstream' of git://git.kernel.org/pub/scm/linux/kernel/git/arm64/linux
+    
+    Pull arm64 updates from Will Deacon:
+     - Errata workarounds for Qualcomm's Falkor CPU
+     - Qualcomm L2 Cache PMU driver
+     - Qualcomm SMCCC firmware quirk
+     - Support for DEBUG_VIRTUAL
+     - CPU feature detection for userspace via MRS emulation
+     - Preliminary work for the Statistical Profiling Extension
+     - Misc cleanups and non-critical fixes
+    
+    * tag 'arm64-upstream' of git://git.kernel.org/pub/scm/linux/kernel/git/arm64/linux: (74 commits)
+      arm64/kprobes: consistently handle MRS/MSR with XZR
+      arm64: cpufeature: correctly handle MRS to XZR
+      arm64: traps: correctly handle MRS/MSR with XZR
+      arm64: ptrace: add XZR-safe regs accessors
+      arm64: include asm/assembler.h in entry-ftrace.S
+      arm64: fix warning about swapper_pg_dir overflow
+      arm64: Work around Falkor erratum 1003
+      arm64: head.S: Enable EL1 (host) access to SPE when entered at EL2
+      arm64: arch_timer: document Hisilicon erratum 161010101
+      arm64: use is_vmalloc_addr
+      arm64: use linux/sizes.h for constants
+      arm64: uaccess: consistently check object sizes
+      perf: add qcom l2 cache perf events driver
+      arm64: remove wrong CONFIG_PROC_SYSCTL ifdef
+      ARM: smccc: Update HVC comment to describe new quirk parameter
+      arm64: do not trace atomic operations
+      ACPI/IORT: Fix the error return code in iort_add_smmu_platform_device()
+      ACPI/IORT: Fix iort_node_get_id() mapping entries indexing
+      arm64: mm: enable CONFIG_HOLES_IN_ZONE for NUMA
+      perf: xgene: Include module.h
+      ...
+
+commit fe0a7ef74d1f65b86820a54636323df2b31e0c3f
+Author: Juri Lelli <juri.lelli@arm.com>
+Date:   Mon Feb 6 16:00:09 2017 +0000
+
+    arm64: remove wrong CONFIG_PROC_SYSCTL ifdef
+    
+    The sysfs cpu_capacity entry for each CPU has nothing to do with
+    PROC_FS, nor it's in /proc/sys path.
+    
+    Remove such ifdef.
+    
+    Cc: Will Deacon <will.deacon@arm.com>
+    Cc: Catalin Marinas <catalin.marinas@arm.com>
+    Reported-and-suggested-by: Sudeep Holla <sudeep.holla@arm.com>
+    Fixes: be8f185d8af4 ('arm64: add sysfs cpu_capacity attribute')
+    Signed-off-by: Juri Lelli <juri.lelli@arm.com>
+    Signed-off-by: Will Deacon <will.deacon@arm.com>
+
+diff --git a/arch/arm64/kernel/topology.c b/arch/arm64/kernel/topology.c
+index 23e9e13bd2aa..62b370388d72 100644
+--- a/arch/arm64/kernel/topology.c
++++ b/arch/arm64/kernel/topology.c
+@@ -40,7 +40,6 @@ static void set_capacity_scale(unsigned int cpu, unsigned long capacity)
+ 	per_cpu(cpu_scale, cpu) = capacity;
+ }
+ 
+-#ifdef CONFIG_PROC_SYSCTL
+ static ssize_t cpu_capacity_show(struct device *dev,
+ 				 struct device_attribute *attr,
+ 				 char *buf)
+@@ -97,7 +96,6 @@ static int register_cpu_capacity_sysctl(void)
+ 	return 0;
+ }
+ subsys_initcall(register_cpu_capacity_sysctl);
+-#endif
+ 
+ static u32 capacity_scale;
+ static u32 *raw_capacity;
+
+commit 606f42265d384b9149bfb953c5dfc6d4710fef4c
+Author: Prashanth Prakash <pprakash@codeaurora.org>
+Date:   Thu Jan 26 11:08:32 2017 -0700
+
+    arm64: skip register_cpufreq_notifier on ACPI-based systems
+    
+    On ACPI based systems where the topology is setup using the API
+    store_cpu_topology, at the moment we do not have necessary code
+    to parse cpu capacity and handle cpufreq notifier, thus
+    resulting in a kernel panic.
+    
+    Stack:
+            init_cpu_capacity_callback+0xb4/0x1c8
+            notifier_call_chain+0x5c/0xa0
+            __blocking_notifier_call_chain+0x58/0xa0
+            blocking_notifier_call_chain+0x3c/0x50
+            cpufreq_set_policy+0xe4/0x328
+            cpufreq_init_policy+0x80/0x100
+            cpufreq_online+0x418/0x710
+            cpufreq_add_dev+0x118/0x180
+            subsys_interface_register+0xa4/0xf8
+            cpufreq_register_driver+0x1c0/0x298
+            cppc_cpufreq_init+0xdc/0x1000 [cppc_cpufreq]
+            do_one_initcall+0x5c/0x168
+            do_init_module+0x64/0x1e4
+            load_module+0x130c/0x14d0
+            SyS_finit_module+0x108/0x120
+            el0_svc_naked+0x24/0x28
+    
+    Fixes: 7202bde8b7ae ("arm64: parse cpu capacity-dmips-mhz from DT")
+    Acked-by: Will Deacon <will.deacon@arm.com>
+    Signed-off-by: Prashanth Prakash <pprakash@codeaurora.org>
+    Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+
+diff --git a/arch/arm64/kernel/topology.c b/arch/arm64/kernel/topology.c
+index 23e9e13bd2aa..655e65f38f31 100644
+--- a/arch/arm64/kernel/topology.c
++++ b/arch/arm64/kernel/topology.c
+@@ -11,6 +11,7 @@
+  * for more details.
+  */
+ 
++#include <linux/acpi.h>
+ #include <linux/cpu.h>
+ #include <linux/cpumask.h>
+ #include <linux/init.h>
+@@ -209,7 +210,12 @@ static struct notifier_block init_cpu_capacity_notifier = {
+ 
+ static int __init register_cpufreq_notifier(void)
+ {
+-	if (cap_parsing_failed)
++	/*
++	 * on ACPI-based systems we need to use the default cpu capacity
++	 * until we have the necessary code to parse the cpu capacity, so
++	 * skip registering cpufreq notifier.
++	 */
++	if (!acpi_disabled || cap_parsing_failed)
+ 		return -EINVAL;
+ 
+ 	if (!alloc_cpumask_var(&cpus_to_visit, GFP_KERNEL)) {
+
+commit be8f185d8af4dbd450023a42a48c6faa8cbcdfe6
+Author: Juri Lelli <juri.lelli@arm.com>
+Date:   Thu Nov 3 05:40:18 2016 +0000
+
+    arm64: add sysfs cpu_capacity attribute
+    
+    Add a sysfs cpu_capacity attribute with which it is possible to read and
+    write (thus over-writing default values) CPUs capacity. This might be
+    useful in situations where values needs changing after boot.
+    
+    The new attribute shows up as:
+    
+     /sys/devices/system/cpu/cpu*/cpu_capacity
+    
+    Cc: Will Deacon <will.deacon@arm.com>
+    Cc: Mark Brown <broonie@kernel.org>
+    Cc: Sudeep Holla <sudeep.holla@arm.com>
+    Signed-off-by: Juri Lelli <juri.lelli@arm.com>
+    Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+
+diff --git a/arch/arm64/kernel/topology.c b/arch/arm64/kernel/topology.c
+index b75b0ba2e113..23e9e13bd2aa 100644
+--- a/arch/arm64/kernel/topology.c
++++ b/arch/arm64/kernel/topology.c
+@@ -20,12 +20,15 @@
+ #include <linux/of.h>
+ #include <linux/sched.h>
+ #include <linux/slab.h>
++#include <linux/string.h>
+ #include <linux/cpufreq.h>
+ 
++#include <asm/cpu.h>
+ #include <asm/cputype.h>
+ #include <asm/topology.h>
+ 
+ static DEFINE_PER_CPU(unsigned long, cpu_scale) = SCHED_CAPACITY_SCALE;
++static DEFINE_MUTEX(cpu_scale_mutex);
+ 
+ unsigned long arch_scale_cpu_capacity(struct sched_domain *sd, int cpu)
+ {
+@@ -37,6 +40,65 @@ static void set_capacity_scale(unsigned int cpu, unsigned long capacity)
+ 	per_cpu(cpu_scale, cpu) = capacity;
+ }
+ 
++#ifdef CONFIG_PROC_SYSCTL
++static ssize_t cpu_capacity_show(struct device *dev,
++				 struct device_attribute *attr,
++				 char *buf)
++{
++	struct cpu *cpu = container_of(dev, struct cpu, dev);
++
++	return sprintf(buf, "%lu\n",
++			arch_scale_cpu_capacity(NULL, cpu->dev.id));
++}
++
++static ssize_t cpu_capacity_store(struct device *dev,
++				  struct device_attribute *attr,
++				  const char *buf,
++				  size_t count)
++{
++	struct cpu *cpu = container_of(dev, struct cpu, dev);
++	int this_cpu = cpu->dev.id, i;
++	unsigned long new_capacity;
++	ssize_t ret;
++
++	if (count) {
++		ret = kstrtoul(buf, 0, &new_capacity);
++		if (ret)
++			return ret;
++		if (new_capacity > SCHED_CAPACITY_SCALE)
++			return -EINVAL;
++
++		mutex_lock(&cpu_scale_mutex);
++		for_each_cpu(i, &cpu_topology[this_cpu].core_sibling)
++			set_capacity_scale(i, new_capacity);
++		mutex_unlock(&cpu_scale_mutex);
++	}
++
++	return count;
++}
++
++static DEVICE_ATTR_RW(cpu_capacity);
++
++static int register_cpu_capacity_sysctl(void)
++{
++	int i;
++	struct device *cpu;
++
++	for_each_possible_cpu(i) {
++		cpu = get_cpu_device(i);
++		if (!cpu) {
++			pr_err("%s: too early to get CPU%d device!\n",
++			       __func__, i);
++			continue;
++		}
++		device_create_file(cpu, &dev_attr_cpu_capacity);
++	}
++
++	return 0;
++}
++subsys_initcall(register_cpu_capacity_sysctl);
++#endif
++
+ static u32 capacity_scale;
+ static u32 *raw_capacity;
+ static bool cap_parsing_failed;
+@@ -87,6 +149,7 @@ static void normalize_cpu_capacity(void)
+ 		return;
+ 
+ 	pr_debug("cpu_capacity: capacity_scale=%u\n", capacity_scale);
++	mutex_lock(&cpu_scale_mutex);
+ 	for_each_possible_cpu(cpu) {
+ 		pr_debug("cpu_capacity: cpu=%d raw_capacity=%u\n",
+ 			 cpu, raw_capacity[cpu]);
+@@ -96,6 +159,7 @@ static void normalize_cpu_capacity(void)
+ 		pr_debug("cpu_capacity: CPU%d cpu_capacity=%lu\n",
+ 			cpu, arch_scale_cpu_capacity(NULL, cpu));
+ 	}
++	mutex_unlock(&cpu_scale_mutex);
+ }
+ 
+ #ifdef CONFIG_CPU_FREQ
+
+commit 7202bde8b7aea7c914e33c7bc2dfb145587f1bdc
+Author: Juri Lelli <juri.lelli@arm.com>
+Date:   Mon Oct 17 16:46:45 2016 +0100
+
+    arm64: parse cpu capacity-dmips-mhz from DT
+    
+    With the introduction of cpu capacity-dmips-mhz bindings, CPU capacities
+    can now be calculated from values extracted from DT and information
+    coming from cpufreq. Add parsing of DT information at boot time, and
+    complement it with cpufreq information. Also, store such information
+    using per CPU variables, as we do for arm.
+    
+    Caveat: the information provided by this patch will start to be used in
+    the future. We need to #define arch_scale_cpu_capacity to something
+    provided in arch, so that scheduler's default implementation (which gets
+    used if arch_scale_cpu_capacity is not defined) is overwritten.
+    
+    Cc: Will Deacon <will.deacon@arm.com>
+    Cc: Mark Brown <broonie@kernel.org>
+    Cc: Sudeep Holla <sudeep.holla@arm.com>
+    Signed-off-by: Juri Lelli <juri.lelli@arm.com>
+    Acked-by: Vincent Guittot <vincent.guittot@linaro.org>
+    Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+
+diff --git a/arch/arm64/kernel/topology.c b/arch/arm64/kernel/topology.c
+index 694f6deedbab..b75b0ba2e113 100644
+--- a/arch/arm64/kernel/topology.c
++++ b/arch/arm64/kernel/topology.c
+@@ -19,10 +19,162 @@
+ #include <linux/nodemask.h>
+ #include <linux/of.h>
+ #include <linux/sched.h>
++#include <linux/slab.h>
++#include <linux/cpufreq.h>
+ 
+ #include <asm/cputype.h>
+ #include <asm/topology.h>
+ 
++static DEFINE_PER_CPU(unsigned long, cpu_scale) = SCHED_CAPACITY_SCALE;
++
++unsigned long arch_scale_cpu_capacity(struct sched_domain *sd, int cpu)
++{
++	return per_cpu(cpu_scale, cpu);
++}
++
++static void set_capacity_scale(unsigned int cpu, unsigned long capacity)
++{
++	per_cpu(cpu_scale, cpu) = capacity;
++}
++
++static u32 capacity_scale;
++static u32 *raw_capacity;
++static bool cap_parsing_failed;
++
++static void __init parse_cpu_capacity(struct device_node *cpu_node, int cpu)
++{
++	int ret;
++	u32 cpu_capacity;
++
++	if (cap_parsing_failed)
++		return;
++
++	ret = of_property_read_u32(cpu_node,
++				   "capacity-dmips-mhz",
++				   &cpu_capacity);
++	if (!ret) {
++		if (!raw_capacity) {
++			raw_capacity = kcalloc(num_possible_cpus(),
++					       sizeof(*raw_capacity),
++					       GFP_KERNEL);
++			if (!raw_capacity) {
++				pr_err("cpu_capacity: failed to allocate memory for raw capacities\n");
++				cap_parsing_failed = true;
++				return;
++			}
++		}
++		capacity_scale = max(cpu_capacity, capacity_scale);
++		raw_capacity[cpu] = cpu_capacity;
++		pr_debug("cpu_capacity: %s cpu_capacity=%u (raw)\n",
++			cpu_node->full_name, raw_capacity[cpu]);
++	} else {
++		if (raw_capacity) {
++			pr_err("cpu_capacity: missing %s raw capacity\n",
++				cpu_node->full_name);
++			pr_err("cpu_capacity: partial information: fallback to 1024 for all CPUs\n");
++		}
++		cap_parsing_failed = true;
++		kfree(raw_capacity);
++	}
++}
++
++static void normalize_cpu_capacity(void)
++{
++	u64 capacity;
++	int cpu;
++
++	if (!raw_capacity || cap_parsing_failed)
++		return;
++
++	pr_debug("cpu_capacity: capacity_scale=%u\n", capacity_scale);
++	for_each_possible_cpu(cpu) {
++		pr_debug("cpu_capacity: cpu=%d raw_capacity=%u\n",
++			 cpu, raw_capacity[cpu]);
++		capacity = (raw_capacity[cpu] << SCHED_CAPACITY_SHIFT)
++			/ capacity_scale;
++		set_capacity_scale(cpu, capacity);
++		pr_debug("cpu_capacity: CPU%d cpu_capacity=%lu\n",
++			cpu, arch_scale_cpu_capacity(NULL, cpu));
++	}
++}
++
++#ifdef CONFIG_CPU_FREQ
++static cpumask_var_t cpus_to_visit;
++static bool cap_parsing_done;
++static void parsing_done_workfn(struct work_struct *work);
++static DECLARE_WORK(parsing_done_work, parsing_done_workfn);
++
++static int
++init_cpu_capacity_callback(struct notifier_block *nb,
++			   unsigned long val,
++			   void *data)
++{
++	struct cpufreq_policy *policy = data;
++	int cpu;
++
++	if (cap_parsing_failed || cap_parsing_done)
++		return 0;
++
++	switch (val) {
++	case CPUFREQ_NOTIFY:
++		pr_debug("cpu_capacity: init cpu capacity for CPUs [%*pbl] (to_visit=%*pbl)\n",
++				cpumask_pr_args(policy->related_cpus),
++				cpumask_pr_args(cpus_to_visit));
++		cpumask_andnot(cpus_to_visit,
++			       cpus_to_visit,
++			       policy->related_cpus);
++		for_each_cpu(cpu, policy->related_cpus) {
++			raw_capacity[cpu] = arch_scale_cpu_capacity(NULL, cpu) *
++					    policy->cpuinfo.max_freq / 1000UL;
++			capacity_scale = max(raw_capacity[cpu], capacity_scale);
++		}
++		if (cpumask_empty(cpus_to_visit)) {
++			normalize_cpu_capacity();
++			kfree(raw_capacity);
++			pr_debug("cpu_capacity: parsing done\n");
++			cap_parsing_done = true;
++			schedule_work(&parsing_done_work);
++		}
++	}
++	return 0;
++}
++
++static struct notifier_block init_cpu_capacity_notifier = {
++	.notifier_call = init_cpu_capacity_callback,
++};
++
++static int __init register_cpufreq_notifier(void)
++{
++	if (cap_parsing_failed)
++		return -EINVAL;
++
++	if (!alloc_cpumask_var(&cpus_to_visit, GFP_KERNEL)) {
++		pr_err("cpu_capacity: failed to allocate memory for cpus_to_visit\n");
++		return -ENOMEM;
++	}
++	cpumask_copy(cpus_to_visit, cpu_possible_mask);
++
++	return cpufreq_register_notifier(&init_cpu_capacity_notifier,
++					 CPUFREQ_POLICY_NOTIFIER);
++}
++core_initcall(register_cpufreq_notifier);
++
++static void parsing_done_workfn(struct work_struct *work)
++{
++	cpufreq_unregister_notifier(&init_cpu_capacity_notifier,
++					 CPUFREQ_POLICY_NOTIFIER);
++}
++
++#else
++static int __init free_raw_capacity(void)
++{
++	kfree(raw_capacity);
++
++	return 0;
++}
++core_initcall(free_raw_capacity);
++#endif
++
+ static int __init get_cpu_for_node(struct device_node *node)
+ {
+ 	struct device_node *cpu_node;
+@@ -34,6 +186,7 @@ static int __init get_cpu_for_node(struct device_node *node)
+ 
+ 	for_each_possible_cpu(cpu) {
+ 		if (of_get_cpu_node(cpu, NULL) == cpu_node) {
++			parse_cpu_capacity(cpu_node, cpu);
+ 			of_node_put(cpu_node);
+ 			return cpu;
+ 		}
+@@ -178,13 +331,17 @@ static int __init parse_dt_topology(void)
+ 	 * cluster with restricted subnodes.
+ 	 */
+ 	map = of_get_child_by_name(cn, "cpu-map");
+-	if (!map)
++	if (!map) {
++		cap_parsing_failed = true;
+ 		goto out;
++	}
+ 
+ 	ret = parse_cluster(map, 0);
+ 	if (ret != 0)
+ 		goto out_map;
+ 
++	normalize_cpu_capacity();
++
+ 	/*
+ 	 * Check that all cores are in the topology; the SMP code will
+ 	 * only mark cores described in the DT as possible.
+
+commit e094d44568680d4e5e2722c4ad090ff0810719b9
+Author: Sudeep Holla <sudeep.holla@arm.com>
+Date:   Thu Jul 23 18:28:26 2015 +0100
+
+    arm64: kernel: remove non-legit DT warnings when booting using ACPI
+    
+    Since both CONFIG_ACPI and CONFIG_OF are enabled when booting using ACPI
+    tables on ARM64 platforms, we get few device tree warnings which are not
+    valid for ACPI boot. We can use of_have_populated_dt to check if the
+    device tree is populated or not before throwing out those errors.
+    
+    This patch uses of_have_populated_dt to remove non legitimate device
+    tree warning when booting using ACPI tables.
+    
+    Cc: Lorenzo Pieralisi <Lorenzo.Pieralisi@arm.com>
+    Acked-by: Catalin Marinas <catalin.marinas@arm.com>
+    Acked-by: Mark Rutland <mark.rutland@arm.com>
+    Signed-off-by: Sudeep Holla <sudeep.holla@arm.com>
+    Signed-off-by: Will Deacon <will.deacon@arm.com>
+
+diff --git a/arch/arm64/kernel/topology.c b/arch/arm64/kernel/topology.c
+index fcb8f7b42271..694f6deedbab 100644
+--- a/arch/arm64/kernel/topology.c
++++ b/arch/arm64/kernel/topology.c
+@@ -300,6 +300,6 @@ void __init init_cpu_topology(void)
+ 	 * Discard anything that was parsed if we hit an error so we
+ 	 * don't use partial information.
+ 	 */
+-	if (parse_dt_topology())
++	if (of_have_populated_dt() && parse_dt_topology())
+ 		reset_cpu_topology();
+ }
+
+commit 1cefdaea613bcd247b2235079fcbb0ca4687542d
+Author: Mark Brown <broonie@linaro.org>
+Date:   Fri Nov 21 00:36:49 2014 +0000
+
+    arm64: topology: Fix handling of multi-level cluster MPIDR-based detection
+    
+    The only requirement the scheduler has on cluster IDs is that they must
+    be unique.  When enumerating the topology based on MPIDR information the
+    kernel currently generates cluster IDs by using the first level of
+    affinity above the core ID (either level one or two depending on if the
+    core has multiple threads) however the ARMv8 architecture allows for up
+    to three levels of affinity.  This means that an ARMv8 system may
+    contain cores which have MPIDRs identical other than affinity level
+    three which with current code will cause us to report multiple cores
+    with the same identification to the scheduler in violation of its
+    uniqueness requirement.
+    
+    Ensure that we do not violate the scheduler requirements on systems that
+    uses all the affinity levels by incorporating both affinity levels two
+    and three into the cluser ID when the cores are not threaded.
+    
+    While no currently known hardware uses multi-level clusters it is better
+    to program defensively, this will help ease bringup of systems that have
+    them and will ensure that things like distribution install media do not
+    need to be respun to replace kernels in order to deploy such systems.
+    In the worst case the system will work but perform suboptimally until a
+    kernel modified to handle the new topology better is installed, in the
+    best case this will be an adequate description of such topologies for
+    the scheduler to perform well.
+    
+    Signed-off-by: Mark Brown <broonie@linaro.org>
+    Signed-off-by: Will Deacon <will.deacon@arm.com>
+
+diff --git a/arch/arm64/kernel/topology.c b/arch/arm64/kernel/topology.c
+index b6ee26b0939a..fcb8f7b42271 100644
+--- a/arch/arm64/kernel/topology.c
++++ b/arch/arm64/kernel/topology.c
+@@ -255,12 +255,15 @@ void store_cpu_topology(unsigned int cpuid)
+ 		/* Multiprocessor system : Multi-threads per core */
+ 		cpuid_topo->thread_id  = MPIDR_AFFINITY_LEVEL(mpidr, 0);
+ 		cpuid_topo->core_id    = MPIDR_AFFINITY_LEVEL(mpidr, 1);
+-		cpuid_topo->cluster_id = MPIDR_AFFINITY_LEVEL(mpidr, 2);
++		cpuid_topo->cluster_id = MPIDR_AFFINITY_LEVEL(mpidr, 2) |
++					 MPIDR_AFFINITY_LEVEL(mpidr, 3) << 8;
+ 	} else {
+ 		/* Multiprocessor system : Single-thread per core */
+ 		cpuid_topo->thread_id  = -1;
+ 		cpuid_topo->core_id    = MPIDR_AFFINITY_LEVEL(mpidr, 0);
+-		cpuid_topo->cluster_id = MPIDR_AFFINITY_LEVEL(mpidr, 1);
++		cpuid_topo->cluster_id = MPIDR_AFFINITY_LEVEL(mpidr, 1) |
++					 MPIDR_AFFINITY_LEVEL(mpidr, 2) << 8 |
++					 MPIDR_AFFINITY_LEVEL(mpidr, 3) << 16;
+ 	}
+ 
+ 	pr_debug("CPU%u: cluster %d core %d thread %d mpidr %#016llx\n",
+
+commit 4e6f7084096c08e37f909d7b075a91b72580405f
+Author: Zi Shen Lim <zlim@broadcom.com>
+Date:   Sat Jun 7 01:55:27 2014 +0100
+
+    arm64: topology: add MPIDR-based detection
+    
+    Create cpu topology based on MPIDR. When hardware sets MPIDR to sane
+    values, this method will always work. Therefore it should also work well
+    as the fallback method. [1]
+    
+    When we have multiple processing elements in the system, we create
+    the cpu topology by mapping each affinity level (from lowest to highest)
+    to threads (if they exist), cores, and clusters.
+    
+    [1] http://www.spinics.net/lists/arm-kernel/msg317445.html
+    
+    Acked-by: Lorenzo Pieralisi <lorenzo.pieralisi@arm.com>
+    Signed-off-by: Zi Shen Lim <zlim@broadcom.com>
+    Signed-off-by: Mark Brown <broonie@linaro.org>
+    Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+
+diff --git a/arch/arm64/kernel/topology.c b/arch/arm64/kernel/topology.c
+index 43514f905916..b6ee26b0939a 100644
+--- a/arch/arm64/kernel/topology.c
++++ b/arch/arm64/kernel/topology.c
+@@ -20,6 +20,7 @@
+ #include <linux/of.h>
+ #include <linux/sched.h>
+ 
++#include <asm/cputype.h>
+ #include <asm/topology.h>
+ 
+ static int __init get_cpu_for_node(struct device_node *node)
+@@ -188,13 +189,9 @@ static int __init parse_dt_topology(void)
+ 	 * Check that all cores are in the topology; the SMP code will
+ 	 * only mark cores described in the DT as possible.
+ 	 */
+-	for_each_possible_cpu(cpu) {
+-		if (cpu_topology[cpu].cluster_id == -1) {
+-			pr_err("CPU%d: No topology information specified\n",
+-			       cpu);
++	for_each_possible_cpu(cpu)
++		if (cpu_topology[cpu].cluster_id == -1)
+ 			ret = -EINVAL;
+-		}
+-	}
+ 
+ out_map:
+ 	of_node_put(map);
+@@ -219,14 +216,6 @@ static void update_siblings_masks(unsigned int cpuid)
+ 	struct cpu_topology *cpu_topo, *cpuid_topo = &cpu_topology[cpuid];
+ 	int cpu;
+ 
+-	if (cpuid_topo->cluster_id == -1) {
+-		/*
+-		 * DT does not contain topology information for this cpu.
+-		 */
+-		pr_debug("CPU%u: No topology information configured\n", cpuid);
+-		return;
+-	}
+-
+ 	/* update core and thread sibling masks */
+ 	for_each_possible_cpu(cpu) {
+ 		cpu_topo = &cpu_topology[cpu];
+@@ -249,6 +238,36 @@ static void update_siblings_masks(unsigned int cpuid)
+ 
+ void store_cpu_topology(unsigned int cpuid)
+ {
++	struct cpu_topology *cpuid_topo = &cpu_topology[cpuid];
++	u64 mpidr;
++
++	if (cpuid_topo->cluster_id != -1)
++		goto topology_populated;
++
++	mpidr = read_cpuid_mpidr();
++
++	/* Uniprocessor systems can rely on default topology values */
++	if (mpidr & MPIDR_UP_BITMASK)
++		return;
++
++	/* Create cpu topology mapping based on MPIDR. */
++	if (mpidr & MPIDR_MT_BITMASK) {
++		/* Multiprocessor system : Multi-threads per core */
++		cpuid_topo->thread_id  = MPIDR_AFFINITY_LEVEL(mpidr, 0);
++		cpuid_topo->core_id    = MPIDR_AFFINITY_LEVEL(mpidr, 1);
++		cpuid_topo->cluster_id = MPIDR_AFFINITY_LEVEL(mpidr, 2);
++	} else {
++		/* Multiprocessor system : Single-thread per core */
++		cpuid_topo->thread_id  = -1;
++		cpuid_topo->core_id    = MPIDR_AFFINITY_LEVEL(mpidr, 0);
++		cpuid_topo->cluster_id = MPIDR_AFFINITY_LEVEL(mpidr, 1);
++	}
++
++	pr_debug("CPU%u: cluster %d core %d thread %d mpidr %#016llx\n",
++		 cpuid, cpuid_topo->cluster_id, cpuid_topo->core_id,
++		 cpuid_topo->thread_id, mpidr);
++
++topology_populated:
+ 	update_siblings_masks(cpuid);
+ }
+ 
+
+commit ebdc94470d23d73dcab3748ae7eefa9ca669cdbe
+Author: Mark Brown <broonie@linaro.org>
+Date:   Fri May 2 21:38:29 2014 +0100
+
+    arm64: topology: Add support for topology DT bindings
+    
+    Add support for parsing the explicit topology bindings to discover the
+    topology of the system.
+    
+    Since it is not currently clear how to map multi-level clusters for the
+    scheduler all leaf clusters are presented to the scheduler at the same
+    level. This should be enough to provide good support for current systems.
+    
+    Signed-off-by: Mark Brown <broonie@linaro.org>
+    Reviewed-by: Lorenzo Pieralisi <lorenzo.pieralisi@arm.com>
+    Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+
+diff --git a/arch/arm64/kernel/topology.c b/arch/arm64/kernel/topology.c
+index ff662b23af5f..43514f905916 100644
+--- a/arch/arm64/kernel/topology.c
++++ b/arch/arm64/kernel/topology.c
+@@ -17,10 +17,192 @@
+ #include <linux/percpu.h>
+ #include <linux/node.h>
+ #include <linux/nodemask.h>
++#include <linux/of.h>
+ #include <linux/sched.h>
+ 
+ #include <asm/topology.h>
+ 
++static int __init get_cpu_for_node(struct device_node *node)
++{
++	struct device_node *cpu_node;
++	int cpu;
++
++	cpu_node = of_parse_phandle(node, "cpu", 0);
++	if (!cpu_node)
++		return -1;
++
++	for_each_possible_cpu(cpu) {
++		if (of_get_cpu_node(cpu, NULL) == cpu_node) {
++			of_node_put(cpu_node);
++			return cpu;
++		}
++	}
++
++	pr_crit("Unable to find CPU node for %s\n", cpu_node->full_name);
++
++	of_node_put(cpu_node);
++	return -1;
++}
++
++static int __init parse_core(struct device_node *core, int cluster_id,
++			     int core_id)
++{
++	char name[10];
++	bool leaf = true;
++	int i = 0;
++	int cpu;
++	struct device_node *t;
++
++	do {
++		snprintf(name, sizeof(name), "thread%d", i);
++		t = of_get_child_by_name(core, name);
++		if (t) {
++			leaf = false;
++			cpu = get_cpu_for_node(t);
++			if (cpu >= 0) {
++				cpu_topology[cpu].cluster_id = cluster_id;
++				cpu_topology[cpu].core_id = core_id;
++				cpu_topology[cpu].thread_id = i;
++			} else {
++				pr_err("%s: Can't get CPU for thread\n",
++				       t->full_name);
++				of_node_put(t);
++				return -EINVAL;
++			}
++			of_node_put(t);
++		}
++		i++;
++	} while (t);
++
++	cpu = get_cpu_for_node(core);
++	if (cpu >= 0) {
++		if (!leaf) {
++			pr_err("%s: Core has both threads and CPU\n",
++			       core->full_name);
++			return -EINVAL;
++		}
++
++		cpu_topology[cpu].cluster_id = cluster_id;
++		cpu_topology[cpu].core_id = core_id;
++	} else if (leaf) {
++		pr_err("%s: Can't get CPU for leaf core\n", core->full_name);
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static int __init parse_cluster(struct device_node *cluster, int depth)
++{
++	char name[10];
++	bool leaf = true;
++	bool has_cores = false;
++	struct device_node *c;
++	static int cluster_id __initdata;
++	int core_id = 0;
++	int i, ret;
++
++	/*
++	 * First check for child clusters; we currently ignore any
++	 * information about the nesting of clusters and present the
++	 * scheduler with a flat list of them.
++	 */
++	i = 0;
++	do {
++		snprintf(name, sizeof(name), "cluster%d", i);
++		c = of_get_child_by_name(cluster, name);
++		if (c) {
++			leaf = false;
++			ret = parse_cluster(c, depth + 1);
++			of_node_put(c);
++			if (ret != 0)
++				return ret;
++		}
++		i++;
++	} while (c);
++
++	/* Now check for cores */
++	i = 0;
++	do {
++		snprintf(name, sizeof(name), "core%d", i);
++		c = of_get_child_by_name(cluster, name);
++		if (c) {
++			has_cores = true;
++
++			if (depth == 0) {
++				pr_err("%s: cpu-map children should be clusters\n",
++				       c->full_name);
++				of_node_put(c);
++				return -EINVAL;
++			}
++
++			if (leaf) {
++				ret = parse_core(c, cluster_id, core_id++);
++			} else {
++				pr_err("%s: Non-leaf cluster with core %s\n",
++				       cluster->full_name, name);
++				ret = -EINVAL;
++			}
++
++			of_node_put(c);
++			if (ret != 0)
++				return ret;
++		}
++		i++;
++	} while (c);
++
++	if (leaf && !has_cores)
++		pr_warn("%s: empty cluster\n", cluster->full_name);
++
++	if (leaf)
++		cluster_id++;
++
++	return 0;
++}
++
++static int __init parse_dt_topology(void)
++{
++	struct device_node *cn, *map;
++	int ret = 0;
++	int cpu;
++
++	cn = of_find_node_by_path("/cpus");
++	if (!cn) {
++		pr_err("No CPU information found in DT\n");
++		return 0;
++	}
++
++	/*
++	 * When topology is provided cpu-map is essentially a root
++	 * cluster with restricted subnodes.
++	 */
++	map = of_get_child_by_name(cn, "cpu-map");
++	if (!map)
++		goto out;
++
++	ret = parse_cluster(map, 0);
++	if (ret != 0)
++		goto out_map;
++
++	/*
++	 * Check that all cores are in the topology; the SMP code will
++	 * only mark cores described in the DT as possible.
++	 */
++	for_each_possible_cpu(cpu) {
++		if (cpu_topology[cpu].cluster_id == -1) {
++			pr_err("CPU%d: No topology information specified\n",
++			       cpu);
++			ret = -EINVAL;
++		}
++	}
++
++out_map:
++	of_node_put(map);
++out:
++	of_node_put(cn);
++	return ret;
++}
++
+ /*
+  * cpu topology table
+  */
+@@ -39,8 +221,7 @@ static void update_siblings_masks(unsigned int cpuid)
+ 
+ 	if (cpuid_topo->cluster_id == -1) {
+ 		/*
+-		 * DT does not contain topology information for this cpu
+-		 * reset it to default behaviour
++		 * DT does not contain topology information for this cpu.
+ 		 */
+ 		pr_debug("CPU%u: No topology information configured\n", cpuid);
+ 		return;
+@@ -71,15 +252,10 @@ void store_cpu_topology(unsigned int cpuid)
+ 	update_siblings_masks(cpuid);
+ }
+ 
+-/*
+- * init_cpu_topology is called at boot when only one cpu is running
+- * which prevent simultaneous write access to cpu_topology array
+- */
+-void __init init_cpu_topology(void)
++static void __init reset_cpu_topology(void)
+ {
+ 	unsigned int cpu;
+ 
+-	/* init core mask and power*/
+ 	for_each_possible_cpu(cpu) {
+ 		struct cpu_topology *cpu_topo = &cpu_topology[cpu];
+ 
+@@ -93,3 +269,15 @@ void __init init_cpu_topology(void)
+ 		cpumask_set_cpu(cpu, &cpu_topo->thread_sibling);
+ 	}
+ }
++
++void __init init_cpu_topology(void)
++{
++	reset_cpu_topology();
++
++	/*
++	 * Discard anything that was parsed if we hit an error so we
++	 * don't use partial information.
++	 */
++	if (parse_dt_topology())
++		reset_cpu_topology();
++}
+
+commit c31bf0488d67737668b7401fac4b7ed550eaad76
+Author: Mark Brown <broonie@linaro.org>
+Date:   Fri May 2 21:38:28 2014 +0100
+
+    arm64: topology: Initialise default topology state immediately
+    
+    As a legacy of the way 32 bit ARM did things the topology code uses a null
+    topology map by default and then overwrites it by mapping cores with no
+    information to a cluster by themselves later. In order to make it simpler
+    to reset things as part of recovering from parse failures in firmware
+    information directly set this configuration on init. A core will always be
+    its own sibling so there should be no risk of confusion with firmware
+    provided information.
+    
+    Signed-off-by: Mark Brown <broonie@linaro.org>
+    Reviewed-by: Lorenzo Pieralisi <lorenzo.pieralisi@arm.com>
+    Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+
+diff --git a/arch/arm64/kernel/topology.c b/arch/arm64/kernel/topology.c
+index 3e06b0be4ec8..ff662b23af5f 100644
+--- a/arch/arm64/kernel/topology.c
++++ b/arch/arm64/kernel/topology.c
+@@ -43,9 +43,6 @@ static void update_siblings_masks(unsigned int cpuid)
+ 		 * reset it to default behaviour
+ 		 */
+ 		pr_debug("CPU%u: No topology information configured\n", cpuid);
+-		cpuid_topo->core_id = 0;
+-		cpumask_set_cpu(cpuid, &cpuid_topo->core_sibling);
+-		cpumask_set_cpu(cpuid, &cpuid_topo->thread_sibling);
+ 		return;
+ 	}
+ 
+@@ -87,9 +84,12 @@ void __init init_cpu_topology(void)
+ 		struct cpu_topology *cpu_topo = &cpu_topology[cpu];
+ 
+ 		cpu_topo->thread_id = -1;
+-		cpu_topo->core_id =  -1;
++		cpu_topo->core_id = 0;
+ 		cpu_topo->cluster_id = -1;
++
+ 		cpumask_clear(&cpu_topo->core_sibling);
++		cpumask_set_cpu(cpu, &cpu_topo->core_sibling);
+ 		cpumask_clear(&cpu_topo->thread_sibling);
++		cpumask_set_cpu(cpu, &cpu_topo->thread_sibling);
+ 	}
+ }
+
+commit f6e763b93a6cd3411fd8df925344022719bcba62
+Author: Mark Brown <broonie@linaro.org>
+Date:   Tue Mar 4 07:51:17 2014 +0000
+
+    arm64: topology: Implement basic CPU topology support
+    
+    Add basic CPU topology support to arm64, based on the existing pre-v8
+    code and some work done by Mark Hambleton.  This patch does not
+    implement any topology discovery support since that should be based on
+    information from firmware, it merely implements the scaffolding for
+    integration of topology support in the architecture.
+    
+    No locking of the topology data is done since it is only modified during
+    CPU bringup with external serialisation from the SMP code.
+    
+    The goal is to separate the architecture hookup for providing topology
+    information from the DT parsing in order to ease review and avoid
+    blocking the architecture code (which will be built on by other work)
+    with the DT code review by providing something simple and basic.
+    
+    Following patches will implement support for interpreting topology
+    information from MPIDR and for parsing the DT topology bindings for ARM,
+    similar patches will be needed for ACPI.
+    
+    Signed-off-by: Mark Brown <broonie@linaro.org>
+    Acked-by: Mark Rutland <mark.rutland@arm.com>
+    [catalin.marinas@arm.com: removed CONFIG_CPU_TOPOLOGY, always on if SMP]
+    Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+
+diff --git a/arch/arm64/kernel/topology.c b/arch/arm64/kernel/topology.c
+new file mode 100644
+index 000000000000..3e06b0be4ec8
+--- /dev/null
++++ b/arch/arm64/kernel/topology.c
+@@ -0,0 +1,95 @@
++/*
++ * arch/arm64/kernel/topology.c
++ *
++ * Copyright (C) 2011,2013,2014 Linaro Limited.
++ *
++ * Based on the arm32 version written by Vincent Guittot in turn based on
++ * arch/sh/kernel/topology.c
++ *
++ * This file is subject to the terms and conditions of the GNU General Public
++ * License.  See the file "COPYING" in the main directory of this archive
++ * for more details.
++ */
++
++#include <linux/cpu.h>
++#include <linux/cpumask.h>
++#include <linux/init.h>
++#include <linux/percpu.h>
++#include <linux/node.h>
++#include <linux/nodemask.h>
++#include <linux/sched.h>
++
++#include <asm/topology.h>
++
++/*
++ * cpu topology table
++ */
++struct cpu_topology cpu_topology[NR_CPUS];
++EXPORT_SYMBOL_GPL(cpu_topology);
++
++const struct cpumask *cpu_coregroup_mask(int cpu)
++{
++	return &cpu_topology[cpu].core_sibling;
++}
++
++static void update_siblings_masks(unsigned int cpuid)
++{
++	struct cpu_topology *cpu_topo, *cpuid_topo = &cpu_topology[cpuid];
++	int cpu;
++
++	if (cpuid_topo->cluster_id == -1) {
++		/*
++		 * DT does not contain topology information for this cpu
++		 * reset it to default behaviour
++		 */
++		pr_debug("CPU%u: No topology information configured\n", cpuid);
++		cpuid_topo->core_id = 0;
++		cpumask_set_cpu(cpuid, &cpuid_topo->core_sibling);
++		cpumask_set_cpu(cpuid, &cpuid_topo->thread_sibling);
++		return;
++	}
++
++	/* update core and thread sibling masks */
++	for_each_possible_cpu(cpu) {
++		cpu_topo = &cpu_topology[cpu];
++
++		if (cpuid_topo->cluster_id != cpu_topo->cluster_id)
++			continue;
++
++		cpumask_set_cpu(cpuid, &cpu_topo->core_sibling);
++		if (cpu != cpuid)
++			cpumask_set_cpu(cpu, &cpuid_topo->core_sibling);
++
++		if (cpuid_topo->core_id != cpu_topo->core_id)
++			continue;
++
++		cpumask_set_cpu(cpuid, &cpu_topo->thread_sibling);
++		if (cpu != cpuid)
++			cpumask_set_cpu(cpu, &cpuid_topo->thread_sibling);
++	}
++}
++
++void store_cpu_topology(unsigned int cpuid)
++{
++	update_siblings_masks(cpuid);
++}
++
++/*
++ * init_cpu_topology is called at boot when only one cpu is running
++ * which prevent simultaneous write access to cpu_topology array
++ */
++void __init init_cpu_topology(void)
++{
++	unsigned int cpu;
++
++	/* init core mask and power*/
++	for_each_possible_cpu(cpu) {
++		struct cpu_topology *cpu_topo = &cpu_topology[cpu];
++
++		cpu_topo->thread_id = -1;
++		cpu_topo->core_id =  -1;
++		cpu_topo->cluster_id = -1;
++		cpumask_clear(&cpu_topo->core_sibling);
++		cpumask_clear(&cpu_topo->thread_sibling);
++	}
++}

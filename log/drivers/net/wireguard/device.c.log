@@ -1,0 +1,919 @@
+commit 01a4967c71c004f8ecad4ab57021348636502fa9
+Author: Jason A. Donenfeld <Jason@zx2c4.com>
+Date:   Mon Jun 29 19:06:20 2020 -0600
+
+    wireguard: implement header_ops->parse_protocol for AF_PACKET
+    
+    WireGuard uses skb->protocol to determine packet type, and bails out if
+    it's not set or set to something it's not expecting. For AF_PACKET
+    injection, we need to support its call chain of:
+    
+        packet_sendmsg -> packet_snd -> packet_parse_headers ->
+          dev_parse_header_protocol -> parse_protocol
+    
+    Without a valid parse_protocol, this returns zero, and wireguard then
+    rejects the skb. So, this wires up the ip_tunnel handler for layer 3
+    packets for that case.
+    
+    Reported-by: Hans Wippel <ndev@hwipl.net>
+    Signed-off-by: Jason A. Donenfeld <Jason@zx2c4.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/wireguard/device.c b/drivers/net/wireguard/device.c
+index a8f151b1b5fa..c9f65e96ccb0 100644
+--- a/drivers/net/wireguard/device.c
++++ b/drivers/net/wireguard/device.c
+@@ -262,6 +262,7 @@ static void wg_setup(struct net_device *dev)
+ 			     max(sizeof(struct ipv6hdr), sizeof(struct iphdr));
+ 
+ 	dev->netdev_ops = &netdev_ops;
++	dev->header_ops = &ip_tunnel_header_ops;
+ 	dev->hard_header_len = 0;
+ 	dev->addr_len = 0;
+ 	dev->needed_headroom = DATA_PACKET_HEAD_ROOM;
+
+commit 900575aa33a3eaaef802b31de187a85c4a4b4bd0
+Author: Jason A. Donenfeld <Jason@zx2c4.com>
+Date:   Tue Jun 23 03:59:45 2020 -0600
+
+    wireguard: device: avoid circular netns references
+    
+    Before, we took a reference to the creating netns if the new netns was
+    different. This caused issues with circular references, with two
+    wireguard interfaces swapping namespaces. The solution is to rather not
+    take any extra references at all, but instead simply invalidate the
+    creating netns pointer when that netns is deleted.
+    
+    In order to prevent this from happening again, this commit improves the
+    rough object leak tracking by allowing it to account for created and
+    destroyed interfaces, aside from just peers and keys. That then makes it
+    possible to check for the object leak when having two interfaces take a
+    reference to each others' namespaces.
+    
+    Fixes: e7096c131e51 ("net: WireGuard secure network tunnel")
+    Signed-off-by: Jason A. Donenfeld <Jason@zx2c4.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/wireguard/device.c b/drivers/net/wireguard/device.c
+index 3ac3f8570ca1..a8f151b1b5fa 100644
+--- a/drivers/net/wireguard/device.c
++++ b/drivers/net/wireguard/device.c
+@@ -45,17 +45,18 @@ static int wg_open(struct net_device *dev)
+ 	if (dev_v6)
+ 		dev_v6->cnf.addr_gen_mode = IN6_ADDR_GEN_MODE_NONE;
+ 
++	mutex_lock(&wg->device_update_lock);
+ 	ret = wg_socket_init(wg, wg->incoming_port);
+ 	if (ret < 0)
+-		return ret;
+-	mutex_lock(&wg->device_update_lock);
++		goto out;
+ 	list_for_each_entry(peer, &wg->peer_list, peer_list) {
+ 		wg_packet_send_staged_packets(peer);
+ 		if (peer->persistent_keepalive_interval)
+ 			wg_packet_send_keepalive(peer);
+ 	}
++out:
+ 	mutex_unlock(&wg->device_update_lock);
+-	return 0;
++	return ret;
+ }
+ 
+ #ifdef CONFIG_PM_SLEEP
+@@ -225,6 +226,7 @@ static void wg_destruct(struct net_device *dev)
+ 	list_del(&wg->device_list);
+ 	rtnl_unlock();
+ 	mutex_lock(&wg->device_update_lock);
++	rcu_assign_pointer(wg->creating_net, NULL);
+ 	wg->incoming_port = 0;
+ 	wg_socket_reinit(wg, NULL, NULL);
+ 	/* The final references are cleared in the below calls to destroy_workqueue. */
+@@ -240,13 +242,11 @@ static void wg_destruct(struct net_device *dev)
+ 	skb_queue_purge(&wg->incoming_handshakes);
+ 	free_percpu(dev->tstats);
+ 	free_percpu(wg->incoming_handshakes_worker);
+-	if (wg->have_creating_net_ref)
+-		put_net(wg->creating_net);
+ 	kvfree(wg->index_hashtable);
+ 	kvfree(wg->peer_hashtable);
+ 	mutex_unlock(&wg->device_update_lock);
+ 
+-	pr_debug("%s: Interface deleted\n", dev->name);
++	pr_debug("%s: Interface destroyed\n", dev->name);
+ 	free_netdev(dev);
+ }
+ 
+@@ -292,7 +292,7 @@ static int wg_newlink(struct net *src_net, struct net_device *dev,
+ 	struct wg_device *wg = netdev_priv(dev);
+ 	int ret = -ENOMEM;
+ 
+-	wg->creating_net = src_net;
++	rcu_assign_pointer(wg->creating_net, src_net);
+ 	init_rwsem(&wg->static_identity.lock);
+ 	mutex_init(&wg->socket_update_lock);
+ 	mutex_init(&wg->device_update_lock);
+@@ -393,30 +393,26 @@ static struct rtnl_link_ops link_ops __read_mostly = {
+ 	.newlink		= wg_newlink,
+ };
+ 
+-static int wg_netdevice_notification(struct notifier_block *nb,
+-				     unsigned long action, void *data)
++static void wg_netns_pre_exit(struct net *net)
+ {
+-	struct net_device *dev = ((struct netdev_notifier_info *)data)->dev;
+-	struct wg_device *wg = netdev_priv(dev);
+-
+-	ASSERT_RTNL();
+-
+-	if (action != NETDEV_REGISTER || dev->netdev_ops != &netdev_ops)
+-		return 0;
++	struct wg_device *wg;
+ 
+-	if (dev_net(dev) == wg->creating_net && wg->have_creating_net_ref) {
+-		put_net(wg->creating_net);
+-		wg->have_creating_net_ref = false;
+-	} else if (dev_net(dev) != wg->creating_net &&
+-		   !wg->have_creating_net_ref) {
+-		wg->have_creating_net_ref = true;
+-		get_net(wg->creating_net);
++	rtnl_lock();
++	list_for_each_entry(wg, &device_list, device_list) {
++		if (rcu_access_pointer(wg->creating_net) == net) {
++			pr_debug("%s: Creating namespace exiting\n", wg->dev->name);
++			netif_carrier_off(wg->dev);
++			mutex_lock(&wg->device_update_lock);
++			rcu_assign_pointer(wg->creating_net, NULL);
++			wg_socket_reinit(wg, NULL, NULL);
++			mutex_unlock(&wg->device_update_lock);
++		}
+ 	}
+-	return 0;
++	rtnl_unlock();
+ }
+ 
+-static struct notifier_block netdevice_notifier = {
+-	.notifier_call = wg_netdevice_notification
++static struct pernet_operations pernet_ops = {
++	.pre_exit = wg_netns_pre_exit
+ };
+ 
+ int __init wg_device_init(void)
+@@ -429,18 +425,18 @@ int __init wg_device_init(void)
+ 		return ret;
+ #endif
+ 
+-	ret = register_netdevice_notifier(&netdevice_notifier);
++	ret = register_pernet_device(&pernet_ops);
+ 	if (ret)
+ 		goto error_pm;
+ 
+ 	ret = rtnl_link_register(&link_ops);
+ 	if (ret)
+-		goto error_netdevice;
++		goto error_pernet;
+ 
+ 	return 0;
+ 
+-error_netdevice:
+-	unregister_netdevice_notifier(&netdevice_notifier);
++error_pernet:
++	unregister_pernet_device(&pernet_ops);
+ error_pm:
+ #ifdef CONFIG_PM_SLEEP
+ 	unregister_pm_notifier(&pm_notifier);
+@@ -451,7 +447,7 @@ int __init wg_device_init(void)
+ void wg_device_uninit(void)
+ {
+ 	rtnl_link_unregister(&link_ops);
+-	unregister_netdevice_notifier(&netdevice_notifier);
++	unregister_pernet_device(&pernet_ops);
+ #ifdef CONFIG_PM_SLEEP
+ 	unregister_pm_notifier(&pm_notifier);
+ #endif
+
+commit a5588604af448664e796daf3c1d5a4523c60667b
+Author: Jason A. Donenfeld <Jason@zx2c4.com>
+Date:   Wed Mar 18 18:30:45 2020 -0600
+
+    wireguard: queueing: account for skb->protocol==0
+    
+    We carry out checks to the effect of:
+    
+      if (skb->protocol != wg_examine_packet_protocol(skb))
+        goto err;
+    
+    By having wg_skb_examine_untrusted_ip_hdr return 0 on failure, this
+    means that the check above still passes in the case where skb->protocol
+    is zero, which is possible to hit with AF_PACKET:
+    
+      struct sockaddr_pkt saddr = { .spkt_device = "wg0" };
+      unsigned char buffer[5] = { 0 };
+      sendto(socket(AF_PACKET, SOCK_PACKET, /* skb->protocol = */ 0),
+             buffer, sizeof(buffer), 0, (const struct sockaddr *)&saddr, sizeof(saddr));
+    
+    Additional checks mean that this isn't actually a problem in the code
+    base, but I could imagine it becoming a problem later if the function is
+    used more liberally.
+    
+    I would prefer to fix this by having wg_examine_packet_protocol return a
+    32-bit ~0 value on failure, which will never match any value of
+    skb->protocol, which would simply change the generated code from a mov
+    to a movzx. However, sparse complains, and adding __force casts doesn't
+    seem like a good idea, so instead we just add a simple helper function
+    to check for the zero return value. Since wg_examine_packet_protocol
+    itself gets inlined, this winds up not adding an additional branch to
+    the generated code, since the 0 return value already happens in a
+    mergable branch.
+    
+    Reported-by: Fabian Freyer <fabianfreyer@radicallyopensecurity.com>
+    Signed-off-by: Jason A. Donenfeld <Jason@zx2c4.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/wireguard/device.c b/drivers/net/wireguard/device.c
+index cdc96968b0f4..3ac3f8570ca1 100644
+--- a/drivers/net/wireguard/device.c
++++ b/drivers/net/wireguard/device.c
+@@ -122,7 +122,7 @@ static netdev_tx_t wg_xmit(struct sk_buff *skb, struct net_device *dev)
+ 	u32 mtu;
+ 	int ret;
+ 
+-	if (unlikely(wg_skb_examine_untrusted_ip_hdr(skb) != skb->protocol)) {
++	if (unlikely(!wg_check_packet_protocol(skb))) {
+ 		ret = -EPROTONOSUPPORT;
+ 		net_dbg_ratelimited("%s: Invalid IP packet\n", dev->name);
+ 		goto err;
+
+commit 175f1ca9a9ed8689d2028da1a7c624bb4fb4ff7e
+Author: Jason A. Donenfeld <Jason@zx2c4.com>
+Date:   Fri Feb 14 23:57:22 2020 +0100
+
+    wireguard: send: account for mtu=0 devices
+    
+    It turns out there's an easy way to get packets queued up while still
+    having an MTU of zero, and that's via persistent keep alive. This commit
+    makes sure that in whatever condition, we don't wind up dividing by
+    zero. Note that an MTU of zero for a wireguard interface is something
+    quasi-valid, so I don't think the correct fix is to limit it via
+    min_mtu. This can be reproduced easily with:
+    
+    ip link add wg0 type wireguard
+    ip link add wg1 type wireguard
+    ip link set wg0 up mtu 0
+    ip link set wg1 up
+    wg set wg0 private-key <(wg genkey)
+    wg set wg1 listen-port 1 private-key <(wg genkey) peer $(wg show wg0 public-key)
+    wg set wg0 peer $(wg show wg1 public-key) persistent-keepalive 1 endpoint 127.0.0.1:1
+    
+    However, while min_mtu=0 seems fine, it makes sense to restrict the
+    max_mtu. This commit also restricts the maximum MTU to the greatest
+    number for which rounding up to the padding multiple won't overflow a
+    signed integer. Packets this large were always rejected anyway
+    eventually, due to checks deeper in, but it seems more sound not to even
+    let the administrator configure something that won't work anyway.
+    
+    We use this opportunity to clean up this function a bit so that it's
+    clear which paths we're expecting.
+    
+    Signed-off-by: Jason A. Donenfeld <Jason@zx2c4.com>
+    Cc: Eric Dumazet <eric.dumazet@gmail.com>
+    Reviewed-by: Eric Dumazet <edumazet@google.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/wireguard/device.c b/drivers/net/wireguard/device.c
+index 43db442b1373..cdc96968b0f4 100644
+--- a/drivers/net/wireguard/device.c
++++ b/drivers/net/wireguard/device.c
+@@ -258,6 +258,8 @@ static void wg_setup(struct net_device *dev)
+ 	enum { WG_NETDEV_FEATURES = NETIF_F_HW_CSUM | NETIF_F_RXCSUM |
+ 				    NETIF_F_SG | NETIF_F_GSO |
+ 				    NETIF_F_GSO_SOFTWARE | NETIF_F_HIGHDMA };
++	const int overhead = MESSAGE_MINIMUM_LENGTH + sizeof(struct udphdr) +
++			     max(sizeof(struct ipv6hdr), sizeof(struct iphdr));
+ 
+ 	dev->netdev_ops = &netdev_ops;
+ 	dev->hard_header_len = 0;
+@@ -271,9 +273,8 @@ static void wg_setup(struct net_device *dev)
+ 	dev->features |= WG_NETDEV_FEATURES;
+ 	dev->hw_features |= WG_NETDEV_FEATURES;
+ 	dev->hw_enc_features |= WG_NETDEV_FEATURES;
+-	dev->mtu = ETH_DATA_LEN - MESSAGE_MINIMUM_LENGTH -
+-		   sizeof(struct udphdr) -
+-		   max(sizeof(struct ipv6hdr), sizeof(struct iphdr));
++	dev->mtu = ETH_DATA_LEN - overhead;
++	dev->max_mtu = round_down(INT_MAX, MESSAGE_PADDING_MULTIPLE) - overhead;
+ 
+ 	SET_NETDEV_DEVTYPE(dev, &device_type);
+ 
+
+commit a12d7f3cbdc72c7625881c8dc2660fc2c979fdf2
+Author: Jason A. Donenfeld <Jason@zx2c4.com>
+Date:   Tue Feb 11 20:47:08 2020 +0100
+
+    wireguard: device: use icmp_ndo_send helper
+    
+    Because wireguard is calling icmp from network device context, it should
+    use the ndo helper so that the rate limiting applies correctly.  This
+    commit adds a small test to the wireguard test suite to ensure that the
+    new functions continue doing the right thing in the context of
+    wireguard. It does this by setting up a condition that will definately
+    evoke an icmp error message from the driver, but along a nat'd path.
+    
+    Signed-off-by: Jason A. Donenfeld <Jason@zx2c4.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/wireguard/device.c b/drivers/net/wireguard/device.c
+index 16b19824b9ad..43db442b1373 100644
+--- a/drivers/net/wireguard/device.c
++++ b/drivers/net/wireguard/device.c
+@@ -203,9 +203,9 @@ static netdev_tx_t wg_xmit(struct sk_buff *skb, struct net_device *dev)
+ err:
+ 	++dev->stats.tx_errors;
+ 	if (skb->protocol == htons(ETH_P_IP))
+-		icmp_send(skb, ICMP_DEST_UNREACH, ICMP_HOST_UNREACH, 0);
++		icmp_ndo_send(skb, ICMP_DEST_UNREACH, ICMP_HOST_UNREACH, 0);
+ 	else if (skb->protocol == htons(ETH_P_IPV6))
+-		icmpv6_send(skb, ICMPV6_DEST_UNREACH, ICMPV6_ADDR_UNREACH, 0);
++		icmpv6_ndo_send(skb, ICMPV6_DEST_UNREACH, ICMPV6_ADDR_UNREACH, 0);
+ 	kfree_skb(skb);
+ 	return ret;
+ }
+
+commit e7096c131e5161fa3b8e52a650d7719d2857adfd
+Author: Jason A. Donenfeld <Jason@zx2c4.com>
+Date:   Mon Dec 9 00:27:34 2019 +0100
+
+    net: WireGuard secure network tunnel
+    
+    WireGuard is a layer 3 secure networking tunnel made specifically for
+    the kernel, that aims to be much simpler and easier to audit than IPsec.
+    Extensive documentation and description of the protocol and
+    considerations, along with formal proofs of the cryptography, are
+    available at:
+    
+      * https://www.wireguard.com/
+      * https://www.wireguard.com/papers/wireguard.pdf
+    
+    This commit implements WireGuard as a simple network device driver,
+    accessible in the usual RTNL way used by virtual network drivers. It
+    makes use of the udp_tunnel APIs, GRO, GSO, NAPI, and the usual set of
+    networking subsystem APIs. It has a somewhat novel multicore queueing
+    system designed for maximum throughput and minimal latency of encryption
+    operations, but it is implemented modestly using workqueues and NAPI.
+    Configuration is done via generic Netlink, and following a review from
+    the Netlink maintainer a year ago, several high profile userspace tools
+    have already implemented the API.
+    
+    This commit also comes with several different tests, both in-kernel
+    tests and out-of-kernel tests based on network namespaces, taking profit
+    of the fact that sockets used by WireGuard intentionally stay in the
+    namespace the WireGuard interface was originally created, exactly like
+    the semantics of userspace tun devices. See wireguard.com/netns/ for
+    pictures and examples.
+    
+    The source code is fairly short, but rather than combining everything
+    into a single file, WireGuard is developed as cleanly separable files,
+    making auditing and comprehension easier. Things are laid out as
+    follows:
+    
+      * noise.[ch], cookie.[ch], messages.h: These implement the bulk of the
+        cryptographic aspects of the protocol, and are mostly data-only in
+        nature, taking in buffers of bytes and spitting out buffers of
+        bytes. They also handle reference counting for their various shared
+        pieces of data, like keys and key lists.
+    
+      * ratelimiter.[ch]: Used as an integral part of cookie.[ch] for
+        ratelimiting certain types of cryptographic operations in accordance
+        with particular WireGuard semantics.
+    
+      * allowedips.[ch], peerlookup.[ch]: The main lookup structures of
+        WireGuard, the former being trie-like with particular semantics, an
+        integral part of the design of the protocol, and the latter just
+        being nice helper functions around the various hashtables we use.
+    
+      * device.[ch]: Implementation of functions for the netdevice and for
+        rtnl, responsible for maintaining the life of a given interface and
+        wiring it up to the rest of WireGuard.
+    
+      * peer.[ch]: Each interface has a list of peers, with helper functions
+        available here for creation, destruction, and reference counting.
+    
+      * socket.[ch]: Implementation of functions related to udp_socket and
+        the general set of kernel socket APIs, for sending and receiving
+        ciphertext UDP packets, and taking care of WireGuard-specific sticky
+        socket routing semantics for the automatic roaming.
+    
+      * netlink.[ch]: Userspace API entry point for configuring WireGuard
+        peers and devices. The API has been implemented by several userspace
+        tools and network management utility, and the WireGuard project
+        distributes the basic wg(8) tool.
+    
+      * queueing.[ch]: Shared function on the rx and tx path for handling
+        the various queues used in the multicore algorithms.
+    
+      * send.c: Handles encrypting outgoing packets in parallel on
+        multiple cores, before sending them in order on a single core, via
+        workqueues and ring buffers. Also handles sending handshake and cookie
+        messages as part of the protocol, in parallel.
+    
+      * receive.c: Handles decrypting incoming packets in parallel on
+        multiple cores, before passing them off in order to be ingested via
+        the rest of the networking subsystem with GRO via the typical NAPI
+        poll function. Also handles receiving handshake and cookie messages
+        as part of the protocol, in parallel.
+    
+      * timers.[ch]: Uses the timer wheel to implement protocol particular
+        event timeouts, and gives a set of very simple event-driven entry
+        point functions for callers.
+    
+      * main.c, version.h: Initialization and deinitialization of the module.
+    
+      * selftest/*.h: Runtime unit tests for some of the most security
+        sensitive functions.
+    
+      * tools/testing/selftests/wireguard/netns.sh: Aforementioned testing
+        script using network namespaces.
+    
+    This commit aims to be as self-contained as possible, implementing
+    WireGuard as a standalone module not needing much special handling or
+    coordination from the network subsystem. I expect for future
+    optimizations to the network stack to positively improve WireGuard, and
+    vice-versa, but for the time being, this exists as intentionally
+    standalone.
+    
+    We introduce a menu option for CONFIG_WIREGUARD, as well as providing a
+    verbose debug log and self-tests via CONFIG_WIREGUARD_DEBUG.
+    
+    Signed-off-by: Jason A. Donenfeld <Jason@zx2c4.com>
+    Cc: David Miller <davem@davemloft.net>
+    Cc: Greg KH <gregkh@linuxfoundation.org>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Herbert Xu <herbert@gondor.apana.org.au>
+    Cc: linux-crypto@vger.kernel.org
+    Cc: linux-kernel@vger.kernel.org
+    Cc: netdev@vger.kernel.org
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/wireguard/device.c b/drivers/net/wireguard/device.c
+new file mode 100644
+index 000000000000..16b19824b9ad
+--- /dev/null
++++ b/drivers/net/wireguard/device.c
+@@ -0,0 +1,458 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright (C) 2015-2019 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.
++ */
++
++#include "queueing.h"
++#include "socket.h"
++#include "timers.h"
++#include "device.h"
++#include "ratelimiter.h"
++#include "peer.h"
++#include "messages.h"
++
++#include <linux/module.h>
++#include <linux/rtnetlink.h>
++#include <linux/inet.h>
++#include <linux/netdevice.h>
++#include <linux/inetdevice.h>
++#include <linux/if_arp.h>
++#include <linux/icmp.h>
++#include <linux/suspend.h>
++#include <net/icmp.h>
++#include <net/rtnetlink.h>
++#include <net/ip_tunnels.h>
++#include <net/addrconf.h>
++
++static LIST_HEAD(device_list);
++
++static int wg_open(struct net_device *dev)
++{
++	struct in_device *dev_v4 = __in_dev_get_rtnl(dev);
++	struct inet6_dev *dev_v6 = __in6_dev_get(dev);
++	struct wg_device *wg = netdev_priv(dev);
++	struct wg_peer *peer;
++	int ret;
++
++	if (dev_v4) {
++		/* At some point we might put this check near the ip_rt_send_
++		 * redirect call of ip_forward in net/ipv4/ip_forward.c, similar
++		 * to the current secpath check.
++		 */
++		IN_DEV_CONF_SET(dev_v4, SEND_REDIRECTS, false);
++		IPV4_DEVCONF_ALL(dev_net(dev), SEND_REDIRECTS) = false;
++	}
++	if (dev_v6)
++		dev_v6->cnf.addr_gen_mode = IN6_ADDR_GEN_MODE_NONE;
++
++	ret = wg_socket_init(wg, wg->incoming_port);
++	if (ret < 0)
++		return ret;
++	mutex_lock(&wg->device_update_lock);
++	list_for_each_entry(peer, &wg->peer_list, peer_list) {
++		wg_packet_send_staged_packets(peer);
++		if (peer->persistent_keepalive_interval)
++			wg_packet_send_keepalive(peer);
++	}
++	mutex_unlock(&wg->device_update_lock);
++	return 0;
++}
++
++#ifdef CONFIG_PM_SLEEP
++static int wg_pm_notification(struct notifier_block *nb, unsigned long action,
++			      void *data)
++{
++	struct wg_device *wg;
++	struct wg_peer *peer;
++
++	/* If the machine is constantly suspending and resuming, as part of
++	 * its normal operation rather than as a somewhat rare event, then we
++	 * don't actually want to clear keys.
++	 */
++	if (IS_ENABLED(CONFIG_PM_AUTOSLEEP) || IS_ENABLED(CONFIG_ANDROID))
++		return 0;
++
++	if (action != PM_HIBERNATION_PREPARE && action != PM_SUSPEND_PREPARE)
++		return 0;
++
++	rtnl_lock();
++	list_for_each_entry(wg, &device_list, device_list) {
++		mutex_lock(&wg->device_update_lock);
++		list_for_each_entry(peer, &wg->peer_list, peer_list) {
++			del_timer(&peer->timer_zero_key_material);
++			wg_noise_handshake_clear(&peer->handshake);
++			wg_noise_keypairs_clear(&peer->keypairs);
++		}
++		mutex_unlock(&wg->device_update_lock);
++	}
++	rtnl_unlock();
++	rcu_barrier();
++	return 0;
++}
++
++static struct notifier_block pm_notifier = { .notifier_call = wg_pm_notification };
++#endif
++
++static int wg_stop(struct net_device *dev)
++{
++	struct wg_device *wg = netdev_priv(dev);
++	struct wg_peer *peer;
++
++	mutex_lock(&wg->device_update_lock);
++	list_for_each_entry(peer, &wg->peer_list, peer_list) {
++		wg_packet_purge_staged_packets(peer);
++		wg_timers_stop(peer);
++		wg_noise_handshake_clear(&peer->handshake);
++		wg_noise_keypairs_clear(&peer->keypairs);
++		wg_noise_reset_last_sent_handshake(&peer->last_sent_handshake);
++	}
++	mutex_unlock(&wg->device_update_lock);
++	skb_queue_purge(&wg->incoming_handshakes);
++	wg_socket_reinit(wg, NULL, NULL);
++	return 0;
++}
++
++static netdev_tx_t wg_xmit(struct sk_buff *skb, struct net_device *dev)
++{
++	struct wg_device *wg = netdev_priv(dev);
++	struct sk_buff_head packets;
++	struct wg_peer *peer;
++	struct sk_buff *next;
++	sa_family_t family;
++	u32 mtu;
++	int ret;
++
++	if (unlikely(wg_skb_examine_untrusted_ip_hdr(skb) != skb->protocol)) {
++		ret = -EPROTONOSUPPORT;
++		net_dbg_ratelimited("%s: Invalid IP packet\n", dev->name);
++		goto err;
++	}
++
++	peer = wg_allowedips_lookup_dst(&wg->peer_allowedips, skb);
++	if (unlikely(!peer)) {
++		ret = -ENOKEY;
++		if (skb->protocol == htons(ETH_P_IP))
++			net_dbg_ratelimited("%s: No peer has allowed IPs matching %pI4\n",
++					    dev->name, &ip_hdr(skb)->daddr);
++		else if (skb->protocol == htons(ETH_P_IPV6))
++			net_dbg_ratelimited("%s: No peer has allowed IPs matching %pI6\n",
++					    dev->name, &ipv6_hdr(skb)->daddr);
++		goto err;
++	}
++
++	family = READ_ONCE(peer->endpoint.addr.sa_family);
++	if (unlikely(family != AF_INET && family != AF_INET6)) {
++		ret = -EDESTADDRREQ;
++		net_dbg_ratelimited("%s: No valid endpoint has been configured or discovered for peer %llu\n",
++				    dev->name, peer->internal_id);
++		goto err_peer;
++	}
++
++	mtu = skb_dst(skb) ? dst_mtu(skb_dst(skb)) : dev->mtu;
++
++	__skb_queue_head_init(&packets);
++	if (!skb_is_gso(skb)) {
++		skb_mark_not_on_list(skb);
++	} else {
++		struct sk_buff *segs = skb_gso_segment(skb, 0);
++
++		if (unlikely(IS_ERR(segs))) {
++			ret = PTR_ERR(segs);
++			goto err_peer;
++		}
++		dev_kfree_skb(skb);
++		skb = segs;
++	}
++
++	skb_list_walk_safe(skb, skb, next) {
++		skb_mark_not_on_list(skb);
++
++		skb = skb_share_check(skb, GFP_ATOMIC);
++		if (unlikely(!skb))
++			continue;
++
++		/* We only need to keep the original dst around for icmp,
++		 * so at this point we're in a position to drop it.
++		 */
++		skb_dst_drop(skb);
++
++		PACKET_CB(skb)->mtu = mtu;
++
++		__skb_queue_tail(&packets, skb);
++	}
++
++	spin_lock_bh(&peer->staged_packet_queue.lock);
++	/* If the queue is getting too big, we start removing the oldest packets
++	 * until it's small again. We do this before adding the new packet, so
++	 * we don't remove GSO segments that are in excess.
++	 */
++	while (skb_queue_len(&peer->staged_packet_queue) > MAX_STAGED_PACKETS) {
++		dev_kfree_skb(__skb_dequeue(&peer->staged_packet_queue));
++		++dev->stats.tx_dropped;
++	}
++	skb_queue_splice_tail(&packets, &peer->staged_packet_queue);
++	spin_unlock_bh(&peer->staged_packet_queue.lock);
++
++	wg_packet_send_staged_packets(peer);
++
++	wg_peer_put(peer);
++	return NETDEV_TX_OK;
++
++err_peer:
++	wg_peer_put(peer);
++err:
++	++dev->stats.tx_errors;
++	if (skb->protocol == htons(ETH_P_IP))
++		icmp_send(skb, ICMP_DEST_UNREACH, ICMP_HOST_UNREACH, 0);
++	else if (skb->protocol == htons(ETH_P_IPV6))
++		icmpv6_send(skb, ICMPV6_DEST_UNREACH, ICMPV6_ADDR_UNREACH, 0);
++	kfree_skb(skb);
++	return ret;
++}
++
++static const struct net_device_ops netdev_ops = {
++	.ndo_open		= wg_open,
++	.ndo_stop		= wg_stop,
++	.ndo_start_xmit		= wg_xmit,
++	.ndo_get_stats64	= ip_tunnel_get_stats64
++};
++
++static void wg_destruct(struct net_device *dev)
++{
++	struct wg_device *wg = netdev_priv(dev);
++
++	rtnl_lock();
++	list_del(&wg->device_list);
++	rtnl_unlock();
++	mutex_lock(&wg->device_update_lock);
++	wg->incoming_port = 0;
++	wg_socket_reinit(wg, NULL, NULL);
++	/* The final references are cleared in the below calls to destroy_workqueue. */
++	wg_peer_remove_all(wg);
++	destroy_workqueue(wg->handshake_receive_wq);
++	destroy_workqueue(wg->handshake_send_wq);
++	destroy_workqueue(wg->packet_crypt_wq);
++	wg_packet_queue_free(&wg->decrypt_queue, true);
++	wg_packet_queue_free(&wg->encrypt_queue, true);
++	rcu_barrier(); /* Wait for all the peers to be actually freed. */
++	wg_ratelimiter_uninit();
++	memzero_explicit(&wg->static_identity, sizeof(wg->static_identity));
++	skb_queue_purge(&wg->incoming_handshakes);
++	free_percpu(dev->tstats);
++	free_percpu(wg->incoming_handshakes_worker);
++	if (wg->have_creating_net_ref)
++		put_net(wg->creating_net);
++	kvfree(wg->index_hashtable);
++	kvfree(wg->peer_hashtable);
++	mutex_unlock(&wg->device_update_lock);
++
++	pr_debug("%s: Interface deleted\n", dev->name);
++	free_netdev(dev);
++}
++
++static const struct device_type device_type = { .name = KBUILD_MODNAME };
++
++static void wg_setup(struct net_device *dev)
++{
++	struct wg_device *wg = netdev_priv(dev);
++	enum { WG_NETDEV_FEATURES = NETIF_F_HW_CSUM | NETIF_F_RXCSUM |
++				    NETIF_F_SG | NETIF_F_GSO |
++				    NETIF_F_GSO_SOFTWARE | NETIF_F_HIGHDMA };
++
++	dev->netdev_ops = &netdev_ops;
++	dev->hard_header_len = 0;
++	dev->addr_len = 0;
++	dev->needed_headroom = DATA_PACKET_HEAD_ROOM;
++	dev->needed_tailroom = noise_encrypted_len(MESSAGE_PADDING_MULTIPLE);
++	dev->type = ARPHRD_NONE;
++	dev->flags = IFF_POINTOPOINT | IFF_NOARP;
++	dev->priv_flags |= IFF_NO_QUEUE;
++	dev->features |= NETIF_F_LLTX;
++	dev->features |= WG_NETDEV_FEATURES;
++	dev->hw_features |= WG_NETDEV_FEATURES;
++	dev->hw_enc_features |= WG_NETDEV_FEATURES;
++	dev->mtu = ETH_DATA_LEN - MESSAGE_MINIMUM_LENGTH -
++		   sizeof(struct udphdr) -
++		   max(sizeof(struct ipv6hdr), sizeof(struct iphdr));
++
++	SET_NETDEV_DEVTYPE(dev, &device_type);
++
++	/* We need to keep the dst around in case of icmp replies. */
++	netif_keep_dst(dev);
++
++	memset(wg, 0, sizeof(*wg));
++	wg->dev = dev;
++}
++
++static int wg_newlink(struct net *src_net, struct net_device *dev,
++		      struct nlattr *tb[], struct nlattr *data[],
++		      struct netlink_ext_ack *extack)
++{
++	struct wg_device *wg = netdev_priv(dev);
++	int ret = -ENOMEM;
++
++	wg->creating_net = src_net;
++	init_rwsem(&wg->static_identity.lock);
++	mutex_init(&wg->socket_update_lock);
++	mutex_init(&wg->device_update_lock);
++	skb_queue_head_init(&wg->incoming_handshakes);
++	wg_allowedips_init(&wg->peer_allowedips);
++	wg_cookie_checker_init(&wg->cookie_checker, wg);
++	INIT_LIST_HEAD(&wg->peer_list);
++	wg->device_update_gen = 1;
++
++	wg->peer_hashtable = wg_pubkey_hashtable_alloc();
++	if (!wg->peer_hashtable)
++		return ret;
++
++	wg->index_hashtable = wg_index_hashtable_alloc();
++	if (!wg->index_hashtable)
++		goto err_free_peer_hashtable;
++
++	dev->tstats = netdev_alloc_pcpu_stats(struct pcpu_sw_netstats);
++	if (!dev->tstats)
++		goto err_free_index_hashtable;
++
++	wg->incoming_handshakes_worker =
++		wg_packet_percpu_multicore_worker_alloc(
++				wg_packet_handshake_receive_worker, wg);
++	if (!wg->incoming_handshakes_worker)
++		goto err_free_tstats;
++
++	wg->handshake_receive_wq = alloc_workqueue("wg-kex-%s",
++			WQ_CPU_INTENSIVE | WQ_FREEZABLE, 0, dev->name);
++	if (!wg->handshake_receive_wq)
++		goto err_free_incoming_handshakes;
++
++	wg->handshake_send_wq = alloc_workqueue("wg-kex-%s",
++			WQ_UNBOUND | WQ_FREEZABLE, 0, dev->name);
++	if (!wg->handshake_send_wq)
++		goto err_destroy_handshake_receive;
++
++	wg->packet_crypt_wq = alloc_workqueue("wg-crypt-%s",
++			WQ_CPU_INTENSIVE | WQ_MEM_RECLAIM, 0, dev->name);
++	if (!wg->packet_crypt_wq)
++		goto err_destroy_handshake_send;
++
++	ret = wg_packet_queue_init(&wg->encrypt_queue, wg_packet_encrypt_worker,
++				   true, MAX_QUEUED_PACKETS);
++	if (ret < 0)
++		goto err_destroy_packet_crypt;
++
++	ret = wg_packet_queue_init(&wg->decrypt_queue, wg_packet_decrypt_worker,
++				   true, MAX_QUEUED_PACKETS);
++	if (ret < 0)
++		goto err_free_encrypt_queue;
++
++	ret = wg_ratelimiter_init();
++	if (ret < 0)
++		goto err_free_decrypt_queue;
++
++	ret = register_netdevice(dev);
++	if (ret < 0)
++		goto err_uninit_ratelimiter;
++
++	list_add(&wg->device_list, &device_list);
++
++	/* We wait until the end to assign priv_destructor, so that
++	 * register_netdevice doesn't call it for us if it fails.
++	 */
++	dev->priv_destructor = wg_destruct;
++
++	pr_debug("%s: Interface created\n", dev->name);
++	return ret;
++
++err_uninit_ratelimiter:
++	wg_ratelimiter_uninit();
++err_free_decrypt_queue:
++	wg_packet_queue_free(&wg->decrypt_queue, true);
++err_free_encrypt_queue:
++	wg_packet_queue_free(&wg->encrypt_queue, true);
++err_destroy_packet_crypt:
++	destroy_workqueue(wg->packet_crypt_wq);
++err_destroy_handshake_send:
++	destroy_workqueue(wg->handshake_send_wq);
++err_destroy_handshake_receive:
++	destroy_workqueue(wg->handshake_receive_wq);
++err_free_incoming_handshakes:
++	free_percpu(wg->incoming_handshakes_worker);
++err_free_tstats:
++	free_percpu(dev->tstats);
++err_free_index_hashtable:
++	kvfree(wg->index_hashtable);
++err_free_peer_hashtable:
++	kvfree(wg->peer_hashtable);
++	return ret;
++}
++
++static struct rtnl_link_ops link_ops __read_mostly = {
++	.kind			= KBUILD_MODNAME,
++	.priv_size		= sizeof(struct wg_device),
++	.setup			= wg_setup,
++	.newlink		= wg_newlink,
++};
++
++static int wg_netdevice_notification(struct notifier_block *nb,
++				     unsigned long action, void *data)
++{
++	struct net_device *dev = ((struct netdev_notifier_info *)data)->dev;
++	struct wg_device *wg = netdev_priv(dev);
++
++	ASSERT_RTNL();
++
++	if (action != NETDEV_REGISTER || dev->netdev_ops != &netdev_ops)
++		return 0;
++
++	if (dev_net(dev) == wg->creating_net && wg->have_creating_net_ref) {
++		put_net(wg->creating_net);
++		wg->have_creating_net_ref = false;
++	} else if (dev_net(dev) != wg->creating_net &&
++		   !wg->have_creating_net_ref) {
++		wg->have_creating_net_ref = true;
++		get_net(wg->creating_net);
++	}
++	return 0;
++}
++
++static struct notifier_block netdevice_notifier = {
++	.notifier_call = wg_netdevice_notification
++};
++
++int __init wg_device_init(void)
++{
++	int ret;
++
++#ifdef CONFIG_PM_SLEEP
++	ret = register_pm_notifier(&pm_notifier);
++	if (ret)
++		return ret;
++#endif
++
++	ret = register_netdevice_notifier(&netdevice_notifier);
++	if (ret)
++		goto error_pm;
++
++	ret = rtnl_link_register(&link_ops);
++	if (ret)
++		goto error_netdevice;
++
++	return 0;
++
++error_netdevice:
++	unregister_netdevice_notifier(&netdevice_notifier);
++error_pm:
++#ifdef CONFIG_PM_SLEEP
++	unregister_pm_notifier(&pm_notifier);
++#endif
++	return ret;
++}
++
++void wg_device_uninit(void)
++{
++	rtnl_link_unregister(&link_ops);
++	unregister_netdevice_notifier(&netdevice_notifier);
++#ifdef CONFIG_PM_SLEEP
++	unregister_pm_notifier(&pm_notifier);
++#endif
++	rcu_barrier();
++}

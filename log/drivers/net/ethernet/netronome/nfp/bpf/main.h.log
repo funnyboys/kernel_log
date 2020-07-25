@@ -1,0 +1,4636 @@
+commit f24e29099f4faf1969151fb4b857fda16b7c1a72
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Tue Aug 27 22:36:29 2019 -0700
+
+    nfp: bpf: add simple map op cache
+    
+    Each get_next and lookup call requires a round trip to the device.
+    However, the device is capable of giving us a few entries back,
+    instead of just one.
+    
+    In this patch we ask for a small yet reasonable number of entries
+    (4) on every get_next call, and on subsequent get_next/lookup calls
+    check this little cache for a hit. The cache is only kept for 250us,
+    and is invalidated on every operation which may modify the map
+    (e.g. delete or update call). Note that operations may be performed
+    simultaneously, so we have to keep track of operations in flight.
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Reviewed-by: Quentin Monnet <quentin.monnet@netronome.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index f4802036eb42..fac9c6f9e197 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -99,6 +99,7 @@ enum pkt_vec {
+  * @maps_neutral:	hash table of offload-neutral maps (on pointer)
+  *
+  * @abi_version:	global BPF ABI version
++ * @cmsg_cache_cnt:	number of entries to read for caching
+  *
+  * @adjust_head:	adjust head capability
+  * @adjust_head.flags:		extra flags for adjust head
+@@ -124,6 +125,7 @@ enum pkt_vec {
+  * @pseudo_random:	FW initialized the pseudo-random machinery (CSRs)
+  * @queue_select:	BPF can set the RX queue ID in packet vector
+  * @adjust_tail:	BPF can simply trunc packet size for adjust tail
++ * @cmsg_multi_ent:	FW can pack multiple map entries in a single cmsg
+  */
+ struct nfp_app_bpf {
+ 	struct nfp_app *app;
+@@ -134,6 +136,8 @@ struct nfp_app_bpf {
+ 	unsigned int cmsg_key_sz;
+ 	unsigned int cmsg_val_sz;
+ 
++	unsigned int cmsg_cache_cnt;
++
+ 	struct list_head map_list;
+ 	unsigned int maps_in_use;
+ 	unsigned int map_elems_in_use;
+@@ -169,6 +173,7 @@ struct nfp_app_bpf {
+ 	bool pseudo_random;
+ 	bool queue_select;
+ 	bool adjust_tail;
++	bool cmsg_multi_ent;
+ };
+ 
+ enum nfp_bpf_map_use {
+@@ -183,11 +188,21 @@ struct nfp_bpf_map_word {
+ 	unsigned char non_zero_update	:1;
+ };
+ 
++#define NFP_BPF_MAP_CACHE_CNT		4U
++#define NFP_BPF_MAP_CACHE_TIME_NS	(250 * 1000)
++
+ /**
+  * struct nfp_bpf_map - private per-map data attached to BPF maps for offload
+  * @offmap:	pointer to the offloaded BPF map
+  * @bpf:	back pointer to bpf app private structure
+  * @tid:	table id identifying map on datapath
++ *
++ * @cache_lock:	protects @cache_blockers, @cache_to, @cache
++ * @cache_blockers:	number of ops in flight which block caching
++ * @cache_gen:	counter incremented by every blocker on exit
++ * @cache_to:	time when cache will no longer be valid (ns)
++ * @cache:	skb with cached response
++ *
+  * @l:		link on the nfp_app_bpf->map_list list
+  * @use_map:	map of how the value is used (in 4B chunks)
+  */
+@@ -195,6 +210,13 @@ struct nfp_bpf_map {
+ 	struct bpf_offloaded_map *offmap;
+ 	struct nfp_app_bpf *bpf;
+ 	u32 tid;
++
++	spinlock_t cache_lock;
++	u32 cache_blockers;
++	u32 cache_gen;
++	u64 cache_to;
++	struct sk_buff *cache;
++
+ 	struct list_head l;
+ 	struct nfp_bpf_map_word use_map[];
+ };
+@@ -566,6 +588,7 @@ void *nfp_bpf_relo_for_vnic(struct nfp_prog *nfp_prog, struct nfp_bpf_vnic *bv);
+ 
+ unsigned int nfp_bpf_ctrl_cmsg_min_mtu(struct nfp_app_bpf *bpf);
+ unsigned int nfp_bpf_ctrl_cmsg_mtu(struct nfp_app_bpf *bpf);
++unsigned int nfp_bpf_ctrl_cmsg_cache_cnt(struct nfp_app_bpf *bpf);
+ long long int
+ nfp_bpf_ctrl_alloc_map(struct nfp_app_bpf *bpf, struct bpf_map *map);
+ void
+
+commit bc2796db5a0246acc998cc5ab2e7f8d6e4e4c146
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Tue Aug 27 22:36:28 2019 -0700
+
+    nfp: bpf: rework MTU checking
+    
+    If control channel MTU is too low to support map operations a warning
+    will be printed. This is not enough, we want to make sure probe fails
+    in such scenario, as this would clearly be a faulty configuration.
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Reviewed-by: Quentin Monnet <quentin.monnet@netronome.com>
+    Acked-by: Song Liu <songliubraving@fb.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 57d6ff51e980..f4802036eb42 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -564,6 +564,7 @@ nfp_bpf_goto_meta(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta,
+ 
+ void *nfp_bpf_relo_for_vnic(struct nfp_prog *nfp_prog, struct nfp_bpf_vnic *bv);
+ 
++unsigned int nfp_bpf_ctrl_cmsg_min_mtu(struct nfp_app_bpf *bpf);
+ unsigned int nfp_bpf_ctrl_cmsg_mtu(struct nfp_app_bpf *bpf);
+ long long int
+ nfp_bpf_ctrl_alloc_map(struct nfp_app_bpf *bpf, struct bpf_map *map);
+
+commit 0b4de1ff19bf878eb38f4f668ee15c9b9eed4240
+Author: Jiong Wang <jiong.wang@netronome.com>
+Date:   Fri May 24 23:25:28 2019 +0100
+
+    nfp: bpf: eliminate zero extension code-gen
+    
+    This patch eliminate zero extension code-gen for instructions including
+    both alu and load/store. The only exception is for ctx load, because
+    offload target doesn't go through host ctx convert logic so we do
+    customized load and ignores zext flag set by verifier.
+    
+    Cc: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Signed-off-by: Jiong Wang <jiong.wang@netronome.com>
+    Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index e54d1ac84df2..57d6ff51e980 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -238,6 +238,8 @@ struct nfp_bpf_reg_state {
+ #define FLAG_INSN_SKIP_PREC_DEPENDENT		BIT(4)
+ /* Instruction is optimized by the verifier */
+ #define FLAG_INSN_SKIP_VERIFIER_OPT		BIT(5)
++/* Instruction needs to zero extend to high 32-bit */
++#define FLAG_INSN_DO_ZEXT			BIT(6)
+ 
+ #define FLAG_INSN_SKIP_MASK		(FLAG_INSN_SKIP_NOOP | \
+ 					 FLAG_INSN_SKIP_PREC_DEPENDENT | \
+
+commit bcf0cafab44fd56b92fe284d010d59fd5d7f17eb
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Thu Apr 11 20:27:07 2019 -0700
+
+    nfp: split out common control message handling code
+    
+    BPF's control message handler seems like a good base to built
+    on for request-reply control messages.  Split it out to allow
+    for reuse.
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Reviewed-by: Dirk van der Merwe <dirk.vandermerwe@netronome.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index b25a48218bcf..e54d1ac84df2 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -14,6 +14,7 @@
+ #include <linux/types.h>
+ #include <linux/wait.h>
+ 
++#include "../ccm.h"
+ #include "../nfp_asm.h"
+ #include "fw.h"
+ 
+@@ -84,16 +85,10 @@ enum pkt_vec {
+ /**
+  * struct nfp_app_bpf - bpf app priv structure
+  * @app:		backpointer to the app
++ * @ccm:		common control message handler data
+  *
+  * @bpf_dev:		BPF offload device handle
+  *
+- * @tag_allocator:	bitmap of control message tags in use
+- * @tag_alloc_next:	next tag bit to allocate
+- * @tag_alloc_last:	next tag bit to be freed
+- *
+- * @cmsg_replies:	received cmsg replies waiting to be consumed
+- * @cmsg_wq:		work queue for waiting for cmsg replies
+- *
+  * @cmsg_key_sz:	size of key in cmsg element array
+  * @cmsg_val_sz:	size of value in cmsg element array
+  *
+@@ -132,16 +127,10 @@ enum pkt_vec {
+  */
+ struct nfp_app_bpf {
+ 	struct nfp_app *app;
++	struct nfp_ccm ccm;
+ 
+ 	struct bpf_offload_dev *bpf_dev;
+ 
+-	DECLARE_BITMAP(tag_allocator, U16_MAX + 1);
+-	u16 tag_alloc_next;
+-	u16 tag_alloc_last;
+-
+-	struct sk_buff_head cmsg_replies;
+-	struct wait_queue_head cmsg_wq;
+-
+ 	unsigned int cmsg_key_sz;
+ 	unsigned int cmsg_val_sz;
+ 
+
+commit 461448398ac104b014530680dbac09e577cd2695
+Author: Jiong Wang <jiong.wang@netronome.com>
+Date:   Sat Jan 26 12:26:12 2019 -0500
+
+    nfp: bpf: implement jitting of JMP32
+    
+    This patch implements code-gen for new JMP32 instructions on NFP.
+    
+    Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Signed-off-by: Jiong Wang <jiong.wang@netronome.com>
+    Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 5813c3e13ebe..b25a48218bcf 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -365,6 +365,21 @@ static inline bool is_mbpf_load(const struct nfp_insn_meta *meta)
+ 	return (meta->insn.code & ~BPF_SIZE_MASK) == (BPF_LDX | BPF_MEM);
+ }
+ 
++static inline bool is_mbpf_jmp32(const struct nfp_insn_meta *meta)
++{
++	return mbpf_class(meta) == BPF_JMP32;
++}
++
++static inline bool is_mbpf_jmp64(const struct nfp_insn_meta *meta)
++{
++	return mbpf_class(meta) == BPF_JMP;
++}
++
++static inline bool is_mbpf_jmp(const struct nfp_insn_meta *meta)
++{
++	return is_mbpf_jmp32(meta) || is_mbpf_jmp64(meta);
++}
++
+ static inline bool is_mbpf_store(const struct nfp_insn_meta *meta)
+ {
+ 	return (meta->insn.code & ~BPF_SIZE_MASK) == (BPF_STX | BPF_MEM);
+@@ -419,10 +434,13 @@ static inline bool is_mbpf_cond_jump(const struct nfp_insn_meta *meta)
+ {
+ 	u8 op;
+ 
+-	if (BPF_CLASS(meta->insn.code) != BPF_JMP)
++	if (is_mbpf_jmp32(meta))
++		return true;
++
++	if (!is_mbpf_jmp64(meta))
+ 		return false;
+ 
+-	op = BPF_OP(meta->insn.code);
++	op = mbpf_op(meta);
+ 	return op != BPF_JA && op != BPF_EXIT && op != BPF_CALL;
+ }
+ 
+
+commit 9a06927e778bc4e805acc8fa03573bbf7e597cc5
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Tue Jan 22 22:45:29 2019 -0800
+
+    nfp: bpf: support removing dead code
+    
+    Add a verifier callback to the nfp JIT to remove the instructions
+    the verifier deemed to be dead.
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Reviewed-by: Quentin Monnet <quentin.monnet@netronome.com>
+    Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index a33aa7df1979..5813c3e13ebe 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -247,9 +247,12 @@ struct nfp_bpf_reg_state {
+ #define FLAG_INSN_SKIP_NOOP			BIT(3)
+ /* Instruction is optimized out based on preceding instructions */
+ #define FLAG_INSN_SKIP_PREC_DEPENDENT		BIT(4)
++/* Instruction is optimized by the verifier */
++#define FLAG_INSN_SKIP_VERIFIER_OPT		BIT(5)
+ 
+ #define FLAG_INSN_SKIP_MASK		(FLAG_INSN_SKIP_NOOP | \
+-					 FLAG_INSN_SKIP_PREC_DEPENDENT)
++					 FLAG_INSN_SKIP_PREC_DEPENDENT | \
++					 FLAG_INSN_SKIP_VERIFIER_OPT)
+ 
+ /**
+  * struct nfp_insn_meta - BPF instruction wrapper
+@@ -533,6 +536,7 @@ int nfp_bpf_finalize(struct bpf_verifier_env *env);
+ 
+ int nfp_bpf_opt_replace_insn(struct bpf_verifier_env *env, u32 off,
+ 			     struct bpf_insn *insn);
++int nfp_bpf_opt_remove_insns(struct bpf_verifier_env *env, u32 off, u32 cnt);
+ 
+ extern const struct bpf_prog_offload_ops nfp_bpf_dev_ops;
+ 
+
+commit a32014b351662fd67c7e0f807855f527d0834d00
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Tue Jan 22 22:45:28 2019 -0800
+
+    nfp: bpf: support optimizing dead branches
+    
+    Verifier will now optimize out branches to dead code, implement
+    the replace_insn callback to take advantage of that optimization.
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Reviewed-by: Quentin Monnet <quentin.monnet@netronome.com>
+    Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 07879eee3d46..a33aa7df1979 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -412,6 +412,17 @@ static inline bool is_mbpf_div(const struct nfp_insn_meta *meta)
+ 	return is_mbpf_alu(meta) && mbpf_op(meta) == BPF_DIV;
+ }
+ 
++static inline bool is_mbpf_cond_jump(const struct nfp_insn_meta *meta)
++{
++	u8 op;
++
++	if (BPF_CLASS(meta->insn.code) != BPF_JMP)
++		return false;
++
++	op = BPF_OP(meta->insn.code);
++	return op != BPF_JA && op != BPF_EXIT && op != BPF_CALL;
++}
++
+ static inline bool is_mbpf_helper_call(const struct nfp_insn_meta *meta)
+ {
+ 	struct bpf_insn insn = meta->insn;
+@@ -520,6 +531,9 @@ int nfp_verify_insn(struct bpf_verifier_env *env, int insn_idx,
+ 		    int prev_insn_idx);
+ int nfp_bpf_finalize(struct bpf_verifier_env *env);
+ 
++int nfp_bpf_opt_replace_insn(struct bpf_verifier_env *env, u32 off,
++			     struct bpf_insn *insn);
++
+ extern const struct bpf_prog_offload_ops nfp_bpf_dev_ops;
+ 
+ struct netdev_bpf;
+
+commit e2fc61146aa6dea81f3231530c130be72af05c5a
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Tue Jan 22 22:45:27 2019 -0800
+
+    nfp: bpf: save original program length
+    
+    Instead of passing env->prog->len around, and trying to adjust
+    for optimized out instructions just save the initial number
+    of instructions in struct nfp_prog.
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Reviewed-by: Quentin Monnet <quentin.monnet@netronome.com>
+    Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 40291aedd895..07879eee3d46 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -462,6 +462,7 @@ struct nfp_bpf_subprog_info {
+  * @subprog_cnt: number of sub-programs, including main function
+  * @map_records: the map record pointers from bpf->maps_neutral
+  * @subprog: pointer to an array of objects holding info about sub-programs
++ * @n_insns: number of instructions on @insns list
+  * @insns: list of BPF instruction wrappers (struct nfp_insn_meta)
+  */
+ struct nfp_prog {
+@@ -494,6 +495,7 @@ struct nfp_prog {
+ 	struct nfp_bpf_neutral_map **map_records;
+ 	struct nfp_bpf_subprog_info *subprog;
+ 
++	unsigned int n_insns;
+ 	struct list_head insns;
+ };
+ 
+@@ -510,7 +512,7 @@ struct nfp_bpf_vnic {
+ };
+ 
+ bool nfp_is_subprog_start(struct nfp_insn_meta *meta);
+-void nfp_bpf_jit_prepare(struct nfp_prog *nfp_prog, unsigned int cnt);
++void nfp_bpf_jit_prepare(struct nfp_prog *nfp_prog);
+ int nfp_bpf_jit(struct nfp_prog *prog);
+ bool nfp_bpf_supported_opcode(u8 code);
+ 
+@@ -531,7 +533,7 @@ int nfp_net_bpf_offload(struct nfp_net *nn, struct bpf_prog *prog,
+ 
+ struct nfp_insn_meta *
+ nfp_bpf_goto_meta(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta,
+-		  unsigned int insn_idx, unsigned int n_insns);
++		  unsigned int insn_idx);
+ 
+ void *nfp_bpf_relo_for_vnic(struct nfp_prog *nfp_prog, struct nfp_bpf_vnic *bv);
+ 
+
+commit 91a87a5823f798f1c7b26783e0d2c6d22a1dc28c
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Tue Jan 22 22:45:26 2019 -0800
+
+    nfp: bpf: split up the skip flag
+    
+    We fail program loading if jump lands on a skipped instruction.
+    This is for historical reasons, it used to be that we only skipped
+    instructions optimized out based on prior context, and therefore
+    the optimization would be buggy if we jumped directly to such
+    instruction (because the context would be skipped by the jump).
+    
+    There are cases where instructions can be skipped without any
+    context, for example there is no point in generating code for:
+    
+             r0 |= 0
+    
+    We will also soon support dropping dead code, so make the skip
+    logic differentiate between "optimized with preceding context"
+    vs other skip types.
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Reviewed-by: Quentin Monnet <quentin.monnet@netronome.com>
+    Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 941277936475..40291aedd895 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -243,6 +243,13 @@ struct nfp_bpf_reg_state {
+ #define FLAG_INSN_IS_JUMP_DST			BIT(0)
+ #define FLAG_INSN_IS_SUBPROG_START		BIT(1)
+ #define FLAG_INSN_PTR_CALLER_STACK_FRAME	BIT(2)
++/* Instruction is pointless, noop even on its own */
++#define FLAG_INSN_SKIP_NOOP			BIT(3)
++/* Instruction is optimized out based on preceding instructions */
++#define FLAG_INSN_SKIP_PREC_DEPENDENT		BIT(4)
++
++#define FLAG_INSN_SKIP_MASK		(FLAG_INSN_SKIP_NOOP | \
++					 FLAG_INSN_SKIP_PREC_DEPENDENT)
+ 
+ /**
+  * struct nfp_insn_meta - BPF instruction wrapper
+@@ -271,7 +278,6 @@ struct nfp_bpf_reg_state {
+  * @n: eBPF instruction number
+  * @flags: eBPF instruction extra optimization flags
+  * @subprog_idx: index of subprogram to which the instruction belongs
+- * @skip: skip this instruction (optimized out)
+  * @double_cb: callback for second part of the instruction
+  * @l: link on nfp_prog->insns list
+  */
+@@ -319,7 +325,6 @@ struct nfp_insn_meta {
+ 	unsigned short n;
+ 	unsigned short flags;
+ 	unsigned short subprog_idx;
+-	bool skip;
+ 	instr_cb_t double_cb;
+ 
+ 	struct list_head l;
+
+commit 1385d755cfb42f596ef1cf9f5c761010ff3b34e7
+Author: Quentin Monnet <quentin.monnet@netronome.com>
+Date:   Fri Nov 9 13:03:25 2018 +0000
+
+    bpf: pass a struct with offload callbacks to bpf_offload_dev_create()
+    
+    For passing device functions for offloaded eBPF programs, there used to
+    be no place where to store the pointer without making the non-offloaded
+    programs pay a memory price.
+    
+    As a consequence, three functions were called with ndo_bpf() through
+    specific commands. Now that we have struct bpf_offload_dev, and since
+    none of those operations rely on RTNL, we can turn these three commands
+    into hooks inside the struct bpf_prog_offload_ops, and pass them as part
+    of bpf_offload_dev_create().
+    
+    This commit effectively passes a pointer to the struct to
+    bpf_offload_dev_create(). We temporarily have two struct
+    bpf_prog_offload_ops instances, one under offdev->ops and one under
+    offload->dev_ops. The next patches will make the transition towards the
+    former, so that offload->dev_ops can be removed, and callbacks relying
+    on ndo_bpf() added to offdev->ops as well.
+    
+    While at it, rename "nfp_bpf_analyzer_ops" as "nfp_bpf_dev_ops" (and
+    similarly for netdevsim).
+    
+    Suggested-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Signed-off-by: Quentin Monnet <quentin.monnet@netronome.com>
+    Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index abdd93d14439..941277936475 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -513,7 +513,7 @@ int nfp_verify_insn(struct bpf_verifier_env *env, int insn_idx,
+ 		    int prev_insn_idx);
+ int nfp_bpf_finalize(struct bpf_verifier_env *env);
+ 
+-extern const struct bpf_prog_offload_ops nfp_bpf_analyzer_ops;
++extern const struct bpf_prog_offload_ops nfp_bpf_dev_ops;
+ 
+ struct netdev_bpf;
+ struct nfp_app;
+
+commit 1da6f5733853fb230265fe1a7d1b5373f13bf5ca
+Author: Quentin Monnet <quentin.monnet@netronome.com>
+Date:   Fri Nov 9 13:03:24 2018 +0000
+
+    nfp: bpf: move nfp_bpf_analyzer_ops from verifier.c to offload.c
+    
+    We are about to add several new callbacks to the struct, all of them
+    defined in offload.c. Move the struct bpf_prog_offload_ops object in
+    that file. As a consequence, nfp_verify_insn() and nfp_finalize() can no
+    longer be static.
+    
+    Signed-off-by: Quentin Monnet <quentin.monnet@netronome.com>
+    Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 7f591d71ab28..abdd93d14439 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -509,6 +509,10 @@ void nfp_bpf_jit_prepare(struct nfp_prog *nfp_prog, unsigned int cnt);
+ int nfp_bpf_jit(struct nfp_prog *prog);
+ bool nfp_bpf_supported_opcode(u8 code);
+ 
++int nfp_verify_insn(struct bpf_verifier_env *env, int insn_idx,
++		    int prev_insn_idx);
++int nfp_bpf_finalize(struct bpf_verifier_env *env);
++
+ extern const struct bpf_prog_offload_ops nfp_bpf_analyzer_ops;
+ 
+ struct netdev_bpf;
+
+commit 44b6fed0c16ea0057292d57c381a31e8986fa7a7
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Tue Oct 16 15:19:10 2018 -0700
+
+    nfp: bpf: double check vNIC capabilities after object sharing
+    
+    Program translation stage checks that program can be offloaded to
+    the netdev which was passed during the load (bpf_attr->prog_ifindex).
+    After program sharing was introduced, however, the netdev on which
+    program is loaded can theoretically be different, and therefore
+    we should recheck the program size and max stack size at load time.
+    
+    This was found by code inspection, AFAIK today all vNICs have
+    identical caps.
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Reviewed-by: Quentin Monnet <quentin.monnet@netronome.com>
+    Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 12e98a0a58e5..7f591d71ab28 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -441,6 +441,7 @@ struct nfp_bpf_subprog_info {
+  * @prog: machine code
+  * @prog_len: number of valid instructions in @prog array
+  * @__prog_alloc_len: alloc size of @prog array
++ * @stack_size: total amount of stack used
+  * @verifier_meta: temporary storage for verifier's insn meta
+  * @type: BPF program type
+  * @last_bpf_off: address of the last instruction translated from BPF
+@@ -465,6 +466,8 @@ struct nfp_prog {
+ 	unsigned int prog_len;
+ 	unsigned int __prog_alloc_len;
+ 
++	unsigned int stack_size;
++
+ 	struct nfp_insn_meta *verifier_meta;
+ 
+ 	enum bpf_prog_type type;
+
+commit 527db74b71ee5a279f818aae51f2c26b4e5c7648
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Tue Oct 16 15:19:09 2018 -0700
+
+    nfp: bpf: protect against mis-initializing atomic counters
+    
+    Atomic operations on the NFP are currently always in big endian.
+    The driver keeps track of regions of memory storing atomic values
+    and byte swaps them accordingly.  There are corner cases where
+    the map values may be initialized before the driver knows they
+    are used as atomic counters.  This can happen either when the
+    datapath is performing the update and the stack contents are
+    unknown or when map is updated before the program which will
+    use it for atomic values is loaded.
+    
+    To avoid situation where user initializes the value to 0 1 2 3
+    and then after loading a program which uses the word as an atomic
+    counter starts reading 3 2 1 0 - only allow atomic counters to be
+    initialized to endian-neutral values.
+    
+    For updates from the datapath the stack information may not be
+    as precise, so just allow initializing such values to 0.
+    
+    Example code which would break:
+    struct bpf_map_def SEC("maps") rxcnt = {
+           .type = BPF_MAP_TYPE_HASH,
+           .key_size = sizeof(__u32),
+           .value_size = sizeof(__u64),
+           .max_entries = 1,
+    };
+    
+    int xdp_prog1()
+    {
+            __u64 nonzeroval = 3;
+            __u32 key = 0;
+            __u64 *value;
+    
+            value = bpf_map_lookup_elem(&rxcnt, &key);
+            if (!value)
+                    bpf_map_update_elem(&rxcnt, &key, &nonzeroval, BPF_ANY);
+            else
+                    __sync_fetch_and_add(value, 1);
+    
+            return XDP_PASS;
+    }
+    
+    $ offload bpftool map dump
+    key: 00 00 00 00 value: 00 00 00 03 00 00 00 00
+    
+    should be:
+    
+    $ offload bpftool map dump
+    key: 00 00 00 00 value: 03 00 00 00 00 00 00 00
+    
+    Reported-by: David Beckett <david.beckett@netronome.com>
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Reviewed-by: Quentin Monnet <quentin.monnet@netronome.com>
+    Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 52457ae3b259..12e98a0a58e5 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -189,6 +189,11 @@ enum nfp_bpf_map_use {
+ 	NFP_MAP_USE_ATOMIC_CNT,
+ };
+ 
++struct nfp_bpf_map_word {
++	unsigned char type		:4;
++	unsigned char non_zero_update	:1;
++};
++
+ /**
+  * struct nfp_bpf_map - private per-map data attached to BPF maps for offload
+  * @offmap:	pointer to the offloaded BPF map
+@@ -202,7 +207,7 @@ struct nfp_bpf_map {
+ 	struct nfp_app_bpf *bpf;
+ 	u32 tid;
+ 	struct list_head l;
+-	enum nfp_bpf_map_use use_map[];
++	struct nfp_bpf_map_word use_map[];
+ };
+ 
+ struct nfp_bpf_neutral_map {
+
+commit 96de25060d192523fa3c75110dc6348df47fa078
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Thu Oct 11 08:57:42 2018 -0700
+
+    nfp: replace long license headers with SPDX
+    
+    Replace the repeated license text with SDPX identifiers.
+    While at it bump the Copyright dates for files we touched
+    this year.
+    
+    Signed-off-by: Edwin Peer <edwin.peer@netronome.com>
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Signed-off-by: Nic Viljoen <nick.viljoen@netronome.com>
+    Reviewed-by: Simon Horman <simon.horman@netronome.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 25e10cfa2678..52457ae3b259 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -1,35 +1,5 @@
+-/*
+- * Copyright (C) 2016-2018 Netronome Systems, Inc.
+- *
+- * This software is dual licensed under the GNU General License Version 2,
+- * June 1991 as shown in the file COPYING in the top-level directory of this
+- * source tree or the BSD 2-Clause License provided below.  You have the
+- * option to license this software under the complete terms of either license.
+- *
+- * The BSD 2-Clause License:
+- *
+- *     Redistribution and use in source and binary forms, with or
+- *     without modification, are permitted provided that the following
+- *     conditions are met:
+- *
+- *      1. Redistributions of source code must retain the above
+- *         copyright notice, this list of conditions and the following
+- *         disclaimer.
+- *
+- *      2. Redistributions in binary form must reproduce the above
+- *         copyright notice, this list of conditions and the following
+- *         disclaimer in the documentation and/or other materials
+- *         provided with the distribution.
+- *
+- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+- * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+- * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+- * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
+- * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+- * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+- * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+- * SOFTWARE.
+- */
++/* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
++/* Copyright (C) 2016-2018 Netronome Systems, Inc. */
+ 
+ #ifndef __NFP_BPF_H__
+ #define __NFP_BPF_H__ 1
+
+commit 7ff0ccde43664e3de9fe60edc19466f16cda6b7a
+Author: Quentin Monnet <quentin.monnet@netronome.com>
+Date:   Sun Oct 7 12:56:57 2018 +0100
+
+    nfp: bpf: support pointers to other stack frames for BPF-to-BPF calls
+    
+    Mark instructions that use pointers to areas in the stack outside of the
+    current stack frame, and process them accordingly in mem_op_stack().
+    This way, we also support BPF-to-BPF calls where the caller passes a
+    pointer to data in its own stack frame to the callee (typically, when
+    the caller passes an address to one of its local variables located in
+    the stack, as an argument).
+    
+    Thanks to Jakub and Jiong for figuring out how to deal with this case,
+    I just had to turn their email discussion into this patch.
+    
+    Suggested-by: Jiong Wang <jiong.wang@netronome.com>
+    Suggested-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Signed-off-by: Quentin Monnet <quentin.monnet@netronome.com>
+    Reviewed-by: Jiong Wang <jiong.wang@netronome.com>
+    Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 44b787a0bd4b..25e10cfa2678 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -267,6 +267,7 @@ struct nfp_bpf_reg_state {
+ 
+ #define FLAG_INSN_IS_JUMP_DST			BIT(0)
+ #define FLAG_INSN_IS_SUBPROG_START		BIT(1)
++#define FLAG_INSN_PTR_CALLER_STACK_FRAME	BIT(2)
+ 
+ /**
+  * struct nfp_insn_meta - BPF instruction wrapper
+
+commit 445496231445aad46866a858a384b428cd073977
+Author: Quentin Monnet <quentin.monnet@netronome.com>
+Date:   Sun Oct 7 12:56:56 2018 +0100
+
+    nfp: bpf: optimise save/restore for R6~R9 based on register usage
+    
+    When pre-processing the instructions, it is trivial to detect what
+    subprograms are using R6, R7, R8 or R9 as destination registers. If a
+    subprogram uses none of those, then we do not need to jump to the
+    subroutines dedicated to saving and restoring callee-saved registers in
+    its prologue and epilogue.
+    
+    This patch introduces detection of callee-saved registers in subprograms
+    and prevents the JIT from adding calls to those subroutines whenever we
+    can: we save some instructions in the translated program, and some time
+    at runtime on BPF-to-BPF calls and returns.
+    
+    If no subprogram needs to save those registers, we can avoid appending
+    the subroutines at the end of the program.
+    
+    Signed-off-by: Quentin Monnet <quentin.monnet@netronome.com>
+    Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 1cef5136c198..44b787a0bd4b 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -452,9 +452,11 @@ static inline bool is_mbpf_pseudo_call(const struct nfp_insn_meta *meta)
+ /**
+  * struct nfp_bpf_subprog_info - nfp BPF sub-program (a.k.a. function) info
+  * @stack_depth:	maximum stack depth used by this sub-program
++ * @needs_reg_push:	whether sub-program uses callee-saved registers
+  */
+ struct nfp_bpf_subprog_info {
+ 	u16 stack_depth;
++	u8 needs_reg_push : 1;
+ };
+ 
+ /**
+
+commit bdf4c66faf5fa6fd5ffb0b59c39c7629103d6479
+Author: Quentin Monnet <quentin.monnet@netronome.com>
+Date:   Sun Oct 7 12:56:54 2018 +0100
+
+    nfp: bpf: update fixup function for BPF-to-BPF calls support
+    
+    Relocation for targets of BPF-to-BPF calls are required at the end of
+    translation. Update the nfp_fixup_branches() function in that regard.
+    
+    When checking that the last instruction of each bloc is a branch, we
+    must account for the length of the instructions required to pop the
+    return address from the stack.
+    
+    Signed-off-by: Quentin Monnet <quentin.monnet@netronome.com>
+    Signed-off-by: Jiong Wang <jiong.wang@netronome.com>
+    Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index d9695bc316dd..1cef5136c198 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -283,6 +283,7 @@ struct nfp_bpf_reg_state {
+  * @xadd_maybe_16bit: 16bit immediate is possible
+  * @jmp_dst: destination info for jump instructions
+  * @jump_neg_op: jump instruction has inverted immediate, use ADD instead of SUB
++ * @num_insns_after_br: number of insns following a branch jump, used for fixup
+  * @func_id: function id for call instructions
+  * @arg1: arg1 for call instructions
+  * @arg2: arg2 for call instructions
+@@ -319,6 +320,7 @@ struct nfp_insn_meta {
+ 		struct {
+ 			struct nfp_insn_meta *jmp_dst;
+ 			bool jump_neg_op;
++			u32 num_insns_after_br; /* only for BPF-to-BPF calls */
+ 		};
+ 		/* function calls */
+ 		struct {
+
+commit 389f263b60c9a3168d47eeb44b6a07bd2b8c66e2
+Author: Quentin Monnet <quentin.monnet@netronome.com>
+Date:   Sun Oct 7 12:56:52 2018 +0100
+
+    nfp: bpf: add main logics for BPF-to-BPF calls support in nfp driver
+    
+    This is the main patch for the logics of BPF-to-BPF calls in the nfp
+    driver.
+    
+    The functions called on BPF_JUMP | BPF_CALL and BPF_JUMP | BPF_EXIT were
+    used to call helpers and exit from the program, respectively; make them
+    usable for calling into, or returning from, a BPF subprogram as well.
+    
+    For all calls, push the return address as well as the callee-saved
+    registers (R6 to R9) to the stack, and pop them upon returning from the
+    calls. In order to limit the overhead in terms of instruction number,
+    this is done through dedicated subroutines. Jumping to the callee
+    actually consists in jumping to the subroutine, that "returns" to the
+    callee: this will require some fixup for passing the address in a later
+    patch. Similarly, returning consists in jumping to the subroutine, which
+    pops registers and then return directly to the caller (but no fixup is
+    needed here).
+    
+    Return to the caller is performed with the RTN instruction newly added
+    to the JIT.
+    
+    For the few steps where we need to know what subprogram an instruction
+    belongs to, the struct nfp_insn_meta is extended with a new subprog_idx
+    field.
+    
+    Note that checks on the available stack size, to take into account the
+    additional requirements associated to BPF-to-BPF calls (storing R6-R9
+    and return addresses), are added in a later patch.
+    
+    Signed-off-by: Quentin Monnet <quentin.monnet@netronome.com>
+    Signed-off-by: Jiong Wang <jiong.wang@netronome.com>
+    Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 20a98ce4b345..d9695bc316dd 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -61,6 +61,8 @@ enum nfp_relo_type {
+ 	/* internal jumps to parts of the outro */
+ 	RELO_BR_GO_OUT,
+ 	RELO_BR_GO_ABORT,
++	RELO_BR_GO_CALL_PUSH_REGS,
++	RELO_BR_GO_CALL_POP_REGS,
+ 	/* external jumps to fixed addresses */
+ 	RELO_BR_NEXT_PKT,
+ 	RELO_BR_HELPER,
+@@ -104,6 +106,7 @@ enum pkt_vec {
+ #define imma_a(np)	reg_a(STATIC_REG_IMMA)
+ #define imma_b(np)	reg_b(STATIC_REG_IMMA)
+ #define imm_both(np)	reg_both(STATIC_REG_IMM)
++#define ret_reg(np)	imm_a(np)
+ 
+ #define NFP_BPF_ABI_FLAGS	reg_imm(0)
+ #define   NFP_BPF_ABI_FLAG_MARK	1
+@@ -290,6 +293,7 @@ struct nfp_bpf_reg_state {
+  * @off: index of first generated machine instruction (in nfp_prog.prog)
+  * @n: eBPF instruction number
+  * @flags: eBPF instruction extra optimization flags
++ * @subprog_idx: index of subprogram to which the instruction belongs
+  * @skip: skip this instruction (optimized out)
+  * @double_cb: callback for second part of the instruction
+  * @l: link on nfp_prog->insns list
+@@ -336,6 +340,7 @@ struct nfp_insn_meta {
+ 	unsigned int off;
+ 	unsigned short n;
+ 	unsigned short flags;
++	unsigned short subprog_idx;
+ 	bool skip;
+ 	instr_cb_t double_cb;
+ 
+@@ -432,6 +437,16 @@ static inline bool is_mbpf_helper_call(const struct nfp_insn_meta *meta)
+ 		insn.src_reg != BPF_PSEUDO_CALL;
+ }
+ 
++static inline bool is_mbpf_pseudo_call(const struct nfp_insn_meta *meta)
++{
++	struct bpf_insn insn = meta->insn;
++
++	return insn.code == (BPF_JMP | BPF_CALL) &&
++		insn.src_reg == BPF_PSEUDO_CALL;
++}
++
++#define STACK_FRAME_ALIGN 64
++
+ /**
+  * struct nfp_bpf_subprog_info - nfp BPF sub-program (a.k.a. function) info
+  * @stack_depth:	maximum stack depth used by this sub-program
+@@ -451,6 +466,8 @@ struct nfp_bpf_subprog_info {
+  * @last_bpf_off: address of the last instruction translated from BPF
+  * @tgt_out: jump target for normal exit
+  * @tgt_abort: jump target for abort (e.g. access outside of packet buffer)
++ * @tgt_call_push_regs: jump target for subroutine for saving R6~R9 to stack
++ * @tgt_call_pop_regs: jump target for subroutine used for restoring R6~R9
+  * @n_translated: number of successfully translated instructions (for errors)
+  * @error: error code if something went wrong
+  * @stack_frame_depth: max stack depth for current frame
+@@ -475,6 +492,8 @@ struct nfp_prog {
+ 	unsigned int last_bpf_off;
+ 	unsigned int tgt_out;
+ 	unsigned int tgt_abort;
++	unsigned int tgt_call_push_regs;
++	unsigned int tgt_call_pop_regs;
+ 
+ 	unsigned int n_translated;
+ 	int error;
+@@ -502,6 +521,7 @@ struct nfp_bpf_vnic {
+ 	unsigned int tgt_done;
+ };
+ 
++bool nfp_is_subprog_start(struct nfp_insn_meta *meta);
+ void nfp_bpf_jit_prepare(struct nfp_prog *nfp_prog, unsigned int cnt);
+ int nfp_bpf_jit(struct nfp_prog *prog);
+ bool nfp_bpf_supported_opcode(u8 code);
+
+commit e3b49dc69b320ba93059509ff2b31bde9242a7fa
+Author: Quentin Monnet <quentin.monnet@netronome.com>
+Date:   Sun Oct 7 12:56:51 2018 +0100
+
+    nfp: bpf: account for BPF-to-BPF calls when preparing nfp JIT
+    
+    Similarly to "exit" or "helper call" instructions, BPF-to-BPF calls will
+    require additional processing before translation starts, in order to
+    record and mark jump destinations.
+    
+    We also mark the instructions where each subprogram begins. This will be
+    used in a following commit to determine where to add prologues for
+    subprograms.
+    
+    Signed-off-by: Quentin Monnet <quentin.monnet@netronome.com>
+    Reviewed-by: Jiong Wang <jiong.wang@netronome.com>
+    Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 853a5346378c..20a98ce4b345 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -262,7 +262,8 @@ struct nfp_bpf_reg_state {
+ 	bool var_off;
+ };
+ 
+-#define FLAG_INSN_IS_JUMP_DST	BIT(0)
++#define FLAG_INSN_IS_JUMP_DST			BIT(0)
++#define FLAG_INSN_IS_SUBPROG_START		BIT(1)
+ 
+ /**
+  * struct nfp_insn_meta - BPF instruction wrapper
+
+commit bcfdfb7c962d84ef07aa2b400ef1c9d70e1120e5
+Author: Quentin Monnet <quentin.monnet@netronome.com>
+Date:   Sun Oct 7 12:56:50 2018 +0100
+
+    nfp: bpf: ignore helper-related checks for BPF calls in nfp verifier
+    
+    The checks related to eBPF helper calls are performed each time the nfp
+    driver meets a BPF_JUMP | BPF_CALL instruction. However, these checks
+    are not relevant for BPF-to-BPF call (same instruction code, different
+    value in source register), so just skip the checks for such calls.
+    
+    While at it, rename the function that runs those checks to make it clear
+    they apply to _helper_ calls only.
+    
+    Signed-off-by: Quentin Monnet <quentin.monnet@netronome.com>
+    Reviewed-by: Jiong Wang <jiong.wang@netronome.com>
+    Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 7f6e850e42da..853a5346378c 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -423,6 +423,14 @@ static inline bool is_mbpf_div(const struct nfp_insn_meta *meta)
+ 	return is_mbpf_alu(meta) && mbpf_op(meta) == BPF_DIV;
+ }
+ 
++static inline bool is_mbpf_helper_call(const struct nfp_insn_meta *meta)
++{
++	struct bpf_insn insn = meta->insn;
++
++	return insn.code == (BPF_JMP | BPF_CALL) &&
++		insn.src_reg != BPF_PSEUDO_CALL;
++}
++
+ /**
+  * struct nfp_bpf_subprog_info - nfp BPF sub-program (a.k.a. function) info
+  * @stack_depth:	maximum stack depth used by this sub-program
+
+commit c5da54d93eb43461a5b79e1fdad8409abad83a77
+Author: Quentin Monnet <quentin.monnet@netronome.com>
+Date:   Sun Oct 7 12:56:49 2018 +0100
+
+    nfp: bpf: copy eBPF subprograms information from kernel verifier
+    
+    In order to support BPF-to-BPF calls in offloaded programs, the nfp
+    driver must collect information about the distinct subprograms: namely,
+    the number of subprograms composing the complete program and the stack
+    depth of those subprograms. The latter in particular is non-trivial to
+    collect, so we copy those elements from the kernel verifier via the
+    newly added post-verification hook. The struct nfp_prog is extended to
+    store this information. Stack depths are stored in an array of dedicated
+    structs.
+    
+    Subprogram start indexes are not collected. Instead, meta instructions
+    associated to the start of a subprogram will be marked with a flag in a
+    later patch.
+    
+    Signed-off-by: Quentin Monnet <quentin.monnet@netronome.com>
+    Reviewed-by: Jiong Wang <jiong.wang@netronome.com>
+    Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 7050535383b8..7f6e850e42da 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -423,6 +423,14 @@ static inline bool is_mbpf_div(const struct nfp_insn_meta *meta)
+ 	return is_mbpf_alu(meta) && mbpf_op(meta) == BPF_DIV;
+ }
+ 
++/**
++ * struct nfp_bpf_subprog_info - nfp BPF sub-program (a.k.a. function) info
++ * @stack_depth:	maximum stack depth used by this sub-program
++ */
++struct nfp_bpf_subprog_info {
++	u16 stack_depth;
++};
++
+ /**
+  * struct nfp_prog - nfp BPF program
+  * @bpf: backpointer to the bpf app priv structure
+@@ -439,7 +447,9 @@ static inline bool is_mbpf_div(const struct nfp_insn_meta *meta)
+  * @stack_frame_depth: max stack depth for current frame
+  * @adjust_head_location: if program has single adjust head call - the insn no.
+  * @map_records_cnt: the number of map pointers recorded for this prog
++ * @subprog_cnt: number of sub-programs, including main function
+  * @map_records: the map record pointers from bpf->maps_neutral
++ * @subprog: pointer to an array of objects holding info about sub-programs
+  * @insns: list of BPF instruction wrappers (struct nfp_insn_meta)
+  */
+ struct nfp_prog {
+@@ -464,7 +474,9 @@ struct nfp_prog {
+ 	unsigned int adjust_head_location;
+ 
+ 	unsigned int map_records_cnt;
++	unsigned int subprog_cnt;
+ 	struct nfp_bpf_neutral_map **map_records;
++	struct nfp_bpf_subprog_info *subprog;
+ 
+ 	struct list_head insns;
+ };
+
+commit 1a7e62e6329c210ff67c5706fbe91187f2452baf
+Author: Quentin Monnet <quentin.monnet@netronome.com>
+Date:   Sun Oct 7 12:56:48 2018 +0100
+
+    nfp: bpf: rename nfp_prog->stack_depth as nfp_prog->stack_frame_depth
+    
+    In preparation for support for BPF to BPF calls in offloaded programs,
+    rename the "stack_depth" field of the struct nfp_prog as
+    "stack_frame_depth". This is to make it clear that the field refers to
+    the maximum size of the current stack frame (as opposed to the maximum
+    size of the whole stack memory).
+    
+    Signed-off-by: Quentin Monnet <quentin.monnet@netronome.com>
+    Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 792ebc4081a3..7050535383b8 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -436,7 +436,7 @@ static inline bool is_mbpf_div(const struct nfp_insn_meta *meta)
+  * @tgt_abort: jump target for abort (e.g. access outside of packet buffer)
+  * @n_translated: number of successfully translated instructions (for errors)
+  * @error: error code if something went wrong
+- * @stack_depth: max stack depth from the verifier
++ * @stack_frame_depth: max stack depth for current frame
+  * @adjust_head_location: if program has single adjust head call - the insn no.
+  * @map_records_cnt: the number of map pointers recorded for this prog
+  * @map_records: the map record pointers from bpf->maps_neutral
+@@ -460,7 +460,7 @@ struct nfp_prog {
+ 	unsigned int n_translated;
+ 	int error;
+ 
+-	unsigned int stack_depth;
++	unsigned int stack_frame_depth;
+ 	unsigned int adjust_head_location;
+ 
+ 	unsigned int map_records_cnt;
+
+commit 0c9864c05f34b0b29109dc5f94707e5943fcfda3
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Mon Oct 1 18:30:34 2018 -0700
+
+    nfp: bpf: allow control message sizing for map ops
+    
+    In current ABI the size of the messages carrying map elements was
+    statically defined to at most 16 words of key and 16 words of value
+    (NFP word is 4 bytes).  We should not make this assumption and use
+    the max key and value sizes from the BPF capability instead.
+    
+    To make sure old kernels don't get surprised with larger (or smaller)
+    messages bump the FW ABI version to 3 when key/value size is different
+    than 16 words.
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 62cdb183efdb..792ebc4081a3 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -121,6 +121,9 @@ enum pkt_vec {
+  * @cmsg_replies:	received cmsg replies waiting to be consumed
+  * @cmsg_wq:		work queue for waiting for cmsg replies
+  *
++ * @cmsg_key_sz:	size of key in cmsg element array
++ * @cmsg_val_sz:	size of value in cmsg element array
++ *
+  * @map_list:		list of offloaded maps
+  * @maps_in_use:	number of currently offloaded maps
+  * @map_elems_in_use:	number of elements allocated to offloaded maps
+@@ -166,6 +169,9 @@ struct nfp_app_bpf {
+ 	struct sk_buff_head cmsg_replies;
+ 	struct wait_queue_head cmsg_wq;
+ 
++	unsigned int cmsg_key_sz;
++	unsigned int cmsg_val_sz;
++
+ 	struct list_head map_list;
+ 	unsigned int maps_in_use;
+ 	unsigned int map_elems_in_use;
+@@ -496,6 +502,7 @@ nfp_bpf_goto_meta(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta,
+ 
+ void *nfp_bpf_relo_for_vnic(struct nfp_prog *nfp_prog, struct nfp_bpf_vnic *bv);
+ 
++unsigned int nfp_bpf_ctrl_cmsg_mtu(struct nfp_app_bpf *bpf);
+ long long int
+ nfp_bpf_ctrl_alloc_map(struct nfp_app_bpf *bpf, struct bpf_map *map);
+ void
+
+commit 28264eb227422165d23a3efeff24735fdedb7410
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Mon Oct 1 18:30:32 2018 -0700
+
+    nfp: bpf: parse global BPF ABI version capability
+    
+    Up until now we only had per-vNIC BPF ABI version capabilities,
+    which are slightly awkward to use because bulk of the resources
+    and configuration does not relate to any particular vNIC.  Add
+    a new capability for global ABI version and check the per-vNIC
+    version are equal to it.  Assume the ABI version 2 if no explicit
+    version capability is present.
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index dbd00982fd2b..62cdb183efdb 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -127,6 +127,8 @@ enum pkt_vec {
+  *
+  * @maps_neutral:	hash table of offload-neutral maps (on pointer)
+  *
++ * @abi_version:	global BPF ABI version
++ *
+  * @adjust_head:	adjust head capability
+  * @adjust_head.flags:		extra flags for adjust head
+  * @adjust_head.off_min:	minimal packet offset within buffer required
+@@ -170,6 +172,8 @@ struct nfp_app_bpf {
+ 
+ 	struct rhashtable maps_neutral;
+ 
++	u32 abi_version;
++
+ 	struct nfp_bpf_cap_adjust_head {
+ 		u32 flags;
+ 		int off_min;
+
+commit 0c26159352ba1cdc5a8c8d74131cc19cdfdf9371
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Fri Aug 3 22:06:00 2018 -0700
+
+    nfp: bpf: xdp_adjust_tail support
+    
+    Add support for adjust_tail.  There are no FW changes needed but add
+    a FW capability just in case there would be any issue with previously
+    released FW, or we will have to change the ABI in the future.
+    
+    The helper is trivial and shouldn't be used too often so just inline
+    the body of the function.  We add the delta to locally maintained
+    packet length register and check for overflow, since add of negative
+    value must overflow if result is positive.  Note that if delta of 0
+    would be allowed in the kernel this trick stops working and we need
+    one more instruction to compare lengths before and after the change.
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Reviewed-by: Quentin Monnet <quentin.monnet@netronome.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 57573bfa8c03..dbd00982fd2b 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -150,6 +150,7 @@ enum pkt_vec {
+  *
+  * @pseudo_random:	FW initialized the pseudo-random machinery (CSRs)
+  * @queue_select:	BPF can set the RX queue ID in packet vector
++ * @adjust_tail:	BPF can simply trunc packet size for adjust tail
+  */
+ struct nfp_app_bpf {
+ 	struct nfp_app *app;
+@@ -195,6 +196,7 @@ struct nfp_app_bpf {
+ 
+ 	bool pseudo_random;
+ 	bool queue_select;
++	bool adjust_tail;
+ };
+ 
+ enum nfp_bpf_map_use {
+
+commit ab01f4ac5faf6a0ea532fa65cf6b1c9b2019e49b
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Wed Jul 25 19:53:34 2018 -0700
+
+    nfp: bpf: remember maps by ID
+    
+    Record perf maps by map ID, not raw kernel pointer.  This helps
+    with debug messages, because printing pointers to logs is frowned
+    upon, and makes debug easier for the users, as map ID is something
+    they should be more familiar with.  Note that perf maps are offload
+    neutral, therefore IDs won't be orphaned.
+    
+    While at it use a rate limited print helper for the error message.
+    
+    Reported-by: Kees Cook <keescook@chromium.org>
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Reviewed-by: Dirk van der Merwe <dirk.vandermerwe@netronome.com>
+    Reviewed-by: Quentin Monnet <quentin.monnet@netronome.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 017e0ae5e736..57573bfa8c03 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -47,6 +47,8 @@
+ #include "../nfp_asm.h"
+ #include "fw.h"
+ 
++#define cmsg_warn(bpf, msg...)	nn_dp_warn(&(bpf)->app->ctrl->dp, msg)
++
+ /* For relocation logic use up-most byte of branch instruction as scratch
+  * area.  Remember to clear this before sending instructions to HW!
+  */
+@@ -221,6 +223,7 @@ struct nfp_bpf_map {
+ struct nfp_bpf_neutral_map {
+ 	struct rhash_head l;
+ 	struct bpf_map *ptr;
++	u32 map_id;
+ 	u32 count;
+ };
+ 
+
+commit 0958762748e4cfeb19d881aa8d3fe5ba8b5bc50b
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Wed Jul 25 19:53:33 2018 -0700
+
+    nfp: bpf: allow receiving perf events on data queues
+    
+    Control queue is fairly low latency, and requires SKB allocations,
+    which means we can't even reach 0.5Msps with perf events.  Allow
+    perf events to be delivered to data queues.  This allows us to not
+    only use multiple queues, but also receive and deliver to user space
+    more than 5Msps per queue (Xeon E5-2630 v4 2.20GHz, no retpolines).
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Reviewed-by: Dirk van der Merwe <dirk.vandermerwe@netronome.com>
+    Reviewed-by: Quentin Monnet <quentin.monnet@netronome.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index e25d3c0c7e43..017e0ae5e736 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -505,4 +505,7 @@ int nfp_bpf_event_output(struct nfp_app_bpf *bpf, const void *data,
+ 			 unsigned int len);
+ 
+ void nfp_bpf_ctrl_msg_rx(struct nfp_app *app, struct sk_buff *skb);
++void
++nfp_bpf_ctrl_msg_rx_raw(struct nfp_app *app, const void *data,
++			unsigned int len);
+ #endif
+
+commit 20c54204219987d620ca9da567dd54e569863dad
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Wed Jul 25 19:53:32 2018 -0700
+
+    nfp: bpf: pass raw data buffer to nfp_bpf_event_output()
+    
+    In preparation for SKB-less perf event handling make
+    nfp_bpf_event_output() take buffer address and length,
+    not SKB as parameters.
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Reviewed-by: Dirk van der Merwe <dirk.vandermerwe@netronome.com>
+    Reviewed-by: Quentin Monnet <quentin.monnet@netronome.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index bec935468f90..e25d3c0c7e43 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -501,7 +501,8 @@ int nfp_bpf_ctrl_lookup_entry(struct bpf_offloaded_map *offmap,
+ int nfp_bpf_ctrl_getnext_entry(struct bpf_offloaded_map *offmap,
+ 			       void *key, void *next_key);
+ 
+-int nfp_bpf_event_output(struct nfp_app_bpf *bpf, struct sk_buff *skb);
++int nfp_bpf_event_output(struct nfp_app_bpf *bpf, const void *data,
++			 unsigned int len);
+ 
+ void nfp_bpf_ctrl_msg_rx(struct nfp_app *app, struct sk_buff *skb);
+ #endif
+
+commit 602144c224604f1cbff02ee2d1cf46825269ecbd
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Tue Jul 17 10:53:25 2018 -0700
+
+    bpf: offload: keep the offload state per-ASIC
+    
+    Create a higher-level entity to represent a device/ASIC to allow
+    programs and maps to be shared between device ports.  The extra
+    work is required to make sure we don't destroy BPF objects as
+    soon as the netdev for which they were loaded gets destroyed,
+    as other ports may still be using them.  When netdev goes away
+    all of its BPF objects will be moved to other netdevs of the
+    device, and only destroyed when last netdev is unregistered.
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Reviewed-by: Quentin Monnet <quentin.monnet@netronome.com>
+    Acked-by: Alexei Starovoitov <ast@kernel.org>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 9845c1a2d4c2..bec935468f90 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -110,6 +110,8 @@ enum pkt_vec {
+  * struct nfp_app_bpf - bpf app priv structure
+  * @app:		backpointer to the app
+  *
++ * @bpf_dev:		BPF offload device handle
++ *
+  * @tag_allocator:	bitmap of control message tags in use
+  * @tag_alloc_next:	next tag bit to allocate
+  * @tag_alloc_last:	next tag bit to be freed
+@@ -150,6 +152,8 @@ enum pkt_vec {
+ struct nfp_app_bpf {
+ 	struct nfp_app *app;
+ 
++	struct bpf_offload_dev *bpf_dev;
++
+ 	DECLARE_BITMAP(tag_allocator, U16_MAX + 1);
+ 	u16 tag_alloc_next;
+ 	u16 tag_alloc_last;
+
+commit 2a952b03d1a011e2e7ddc9ca59cbb21df7dc3525
+Author: Jiong Wang <jiong.wang@netronome.com>
+Date:   Fri Jul 6 15:13:22 2018 -0700
+
+    nfp: bpf: support u32 divide using reciprocal_div.h
+    
+    NFP doesn't have integer divide instruction, this patch use reciprocal
+    algorithm (the basic one, reciprocal_div) to emulate it.
+    
+    For each u32 divide, we would need 11 instructions to finish the operation.
+    
+      7 (for multiplication) + 4 (various ALUs) = 11
+    
+    Given NFP only supports multiplication no bigger than u32, we'd require
+    divisor and dividend no bigger than that as well.
+    
+    Also eBPF doesn't support signed divide and has enforced this on C language
+    level by failing compilation. However LLVM assembler hasn't enforced this,
+    so it is possible for negative constant to leak in as a BPF_K operand
+    through assembly code, we reject such cases as well.
+    
+    Signed-off-by: Jiong Wang <jiong.wang@netronome.com>
+    Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Acked-by: Song Liu <songliubraving@fb.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index c10079b1a312..9845c1a2d4c2 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -399,6 +399,11 @@ static inline bool is_mbpf_mul(const struct nfp_insn_meta *meta)
+ 	return is_mbpf_alu(meta) && mbpf_op(meta) == BPF_MUL;
+ }
+ 
++static inline bool is_mbpf_div(const struct nfp_insn_meta *meta)
++{
++	return is_mbpf_alu(meta) && mbpf_op(meta) == BPF_DIV;
++}
++
+ /**
+  * struct nfp_prog - nfp BPF program
+  * @bpf: backpointer to the bpf app priv structure
+
+commit d3d23fdb4688de4421e94227c95b1d54b233f432
+Author: Jiong Wang <jiong.wang@netronome.com>
+Date:   Fri Jul 6 15:13:21 2018 -0700
+
+    nfp: bpf: support u16 and u32 multiplications
+    
+    NFP supports u16 and u32 multiplication. Multiplication is done 8-bits per
+    step, therefore we need 2 steps for u16 and 4 steps for u32.
+    
+    We also need one start instruction to initialize the sequence and one or
+    two instructions to fetch the result depending on either you need the high
+    halve of u32 multiplication.
+    
+    For ALU64, if either operand is beyond u32's value range, we reject it. One
+    thing to note, if the source operand is BPF_K, then we need to check "imm"
+    field directly, and we'd reject it if it is negative.  Because for ALU64,
+    "imm" (with s32 type) is expected to be sign extended to s64 which NFP mul
+    doesn't support. For ALU32, it is fine for "imm" be negative though,
+    because the result is 32-bits and here is no difference on the low halve
+    of result for signed/unsigned mul, so we will get correct result.
+    
+    Signed-off-by: Jiong Wang <jiong.wang@netronome.com>
+    Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Acked-by: Song Liu <songliubraving@fb.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index c985d0ac61a3..c10079b1a312 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -394,6 +394,11 @@ static inline bool is_mbpf_xadd(const struct nfp_insn_meta *meta)
+ 	return (meta->insn.code & ~BPF_SIZE_MASK) == (BPF_STX | BPF_XADD);
+ }
+ 
++static inline bool is_mbpf_mul(const struct nfp_insn_meta *meta)
++{
++	return is_mbpf_alu(meta) && mbpf_op(meta) == BPF_MUL;
++}
++
+ /**
+  * struct nfp_prog - nfp BPF program
+  * @bpf: backpointer to the bpf app priv structure
+
+commit 33b94310586b761fd04de0ef951d2f5d764b9b2a
+Author: Jiong Wang <jiong.wang@netronome.com>
+Date:   Fri Jul 6 15:13:20 2018 -0700
+
+    nfp: bpf: copy range info for all operands of all ALU operations
+    
+    NFP verifier hook is coping range information of the shift amount for
+    indirect shift operation so optimized shift sequences could be generated.
+    
+    We want to use range info to do more things. For example, to decide whether
+    multiplication and divide are supported on the given range.
+    
+    This patch simply let NFP verifier hook to copy range info for all operands
+    of all ALU operands.
+    
+    Signed-off-by: Jiong Wang <jiong.wang@netronome.com>
+    Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Acked-by: Song Liu <songliubraving@fb.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 5975a19c28cb..c985d0ac61a3 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -265,6 +265,8 @@ struct nfp_bpf_reg_state {
+  * @arg2: arg2 for call instructions
+  * @umin_src: copy of core verifier umin_value for src opearnd.
+  * @umax_src: copy of core verifier umax_value for src operand.
++ * @umin_dst: copy of core verifier umin_value for dst opearnd.
++ * @umax_dst: copy of core verifier umax_value for dst operand.
+  * @off: index of first generated machine instruction (in nfp_prog.prog)
+  * @n: eBPF instruction number
+  * @flags: eBPF instruction extra optimization flags
+@@ -300,12 +302,15 @@ struct nfp_insn_meta {
+ 			struct bpf_reg_state arg1;
+ 			struct nfp_bpf_reg_state arg2;
+ 		};
+-		/* We are interested in range info for some operands,
+-		 * for example, the shift amount which is kept in src operand.
++		/* We are interested in range info for operands of ALU
++		 * operations. For example, shift amount, multiplicand and
++		 * multiplier etc.
+ 		 */
+ 		struct {
+ 			u64 umin_src;
+ 			u64 umax_src;
++			u64 umin_dst;
++			u64 umax_dst;
+ 		};
+ 	};
+ 	unsigned int off;
+@@ -339,6 +344,11 @@ static inline u8 mbpf_mode(const struct nfp_insn_meta *meta)
+ 	return BPF_MODE(meta->insn.code);
+ }
+ 
++static inline bool is_mbpf_alu(const struct nfp_insn_meta *meta)
++{
++	return mbpf_class(meta) == BPF_ALU64 || mbpf_class(meta) == BPF_ALU;
++}
++
+ static inline bool is_mbpf_load(const struct nfp_insn_meta *meta)
+ {
+ 	return (meta->insn.code & ~BPF_SIZE_MASK) == (BPF_LDX | BPF_MEM);
+@@ -384,25 +394,6 @@ static inline bool is_mbpf_xadd(const struct nfp_insn_meta *meta)
+ 	return (meta->insn.code & ~BPF_SIZE_MASK) == (BPF_STX | BPF_XADD);
+ }
+ 
+-static inline bool is_mbpf_indir_shift(const struct nfp_insn_meta *meta)
+-{
+-	u8 code = meta->insn.code;
+-	bool is_alu, is_shift;
+-	u8 opclass, opcode;
+-
+-	opclass = BPF_CLASS(code);
+-	is_alu = opclass == BPF_ALU64 || opclass == BPF_ALU;
+-	if (!is_alu)
+-		return false;
+-
+-	opcode = BPF_OP(code);
+-	is_shift = opcode == BPF_LSH || opcode == BPF_RSH || opcode == BPF_ARSH;
+-	if (!is_shift)
+-		return false;
+-
+-	return BPF_SRC(code) == BPF_X;
+-}
+-
+ /**
+  * struct nfp_prog - nfp BPF program
+  * @bpf: backpointer to the bpf app priv structure
+
+commit 662c54721d3a1e8950029cb6b0ed264d59847711
+Author: Jiong Wang <jiong.wang@netronome.com>
+Date:   Fri Jul 6 15:13:19 2018 -0700
+
+    nfp: bpf: rename umin/umax to umin_src/umax_src
+    
+    The two fields are a copy of umin and umax info of bpf_insn->src_reg
+    generated by verifier.
+    
+    Rename to make their meaning clear.
+    
+    Signed-off-by: Jiong Wang <jiong.wang@netronome.com>
+    Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Acked-by: Song Liu <songliubraving@fb.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 654fe7823e5e..5975a19c28cb 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -263,8 +263,8 @@ struct nfp_bpf_reg_state {
+  * @func_id: function id for call instructions
+  * @arg1: arg1 for call instructions
+  * @arg2: arg2 for call instructions
+- * @umin: copy of core verifier umin_value.
+- * @umax: copy of core verifier umax_value.
++ * @umin_src: copy of core verifier umin_value for src opearnd.
++ * @umax_src: copy of core verifier umax_value for src operand.
+  * @off: index of first generated machine instruction (in nfp_prog.prog)
+  * @n: eBPF instruction number
+  * @flags: eBPF instruction extra optimization flags
+@@ -301,11 +301,11 @@ struct nfp_insn_meta {
+ 			struct nfp_bpf_reg_state arg2;
+ 		};
+ 		/* We are interested in range info for some operands,
+-		 * for example, the shift amount.
++		 * for example, the shift amount which is kept in src operand.
+ 		 */
+ 		struct {
+-			u64 umin;
+-			u64 umax;
++			u64 umin_src;
++			u64 umax_src;
+ 		};
+ 	};
+ 	unsigned int off;
+
+commit 991f5b3651f6bb1cb5034f422e43f489e65f2701
+Author: Jiong Wang <jiong.wang@netronome.com>
+Date:   Fri May 18 12:12:09 2018 -0700
+
+    nfp: bpf: support logic indirect shifts (BPF_[L|R]SH | BPF_X)
+    
+    For indirect shifts, shift amount is not specified as constant, NFP needs
+    to get the shift amount through the low 5 bits of source A operand in
+    PREV_ALU, therefore extra instructions are needed compared with shifts by
+    constants.
+    
+    Because NFP is 32-bit, so we are using register pair for 64-bit shifts and
+    therefore would need different instruction sequences depending on whether
+    shift amount is less than 32 or not.
+    
+    NFP branch-on-bit-test instruction emitter is added by this patch and is
+    used for efficient runtime check on shift amount. We'd think the shift
+    amount is less than 32 if bit 5 is clear and greater or equal than 32
+    otherwise. Shift amount is greater than or equal to 64 will result in
+    undefined behavior.
+    
+    This patch also use range info to avoid generating unnecessary runtime code
+    if we are certain shift amount is less than 32 or not.
+    
+    Signed-off-by: Jiong Wang <jiong.wang@netronome.com>
+    Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 8b143546ae85..654fe7823e5e 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -263,6 +263,8 @@ struct nfp_bpf_reg_state {
+  * @func_id: function id for call instructions
+  * @arg1: arg1 for call instructions
+  * @arg2: arg2 for call instructions
++ * @umin: copy of core verifier umin_value.
++ * @umax: copy of core verifier umax_value.
+  * @off: index of first generated machine instruction (in nfp_prog.prog)
+  * @n: eBPF instruction number
+  * @flags: eBPF instruction extra optimization flags
+@@ -298,6 +300,13 @@ struct nfp_insn_meta {
+ 			struct bpf_reg_state arg1;
+ 			struct nfp_bpf_reg_state arg2;
+ 		};
++		/* We are interested in range info for some operands,
++		 * for example, the shift amount.
++		 */
++		struct {
++			u64 umin;
++			u64 umax;
++		};
+ 	};
+ 	unsigned int off;
+ 	unsigned short n;
+@@ -375,6 +384,25 @@ static inline bool is_mbpf_xadd(const struct nfp_insn_meta *meta)
+ 	return (meta->insn.code & ~BPF_SIZE_MASK) == (BPF_STX | BPF_XADD);
+ }
+ 
++static inline bool is_mbpf_indir_shift(const struct nfp_insn_meta *meta)
++{
++	u8 code = meta->insn.code;
++	bool is_alu, is_shift;
++	u8 opclass, opcode;
++
++	opclass = BPF_CLASS(code);
++	is_alu = opclass == BPF_ALU64 || opclass == BPF_ALU;
++	if (!is_alu)
++		return false;
++
++	opcode = BPF_OP(code);
++	is_shift = opcode == BPF_LSH || opcode == BPF_RSH || opcode == BPF_ARSH;
++	if (!is_shift)
++		return false;
++
++	return BPF_SRC(code) == BPF_X;
++}
++
+ /**
+  * struct nfp_prog - nfp BPF program
+  * @bpf: backpointer to the bpf app priv structure
+
+commit d985888faae6588c8ce9e45ad1e4a3ab5f0376b4
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Tue May 8 19:37:07 2018 -0700
+
+    nfp: bpf: support setting the RX queue index
+    
+    BPF has access to all internal FW datapath structures.  Including
+    the structure containing RX queue selection.  With little coordination
+    with the datapath we can let the offloaded BPF select the RX queue.
+    We just need a way to tell the datapath that queue selection has already
+    been done and it shouldn't overwrite it.  Define a bit to tell datapath
+    BPF already selected a queue (QSEL_SET), if the selected queue is not
+    enabled (>= number of enabled queues) datapath will perform normal RSS.
+    
+    BPF queue selection on the NIC can be used to replace standard
+    datapath RSS with fully programmable BPF/XDP RSS.
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Reviewed-by: Quentin Monnet <quentin.monnet@netronome.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 82682378d57f..8b143546ae85 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -82,10 +82,16 @@ enum static_regs {
+ enum pkt_vec {
+ 	PKT_VEC_PKT_LEN		= 0,
+ 	PKT_VEC_PKT_PTR		= 2,
++	PKT_VEC_QSEL_SET	= 4,
++	PKT_VEC_QSEL_VAL	= 6,
+ };
+ 
++#define PKT_VEL_QSEL_SET_BIT	4
++
+ #define pv_len(np)	reg_lm(1, PKT_VEC_PKT_LEN)
+ #define pv_ctm_ptr(np)	reg_lm(1, PKT_VEC_PKT_PTR)
++#define pv_qsel_set(np)	reg_lm(1, PKT_VEC_QSEL_SET)
++#define pv_qsel_val(np)	reg_lm(1, PKT_VEC_QSEL_VAL)
+ 
+ #define stack_reg(np)	reg_a(STATIC_REG_STACK)
+ #define stack_imm(np)	imm_b(np)
+@@ -139,6 +145,7 @@ enum pkt_vec {
+  * @helpers.perf_event_output:	output perf event to a ring buffer
+  *
+  * @pseudo_random:	FW initialized the pseudo-random machinery (CSRs)
++ * @queue_select:	BPF can set the RX queue ID in packet vector
+  */
+ struct nfp_app_bpf {
+ 	struct nfp_app *app;
+@@ -181,6 +188,7 @@ struct nfp_app_bpf {
+ 	} helpers;
+ 
+ 	bool pseudo_random;
++	bool queue_select;
+ };
+ 
+ enum nfp_bpf_map_use {
+
+commit 9816dd35ececc095f3e3be29d30d3adc755908d9
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Thu May 3 18:37:12 2018 -0700
+
+    nfp: bpf: perf event output helpers support
+    
+    Add support for the perf_event_output family of helpers.
+    
+    The implementation on the NFP will not match the host code exactly.
+    The state of the host map and rings is unknown to the device, hence
+    device can't return errors when rings are not installed.  The device
+    simply packs the data into a firmware notification message and sends
+    it over to the host, returning success to the program.
+    
+    There is no notion of a host CPU on the device when packets are being
+    processed.  Device will only offload programs which set BPF_F_CURRENT_CPU.
+    Still, if map index doesn't match CPU no error will be returned (see
+    above).
+    
+    Dropped/lost firmware notification messages will not cause "lost
+    events" event on the perf ring, they are only visible via device
+    error counters.
+    
+    Firmware notification messages may also get reordered in respect
+    to the packets which caused their generation.
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Reviewed-by: Quentin Monnet <quentin.monnet@netronome.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 5db6284a44ba..82682378d57f 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -136,6 +136,7 @@ enum pkt_vec {
+  * @helpers.map_lookup:		map lookup helper address
+  * @helpers.map_update:		map update helper address
+  * @helpers.map_delete:		map delete helper address
++ * @helpers.perf_event_output:	output perf event to a ring buffer
+  *
+  * @pseudo_random:	FW initialized the pseudo-random machinery (CSRs)
+  */
+@@ -176,6 +177,7 @@ struct nfp_app_bpf {
+ 		u32 map_lookup;
+ 		u32 map_update;
+ 		u32 map_delete;
++		u32 perf_event_output;
+ 	} helpers;
+ 
+ 	bool pseudo_random;
+@@ -458,5 +460,7 @@ int nfp_bpf_ctrl_lookup_entry(struct bpf_offloaded_map *offmap,
+ int nfp_bpf_ctrl_getnext_entry(struct bpf_offloaded_map *offmap,
+ 			       void *key, void *next_key);
+ 
++int nfp_bpf_event_output(struct nfp_app_bpf *bpf, struct sk_buff *skb);
++
+ void nfp_bpf_ctrl_msg_rx(struct nfp_app *app, struct sk_buff *skb);
+ #endif
+
+commit 630a4d3874a06aa9f9481cbfc688981aad7a834c
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Thu May 3 18:37:09 2018 -0700
+
+    nfp: bpf: record offload neutral maps in the driver
+    
+    For asynchronous events originating from the device, like perf event
+    output, we need to be able to make sure that objects being referred
+    to by the FW message are valid on the host.  FW events can get queued
+    and reordered.  Even if we had a FW message "barrier" we should still
+    protect ourselves from bogus FW output.
+    
+    Add a reverse-mapping hash table and record in it all raw map pointers
+    FW may refer to.  Only record neutral maps, i.e. perf event arrays.
+    These are currently the only objects FW can refer to.  Use RCU protection
+    on the read side, update side is under RTNL.
+    
+    Since program vs map destruction order is slightly painful for offload
+    simply take an extra reference on all the recorded maps to make sure
+    they don't disappear.
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Reviewed-by: Quentin Monnet <quentin.monnet@netronome.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 68b5d326483d..5db6284a44ba 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (C) 2016-2017 Netronome Systems, Inc.
++ * Copyright (C) 2016-2018 Netronome Systems, Inc.
+  *
+  * This software is dual licensed under the GNU General License Version 2,
+  * June 1991 as shown in the file COPYING in the top-level directory of this
+@@ -39,6 +39,7 @@
+ #include <linux/bpf_verifier.h>
+ #include <linux/kernel.h>
+ #include <linux/list.h>
++#include <linux/rhashtable.h>
+ #include <linux/skbuff.h>
+ #include <linux/types.h>
+ #include <linux/wait.h>
+@@ -114,6 +115,8 @@ enum pkt_vec {
+  * @maps_in_use:	number of currently offloaded maps
+  * @map_elems_in_use:	number of elements allocated to offloaded maps
+  *
++ * @maps_neutral:	hash table of offload-neutral maps (on pointer)
++ *
+  * @adjust_head:	adjust head capability
+  * @adjust_head.flags:		extra flags for adjust head
+  * @adjust_head.off_min:	minimal packet offset within buffer required
+@@ -150,6 +153,8 @@ struct nfp_app_bpf {
+ 	unsigned int maps_in_use;
+ 	unsigned int map_elems_in_use;
+ 
++	struct rhashtable maps_neutral;
++
+ 	struct nfp_bpf_cap_adjust_head {
+ 		u32 flags;
+ 		int off_min;
+@@ -199,6 +204,14 @@ struct nfp_bpf_map {
+ 	enum nfp_bpf_map_use use_map[];
+ };
+ 
++struct nfp_bpf_neutral_map {
++	struct rhash_head l;
++	struct bpf_map *ptr;
++	u32 count;
++};
++
++extern const struct rhashtable_params nfp_bpf_maps_neutral_params;
++
+ struct nfp_prog;
+ struct nfp_insn_meta;
+ typedef int (*instr_cb_t)(struct nfp_prog *, struct nfp_insn_meta *);
+@@ -367,6 +380,8 @@ static inline bool is_mbpf_xadd(const struct nfp_insn_meta *meta)
+  * @error: error code if something went wrong
+  * @stack_depth: max stack depth from the verifier
+  * @adjust_head_location: if program has single adjust head call - the insn no.
++ * @map_records_cnt: the number of map pointers recorded for this prog
++ * @map_records: the map record pointers from bpf->maps_neutral
+  * @insns: list of BPF instruction wrappers (struct nfp_insn_meta)
+  */
+ struct nfp_prog {
+@@ -390,6 +405,9 @@ struct nfp_prog {
+ 	unsigned int stack_depth;
+ 	unsigned int adjust_head_location;
+ 
++	unsigned int map_records_cnt;
++	struct nfp_bpf_neutral_map **map_records;
++
+ 	struct list_head insns;
+ };
+ 
+
+commit 7bdc97be9075c074be0f0aa9c59a8d2238224743
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Tue Apr 24 21:22:39 2018 -0700
+
+    nfp: bpf: optimize comparisons to negative constants
+    
+    Comparison instruction requires a subtraction.  If the constant
+    is negative we are more likely to fit it into a NFP instruction
+    directly if we change the sign and use addition.
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 4981c8944ca3..68b5d326483d 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -236,6 +236,7 @@ struct nfp_bpf_reg_state {
+  * @xadd_over_16bit: 16bit immediate is not guaranteed
+  * @xadd_maybe_16bit: 16bit immediate is possible
+  * @jmp_dst: destination info for jump instructions
++ * @jump_neg_op: jump instruction has inverted immediate, use ADD instead of SUB
+  * @func_id: function id for call instructions
+  * @arg1: arg1 for call instructions
+  * @arg2: arg2 for call instructions
+@@ -264,7 +265,10 @@ struct nfp_insn_meta {
+ 			bool xadd_maybe_16bit;
+ 		};
+ 		/* jump */
+-		struct nfp_insn_meta *jmp_dst;
++		struct {
++			struct nfp_insn_meta *jmp_dst;
++			bool jump_neg_op;
++		};
+ 		/* function calls */
+ 		struct {
+ 			u32 func_id;
+
+commit df4a37d8b53f9fb9af722b056da5edbd9a531768
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Wed Mar 28 17:48:37 2018 -0700
+
+    nfp: bpf: add support for bpf_get_prandom_u32()
+    
+    NFP has a prng register, which we can read to obtain a u32 worth
+    of pseudo random data.  Generate code for it.
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Reviewed-by: Quentin Monnet <quentin.monnet@netronome.com>
+    Reviewed-by: Jiong Wang <jiong.wang@netronome.com>
+    Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index a73b86c6ce52..4981c8944ca3 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -133,6 +133,8 @@ enum pkt_vec {
+  * @helpers.map_lookup:		map lookup helper address
+  * @helpers.map_update:		map update helper address
+  * @helpers.map_delete:		map delete helper address
++ *
++ * @pseudo_random:	FW initialized the pseudo-random machinery (CSRs)
+  */
+ struct nfp_app_bpf {
+ 	struct nfp_app *app;
+@@ -170,6 +172,8 @@ struct nfp_app_bpf {
+ 		u32 map_update;
+ 		u32 map_delete;
+ 	} helpers;
++
++	bool pseudo_random;
+ };
+ 
+ enum nfp_bpf_map_use {
+
+commit 41aed09cf61c00ef6c3b2648d5a193cbaf2a74d0
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Wed Mar 28 17:48:36 2018 -0700
+
+    nfp: bpf: add support for atomic add of unknown values
+    
+    Allow atomic add to be used even when the value is not guaranteed
+    to fit into a 16 bit immediate.  This requires the value to be pulled
+    as data, and therefore use of a transfer register and a context swap.
+    
+    Track the information about possible lengths of the value, if it's
+    guaranteed to be larger than 16bits don't generate the code for the
+    optimized case at all.
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Reviewed-by: Quentin Monnet <quentin.monnet@netronome.com>
+    Reviewed-by: Jiong Wang <jiong.wang@netronome.com>
+    Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 877be7143991..a73b86c6ce52 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -229,6 +229,8 @@ struct nfp_bpf_reg_state {
+  * @pkt_cache.range_start: start offset for associated packet data cache
+  * @pkt_cache.range_end: end offset for associated packet data cache
+  * @pkt_cache.do_init: this read needs to initialize packet data cache
++ * @xadd_over_16bit: 16bit immediate is not guaranteed
++ * @xadd_maybe_16bit: 16bit immediate is possible
+  * @jmp_dst: destination info for jump instructions
+  * @func_id: function id for call instructions
+  * @arg1: arg1 for call instructions
+@@ -243,6 +245,7 @@ struct nfp_bpf_reg_state {
+ struct nfp_insn_meta {
+ 	struct bpf_insn insn;
+ 	union {
++		/* pointer ops (ld/st/xadd) */
+ 		struct {
+ 			struct bpf_reg_state ptr;
+ 			struct bpf_insn *paired_st;
+@@ -253,8 +256,12 @@ struct nfp_insn_meta {
+ 				s16 range_end;
+ 				bool do_init;
+ 			} pkt_cache;
++			bool xadd_over_16bit;
++			bool xadd_maybe_16bit;
+ 		};
++		/* jump */
+ 		struct nfp_insn_meta *jmp_dst;
++		/* function calls */
+ 		struct {
+ 			u32 func_id;
+ 			struct bpf_reg_state arg1;
+
+commit dcb0c27f3c989fecae42593f470a2413434aae28
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Wed Mar 28 17:48:34 2018 -0700
+
+    nfp: bpf: add basic support for atomic adds
+    
+    Implement atomic add operation for 32 and 64 bit values.  Depend
+    on the verifier to ensure alignment.  Values have to be kept in
+    big endian and swapped upon read/write.  For now only support
+    atomic add of a constant.
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Reviewed-by: Quentin Monnet <quentin.monnet@netronome.com>
+    Reviewed-by: Jiong Wang <jiong.wang@netronome.com>
+    Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 26bb491224b3..877be7143991 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -72,6 +72,7 @@ enum nfp_relo_type {
+ #define BR_OFF_RELO		15000
+ 
+ enum static_regs {
++	STATIC_REG_IMMA		= 20, /* Bank AB */
+ 	STATIC_REG_IMM		= 21, /* Bank AB */
+ 	STATIC_REG_STACK	= 22, /* Bank A */
+ 	STATIC_REG_PKT_LEN	= 22, /* Bank B */
+@@ -91,6 +92,8 @@ enum pkt_vec {
+ #define pptr_reg(np)	pv_ctm_ptr(np)
+ #define imm_a(np)	reg_a(STATIC_REG_IMM)
+ #define imm_b(np)	reg_b(STATIC_REG_IMM)
++#define imma_a(np)	reg_a(STATIC_REG_IMMA)
++#define imma_b(np)	reg_b(STATIC_REG_IMMA)
+ #define imm_both(np)	reg_both(STATIC_REG_IMM)
+ 
+ #define NFP_BPF_ABI_FLAGS	reg_imm(0)
+@@ -169,18 +172,27 @@ struct nfp_app_bpf {
+ 	} helpers;
+ };
+ 
++enum nfp_bpf_map_use {
++	NFP_MAP_UNUSED = 0,
++	NFP_MAP_USE_READ,
++	NFP_MAP_USE_WRITE,
++	NFP_MAP_USE_ATOMIC_CNT,
++};
++
+ /**
+  * struct nfp_bpf_map - private per-map data attached to BPF maps for offload
+  * @offmap:	pointer to the offloaded BPF map
+  * @bpf:	back pointer to bpf app private structure
+  * @tid:	table id identifying map on datapath
+  * @l:		link on the nfp_app_bpf->map_list list
++ * @use_map:	map of how the value is used (in 4B chunks)
+  */
+ struct nfp_bpf_map {
+ 	struct bpf_offloaded_map *offmap;
+ 	struct nfp_app_bpf *bpf;
+ 	u32 tid;
+ 	struct list_head l;
++	enum nfp_bpf_map_use use_map[];
+ };
+ 
+ struct nfp_prog;
+@@ -320,6 +332,11 @@ static inline bool is_mbpf_classic_store_pkt(const struct nfp_insn_meta *meta)
+ 	return is_mbpf_classic_store(meta) && meta->ptr.type == PTR_TO_PACKET;
+ }
+ 
++static inline bool is_mbpf_xadd(const struct nfp_insn_meta *meta)
++{
++	return (meta->insn.code & ~BPF_SIZE_MASK) == (BPF_STX | BPF_XADD);
++}
++
+ /**
+  * struct nfp_prog - nfp BPF program
+  * @bpf: backpointer to the bpf app priv structure
+
+commit bfee64deaa766ba88ff42fcbced82ad4ef6cb315
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Wed Mar 28 17:48:32 2018 -0700
+
+    nfp: bpf: add map deletes from the datapath
+    
+    Support calling map_delete_elem() FW helper from the datapath
+    programs.  For JIT checks and code are basically equivalent
+    to map lookups.  Similarly to other map helper key must be on
+    the stack.  Different pointer types are left for future extension.
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Reviewed-by: Quentin Monnet <quentin.monnet@netronome.com>
+    Reviewed-by: Jiong Wang <jiong.wang@netronome.com>
+    Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 0246bd88bff3..26bb491224b3 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -129,6 +129,7 @@ enum pkt_vec {
+  * @helpers:		helper addressess for various calls
+  * @helpers.map_lookup:		map lookup helper address
+  * @helpers.map_update:		map update helper address
++ * @helpers.map_delete:		map delete helper address
+  */
+ struct nfp_app_bpf {
+ 	struct nfp_app *app;
+@@ -164,6 +165,7 @@ struct nfp_app_bpf {
+ 	struct {
+ 		u32 map_lookup;
+ 		u32 map_update;
++		u32 map_delete;
+ 	} helpers;
+ };
+ 
+
+commit 44d65a47aeabc40619ad6d1900e0f54e5b5145b8
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Wed Mar 28 17:48:31 2018 -0700
+
+    nfp: bpf: add map updates from the datapath
+    
+    Support calling map_update_elem() from the datapath programs
+    by calling into FW-provided helper.  Value pointer is passed
+    in LM pointer #2.  Keeping track of old state for arg3 is not
+    necessary, since LM pointer #2 will be always loaded in this
+    case, the trivial optimization for value at the bottom of the
+    stack can't be done here.
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Reviewed-by: Quentin Monnet <quentin.monnet@netronome.com>
+    Reviewed-by: Jiong Wang <jiong.wang@netronome.com>
+    Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 0f920bf48b01..0246bd88bff3 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -128,6 +128,7 @@ enum pkt_vec {
+  *
+  * @helpers:		helper addressess for various calls
+  * @helpers.map_lookup:		map lookup helper address
++ * @helpers.map_update:		map update helper address
+  */
+ struct nfp_app_bpf {
+ 	struct nfp_app *app;
+@@ -162,6 +163,7 @@ struct nfp_app_bpf {
+ 
+ 	struct {
+ 		u32 map_lookup;
++		u32 map_update;
+ 	} helpers;
+ };
+ 
+
+commit 2f46e0c1273512cbdb944f5a50cc93cf0888c3d7
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Wed Mar 28 17:48:29 2018 -0700
+
+    nfp: bpf: add helper for validating stack pointers
+    
+    Our implementation has restriction on stack pointers for function
+    calls.  Move the common checks into a helper for reuse.  The state
+    has to be encapsulated into a structure to support parameters
+    other than BPF_REG_2.
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Reviewed-by: Quentin Monnet <quentin.monnet@netronome.com>
+    Reviewed-by: Jiong Wang <jiong.wang@netronome.com>
+    Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index c220ac5a734a..0f920bf48b01 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -190,6 +190,16 @@ typedef int (*instr_cb_t)(struct nfp_prog *, struct nfp_insn_meta *);
+ #define nfp_meta_next(meta)	list_next_entry(meta, l)
+ #define nfp_meta_prev(meta)	list_prev_entry(meta, l)
+ 
++/**
++ * struct nfp_bpf_reg_state - register state for calls
++ * @reg: BPF register state from latest path
++ * @var_off: for stack arg - changes stack offset on different paths
++ */
++struct nfp_bpf_reg_state {
++	struct bpf_reg_state reg;
++	bool var_off;
++};
++
+ #define FLAG_INSN_IS_JUMP_DST	BIT(0)
+ 
+ /**
+@@ -207,7 +217,6 @@ typedef int (*instr_cb_t)(struct nfp_prog *, struct nfp_insn_meta *);
+  * @func_id: function id for call instructions
+  * @arg1: arg1 for call instructions
+  * @arg2: arg2 for call instructions
+- * @arg2_var_off: arg2 changes stack offset on different paths
+  * @off: index of first generated machine instruction (in nfp_prog.prog)
+  * @n: eBPF instruction number
+  * @flags: eBPF instruction extra optimization flags
+@@ -233,8 +242,7 @@ struct nfp_insn_meta {
+ 		struct {
+ 			u32 func_id;
+ 			struct bpf_reg_state arg1;
+-			struct bpf_reg_state arg2;
+-			bool arg2_var_off;
++			struct nfp_bpf_reg_state arg2;
+ 		};
+ 	};
+ 	unsigned int off;
+
+commit 87b10ecdced224dc0def123e1f57bc6c5ac4ac5c
+Author: Jiong Wang <jiong.wang@netronome.com>
+Date:   Wed Mar 28 17:48:27 2018 -0700
+
+    nfp: bpf: detect packet reads could be cached, enable the optimisation
+    
+    This patch is the front end of this optimisation, it detects and marks
+    those packet reads that could be cached. Then the optimisation "backend"
+    will be activated automatically.
+    
+    Signed-off-by: Jiong Wang <jiong.wang@netronome.com>
+    Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 861211e27ea6..c220ac5a734a 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -278,6 +278,36 @@ static inline bool is_mbpf_store(const struct nfp_insn_meta *meta)
+ 	return (meta->insn.code & ~BPF_SIZE_MASK) == (BPF_STX | BPF_MEM);
+ }
+ 
++static inline bool is_mbpf_load_pkt(const struct nfp_insn_meta *meta)
++{
++	return is_mbpf_load(meta) && meta->ptr.type == PTR_TO_PACKET;
++}
++
++static inline bool is_mbpf_store_pkt(const struct nfp_insn_meta *meta)
++{
++	return is_mbpf_store(meta) && meta->ptr.type == PTR_TO_PACKET;
++}
++
++static inline bool is_mbpf_classic_load(const struct nfp_insn_meta *meta)
++{
++	u8 code = meta->insn.code;
++
++	return BPF_CLASS(code) == BPF_LD &&
++	       (BPF_MODE(code) == BPF_ABS || BPF_MODE(code) == BPF_IND);
++}
++
++static inline bool is_mbpf_classic_store(const struct nfp_insn_meta *meta)
++{
++	u8 code = meta->insn.code;
++
++	return BPF_CLASS(code) == BPF_ST && BPF_MODE(code) == BPF_MEM;
++}
++
++static inline bool is_mbpf_classic_store_pkt(const struct nfp_insn_meta *meta)
++{
++	return is_mbpf_classic_store(meta) && meta->ptr.type == PTR_TO_PACKET;
++}
++
+ /**
+  * struct nfp_prog - nfp BPF program
+  * @bpf: backpointer to the bpf app priv structure
+
+commit be75923786aa28774bf2b5ef8184590a52429103
+Author: Jiong Wang <jiong.wang@netronome.com>
+Date:   Wed Mar 28 17:48:25 2018 -0700
+
+    nfp: bpf: read from packet data cache for PTR_TO_PACKET
+    
+    This patch assumes there is a packet data cache, and would try to read
+    packet data from the cache instead of from memory.
+    
+    This patch only implements the optimisation "backend", it doesn't build
+    the packet data cache, so this optimisation is not enabled.
+    
+    This patch has only enabled aligned packet data read, i.e. when the read
+    offset to the start of cache is REG_WIDTH aligned.
+    
+    Signed-off-by: Jiong Wang <jiong.wang@netronome.com>
+    Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 054df3dc0698..861211e27ea6 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -199,6 +199,10 @@ typedef int (*instr_cb_t)(struct nfp_prog *, struct nfp_insn_meta *);
+  * @ldst_gather_len: memcpy length gathered from load/store sequence
+  * @paired_st: the paired store insn at the head of the sequence
+  * @ptr_not_const: pointer is not always constant
++ * @pkt_cache: packet data cache information
++ * @pkt_cache.range_start: start offset for associated packet data cache
++ * @pkt_cache.range_end: end offset for associated packet data cache
++ * @pkt_cache.do_init: this read needs to initialize packet data cache
+  * @jmp_dst: destination info for jump instructions
+  * @func_id: function id for call instructions
+  * @arg1: arg1 for call instructions
+@@ -219,6 +223,11 @@ struct nfp_insn_meta {
+ 			struct bpf_insn *paired_st;
+ 			s16 ldst_gather_len;
+ 			bool ptr_not_const;
++			struct {
++				s16 range_start;
++				s16 range_end;
++				bool do_init;
++			} pkt_cache;
+ 		};
+ 		struct nfp_insn_meta *jmp_dst;
+ 		struct {
+
+commit 703f578a353d0735961b7fd7e2589532dfa9bf11
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Mon Feb 5 15:29:27 2018 -0800
+
+    nfp: fix kdoc warnings on nested structures
+    
+    Commit 84ce5b987783 ("scripts: kernel-doc: improve nested logic to
+    handle multiple identifiers") improved the handling of nested structure
+    definitions in scripts/kernel-doc, and changed the expected format of
+    documentation.  This causes new warnings to appear on W=1 builds.
+    
+    Only comment changes.
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Reviewed-by: Simon Horman <simon.horman@netronome.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 424fe8338105..054df3dc0698 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -112,22 +112,22 @@ enum pkt_vec {
+  * @map_elems_in_use:	number of elements allocated to offloaded maps
+  *
+  * @adjust_head:	adjust head capability
+- * @flags:		extra flags for adjust head
+- * @off_min:		minimal packet offset within buffer required
+- * @off_max:		maximum packet offset within buffer required
+- * @guaranteed_sub:	amount of negative adjustment guaranteed possible
+- * @guaranteed_add:	amount of positive adjustment guaranteed possible
++ * @adjust_head.flags:		extra flags for adjust head
++ * @adjust_head.off_min:	minimal packet offset within buffer required
++ * @adjust_head.off_max:	maximum packet offset within buffer required
++ * @adjust_head.guaranteed_sub:	negative adjustment guaranteed possible
++ * @adjust_head.guaranteed_add:	positive adjustment guaranteed possible
+  *
+  * @maps:		map capability
+- * @types:		supported map types
+- * @max_maps:		max number of maps supported
+- * @max_elems:		max number of entries in each map
+- * @max_key_sz:		max size of map key
+- * @max_val_sz:		max size of map value
+- * @max_elem_sz:	max size of map entry (key + value)
++ * @maps.types:			supported map types
++ * @maps.max_maps:		max number of maps supported
++ * @maps.max_elems:		max number of entries in each map
++ * @maps.max_key_sz:		max size of map key
++ * @maps.max_val_sz:		max size of map value
++ * @maps.max_elem_sz:		max size of map entry (key + value)
+  *
+  * @helpers:		helper addressess for various calls
+- * @map_lookup:		map lookup helper address
++ * @helpers.map_lookup:		map lookup helper address
+  */
+ struct nfp_app_bpf {
+ 	struct nfp_app *app;
+
+commit 52be9a7cde1fd26e43a01ac06d5c2558c563a7cb
+Author: Quentin Monnet <quentin.monnet@netronome.com>
+Date:   Fri Jan 19 17:44:50 2018 -0800
+
+    nfp: bpf: use extack support to improve debugging
+    
+    Use the recently added extack support for eBPF offload in the driver.
+    
+    Signed-off-by: Quentin Monnet <quentin.monnet@netronome.com>
+    Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index c476bca15ba4..424fe8338105 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -335,7 +335,7 @@ struct nfp_net;
+ int nfp_ndo_bpf(struct nfp_app *app, struct nfp_net *nn,
+ 		struct netdev_bpf *bpf);
+ int nfp_net_bpf_offload(struct nfp_net *nn, struct bpf_prog *prog,
+-			bool old_prog);
++			bool old_prog, struct netlink_ext_ack *extack);
+ 
+ struct nfp_insn_meta *
+ nfp_bpf_goto_meta(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta,
+
+commit 74801e50d5b89329e6c02b8bd924a41234f76316
+Author: Quentin Monnet <quentin.monnet@netronome.com>
+Date:   Tue Jan 16 15:51:50 2018 -0800
+
+    nfp: bpf: reject program on instructions unknown to the JIT compiler
+    
+    If an eBPF instruction is unknown to the driver JIT compiler, we can
+    reject the program at verification time.
+    
+    Signed-off-by: Quentin Monnet <quentin.monnet@netronome.com>
+    Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Reviewed-by: Jiong Wang <jiong.wang@netronome.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index b80e75a8ecda..c476bca15ba4 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -324,6 +324,7 @@ struct nfp_bpf_vnic {
+ 
+ void nfp_bpf_jit_prepare(struct nfp_prog *nfp_prog, unsigned int cnt);
+ int nfp_bpf_jit(struct nfp_prog *prog);
++bool nfp_bpf_supported_opcode(u8 code);
+ 
+ extern const struct bpf_prog_offload_ops nfp_bpf_analyzer_ops;
+ 
+
+commit 1bba4c413a328bfd216d59a212bec371e032391b
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Thu Jan 11 20:29:17 2018 -0800
+
+    nfp: bpf: implement bpf map offload
+    
+    Plug in to the stack's map offload callbacks for BPF map offload.
+    Get next call needs some special handling on the FW side, since
+    we can't send a NULL pointer to the FW there is a get first entry
+    FW command.
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Reviewed-by: Quentin Monnet <quentin.monnet@netronome.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 59197535c465..b80e75a8ecda 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -108,6 +108,8 @@ enum pkt_vec {
+  * @cmsg_wq:		work queue for waiting for cmsg replies
+  *
+  * @map_list:		list of offloaded maps
++ * @maps_in_use:	number of currently offloaded maps
++ * @map_elems_in_use:	number of elements allocated to offloaded maps
+  *
+  * @adjust_head:	adjust head capability
+  * @flags:		extra flags for adjust head
+@@ -138,6 +140,8 @@ struct nfp_app_bpf {
+ 	struct wait_queue_head cmsg_wq;
+ 
+ 	struct list_head map_list;
++	unsigned int maps_in_use;
++	unsigned int map_elems_in_use;
+ 
+ 	struct nfp_bpf_cap_adjust_head {
+ 		u32 flags;
+
+commit 77a3d3113ba2aa5919af2335c05bf9505f4241db
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Thu Jan 11 20:29:15 2018 -0800
+
+    nfp: bpf: add verification and codegen for map lookups
+    
+    Verify our current constraints on the location of the key are
+    met and generate the code for calling map lookup on the datapath.
+    
+    New relocation types have to be added - for helpers and return
+    addresses.
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index d381ae8629a2..59197535c465 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -60,6 +60,9 @@ enum nfp_relo_type {
+ 	RELO_BR_GO_ABORT,
+ 	/* external jumps to fixed addresses */
+ 	RELO_BR_NEXT_PKT,
++	RELO_BR_HELPER,
++	/* immediate relocation against load address */
++	RELO_IMMED_REL,
+ };
+ 
+ /* To make absolute relocated branches (branches other than RELO_BR_REL)
+@@ -191,9 +194,12 @@ typedef int (*instr_cb_t)(struct nfp_prog *, struct nfp_insn_meta *);
+  * @ptr: pointer type for memory operations
+  * @ldst_gather_len: memcpy length gathered from load/store sequence
+  * @paired_st: the paired store insn at the head of the sequence
+- * @arg2: arg2 for call instructions
+  * @ptr_not_const: pointer is not always constant
+  * @jmp_dst: destination info for jump instructions
++ * @func_id: function id for call instructions
++ * @arg1: arg1 for call instructions
++ * @arg2: arg2 for call instructions
++ * @arg2_var_off: arg2 changes stack offset on different paths
+  * @off: index of first generated machine instruction (in nfp_prog.prog)
+  * @n: eBPF instruction number
+  * @flags: eBPF instruction extra optimization flags
+@@ -211,7 +217,12 @@ struct nfp_insn_meta {
+ 			bool ptr_not_const;
+ 		};
+ 		struct nfp_insn_meta *jmp_dst;
+-		struct bpf_reg_state arg2;
++		struct {
++			u32 func_id;
++			struct bpf_reg_state arg1;
++			struct bpf_reg_state arg2;
++			bool arg2_var_off;
++		};
+ 	};
+ 	unsigned int off;
+ 	unsigned short n;
+
+commit 9d080d5da959ac4b64954f47b5ffd35a752d268e
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Thu Jan 11 20:29:13 2018 -0800
+
+    nfp: bpf: parse function call and map capabilities
+    
+    Parse helper function and supported map FW TLV capabilities.
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Reviewed-by: Quentin Monnet <quentin.monnet@netronome.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 047f253fc581..d381ae8629a2 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -112,6 +112,17 @@ enum pkt_vec {
+  * @off_max:		maximum packet offset within buffer required
+  * @guaranteed_sub:	amount of negative adjustment guaranteed possible
+  * @guaranteed_add:	amount of positive adjustment guaranteed possible
++ *
++ * @maps:		map capability
++ * @types:		supported map types
++ * @max_maps:		max number of maps supported
++ * @max_elems:		max number of entries in each map
++ * @max_key_sz:		max size of map key
++ * @max_val_sz:		max size of map value
++ * @max_elem_sz:	max size of map entry (key + value)
++ *
++ * @helpers:		helper addressess for various calls
++ * @map_lookup:		map lookup helper address
+  */
+ struct nfp_app_bpf {
+ 	struct nfp_app *app;
+@@ -132,6 +143,19 @@ struct nfp_app_bpf {
+ 		int guaranteed_sub;
+ 		int guaranteed_add;
+ 	} adjust_head;
++
++	struct {
++		u32 types;
++		u32 max_maps;
++		u32 max_elems;
++		u32 max_key_sz;
++		u32 max_val_sz;
++		u32 max_elem_sz;
++	} maps;
++
++	struct {
++		u32 map_lookup;
++	} helpers;
+ };
+ 
+ /**
+
+commit ff3d43f7568c82b335d7df2d40a31447c3fce10c
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Thu Jan 11 20:29:12 2018 -0800
+
+    nfp: bpf: implement helpers for FW map ops
+    
+    Implement calls for FW map communication.
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Reviewed-by: Quentin Monnet <quentin.monnet@netronome.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index e00a7de2a9c2..047f253fc581 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -303,8 +303,19 @@ nfp_bpf_goto_meta(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta,
+ 
+ void *nfp_bpf_relo_for_vnic(struct nfp_prog *nfp_prog, struct nfp_bpf_vnic *bv);
+ 
+-struct sk_buff *
+-nfp_bpf_cmsg_communicate(struct nfp_app_bpf *bpf, struct sk_buff *skb,
+-			 enum nfp_bpf_cmsg_type type, unsigned int reply_size);
++long long int
++nfp_bpf_ctrl_alloc_map(struct nfp_app_bpf *bpf, struct bpf_map *map);
++void
++nfp_bpf_ctrl_free_map(struct nfp_app_bpf *bpf, struct nfp_bpf_map *nfp_map);
++int nfp_bpf_ctrl_getfirst_entry(struct bpf_offloaded_map *offmap,
++				void *next_key);
++int nfp_bpf_ctrl_update_entry(struct bpf_offloaded_map *offmap,
++			      void *key, void *value, u64 flags);
++int nfp_bpf_ctrl_del_entry(struct bpf_offloaded_map *offmap, void *key);
++int nfp_bpf_ctrl_lookup_entry(struct bpf_offloaded_map *offmap,
++			      void *key, void *value);
++int nfp_bpf_ctrl_getnext_entry(struct bpf_offloaded_map *offmap,
++			       void *key, void *next_key);
++
+ void nfp_bpf_ctrl_msg_rx(struct nfp_app *app, struct sk_buff *skb);
+ #endif
+
+commit d48ae231c5e13d98e3664443c6342c2011f5df2b
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Thu Jan 11 20:29:11 2018 -0800
+
+    nfp: bpf: add basic control channel communication
+    
+    For map support we will need to send and receive control messages.
+    Add basic support for sending a message to FW, and waiting for a
+    reply.
+    
+    Control messages are tagged with a 16 bit ID.  Add a simple ID
+    allocator and make sure we don't allow too many messages in flight,
+    to avoid request <> reply mismatches.
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Reviewed-by: Quentin Monnet <quentin.monnet@netronome.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 23763b22f8fc..e00a7de2a9c2 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -37,10 +37,14 @@
+ #include <linux/bitfield.h>
+ #include <linux/bpf.h>
+ #include <linux/bpf_verifier.h>
++#include <linux/kernel.h>
+ #include <linux/list.h>
++#include <linux/skbuff.h>
+ #include <linux/types.h>
++#include <linux/wait.h>
+ 
+ #include "../nfp_asm.h"
++#include "fw.h"
+ 
+ /* For relocation logic use up-most byte of branch instruction as scratch
+  * area.  Remember to clear this before sending instructions to HW!
+@@ -93,6 +97,13 @@ enum pkt_vec {
+  * struct nfp_app_bpf - bpf app priv structure
+  * @app:		backpointer to the app
+  *
++ * @tag_allocator:	bitmap of control message tags in use
++ * @tag_alloc_next:	next tag bit to allocate
++ * @tag_alloc_last:	next tag bit to be freed
++ *
++ * @cmsg_replies:	received cmsg replies waiting to be consumed
++ * @cmsg_wq:		work queue for waiting for cmsg replies
++ *
+  * @map_list:		list of offloaded maps
+  *
+  * @adjust_head:	adjust head capability
+@@ -105,6 +116,13 @@ enum pkt_vec {
+ struct nfp_app_bpf {
+ 	struct nfp_app *app;
+ 
++	DECLARE_BITMAP(tag_allocator, U16_MAX + 1);
++	u16 tag_alloc_next;
++	u16 tag_alloc_last;
++
++	struct sk_buff_head cmsg_replies;
++	struct wait_queue_head cmsg_wq;
++
+ 	struct list_head map_list;
+ 
+ 	struct nfp_bpf_cap_adjust_head {
+@@ -284,4 +302,9 @@ nfp_bpf_goto_meta(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta,
+ 		  unsigned int insn_idx, unsigned int n_insns);
+ 
+ void *nfp_bpf_relo_for_vnic(struct nfp_prog *nfp_prog, struct nfp_bpf_vnic *bv);
++
++struct sk_buff *
++nfp_bpf_cmsg_communicate(struct nfp_app_bpf *bpf, struct sk_buff *skb,
++			 enum nfp_bpf_cmsg_type type, unsigned int reply_size);
++void nfp_bpf_ctrl_msg_rx(struct nfp_app *app, struct sk_buff *skb);
+ #endif
+
+commit 4da98eea7903670d7b1d9ac83bbc6502a60bf0fd
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Thu Jan 11 20:29:10 2018 -0800
+
+    nfp: bpf: add map data structure
+    
+    To be able to split code into reasonable chunks we need to add
+    the map data structures already.  Later patches will add code
+    piece by piece.
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Reviewed-by: Quentin Monnet <quentin.monnet@netronome.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 66381afee2a9..23763b22f8fc 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -93,6 +93,8 @@ enum pkt_vec {
+  * struct nfp_app_bpf - bpf app priv structure
+  * @app:		backpointer to the app
+  *
++ * @map_list:		list of offloaded maps
++ *
+  * @adjust_head:	adjust head capability
+  * @flags:		extra flags for adjust head
+  * @off_min:		minimal packet offset within buffer required
+@@ -103,6 +105,8 @@ enum pkt_vec {
+ struct nfp_app_bpf {
+ 	struct nfp_app *app;
+ 
++	struct list_head map_list;
++
+ 	struct nfp_bpf_cap_adjust_head {
+ 		u32 flags;
+ 		int off_min;
+@@ -112,6 +116,20 @@ struct nfp_app_bpf {
+ 	} adjust_head;
+ };
+ 
++/**
++ * struct nfp_bpf_map - private per-map data attached to BPF maps for offload
++ * @offmap:	pointer to the offloaded BPF map
++ * @bpf:	back pointer to bpf app private structure
++ * @tid:	table id identifying map on datapath
++ * @l:		link on the nfp_app_bpf->map_list list
++ */
++struct nfp_bpf_map {
++	struct bpf_offloaded_map *offmap;
++	struct nfp_app_bpf *bpf;
++	u32 tid;
++	struct list_head l;
++};
++
+ struct nfp_prog;
+ struct nfp_insn_meta;
+ typedef int (*instr_cb_t)(struct nfp_prog *, struct nfp_insn_meta *);
+
+commit af93d15ac6c40d097b08c18a65a0414f94110401
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Wed Jan 10 12:26:04 2018 +0000
+
+    nfp: hand over to BPF offload app at coarser granularity
+    
+    Instead of having an app callback per message type hand off
+    all offload-related handling to apps with one "rest of ndo_bpf"
+    callback.
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Reviewed-by: Quentin Monnet <quentin.monnet@netronome.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 8d02c39b9b10..66381afee2a9 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -256,15 +256,11 @@ struct netdev_bpf;
+ struct nfp_app;
+ struct nfp_net;
+ 
++int nfp_ndo_bpf(struct nfp_app *app, struct nfp_net *nn,
++		struct netdev_bpf *bpf);
+ int nfp_net_bpf_offload(struct nfp_net *nn, struct bpf_prog *prog,
+ 			bool old_prog);
+ 
+-int nfp_bpf_verifier_prep(struct nfp_app *app, struct nfp_net *nn,
+-			  struct netdev_bpf *bpf);
+-int nfp_bpf_translate(struct nfp_app *app, struct nfp_net *nn,
+-		      struct bpf_prog *prog);
+-int nfp_bpf_destroy(struct nfp_app *app, struct nfp_net *nn,
+-		    struct bpf_prog *prog);
+ struct nfp_insn_meta *
+ nfp_bpf_goto_meta(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta,
+ 		  unsigned int insn_idx, unsigned int n_insns);
+
+commit e84797fe159c8f849edd96ab72cc21eb890656fe
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Wed Jan 10 12:26:03 2018 +0000
+
+    nfp: bpf: use a large constant in unresolved branches
+    
+    To make absolute relocated branches (branches which will be completely
+    rewritten with br_set_offset()) distinguishable in user space dumps
+    from normal jumps add a large offset to them.
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Reviewed-by: Jiong Wang <jiong.wang@netronome.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 5deba5099618..8d02c39b9b10 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -58,6 +58,12 @@ enum nfp_relo_type {
+ 	RELO_BR_NEXT_PKT,
+ };
+ 
++/* To make absolute relocated branches (branches other than RELO_BR_REL)
++ * distinguishable in user space dumps from normal jumps, add a large offset
++ * to them.
++ */
++#define BR_OFF_RELO		15000
++
+ enum static_regs {
+ 	STATIC_REG_IMM		= 21, /* Bank AB */
+ 	STATIC_REG_STACK	= 22, /* Bank A */
+
+commit 2314fe9ed0a1760ceab96b81e6b7181963c93254
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Wed Jan 10 12:26:01 2018 +0000
+
+    nfp: bpf: relocate jump targets just before the load
+    
+    Don't translate the program assuming it will be loaded at a given
+    address.  This will be required for sharing programs between ports
+    of the same NIC, tail calls and subprograms.  It will also make the
+    jump targets easier to understand when dumping the program to user
+    space.
+    
+    Translate the program as if it was going to be loaded at address
+    zero.  When load happens add the load offset in and set addresses
+    of special branches.
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Reviewed-by: Jiong Wang <jiong.wang@netronome.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 0b1347f2afd1..5deba5099618 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -42,15 +42,20 @@
+ 
+ #include "../nfp_asm.h"
+ 
+-/* For branch fixup logic use up-most byte of branch instruction as scratch
++/* For relocation logic use up-most byte of branch instruction as scratch
+  * area.  Remember to clear this before sending instructions to HW!
+  */
+-#define OP_BR_SPECIAL	0xff00000000000000ULL
+-
+-enum br_special {
+-	OP_BR_NORMAL = 0,
+-	OP_BR_GO_OUT,
+-	OP_BR_GO_ABORT,
++#define OP_RELO_TYPE	0xff00000000000000ULL
++
++enum nfp_relo_type {
++	RELO_NONE = 0,
++	/* standard internal jumps */
++	RELO_BR_REL,
++	/* internal jumps to parts of the outro */
++	RELO_BR_GO_OUT,
++	RELO_BR_GO_ABORT,
++	/* external jumps to fixed addresses */
++	RELO_BR_NEXT_PKT,
+ };
+ 
+ enum static_regs {
+@@ -191,11 +196,9 @@ static inline bool is_mbpf_store(const struct nfp_insn_meta *meta)
+  * @__prog_alloc_len: alloc size of @prog array
+  * @verifier_meta: temporary storage for verifier's insn meta
+  * @type: BPF program type
+- * @start_off: address of the first instruction in the memory
+  * @last_bpf_off: address of the last instruction translated from BPF
+  * @tgt_out: jump target for normal exit
+  * @tgt_abort: jump target for abort (e.g. access outside of packet buffer)
+- * @tgt_done: jump target to get the next packet
+  * @n_translated: number of successfully translated instructions (for errors)
+  * @error: error code if something went wrong
+  * @stack_depth: max stack depth from the verifier
+@@ -213,11 +216,9 @@ struct nfp_prog {
+ 
+ 	enum bpf_prog_type type;
+ 
+-	unsigned int start_off;
+ 	unsigned int last_bpf_off;
+ 	unsigned int tgt_out;
+ 	unsigned int tgt_abort;
+-	unsigned int tgt_done;
+ 
+ 	unsigned int n_translated;
+ 	int error;
+@@ -231,9 +232,13 @@ struct nfp_prog {
+ /**
+  * struct nfp_bpf_vnic - per-vNIC BPF priv structure
+  * @tc_prog:	currently loaded cls_bpf program
++ * @start_off:	address of the first instruction in the memory
++ * @tgt_done:	jump target to get the next packet
+  */
+ struct nfp_bpf_vnic {
+ 	struct bpf_prog *tc_prog;
++	unsigned int start_off;
++	unsigned int tgt_done;
+ };
+ 
+ void nfp_bpf_jit_prepare(struct nfp_prog *nfp_prog, unsigned int cnt);
+@@ -257,4 +262,6 @@ int nfp_bpf_destroy(struct nfp_app *app, struct nfp_net *nn,
+ struct nfp_insn_meta *
+ nfp_bpf_goto_meta(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta,
+ 		  unsigned int insn_idx, unsigned int n_insns);
++
++void *nfp_bpf_relo_for_vnic(struct nfp_prog *nfp_prog, struct nfp_bpf_vnic *bv);
+ #endif
+
+commit 1549921da3e8efb6c95e39444c67ed1729a0ccaf
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Wed Jan 10 12:25:59 2018 +0000
+
+    nfp: bpf: move jump resolution to jit.c
+    
+    Jump target resolution should be in jit.c not offload.c.
+    No functional changes.
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Reviewed-by: Jiong Wang <jiong.wang@netronome.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 89a9b6393882..0b1347f2afd1 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -236,6 +236,7 @@ struct nfp_bpf_vnic {
+ 	struct bpf_prog *tc_prog;
+ };
+ 
++void nfp_bpf_jit_prepare(struct nfp_prog *nfp_prog, unsigned int cnt);
+ int nfp_bpf_jit(struct nfp_prog *prog);
+ 
+ extern const struct bpf_prog_offload_ops nfp_bpf_analyzer_ops;
+
+commit cae1927c0b4a93ae15de824faca1f6f611a44fcd
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Wed Dec 27 18:39:05 2017 -0800
+
+    bpf: offload: allow netdev to disappear while verifier is running
+    
+    To allow verifier instruction callbacks without any extra locking
+    NETDEV_UNREGISTER notification would wait on a waitqueue for verifier
+    to finish.  This design decision was made when rtnl lock was providing
+    all the locking.  Use the read/write lock instead and remove the
+    workqueue.
+    
+    Verifier will now call into the offload code, so dev_ops are moved
+    to offload structure.  Since verifier calls are all under
+    bpf_prog_is_dev_bound() we no longer need static inline implementations
+    to please builds with CONFIG_NET=n.
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Reviewed-by: Quentin Monnet <quentin.monnet@netronome.com>
+    Acked-by: Alexei Starovoitov <ast@kernel.org>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index aae1be9ed056..89a9b6393882 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -238,7 +238,7 @@ struct nfp_bpf_vnic {
+ 
+ int nfp_bpf_jit(struct nfp_prog *prog);
+ 
+-extern const struct bpf_ext_analyzer_ops nfp_bpf_analyzer_ops;
++extern const struct bpf_prog_offload_ops nfp_bpf_analyzer_ops;
+ 
+ struct netdev_bpf;
+ struct nfp_app;
+
+commit fba961ab29e5ffb055592442808bb0f7962e05da
+Merge: 0a80f0c26bf5 ead68f216110
+Author: David S. Miller <davem@davemloft.net>
+Date:   Fri Dec 22 11:16:31 2017 -0500
+
+    Merge git://git.kernel.org/pub/scm/linux/kernel/git/davem/net
+    
+    Lots of overlapping changes.  Also on the net-next side
+    the XDP state management is handled more in the generic
+    layers so undo the 'net' nfp fix which isn't applicable
+    in net-next.
+    
+    Include a necessary change by Jakub Kicinski, with log message:
+    
+    ====================
+    cls_bpf no longer takes care of offload tracking.  Make sure
+    netdevsim performs necessary checks.  This fixes a warning
+    caused by TC trying to remove a filter it has not added.
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Reviewed-by: Quentin Monnet <quentin.monnet@netronome.com>
+    ====================
+    
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+commit d3f89b98e391475419ae2d8834813d3ecbb48f67
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Tue Dec 19 13:32:14 2017 -0800
+
+    nfp: bpf: keep track of the offloaded program
+    
+    After TC offloads were converted to callbacks we have no choice
+    but keep track of the offloaded filter in the driver.
+    
+    The check for nn->dp.bpf_offload_xdp was a stop gap solution
+    to make sure failed TC offload won't disable XDP, it's no longer
+    necessary.  nfp_net_bpf_offload() will return -EBUSY on
+    TC vs XDP conflicts.
+    
+    Fixes: 3f7889c4c79b ("net: sched: cls_bpf: call block callbacks for offload")
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 082a15f6dfb5..57b6043177a3 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -172,6 +172,14 @@ struct nfp_prog {
+ 	struct list_head insns;
+ };
+ 
++/**
++ * struct nfp_bpf_vnic - per-vNIC BPF priv structure
++ * @tc_prog:	currently loaded cls_bpf program
++ */
++struct nfp_bpf_vnic {
++	struct bpf_prog *tc_prog;
++};
++
+ int nfp_bpf_jit(struct nfp_prog *prog);
+ 
+ extern const struct bpf_ext_analyzer_ops nfp_bpf_analyzer_ops;
+
+commit 8231f8444110c346a7d28756abbca11c956d5803
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Thu Dec 14 21:29:19 2017 -0800
+
+    nfp: bpf: optimize the adjust_head calls in trivial cases
+    
+    If the program is simple and has only one adjust head call
+    with constant parameters, we can check that the call will
+    always succeed at translation time.  We need to track the
+    location of the call and make sure parameters are always
+    the same.  We also have to check the parameters against
+    datapath constraints and ETH_HLEN.
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 00a46258fb6d..f49669bf6b44 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -86,6 +86,8 @@ enum pkt_vec {
+  * @flags:		extra flags for adjust head
+  * @off_min:		minimal packet offset within buffer required
+  * @off_max:		maximum packet offset within buffer required
++ * @guaranteed_sub:	amount of negative adjustment guaranteed possible
++ * @guaranteed_add:	amount of positive adjustment guaranteed possible
+  */
+ struct nfp_app_bpf {
+ 	struct nfp_app *app;
+@@ -94,6 +96,8 @@ struct nfp_app_bpf {
+ 		u32 flags;
+ 		int off_min;
+ 		int off_max;
++		int guaranteed_sub;
++		int guaranteed_add;
+ 	} adjust_head;
+ };
+ 
+@@ -116,6 +120,7 @@ typedef int (*instr_cb_t)(struct nfp_prog *, struct nfp_insn_meta *);
+  * @ptr: pointer type for memory operations
+  * @ldst_gather_len: memcpy length gathered from load/store sequence
+  * @paired_st: the paired store insn at the head of the sequence
++ * @arg2: arg2 for call instructions
+  * @ptr_not_const: pointer is not always constant
+  * @jmp_dst: destination info for jump instructions
+  * @off: index of first generated machine instruction (in nfp_prog.prog)
+@@ -135,6 +140,7 @@ struct nfp_insn_meta {
+ 			bool ptr_not_const;
+ 		};
+ 		struct nfp_insn_meta *jmp_dst;
++		struct bpf_reg_state arg2;
+ 	};
+ 	unsigned int off;
+ 	unsigned short n;
+@@ -193,6 +199,7 @@ static inline bool is_mbpf_store(const struct nfp_insn_meta *meta)
+  * @n_translated: number of successfully translated instructions (for errors)
+  * @error: error code if something went wrong
+  * @stack_depth: max stack depth from the verifier
++ * @adjust_head_location: if program has single adjust head call - the insn no.
+  * @insns: list of BPF instruction wrappers (struct nfp_insn_meta)
+  */
+ struct nfp_prog {
+@@ -216,6 +223,7 @@ struct nfp_prog {
+ 	int error;
+ 
+ 	unsigned int stack_depth;
++	unsigned int adjust_head_location;
+ 
+ 	struct list_head insns;
+ };
+
+commit 0d49eaf4db2ad18489ff1cfceba17006c1d17b7e
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Thu Dec 14 21:29:18 2017 -0800
+
+    nfp: bpf: add basic support for adjust head call
+    
+    Support bpf_xdp_adjust_head().  We need to check whether the
+    packet offset after adjustment is within datapath's limits.
+    We also check if the frame is at least ETH_HLEN long (similar
+    to the kernel implementation).
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index a1a3f96353df..00a46258fb6d 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -81,9 +81,20 @@ enum pkt_vec {
+ /**
+  * struct nfp_app_bpf - bpf app priv structure
+  * @app:		backpointer to the app
++ *
++ * @adjust_head:	adjust head capability
++ * @flags:		extra flags for adjust head
++ * @off_min:		minimal packet offset within buffer required
++ * @off_max:		maximum packet offset within buffer required
+  */
+ struct nfp_app_bpf {
+ 	struct nfp_app *app;
++
++	struct nfp_bpf_cap_adjust_head {
++		u32 flags;
++		int off_min;
++		int off_max;
++	} adjust_head;
+ };
+ 
+ struct nfp_prog;
+
+commit 77a844ee650cdafd82d13c40f587892c79e77c77
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Thu Dec 14 21:29:16 2017 -0800
+
+    nfp: bpf: prepare for parsing BPF FW capabilities
+    
+    BPF FW creates a run time symbol called bpf_capabilities which
+    contains TLV-formatted capability information.  Allocate app
+    private structure to store parsed capabilities and add a skeleton
+    of parsing logic.
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 5884291ddba5..a1a3f96353df 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -78,6 +78,14 @@ enum pkt_vec {
+ #define NFP_BPF_ABI_FLAGS	reg_imm(0)
+ #define   NFP_BPF_ABI_FLAG_MARK	1
+ 
++/**
++ * struct nfp_app_bpf - bpf app priv structure
++ * @app:		backpointer to the app
++ */
++struct nfp_app_bpf {
++	struct nfp_app *app;
++};
++
+ struct nfp_prog;
+ struct nfp_insn_meta;
+ typedef int (*instr_cb_t)(struct nfp_prog *, struct nfp_insn_meta *);
+@@ -160,6 +168,7 @@ static inline bool is_mbpf_store(const struct nfp_insn_meta *meta)
+ 
+ /**
+  * struct nfp_prog - nfp BPF program
++ * @bpf: backpointer to the bpf app priv structure
+  * @prog: machine code
+  * @prog_len: number of valid instructions in @prog array
+  * @__prog_alloc_len: alloc size of @prog array
+@@ -176,6 +185,8 @@ static inline bool is_mbpf_store(const struct nfp_insn_meta *meta)
+  * @insns: list of BPF instruction wrappers (struct nfp_insn_meta)
+  */
+ struct nfp_prog {
++	struct nfp_app_bpf *bpf;
++
+ 	u64 *prog;
+ 	unsigned int prog_len;
+ 	unsigned int __prog_alloc_len;
+
+commit 9879a3814beb3b1350755475e67a8d92ba1f7e4b
+Author: Jiong Wang <jiong.wang@netronome.com>
+Date:   Thu Nov 30 21:32:58 2017 -0800
+
+    nfp: bpf: implement memory bulk copy for length within 32-bytes
+    
+    For NFP, we want to re-group a sequence of load/store pairs lowered from
+    memcpy/memmove into single memory bulk operation which then could be
+    accelerated using NFP CPP bus.
+    
+    This patch extends the existing load/store auxiliary information by adding
+    two new fields:
+    
+            struct bpf_insn *paired_st;
+            s16 ldst_gather_len;
+    
+    Both fields are supposed to be carried by the the load instruction at the
+    head of the sequence. "paired_st" is the corresponding store instruction at
+    the head and "ldst_gather_len" is the gathered length.
+    
+    If "ldst_gather_len" is negative, then the sequence is doing memory
+    load/store in descending order, otherwise it is in ascending order. We need
+    this information to detect overlapped memory access.
+    
+    This patch then optimize memory bulk copy when the copy length is within
+    32-bytes.
+    
+    The strategy of read/write used is:
+    
+      * Read.
+        Use read32 (direct_ref), always.
+    
+      * Write.
+        - length <= 8-bytes
+          write8 (direct_ref).
+        - length <= 32-bytes and is 4-byte aligned
+          write32 (direct_ref).
+        - length <= 32-bytes but is not 4-byte aligned
+          write8 (indirect_ref).
+    
+    NOTE: the optimization should not change program semantics. The destination
+    register of the last load instruction should contain the same value before
+    and after this optimization.
+    
+    Signed-off-by: Jiong Wang <jiong.wang@netronome.com>
+    Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 20ef0adb2931..5884291ddba5 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -95,6 +95,8 @@ typedef int (*instr_cb_t)(struct nfp_prog *, struct nfp_insn_meta *);
+  * struct nfp_insn_meta - BPF instruction wrapper
+  * @insn: BPF instruction
+  * @ptr: pointer type for memory operations
++ * @ldst_gather_len: memcpy length gathered from load/store sequence
++ * @paired_st: the paired store insn at the head of the sequence
+  * @ptr_not_const: pointer is not always constant
+  * @jmp_dst: destination info for jump instructions
+  * @off: index of first generated machine instruction (in nfp_prog.prog)
+@@ -109,6 +111,8 @@ struct nfp_insn_meta {
+ 	union {
+ 		struct {
+ 			struct bpf_reg_state ptr;
++			struct bpf_insn *paired_st;
++			s16 ldst_gather_len;
+ 			bool ptr_not_const;
+ 		};
+ 		struct nfp_insn_meta *jmp_dst;
+
+commit 5e4d6d20939f8e77b7734c0cea6886dff60c99de
+Author: Jiong Wang <jiong.wang@netronome.com>
+Date:   Thu Nov 30 21:32:57 2017 -0800
+
+    nfp: bpf: factor out is_mbpf_load & is_mbpf_store
+    
+    It is usual that we need to check if one BPF insn is for loading/storeing
+    data from/to memory.
+    
+    Therefore, it makes sense to factor out related code to become common
+    helper functions.
+    
+    Signed-off-by: Jiong Wang <jiong.wang@netronome.com>
+    Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 99da1d34dd0e..20ef0adb2931 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -144,6 +144,16 @@ static inline u8 mbpf_mode(const struct nfp_insn_meta *meta)
+ 	return BPF_MODE(meta->insn.code);
+ }
+ 
++static inline bool is_mbpf_load(const struct nfp_insn_meta *meta)
++{
++	return (meta->insn.code & ~BPF_SIZE_MASK) == (BPF_LDX | BPF_MEM);
++}
++
++static inline bool is_mbpf_store(const struct nfp_insn_meta *meta)
++{
++	return (meta->insn.code & ~BPF_SIZE_MASK) == (BPF_STX | BPF_MEM);
++}
++
+ /**
+  * struct nfp_prog - nfp BPF program
+  * @prog: machine code
+
+commit a09d5c52c42129adbac2d1e39bd0e49a92729e3e
+Author: Jiong Wang <jiong.wang@netronome.com>
+Date:   Thu Nov 30 21:32:51 2017 -0800
+
+    nfp: bpf: flag jump destination to guide insn combine optimizations
+    
+    NFP eBPF offload JIT engine is doing some instruction combine based
+    optimizations which however must not be safe if the combined sequences
+    are across basic block boarders.
+    
+    Currently, there are post checks during fixing jump destinations. If the
+    jump destination is found to be eBPF insn that has been combined into
+    another one, then JIT engine will raise error and abort.
+    
+    This is not optimal. The JIT engine ought to disable the optimization on
+    such cross-bb-border sequences instead of abort.
+    
+    As there is no control flow information in eBPF infrastructure that we
+    can't do basic block based optimizations, this patch extends the existing
+    jump destination record pass to also flag the jump destination, then in
+    instruction combine passes we could skip the optimizations if insns in the
+    sequence are jump targets.
+    
+    Suggested-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Signed-off-by: Jiong Wang <jiong.wang@netronome.com>
+    Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index e488656f406c..99da1d34dd0e 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -89,6 +89,8 @@ typedef int (*instr_cb_t)(struct nfp_prog *, struct nfp_insn_meta *);
+ #define nfp_meta_next(meta)	list_next_entry(meta, l)
+ #define nfp_meta_prev(meta)	list_prev_entry(meta, l)
+ 
++#define FLAG_INSN_IS_JUMP_DST	BIT(0)
++
+ /**
+  * struct nfp_insn_meta - BPF instruction wrapper
+  * @insn: BPF instruction
+@@ -97,6 +99,7 @@ typedef int (*instr_cb_t)(struct nfp_prog *, struct nfp_insn_meta *);
+  * @jmp_dst: destination info for jump instructions
+  * @off: index of first generated machine instruction (in nfp_prog.prog)
+  * @n: eBPF instruction number
++ * @flags: eBPF instruction extra optimization flags
+  * @skip: skip this instruction (optimized out)
+  * @double_cb: callback for second part of the instruction
+  * @l: link on nfp_prog->insns list
+@@ -112,6 +115,7 @@ struct nfp_insn_meta {
+ 	};
+ 	unsigned int off;
+ 	unsigned short n;
++	unsigned short flags;
+ 	bool skip;
+ 	instr_cb_t double_cb;
+ 
+
+commit 5b674140addc3c863efa227946ad7328f016a7a3
+Author: Jiong Wang <jiong.wang@netronome.com>
+Date:   Thu Nov 30 21:32:50 2017 -0800
+
+    nfp: bpf: record jump destination to simplify jump fixup
+    
+    eBPF insns are internally organized as dual-list inside NFP offload JIT.
+    Random access to an insn needs to be done by either forward or backward
+    traversal along the list.
+    
+    One place we need to do such traversal is at nfp_fixup_branches where one
+    traversal is needed for each jump insn to find the destination. Such
+    traversals could be avoided if jump destinations are collected through a
+    single travesal in a pre-scan pass, and such information could also be
+    useful in other places where jump destination info are needed.
+    
+    This patch adds such jump destination collection in nfp_prog_prepare.
+    
+    Suggested-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Signed-off-by: Jiong Wang <jiong.wang@netronome.com>
+    Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 0f4d218fc77a..e488656f406c 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -94,6 +94,7 @@ typedef int (*instr_cb_t)(struct nfp_prog *, struct nfp_insn_meta *);
+  * @insn: BPF instruction
+  * @ptr: pointer type for memory operations
+  * @ptr_not_const: pointer is not always constant
++ * @jmp_dst: destination info for jump instructions
+  * @off: index of first generated machine instruction (in nfp_prog.prog)
+  * @n: eBPF instruction number
+  * @skip: skip this instruction (optimized out)
+@@ -102,8 +103,13 @@ typedef int (*instr_cb_t)(struct nfp_prog *, struct nfp_insn_meta *);
+  */
+ struct nfp_insn_meta {
+ 	struct bpf_insn insn;
+-	struct bpf_reg_state ptr;
+-	bool ptr_not_const;
++	union {
++		struct {
++			struct bpf_reg_state ptr;
++			bool ptr_not_const;
++		};
++		struct nfp_insn_meta *jmp_dst;
++	};
+ 	unsigned int off;
+ 	unsigned short n;
+ 	bool skip;
+@@ -191,4 +197,7 @@ int nfp_bpf_translate(struct nfp_app *app, struct nfp_net *nn,
+ 		      struct bpf_prog *prog);
+ int nfp_bpf_destroy(struct nfp_app *app, struct nfp_net *nn,
+ 		    struct bpf_prog *prog);
++struct nfp_insn_meta *
++nfp_bpf_goto_meta(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta,
++		  unsigned int insn_idx, unsigned int n_insns);
+ #endif
+
+commit 854dc87d1a7be1f11b2d079a80a822742d6e560e
+Author: Jiong Wang <jiong.wang@netronome.com>
+Date:   Thu Nov 30 21:32:49 2017 -0800
+
+    nfp: bpf: support backward jump
+    
+    This patch adds support for backward jump on NFP.
+    
+      - restrictions on backward jump in various functions have been removed.
+      - nfp_fixup_branches now supports backward jump.
+    
+    There is one thing to note, currently an input eBPF JMP insn may generate
+    several NFP insns, for example,
+    
+      NFP imm move insn A \
+      NFP compare insn  B  --> 3 NFP insn jited from eBPF JMP insn M
+      NFP branch insn   C /
+      ---
+      NFP insn X           --> 1 NFP insn jited from eBPF insn N
+      ---
+      ...
+    
+    therefore, we are doing sanity check to make sure the last jited insn from
+    an eBPF JMP is a NFP branch instruction.
+    
+    Once backward jump is allowed, it is possible an eBPF JMP insn is at the
+    end of the program. This is however causing trouble for the sanity check.
+    Because the sanity check requires the end index of the NFP insns jited from
+    one eBPF insn while only the start index is recorded before this patch that
+    we can only get the end index by:
+    
+      start_index_of_the_next_eBPF_insn - 1
+    
+    or for the above example:
+    
+      start_index_of_eBPF_insn_N (which is the index of NFP insn X) - 1
+    
+    nfp_fixup_branches was using nfp_for_each_insn_walk2 to expose *next* insn
+    to each iteration during the traversal so the last index could be
+    calculated from which. Now, it needs some extra code to handle the last
+    insn. Meanwhile, the use of walk2 is actually unnecessary, we could simply
+    use generic single instruction walk to do this, the next insn could be
+    easily calculated using list_next_entry.
+    
+    So, this patch migrates the jump fixup traversal method to
+    *list_for_each_entry*, this simplifies the code logic a little bit.
+    
+    The other thing to note is a new state variable "last_bpf_off" is
+    introduced to track the index of the last jited NFP insn. This is necessary
+    because NFP is generating special purposes epilogue sequences, so the index
+    of the last jited NFP insn is *not* always nfp_prog->prog_len - 1.
+    
+    Suggested-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Signed-off-by: Jiong Wang <jiong.wang@netronome.com>
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 082a15f6dfb5..0f4d218fc77a 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (C) 2016 Netronome Systems, Inc.
++ * Copyright (C) 2016-2017 Netronome Systems, Inc.
+  *
+  * This software is dual licensed under the GNU General License Version 2,
+  * June 1991 as shown in the file COPYING in the top-level directory of this
+@@ -142,6 +142,7 @@ static inline u8 mbpf_mode(const struct nfp_insn_meta *meta)
+  * @verifier_meta: temporary storage for verifier's insn meta
+  * @type: BPF program type
+  * @start_off: address of the first instruction in the memory
++ * @last_bpf_off: address of the last instruction translated from BPF
+  * @tgt_out: jump target for normal exit
+  * @tgt_abort: jump target for abort (e.g. access outside of packet buffer)
+  * @tgt_done: jump target to get the next packet
+@@ -160,6 +161,7 @@ struct nfp_prog {
+ 	enum bpf_prog_type type;
+ 
+ 	unsigned int start_off;
++	unsigned int last_bpf_off;
+ 	unsigned int tgt_out;
+ 	unsigned int tgt_abort;
+ 	unsigned int tgt_done;
+
+commit c6c580d7bc390f864488c66153a487057e76d9d8
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Fri Nov 3 13:56:29 2017 -0700
+
+    nfp: bpf: move to new BPF program offload infrastructure
+    
+    Following steps are taken in the driver to offload an XDP program:
+    
+    XDP_SETUP_PROG:
+     * prepare:
+       - allocate program state;
+       - run verifier (bpf_analyzer());
+       - run translation;
+     * load:
+       - stop old program if needed;
+       - load program;
+       - enable BPF if not enabled;
+     * clean up:
+       - free program image.
+    
+    With new infrastructure the flow will look like this:
+    
+    BPF_OFFLOAD_VERIFIER_PREP:
+      - allocate program state;
+    BPF_OFFLOAD_TRANSLATE:
+       - run translation;
+    XDP_SETUP_PROG:
+       - stop old program if needed;
+       - load program;
+       - enable BPF if not enabled;
+    BPF_OFFLOAD_DESTROY:
+       - free program image.
+    
+    Take advantage of the new infrastructure.  Allocation of driver
+    metadata has to be moved from jit.c to offload.c since it's now
+    done at a different stage.  Since there is no separate driver
+    private data for verification step, move temporary nfp_meta
+    pointer into nfp_prog.  We will now use user space context
+    offsets.
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Reviewed-by: Quentin Monnet <quentin.monnet@netronome.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 36b4eda2d3f8..082a15f6dfb5 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -139,6 +139,7 @@ static inline u8 mbpf_mode(const struct nfp_insn_meta *meta)
+  * @prog: machine code
+  * @prog_len: number of valid instructions in @prog array
+  * @__prog_alloc_len: alloc size of @prog array
++ * @verifier_meta: temporary storage for verifier's insn meta
+  * @type: BPF program type
+  * @start_off: address of the first instruction in the memory
+  * @tgt_out: jump target for normal exit
+@@ -154,6 +155,8 @@ struct nfp_prog {
+ 	unsigned int prog_len;
+ 	unsigned int __prog_alloc_len;
+ 
++	struct nfp_insn_meta *verifier_meta;
++
+ 	enum bpf_prog_type type;
+ 
+ 	unsigned int start_off;
+@@ -169,13 +172,21 @@ struct nfp_prog {
+ 	struct list_head insns;
+ };
+ 
+-int nfp_bpf_jit(struct nfp_prog *nfp_prog, struct bpf_prog *filter);
++int nfp_bpf_jit(struct nfp_prog *prog);
+ 
+-int nfp_prog_verify(struct nfp_prog *nfp_prog, struct bpf_prog *prog);
++extern const struct bpf_ext_analyzer_ops nfp_bpf_analyzer_ops;
+ 
++struct netdev_bpf;
++struct nfp_app;
+ struct nfp_net;
+ 
+ int nfp_net_bpf_offload(struct nfp_net *nn, struct bpf_prog *prog,
+ 			bool old_prog);
+ 
++int nfp_bpf_verifier_prep(struct nfp_app *app, struct nfp_net *nn,
++			  struct netdev_bpf *bpf);
++int nfp_bpf_translate(struct nfp_app *app, struct nfp_net *nn,
++		      struct bpf_prog *prog);
++int nfp_bpf_destroy(struct nfp_app *app, struct nfp_net *nn,
++		    struct bpf_prog *prog);
+ #endif
+
+commit 9314c442d7ddf749d29c09ab48ffa5333d2bf48e
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Fri Nov 3 13:56:28 2017 -0700
+
+    nfp: bpf: move translation prepare to offload.c
+    
+    struct nfp_prog is currently only used internally by the translator.
+    This means there is a lot of parameter passing going on, between
+    the translator and different stages of offload.  Simplify things
+    by allocating nfp_prog in offload.c already.
+    
+    We will now use kmalloc() to allocate the program area and only
+    DMA map it for the time of loading (instead of allocating DMA
+    coherent memory upfront).
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Reviewed-by: Quentin Monnet <quentin.monnet@netronome.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index b77231a134b9..36b4eda2d3f8 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -169,19 +169,7 @@ struct nfp_prog {
+ 	struct list_head insns;
+ };
+ 
+-struct nfp_bpf_result {
+-	unsigned int n_instr;
+-};
+-
+-int
+-nfp_prog_prepare(struct nfp_prog *nfp_prog, const struct bpf_insn *prog,
+-		 unsigned int cnt);
+-void nfp_prog_free(struct nfp_prog *nfp_prog);
+-
+-int
+-nfp_bpf_jit(struct bpf_prog *filter, void *prog,
+-	    unsigned int prog_start, unsigned int prog_done,
+-	    unsigned int prog_sz, struct nfp_bpf_result *res);
++int nfp_bpf_jit(struct nfp_prog *nfp_prog, struct bpf_prog *filter);
+ 
+ int nfp_prog_verify(struct nfp_prog *nfp_prog, struct bpf_prog *prog);
+ 
+
+commit c1c88eae8a8155c55dbbc7363f1f127c43e1b5d1
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Fri Nov 3 13:56:27 2017 -0700
+
+    nfp: bpf: move program prepare and free into offload.c
+    
+    Most of offload/translation prepare logic will be moved to
+    offload.c.  To help git generate more reasonable diffs
+    move nfp_prog_prepare() and nfp_prog_free() functions
+    there as a first step.
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Reviewed-by: Quentin Monnet <quentin.monnet@netronome.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index df56f40fea7c..b77231a134b9 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -173,6 +173,11 @@ struct nfp_bpf_result {
+ 	unsigned int n_instr;
+ };
+ 
++int
++nfp_prog_prepare(struct nfp_prog *nfp_prog, const struct bpf_insn *prog,
++		 unsigned int cnt);
++void nfp_prog_free(struct nfp_prog *nfp_prog);
++
+ int
+ nfp_bpf_jit(struct bpf_prog *filter, void *prog,
+ 	    unsigned int prog_start, unsigned int prog_done,
+
+commit e4a91cd565e2c4e299abe9eb906c506ecc01032a
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Fri Nov 3 13:56:26 2017 -0700
+
+    nfp: bpf: require seamless reload for program replace
+    
+    Firmware supports live replacement of programs for quite some
+    time now.  Remove the software-fallback related logic and
+    depend on the FW for program replace.  Seamless reload will
+    become a requirement if maps are present, anyway.
+    
+    Load and start stages have to be split now, since replace
+    only needs a load, start has already been done on add.
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Reviewed-by: Quentin Monnet <quentin.monnet@netronome.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 6dddab95d57a..df56f40fea7c 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -183,6 +183,6 @@ int nfp_prog_verify(struct nfp_prog *nfp_prog, struct bpf_prog *prog);
+ struct nfp_net;
+ 
+ int nfp_net_bpf_offload(struct nfp_net *nn, struct bpf_prog *prog,
+-			bool old_prog, bool sw_fallback);
++			bool old_prog);
+ 
+ #endif
+
+commit 9ce7a956327ad6c14e1a7eb9f4cb5300c8b61db6
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Fri Nov 3 13:56:25 2017 -0700
+
+    nfp: bpf: refactor offload logic
+    
+    We currently create a fake cls_bpf offload object when we want
+    to offload XDP.  Simplify and clarify the code by moving the
+    TC/XDP specific logic out of common offload code.  This is easy
+    now that we don't support legacy TC actions.  We only need the
+    bpf program and state of the skip_sw flag.
+    
+    Temporarily set @code to NULL in nfp_net_bpf_offload(), compilers
+    seem to have trouble recognizing it's always initialized.  Next
+    patches will eliminate that variable.
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Reviewed-by: Quentin Monnet <quentin.monnet@netronome.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 9f0df6a9786d..6dddab95d57a 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -181,8 +181,8 @@ nfp_bpf_jit(struct bpf_prog *filter, void *prog,
+ int nfp_prog_verify(struct nfp_prog *nfp_prog, struct bpf_prog *prog);
+ 
+ struct nfp_net;
+-struct tc_cls_bpf_offload;
+ 
+-int nfp_net_bpf_offload(struct nfp_net *nn, struct tc_cls_bpf_offload *cls_bpf);
++int nfp_net_bpf_offload(struct nfp_net *nn, struct bpf_prog *prog,
++			bool old_prog, bool sw_fallback);
+ 
+ #endif
+
+commit 5559eedb78127d6b76c36e3918a75bbc2801653a
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Fri Nov 3 13:56:24 2017 -0700
+
+    nfp: bpf: remove unnecessary include of nfp_net.h
+    
+    BPF offload's main header does not need to include nfp_net.h.
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Reviewed-by: Quentin Monnet <quentin.monnet@netronome.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 85b7d9398cda..9f0df6a9786d 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -41,7 +41,6 @@
+ #include <linux/types.h>
+ 
+ #include "../nfp_asm.h"
+-#include "../nfp_net.h"
+ 
+ /* For branch fixup logic use up-most byte of branch instruction as scratch
+  * area.  Remember to clear this before sending instructions to HW!
+
+commit 94508438e8ea4391696c5171527678e9dbd08789
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Fri Nov 3 13:56:23 2017 -0700
+
+    nfp: bpf: remove the register renumbering leftovers
+    
+    The register renumbering was removed and will not be coming back
+    in its old, naive form, given that it would be fundamentally
+    incompatible with calling functions.  Remove the leftovers.
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Reviewed-by: Quentin Monnet <quentin.monnet@netronome.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index c5280de2ab14..85b7d9398cda 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -141,8 +141,6 @@ static inline u8 mbpf_mode(const struct nfp_insn_meta *meta)
+  * @prog_len: number of valid instructions in @prog array
+  * @__prog_alloc_len: alloc size of @prog array
+  * @type: BPF program type
+- * @num_regs: number of registers used by this program
+- * @regs_per_thread: number of basic registers allocated per thread
+  * @start_off: address of the first instruction in the memory
+  * @tgt_out: jump target for normal exit
+  * @tgt_abort: jump target for abort (e.g. access outside of packet buffer)
+@@ -159,9 +157,6 @@ struct nfp_prog {
+ 
+ 	enum bpf_prog_type type;
+ 
+-	unsigned int num_regs;
+-	unsigned int regs_per_thread;
+-
+ 	unsigned int start_off;
+ 	unsigned int tgt_out;
+ 	unsigned int tgt_abort;
+@@ -177,7 +172,6 @@ struct nfp_prog {
+ 
+ struct nfp_bpf_result {
+ 	unsigned int n_instr;
+-	bool dense_mode;
+ };
+ 
+ int
+
+commit 012bb8a8b5a2688590f829884acc83697d68a96d
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Fri Nov 3 13:56:22 2017 -0700
+
+    nfp: bpf: drop support for cls_bpf with legacy actions
+    
+    Only support BPF_PROG_TYPE_SCHED_CLS programs in direct
+    action mode.  This simplifies preparing the offload since
+    there will now be only one mode of operation for that type
+    of program.  We need to know the attachment mode type of
+    cls_bpf programs, because exit codes are interpreted
+    differently for legacy vs DA mode.
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Reviewed-by: Quentin Monnet <quentin.monnet@netronome.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index bc604030ff6c..c5280de2ab14 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -65,13 +65,6 @@ enum pkt_vec {
+ 	PKT_VEC_PKT_PTR		= 2,
+ };
+ 
+-enum nfp_bpf_action_type {
+-	NN_ACT_TC_DROP,
+-	NN_ACT_TC_REDIR,
+-	NN_ACT_DIRECT,
+-	NN_ACT_XDP,
+-};
+-
+ #define pv_len(np)	reg_lm(1, PKT_VEC_PKT_LEN)
+ #define pv_ctm_ptr(np)	reg_lm(1, PKT_VEC_PKT_PTR)
+ 
+@@ -147,7 +140,7 @@ static inline u8 mbpf_mode(const struct nfp_insn_meta *meta)
+  * @prog: machine code
+  * @prog_len: number of valid instructions in @prog array
+  * @__prog_alloc_len: alloc size of @prog array
+- * @act: BPF program/action type (TC DA, TC with action, XDP etc.)
++ * @type: BPF program type
+  * @num_regs: number of registers used by this program
+  * @regs_per_thread: number of basic registers allocated per thread
+  * @start_off: address of the first instruction in the memory
+@@ -164,7 +157,7 @@ struct nfp_prog {
+ 	unsigned int prog_len;
+ 	unsigned int __prog_alloc_len;
+ 
+-	enum nfp_bpf_action_type act;
++	enum bpf_prog_type type;
+ 
+ 	unsigned int num_regs;
+ 	unsigned int regs_per_thread;
+@@ -188,7 +181,7 @@ struct nfp_bpf_result {
+ };
+ 
+ int
+-nfp_bpf_jit(struct bpf_prog *filter, void *prog, enum nfp_bpf_action_type act,
++nfp_bpf_jit(struct bpf_prog *filter, void *prog,
+ 	    unsigned int prog_start, unsigned int prog_done,
+ 	    unsigned int prog_sz, struct nfp_bpf_result *res);
+ 
+@@ -197,23 +190,6 @@ int nfp_prog_verify(struct nfp_prog *nfp_prog, struct bpf_prog *prog);
+ struct nfp_net;
+ struct tc_cls_bpf_offload;
+ 
+-/**
+- * struct nfp_net_bpf_priv - per-vNIC BPF private data
+- * @rx_filter:		Filter offload statistics - dropped packets/bytes
+- * @rx_filter_prev:	Filter offload statistics - values from previous update
+- * @rx_filter_change:	Jiffies when statistics last changed
+- * @rx_filter_stats_timer:  Timer for polling filter offload statistics
+- * @rx_filter_lock:	Lock protecting timer state changes (teardown)
+- */
+-struct nfp_net_bpf_priv {
+-	struct nfp_stat_pair rx_filter, rx_filter_prev;
+-	unsigned long rx_filter_change;
+-	struct timer_list rx_filter_stats_timer;
+-	struct nfp_net *nn;
+-	spinlock_t rx_filter_lock;
+-};
+-
+ int nfp_net_bpf_offload(struct nfp_net *nn, struct tc_cls_bpf_offload *cls_bpf);
+-void nfp_net_filter_stats_timer(struct timer_list *t);
+ 
+ #endif
+
+commit 3248f77fa3eec6014653166a9cd0d429e8d30890
+Author: Kees Cook <keescook@chromium.org>
+Date:   Wed Oct 25 03:51:38 2017 -0700
+
+    drivers/net: netronome: Convert timers to use timer_setup()
+    
+    In preparation for unconditionally passing the struct timer_list pointer to
+    all timer callbacks, switch to using the new timer_setup() and from_timer()
+    to pass the timer pointer explicitly.
+    
+    Cc: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Cc: "David S. Miller" <davem@davemloft.net>
+    Cc: Jiri Pirko <jiri@mellanox.com>
+    Cc: Jamal Hadi Salim <jhs@mojatatu.com>
+    Cc: Simon Horman <simon.horman@netronome.com>
+    Cc: oss-drivers@netronome.com
+    Cc: netdev@vger.kernel.org
+    Signed-off-by: Kees Cook <keescook@chromium.org>
+    Acked-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 86edc0691a5f..bc604030ff6c 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -209,10 +209,11 @@ struct nfp_net_bpf_priv {
+ 	struct nfp_stat_pair rx_filter, rx_filter_prev;
+ 	unsigned long rx_filter_change;
+ 	struct timer_list rx_filter_stats_timer;
++	struct nfp_net *nn;
+ 	spinlock_t rx_filter_lock;
+ };
+ 
+ int nfp_net_bpf_offload(struct nfp_net *nn, struct tc_cls_bpf_offload *cls_bpf);
+-void nfp_net_filter_stats_timer(unsigned long data);
++void nfp_net_filter_stats_timer(struct timer_list *t);
+ 
+ #endif
+
+commit b14157eeed4eff2b293e0ca7738f6a3dbfff51cc
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Mon Oct 23 11:58:13 2017 -0700
+
+    nfp: bpf: support stack accesses via non-constant pointers
+    
+    If stack pointer has a different value on different paths
+    but the alignment to words (4B) remains the same, we can
+    set a new LMEM access pointer to the calculated value and
+    access whichever word it's pointing to.
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Reviewed-by: Quentin Monnet <quentin.monnet@netronome.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index d4f144a62f0f..86edc0691a5f 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -101,6 +101,7 @@ typedef int (*instr_cb_t)(struct nfp_prog *, struct nfp_insn_meta *);
+  * struct nfp_insn_meta - BPF instruction wrapper
+  * @insn: BPF instruction
+  * @ptr: pointer type for memory operations
++ * @ptr_not_const: pointer is not always constant
+  * @off: index of first generated machine instruction (in nfp_prog.prog)
+  * @n: eBPF instruction number
+  * @skip: skip this instruction (optimized out)
+@@ -110,6 +111,7 @@ typedef int (*instr_cb_t)(struct nfp_prog *, struct nfp_insn_meta *);
+ struct nfp_insn_meta {
+ 	struct bpf_insn insn;
+ 	struct bpf_reg_state ptr;
++	bool ptr_not_const;
+ 	unsigned int off;
+ 	unsigned short n;
+ 	bool skip;
+
+commit d3488480635f453410fd27cea3fc370cedc7e28a
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Mon Oct 23 11:58:11 2017 -0700
+
+    nfp: bpf: allow stack accesses via modified stack registers
+    
+    As long as the verifier tells us the stack offset exactly we
+    can render the LMEM reads quite easily.  Simply make sure that
+    the offset is constant for a given instruction and add it to
+    the instruction's offset.
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Reviewed-by: Quentin Monnet <quentin.monnet@netronome.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index a31632681e79..d4f144a62f0f 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -56,6 +56,7 @@ enum br_special {
+ 
+ enum static_regs {
+ 	STATIC_REG_IMM		= 21, /* Bank AB */
++	STATIC_REG_STACK	= 22, /* Bank A */
+ 	STATIC_REG_PKT_LEN	= 22, /* Bank B */
+ };
+ 
+@@ -74,6 +75,8 @@ enum nfp_bpf_action_type {
+ #define pv_len(np)	reg_lm(1, PKT_VEC_PKT_LEN)
+ #define pv_ctm_ptr(np)	reg_lm(1, PKT_VEC_PKT_PTR)
+ 
++#define stack_reg(np)	reg_a(STATIC_REG_STACK)
++#define stack_imm(np)	imm_b(np)
+ #define plen_reg(np)	reg_b(STATIC_REG_PKT_LEN)
+ #define pptr_reg(np)	pv_ctm_ptr(np)
+ #define imm_a(np)	reg_a(STATIC_REG_IMM)
+
+commit ee9133a845fe8ad15f989e29bf8e2c8abe7986b8
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Mon Oct 23 11:58:08 2017 -0700
+
+    nfp: bpf: add stack write support
+    
+    Stack is implemented by the LMEM register file.  Unaligned accesses
+    to LMEM are not allowed.  Accesses also have to be 4B wide.
+    
+    To support stack we need to make sure offsets of pointers are known
+    at translation time (for now) and perform correct load/mask/shift
+    operations.
+    
+    Since we can access first 64B of LMEM without much effort support
+    only stacks not bigger than 64B.  Following commits will extend
+    the possible sizes beyond that.
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Reviewed-by: Quentin Monnet <quentin.monnet@netronome.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index d77e88a45409..a31632681e79 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -151,6 +151,7 @@ static inline u8 mbpf_mode(const struct nfp_insn_meta *meta)
+  * @tgt_done: jump target to get the next packet
+  * @n_translated: number of successfully translated instructions (for errors)
+  * @error: error code if something went wrong
++ * @stack_depth: max stack depth from the verifier
+  * @insns: list of BPF instruction wrappers (struct nfp_insn_meta)
+  */
+ struct nfp_prog {
+@@ -171,6 +172,8 @@ struct nfp_prog {
+ 	unsigned int n_translated;
+ 	int error;
+ 
++	unsigned int stack_depth;
++
+ 	struct list_head insns;
+ };
+ 
+
+commit 2ca71441f524b0a0cc01d8e51c875b00fbe31275
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Thu Oct 12 10:34:16 2017 -0700
+
+    nfp: bpf: add support for direct packet access - read
+    
+    In direct packet access bound checks are already done, we can
+    simply dereference the packet pointer.
+    
+    Verifier/parser logic needs to record pointer type.  Note that
+    although verifier does protect us from CTX vs other pointer
+    changes we will also want to differentiate between PACKET vs
+    MAP_VALUE or STACK, so we can add the check already.
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Reviewed-by: Simon Horman <simon.horman@netronome.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index b7a112acbdb7..d77e88a45409 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -36,6 +36,7 @@
+ 
+ #include <linux/bitfield.h>
+ #include <linux/bpf.h>
++#include <linux/bpf_verifier.h>
+ #include <linux/list.h>
+ #include <linux/types.h>
+ 
+@@ -96,6 +97,7 @@ typedef int (*instr_cb_t)(struct nfp_prog *, struct nfp_insn_meta *);
+ /**
+  * struct nfp_insn_meta - BPF instruction wrapper
+  * @insn: BPF instruction
++ * @ptr: pointer type for memory operations
+  * @off: index of first generated machine instruction (in nfp_prog.prog)
+  * @n: eBPF instruction number
+  * @skip: skip this instruction (optimized out)
+@@ -104,6 +106,7 @@ typedef int (*instr_cb_t)(struct nfp_prog *, struct nfp_insn_meta *);
+  */
+ struct nfp_insn_meta {
+ 	struct bpf_insn insn;
++	struct bpf_reg_state ptr;
+ 	unsigned int off;
+ 	unsigned short n;
+ 	bool skip;
+
+commit 18e53b6cb9ac157f4b2c7db698d4adc064df2fa0
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Sun Oct 8 21:04:13 2017 -0700
+
+    nfp: bpf: move to datapath ABI version 2
+    
+    Datapath ABI version 2 stores the packet information in LMEM
+    instead of NNRs.  We also have strict restrictions on which
+    GPRs we can use.  Only GPRs 0-23 are reserved for BPF.
+    
+    Adjust the static register locations and "ABI" registers.
+    Note that packet length is packed with other info so we have
+    to extract it into one of the scratch registers, OTOH since
+    LMEM can be used in restricted operands we don't have to
+    extract packet pointer.
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Reviewed-by: Simon Horman <simon.horman@netronome.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 7d959757a51a..b7a112acbdb7 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -54,9 +54,13 @@ enum br_special {
+ };
+ 
+ enum static_regs {
+-	STATIC_REG_PKT		= 1,
+-#define REG_PKT_BANK	ALU_DST_A
+-	STATIC_REG_IMM		= 2, /* Bank AB */
++	STATIC_REG_IMM		= 21, /* Bank AB */
++	STATIC_REG_PKT_LEN	= 22, /* Bank B */
++};
++
++enum pkt_vec {
++	PKT_VEC_PKT_LEN		= 0,
++	PKT_VEC_PKT_PTR		= 2,
+ };
+ 
+ enum nfp_bpf_action_type {
+@@ -66,15 +70,17 @@ enum nfp_bpf_action_type {
+ 	NN_ACT_XDP,
+ };
+ 
+-#define pkt_reg(np)	reg_a((np)->regs_per_thread - STATIC_REG_PKT)
+-#define imm_a(np)	reg_a((np)->regs_per_thread - STATIC_REG_IMM)
+-#define imm_b(np)	reg_b((np)->regs_per_thread - STATIC_REG_IMM)
+-#define imm_both(np)	reg_both((np)->regs_per_thread - STATIC_REG_IMM)
++#define pv_len(np)	reg_lm(1, PKT_VEC_PKT_LEN)
++#define pv_ctm_ptr(np)	reg_lm(1, PKT_VEC_PKT_PTR)
++
++#define plen_reg(np)	reg_b(STATIC_REG_PKT_LEN)
++#define pptr_reg(np)	pv_ctm_ptr(np)
++#define imm_a(np)	reg_a(STATIC_REG_IMM)
++#define imm_b(np)	reg_b(STATIC_REG_IMM)
++#define imm_both(np)	reg_both(STATIC_REG_IMM)
+ 
+ #define NFP_BPF_ABI_FLAGS	reg_imm(0)
+ #define   NFP_BPF_ABI_FLAG_MARK	1
+-#define NFP_BPF_ABI_PKT		reg_nnr(2)
+-#define NFP_BPF_ABI_LEN		reg_nnr(3)
+ 
+ struct nfp_prog;
+ struct nfp_insn_meta;
+
+commit 509144e25049831ffe94160b1f03cf1b900aaa3c
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Sun Oct 8 21:04:09 2017 -0700
+
+    nfp: bpf: remove packet marking support
+    
+    Temporarily drop support for skb->mark.  We are primarily focusing
+    on XDP offload, and implementing skb->mark on the new datapath has
+    lower priority.
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Reviewed-by: Simon Horman <simon.horman@netronome.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index ccc3dbea25f6..7d959757a51a 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -71,9 +71,8 @@ enum nfp_bpf_action_type {
+ #define imm_b(np)	reg_b((np)->regs_per_thread - STATIC_REG_IMM)
+ #define imm_both(np)	reg_both((np)->regs_per_thread - STATIC_REG_IMM)
+ 
+-#define NFP_BPF_ABI_FLAGS	reg_nnr(0)
++#define NFP_BPF_ABI_FLAGS	reg_imm(0)
+ #define   NFP_BPF_ABI_FLAG_MARK	1
+-#define NFP_BPF_ABI_MARK	reg_nnr(1)
+ #define NFP_BPF_ABI_PKT		reg_nnr(2)
+ #define NFP_BPF_ABI_LEN		reg_nnr(3)
+ 
+
+commit b3f868df3c8904e964d7b257b47d7d90d93375e0
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Sun Oct 8 21:04:05 2017 -0700
+
+    nfp: bpf: use the power of sparse to check we encode registers right
+    
+    Define a new __bitwise type for software representation of registers.
+    This will allow us to catch incorrect parameter types using sparse.
+    
+    Accessors we define also allow us to return correct enum type and
+    therefore ensure all switches handle all register types.
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Reviewed-by: Simon Horman <simon.horman@netronome.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 4051e943f363..ccc3dbea25f6 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -39,6 +39,7 @@
+ #include <linux/list.h>
+ #include <linux/types.h>
+ 
++#include "../nfp_asm.h"
+ #include "../nfp_net.h"
+ 
+ /* For branch fixup logic use up-most byte of branch instruction as scratch
+@@ -65,29 +66,6 @@ enum nfp_bpf_action_type {
+ 	NN_ACT_XDP,
+ };
+ 
+-/* Software register representation, hardware encoding in asm.h */
+-#define NN_REG_TYPE	GENMASK(31, 24)
+-#define NN_REG_VAL	GENMASK(7, 0)
+-
+-enum nfp_bpf_reg_type {
+-	NN_REG_GPR_A =	BIT(0),
+-	NN_REG_GPR_B =	BIT(1),
+-	NN_REG_NNR =	BIT(2),
+-	NN_REG_XFER =	BIT(3),
+-	NN_REG_IMM =	BIT(4),
+-	NN_REG_NONE =	BIT(5),
+-};
+-
+-#define NN_REG_GPR_BOTH	(NN_REG_GPR_A | NN_REG_GPR_B)
+-
+-#define reg_both(x)	((x) | FIELD_PREP(NN_REG_TYPE, NN_REG_GPR_BOTH))
+-#define reg_a(x)	((x) | FIELD_PREP(NN_REG_TYPE, NN_REG_GPR_A))
+-#define reg_b(x)	((x) | FIELD_PREP(NN_REG_TYPE, NN_REG_GPR_B))
+-#define reg_nnr(x)	((x) | FIELD_PREP(NN_REG_TYPE, NN_REG_NNR))
+-#define reg_xfer(x)	((x) | FIELD_PREP(NN_REG_TYPE, NN_REG_XFER))
+-#define reg_imm(x)	((x) | FIELD_PREP(NN_REG_TYPE, NN_REG_IMM))
+-#define reg_none()	(FIELD_PREP(NN_REG_TYPE, NN_REG_NONE))
+-
+ #define pkt_reg(np)	reg_a((np)->regs_per_thread - STATIC_REG_PKT)
+ #define imm_a(np)	reg_a((np)->regs_per_thread - STATIC_REG_IMM)
+ #define imm_b(np)	reg_b((np)->regs_per_thread - STATIC_REG_IMM)
+
+commit c66a9cf408037781fc1984bc60785049b453d8a4
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Wed May 31 08:06:50 2017 -0700
+
+    nfp: move basic eBPF stats to app-specific code
+    
+    Allow apps to associate private data with vNICs and move
+    BPF-specific fields of nfp_net to such structure.
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 9b526698e47d..4051e943f363 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -39,6 +39,8 @@
+ #include <linux/list.h>
+ #include <linux/types.h>
+ 
++#include "../nfp_net.h"
++
+ /* For branch fixup logic use up-most byte of branch instruction as scratch
+  * area.  Remember to clear this before sending instructions to HW!
+  */
+@@ -201,6 +203,22 @@ int nfp_prog_verify(struct nfp_prog *nfp_prog, struct bpf_prog *prog);
+ struct nfp_net;
+ struct tc_cls_bpf_offload;
+ 
++/**
++ * struct nfp_net_bpf_priv - per-vNIC BPF private data
++ * @rx_filter:		Filter offload statistics - dropped packets/bytes
++ * @rx_filter_prev:	Filter offload statistics - values from previous update
++ * @rx_filter_change:	Jiffies when statistics last changed
++ * @rx_filter_stats_timer:  Timer for polling filter offload statistics
++ * @rx_filter_lock:	Lock protecting timer state changes (teardown)
++ */
++struct nfp_net_bpf_priv {
++	struct nfp_stat_pair rx_filter, rx_filter_prev;
++	unsigned long rx_filter_change;
++	struct timer_list rx_filter_stats_timer;
++	spinlock_t rx_filter_lock;
++};
++
+ int nfp_net_bpf_offload(struct nfp_net *nn, struct tc_cls_bpf_offload *cls_bpf);
++void nfp_net_filter_stats_timer(unsigned long data);
+ 
+ #endif
+
+commit bb45e51cb0f8fea496eb2d6a9ef2ffb5da564048
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Wed May 31 08:06:49 2017 -0700
+
+    nfp: move bpf offload code to the BPF app
+    
+    Move bulk of the eBPF offload code out of common vNIC code into
+    app-specific callbacks.
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+index 9513c80f7be5..9b526698e47d 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -198,4 +198,9 @@ nfp_bpf_jit(struct bpf_prog *filter, void *prog, enum nfp_bpf_action_type act,
+ 
+ int nfp_prog_verify(struct nfp_prog *nfp_prog, struct bpf_prog *prog);
+ 
++struct nfp_net;
++struct tc_cls_bpf_offload;
++
++int nfp_net_bpf_offload(struct nfp_net *nn, struct tc_cls_bpf_offload *cls_bpf);
++
+ #endif
+
+commit d9ae7f2bfead4600e85459be93082ca8b1c884f9
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Wed May 31 08:06:48 2017 -0700
+
+    nfp: move eBPF offload files to BPF app directory
+    
+    Pure move of eBPF offload files to BPF app directory,
+    only change the names and relative header location.
+    nfp_asm.h stays in the main dir and it doesn't really
+    have to include nfp_bpf.h.
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/main.h b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+new file mode 100644
+index 000000000000..9513c80f7be5
+--- /dev/null
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@ -0,0 +1,201 @@
++/*
++ * Copyright (C) 2016 Netronome Systems, Inc.
++ *
++ * This software is dual licensed under the GNU General License Version 2,
++ * June 1991 as shown in the file COPYING in the top-level directory of this
++ * source tree or the BSD 2-Clause License provided below.  You have the
++ * option to license this software under the complete terms of either license.
++ *
++ * The BSD 2-Clause License:
++ *
++ *     Redistribution and use in source and binary forms, with or
++ *     without modification, are permitted provided that the following
++ *     conditions are met:
++ *
++ *      1. Redistributions of source code must retain the above
++ *         copyright notice, this list of conditions and the following
++ *         disclaimer.
++ *
++ *      2. Redistributions in binary form must reproduce the above
++ *         copyright notice, this list of conditions and the following
++ *         disclaimer in the documentation and/or other materials
++ *         provided with the distribution.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
++ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
++ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++#ifndef __NFP_BPF_H__
++#define __NFP_BPF_H__ 1
++
++#include <linux/bitfield.h>
++#include <linux/bpf.h>
++#include <linux/list.h>
++#include <linux/types.h>
++
++/* For branch fixup logic use up-most byte of branch instruction as scratch
++ * area.  Remember to clear this before sending instructions to HW!
++ */
++#define OP_BR_SPECIAL	0xff00000000000000ULL
++
++enum br_special {
++	OP_BR_NORMAL = 0,
++	OP_BR_GO_OUT,
++	OP_BR_GO_ABORT,
++};
++
++enum static_regs {
++	STATIC_REG_PKT		= 1,
++#define REG_PKT_BANK	ALU_DST_A
++	STATIC_REG_IMM		= 2, /* Bank AB */
++};
++
++enum nfp_bpf_action_type {
++	NN_ACT_TC_DROP,
++	NN_ACT_TC_REDIR,
++	NN_ACT_DIRECT,
++	NN_ACT_XDP,
++};
++
++/* Software register representation, hardware encoding in asm.h */
++#define NN_REG_TYPE	GENMASK(31, 24)
++#define NN_REG_VAL	GENMASK(7, 0)
++
++enum nfp_bpf_reg_type {
++	NN_REG_GPR_A =	BIT(0),
++	NN_REG_GPR_B =	BIT(1),
++	NN_REG_NNR =	BIT(2),
++	NN_REG_XFER =	BIT(3),
++	NN_REG_IMM =	BIT(4),
++	NN_REG_NONE =	BIT(5),
++};
++
++#define NN_REG_GPR_BOTH	(NN_REG_GPR_A | NN_REG_GPR_B)
++
++#define reg_both(x)	((x) | FIELD_PREP(NN_REG_TYPE, NN_REG_GPR_BOTH))
++#define reg_a(x)	((x) | FIELD_PREP(NN_REG_TYPE, NN_REG_GPR_A))
++#define reg_b(x)	((x) | FIELD_PREP(NN_REG_TYPE, NN_REG_GPR_B))
++#define reg_nnr(x)	((x) | FIELD_PREP(NN_REG_TYPE, NN_REG_NNR))
++#define reg_xfer(x)	((x) | FIELD_PREP(NN_REG_TYPE, NN_REG_XFER))
++#define reg_imm(x)	((x) | FIELD_PREP(NN_REG_TYPE, NN_REG_IMM))
++#define reg_none()	(FIELD_PREP(NN_REG_TYPE, NN_REG_NONE))
++
++#define pkt_reg(np)	reg_a((np)->regs_per_thread - STATIC_REG_PKT)
++#define imm_a(np)	reg_a((np)->regs_per_thread - STATIC_REG_IMM)
++#define imm_b(np)	reg_b((np)->regs_per_thread - STATIC_REG_IMM)
++#define imm_both(np)	reg_both((np)->regs_per_thread - STATIC_REG_IMM)
++
++#define NFP_BPF_ABI_FLAGS	reg_nnr(0)
++#define   NFP_BPF_ABI_FLAG_MARK	1
++#define NFP_BPF_ABI_MARK	reg_nnr(1)
++#define NFP_BPF_ABI_PKT		reg_nnr(2)
++#define NFP_BPF_ABI_LEN		reg_nnr(3)
++
++struct nfp_prog;
++struct nfp_insn_meta;
++typedef int (*instr_cb_t)(struct nfp_prog *, struct nfp_insn_meta *);
++
++#define nfp_prog_first_meta(nfp_prog)					\
++	list_first_entry(&(nfp_prog)->insns, struct nfp_insn_meta, l)
++#define nfp_prog_last_meta(nfp_prog)					\
++	list_last_entry(&(nfp_prog)->insns, struct nfp_insn_meta, l)
++#define nfp_meta_next(meta)	list_next_entry(meta, l)
++#define nfp_meta_prev(meta)	list_prev_entry(meta, l)
++
++/**
++ * struct nfp_insn_meta - BPF instruction wrapper
++ * @insn: BPF instruction
++ * @off: index of first generated machine instruction (in nfp_prog.prog)
++ * @n: eBPF instruction number
++ * @skip: skip this instruction (optimized out)
++ * @double_cb: callback for second part of the instruction
++ * @l: link on nfp_prog->insns list
++ */
++struct nfp_insn_meta {
++	struct bpf_insn insn;
++	unsigned int off;
++	unsigned short n;
++	bool skip;
++	instr_cb_t double_cb;
++
++	struct list_head l;
++};
++
++#define BPF_SIZE_MASK	0x18
++
++static inline u8 mbpf_class(const struct nfp_insn_meta *meta)
++{
++	return BPF_CLASS(meta->insn.code);
++}
++
++static inline u8 mbpf_src(const struct nfp_insn_meta *meta)
++{
++	return BPF_SRC(meta->insn.code);
++}
++
++static inline u8 mbpf_op(const struct nfp_insn_meta *meta)
++{
++	return BPF_OP(meta->insn.code);
++}
++
++static inline u8 mbpf_mode(const struct nfp_insn_meta *meta)
++{
++	return BPF_MODE(meta->insn.code);
++}
++
++/**
++ * struct nfp_prog - nfp BPF program
++ * @prog: machine code
++ * @prog_len: number of valid instructions in @prog array
++ * @__prog_alloc_len: alloc size of @prog array
++ * @act: BPF program/action type (TC DA, TC with action, XDP etc.)
++ * @num_regs: number of registers used by this program
++ * @regs_per_thread: number of basic registers allocated per thread
++ * @start_off: address of the first instruction in the memory
++ * @tgt_out: jump target for normal exit
++ * @tgt_abort: jump target for abort (e.g. access outside of packet buffer)
++ * @tgt_done: jump target to get the next packet
++ * @n_translated: number of successfully translated instructions (for errors)
++ * @error: error code if something went wrong
++ * @insns: list of BPF instruction wrappers (struct nfp_insn_meta)
++ */
++struct nfp_prog {
++	u64 *prog;
++	unsigned int prog_len;
++	unsigned int __prog_alloc_len;
++
++	enum nfp_bpf_action_type act;
++
++	unsigned int num_regs;
++	unsigned int regs_per_thread;
++
++	unsigned int start_off;
++	unsigned int tgt_out;
++	unsigned int tgt_abort;
++	unsigned int tgt_done;
++
++	unsigned int n_translated;
++	int error;
++
++	struct list_head insns;
++};
++
++struct nfp_bpf_result {
++	unsigned int n_instr;
++	bool dense_mode;
++};
++
++int
++nfp_bpf_jit(struct bpf_prog *filter, void *prog, enum nfp_bpf_action_type act,
++	    unsigned int prog_start, unsigned int prog_done,
++	    unsigned int prog_sz, struct nfp_bpf_result *res);
++
++int nfp_prog_verify(struct nfp_prog *nfp_prog, struct bpf_prog *prog);
++
++#endif

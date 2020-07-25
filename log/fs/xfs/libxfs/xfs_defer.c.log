@@ -1,0 +1,4207 @@
+commit 78bba5c812cc651cee51b64b786be926ab7fe2a9
+Author: Darrick J. Wong <darrick.wong@oracle.com>
+Date:   Wed May 13 15:33:27 2020 -0700
+
+    xfs: use ordered buffers to initialize dquot buffers during quotacheck
+    
+    While QAing the new xfs_repair quotacheck code, I uncovered a quota
+    corruption bug resulting from a bad interaction between dquot buffer
+    initialization and quotacheck.  The bug can be reproduced with the
+    following sequence:
+    
+    # mkfs.xfs -f /dev/sdf
+    # mount /dev/sdf /opt -o usrquota
+    # su nobody -s /bin/bash -c 'touch /opt/barf'
+    # sync
+    # xfs_quota -x -c 'report -ahi' /opt
+    User quota on /opt (/dev/sdf)
+                            Inodes
+    User ID      Used   Soft   Hard Warn/Grace
+    ---------- ---------------------------------
+    root            3      0      0  00 [------]
+    nobody          1      0      0  00 [------]
+    
+    # xfs_io -x -c 'shutdown' /opt
+    # umount /opt
+    # mount /dev/sdf /opt -o usrquota
+    # touch /opt/man2
+    # xfs_quota -x -c 'report -ahi' /opt
+    User quota on /opt (/dev/sdf)
+                            Inodes
+    User ID      Used   Soft   Hard Warn/Grace
+    ---------- ---------------------------------
+    root            1      0      0  00 [------]
+    nobody          1      0      0  00 [------]
+    
+    # umount /opt
+    
+    Notice how the initial quotacheck set the root dquot icount to 3
+    (rootino, rbmino, rsumino), but after shutdown -> remount -> recovery,
+    xfs_quota reports that the root dquot has only 1 icount.  We haven't
+    deleted anything from the filesystem, which means that quota is now
+    under-counting.  This behavior is not limited to icount or the root
+    dquot, but this is the shortest reproducer.
+    
+    I traced the cause of this discrepancy to the way that we handle ondisk
+    dquot updates during quotacheck vs. regular fs activity.  Normally, when
+    we allocate a disk block for a dquot, we log the buffer as a regular
+    (dquot) buffer.  Subsequent updates to the dquots backed by that block
+    are done via separate dquot log item updates, which means that they
+    depend on the logged buffer update being written to disk before the
+    dquot items.  Because individual dquots have their own LSN fields, that
+    initial dquot buffer must always be recovered.
+    
+    However, the story changes for quotacheck, which can cause dquot block
+    allocations but persists the final dquot counter values via a delwri
+    list.  Because recovery doesn't gate dquot buffer replay on an LSN, this
+    means that the initial dquot buffer can be replayed over the (newer)
+    contents that were delwritten at the end of quotacheck.  In effect, this
+    re-initializes the dquot counters after they've been updated.  If the
+    log does not contain any other dquot items to recover, the obsolete
+    dquot contents will not be corrected by log recovery.
+    
+    Because quotacheck uses a transaction to log the setting of the CHKD
+    flags in the superblock, we skip quotacheck during the second mount
+    call, which allows the incorrect icount to remain.
+    
+    Fix this by changing the ondisk dquot initialization function to use
+    ordered buffers to write out fresh dquot blocks if it detects that we're
+    running quotacheck.  If the system goes down before quotacheck can
+    complete, the CHKD flags will not be set in the superblock and the next
+    mount will run quotacheck again, which can fix uninitialized dquot
+    buffers.  This requires amending the defer code to maintaine ordered
+    buffer state across defer rolls for the sake of the dquot allocation
+    code.
+    
+    For regular operations we preserve the current behavior since the dquot
+    items require properly initialized ondisk dquot records.
+    
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Reviewed-by: Brian Foster <bfoster@redhat.com>
+    Reviewed-by: Christoph Hellwig <hch@lst.de>
+
+diff --git a/fs/xfs/libxfs/xfs_defer.c b/fs/xfs/libxfs/xfs_defer.c
+index 1172fbf072d8..d8f586256add 100644
+--- a/fs/xfs/libxfs/xfs_defer.c
++++ b/fs/xfs/libxfs/xfs_defer.c
+@@ -240,10 +240,13 @@ xfs_defer_trans_roll(
+ 	struct xfs_log_item		*lip;
+ 	struct xfs_buf			*bplist[XFS_DEFER_OPS_NR_BUFS];
+ 	struct xfs_inode		*iplist[XFS_DEFER_OPS_NR_INODES];
++	unsigned int			ordered = 0; /* bitmap */
+ 	int				bpcount = 0, ipcount = 0;
+ 	int				i;
+ 	int				error;
+ 
++	BUILD_BUG_ON(NBBY * sizeof(ordered) < XFS_DEFER_OPS_NR_BUFS);
++
+ 	list_for_each_entry(lip, &tp->t_items, li_trans) {
+ 		switch (lip->li_type) {
+ 		case XFS_LI_BUF:
+@@ -254,7 +257,10 @@ xfs_defer_trans_roll(
+ 					ASSERT(0);
+ 					return -EFSCORRUPTED;
+ 				}
+-				xfs_trans_dirty_buf(tp, bli->bli_buf);
++				if (bli->bli_flags & XFS_BLI_ORDERED)
++					ordered |= (1U << bpcount);
++				else
++					xfs_trans_dirty_buf(tp, bli->bli_buf);
+ 				bplist[bpcount++] = bli->bli_buf;
+ 			}
+ 			break;
+@@ -295,6 +301,8 @@ xfs_defer_trans_roll(
+ 	/* Rejoin the buffers and dirty them so the log moves forward. */
+ 	for (i = 0; i < bpcount; i++) {
+ 		xfs_trans_bjoin(tp, bplist[i]);
++		if (ordered & (1U << i))
++			xfs_trans_ordered_buf(tp, bplist[i]);
+ 		xfs_trans_bhold(tp, bplist[i]);
+ 	}
+ 
+
+commit 3ec1b26c04d4910f37cdaad26d14b403c0240e30
+Author: Christoph Hellwig <hch@lst.de>
+Date:   Thu Apr 30 12:52:22 2020 -0700
+
+    xfs: use a xfs_btree_cur for the ->finish_cleanup state
+    
+    Given how XFS is all based around btrees it doesn't make much sense
+    to offer a totally generic state when we can just use the btree cursor.
+    
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Reviewed-by: Brian Foster <bfoster@redhat.com>
+    Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+
+diff --git a/fs/xfs/libxfs/xfs_defer.c b/fs/xfs/libxfs/xfs_defer.c
+index 5f37f42cda67..1172fbf072d8 100644
+--- a/fs/xfs/libxfs/xfs_defer.c
++++ b/fs/xfs/libxfs/xfs_defer.c
+@@ -361,7 +361,7 @@ xfs_defer_finish_one(
+ 	struct xfs_defer_pending	*dfp)
+ {
+ 	const struct xfs_defer_op_type	*ops = defer_op_types[dfp->dfp_type];
+-	void				*state = NULL;
++	struct xfs_btree_cur		*state = NULL;
+ 	struct list_head		*li, *n;
+ 	int				error;
+ 
+
+commit f09d167c20332ad1298ff82a6f538b4c7ea3fe1b
+Author: Christoph Hellwig <hch@lst.de>
+Date:   Thu Apr 30 12:52:22 2020 -0700
+
+    xfs: turn dfp_done into a xfs_log_item
+    
+    All defer op instance place their own extension of the log item into
+    the dfp_done field.  Replace that with a xfs_log_item to improve type
+    safety and make the code easier to follow.
+    
+    Also use the opportunity to improve the ->finish_item calling conventions
+    to place the done log item as the higher level structure before the
+    list_entry used for the individual items.
+    
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Reviewed-by: Brian Foster <bfoster@redhat.com>
+    Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+
+diff --git a/fs/xfs/libxfs/xfs_defer.c b/fs/xfs/libxfs/xfs_defer.c
+index 20950b56cdd0..5f37f42cda67 100644
+--- a/fs/xfs/libxfs/xfs_defer.c
++++ b/fs/xfs/libxfs/xfs_defer.c
+@@ -371,7 +371,7 @@ xfs_defer_finish_one(
+ 	list_for_each_safe(li, n, &dfp->dfp_work) {
+ 		list_del(li);
+ 		dfp->dfp_count--;
+-		error = ops->finish_item(tp, li, dfp->dfp_done, &state);
++		error = ops->finish_item(tp, dfp->dfp_done, li, &state);
+ 		if (error == -EAGAIN) {
+ 			/*
+ 			 * Caller wants a fresh transaction; put the work item
+
+commit bb47d79750f1a68a75d4c7defc2da934ba31de14
+Author: Christoph Hellwig <hch@lst.de>
+Date:   Thu Apr 30 12:52:21 2020 -0700
+
+    xfs: refactor xfs_defer_finish_noroll
+    
+    Split out a helper that operates on a single xfs_defer_pending structure
+    to untangle the code.
+    
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Reviewed-by: Brian Foster <bfoster@redhat.com>
+    Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+
+diff --git a/fs/xfs/libxfs/xfs_defer.c b/fs/xfs/libxfs/xfs_defer.c
+index 5402a7bf3110..20950b56cdd0 100644
+--- a/fs/xfs/libxfs/xfs_defer.c
++++ b/fs/xfs/libxfs/xfs_defer.c
+@@ -351,6 +351,53 @@ xfs_defer_cancel_list(
+ 	}
+ }
+ 
++/*
++ * Log an intent-done item for the first pending intent, and finish the work
++ * items.
++ */
++static int
++xfs_defer_finish_one(
++	struct xfs_trans		*tp,
++	struct xfs_defer_pending	*dfp)
++{
++	const struct xfs_defer_op_type	*ops = defer_op_types[dfp->dfp_type];
++	void				*state = NULL;
++	struct list_head		*li, *n;
++	int				error;
++
++	trace_xfs_defer_pending_finish(tp->t_mountp, dfp);
++
++	dfp->dfp_done = ops->create_done(tp, dfp->dfp_intent, dfp->dfp_count);
++	list_for_each_safe(li, n, &dfp->dfp_work) {
++		list_del(li);
++		dfp->dfp_count--;
++		error = ops->finish_item(tp, li, dfp->dfp_done, &state);
++		if (error == -EAGAIN) {
++			/*
++			 * Caller wants a fresh transaction; put the work item
++			 * back on the list and log a new log intent item to
++			 * replace the old one.  See "Requesting a Fresh
++			 * Transaction while Finishing Deferred Work" above.
++			 */
++			list_add(li, &dfp->dfp_work);
++			dfp->dfp_count++;
++			dfp->dfp_done = NULL;
++			xfs_defer_create_intent(tp, dfp, false);
++		}
++
++		if (error)
++			goto out;
++	}
++
++	/* Done with the dfp, free it. */
++	list_del(&dfp->dfp_list);
++	kmem_free(dfp);
++out:
++	if (ops->finish_cleanup)
++		ops->finish_cleanup(tp, state, error);
++	return error;
++}
++
+ /*
+  * Finish all the pending work.  This involves logging intent items for
+  * any work items that wandered in since the last transaction roll (if
+@@ -364,11 +411,7 @@ xfs_defer_finish_noroll(
+ 	struct xfs_trans		**tp)
+ {
+ 	struct xfs_defer_pending	*dfp;
+-	struct list_head		*li;
+-	struct list_head		*n;
+-	void				*state;
+ 	int				error = 0;
+-	const struct xfs_defer_op_type	*ops;
+ 	LIST_HEAD(dop_pending);
+ 
+ 	ASSERT((*tp)->t_flags & XFS_TRANS_PERM_LOG_RES);
+@@ -377,83 +420,30 @@ xfs_defer_finish_noroll(
+ 
+ 	/* Until we run out of pending work to finish... */
+ 	while (!list_empty(&dop_pending) || !list_empty(&(*tp)->t_dfops)) {
+-		/* log intents and pull in intake items */
+ 		xfs_defer_create_intents(*tp);
+ 		list_splice_tail_init(&(*tp)->t_dfops, &dop_pending);
+ 
+-		/*
+-		 * Roll the transaction.
+-		 */
+ 		error = xfs_defer_trans_roll(tp);
+ 		if (error)
+-			goto out;
++			goto out_shutdown;
+ 
+-		/* Log an intent-done item for the first pending item. */
+ 		dfp = list_first_entry(&dop_pending, struct xfs_defer_pending,
+ 				       dfp_list);
+-		ops = defer_op_types[dfp->dfp_type];
+-		trace_xfs_defer_pending_finish((*tp)->t_mountp, dfp);
+-		dfp->dfp_done = ops->create_done(*tp, dfp->dfp_intent,
+-				dfp->dfp_count);
+-
+-		/* Finish the work items. */
+-		state = NULL;
+-		list_for_each_safe(li, n, &dfp->dfp_work) {
+-			list_del(li);
+-			dfp->dfp_count--;
+-			error = ops->finish_item(*tp, li, dfp->dfp_done,
+-					&state);
+-			if (error == -EAGAIN) {
+-				/*
+-				 * Caller wants a fresh transaction;
+-				 * put the work item back on the list
+-				 * and jump out.
+-				 */
+-				list_add(li, &dfp->dfp_work);
+-				dfp->dfp_count++;
+-				break;
+-			} else if (error) {
+-				/*
+-				 * Clean up after ourselves and jump out.
+-				 * xfs_defer_cancel will take care of freeing
+-				 * all these lists and stuff.
+-				 */
+-				if (ops->finish_cleanup)
+-					ops->finish_cleanup(*tp, state, error);
+-				goto out;
+-			}
+-		}
+-		if (error == -EAGAIN) {
+-			/*
+-			 * Caller wants a fresh transaction, so log a new log
+-			 * intent item to replace the old one and roll the
+-			 * transaction.  See "Requesting a Fresh Transaction
+-			 * while Finishing Deferred Work" above.
+-			 */
+-			dfp->dfp_done = NULL;
+-			xfs_defer_create_intent(*tp, dfp, false);
+-		} else {
+-			/* Done with the dfp, free it. */
+-			list_del(&dfp->dfp_list);
+-			kmem_free(dfp);
+-		}
+-
+-		if (ops->finish_cleanup)
+-			ops->finish_cleanup(*tp, state, error);
+-	}
+-
+-out:
+-	if (error) {
+-		xfs_defer_trans_abort(*tp, &dop_pending);
+-		xfs_force_shutdown((*tp)->t_mountp, SHUTDOWN_CORRUPT_INCORE);
+-		trace_xfs_defer_finish_error(*tp, error);
+-		xfs_defer_cancel_list((*tp)->t_mountp, &dop_pending);
+-		xfs_defer_cancel(*tp);
+-		return error;
++		error = xfs_defer_finish_one(*tp, dfp);
++		if (error && error != -EAGAIN)
++			goto out_shutdown;
+ 	}
+ 
+ 	trace_xfs_defer_finish_done(*tp, _RET_IP_);
+ 	return 0;
++
++out_shutdown:
++	xfs_defer_trans_abort(*tp, &dop_pending);
++	xfs_force_shutdown((*tp)->t_mountp, SHUTDOWN_CORRUPT_INCORE);
++	trace_xfs_defer_finish_error(*tp, error);
++	xfs_defer_cancel_list((*tp)->t_mountp, &dop_pending);
++	xfs_defer_cancel(*tp);
++	return error;
+ }
+ 
+ int
+
+commit d367a868e46b025a8ced8e00ef2b3a3c2f3bf732
+Author: Christoph Hellwig <hch@lst.de>
+Date:   Thu Apr 30 12:52:20 2020 -0700
+
+    xfs: merge the ->diff_items defer op into ->create_intent
+    
+    This avoids a per-item indirect call, and also simplifies the interface
+    a bit.
+    
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Reviewed-by: Brian Foster <bfoster@redhat.com>
+    Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+
+diff --git a/fs/xfs/libxfs/xfs_defer.c b/fs/xfs/libxfs/xfs_defer.c
+index 56d1357f9d13..5402a7bf3110 100644
+--- a/fs/xfs/libxfs/xfs_defer.c
++++ b/fs/xfs/libxfs/xfs_defer.c
+@@ -186,11 +186,8 @@ xfs_defer_create_intent(
+ {
+ 	const struct xfs_defer_op_type	*ops = defer_op_types[dfp->dfp_type];
+ 
+-	if (sort)
+-		list_sort(tp->t_mountp, &dfp->dfp_work, ops->diff_items);
+-
+ 	dfp->dfp_intent = ops->create_intent(tp, &dfp->dfp_work,
+-			dfp->dfp_count);
++			dfp->dfp_count, sort);
+ }
+ 
+ /*
+
+commit c1f09188e8de0ae65433cb9c8ace4feb66359bcc
+Author: Christoph Hellwig <hch@lst.de>
+Date:   Thu Apr 30 12:52:20 2020 -0700
+
+    xfs: merge the ->log_item defer op into ->create_intent
+    
+    These are aways called together, and my merging them we reduce the amount
+    of indirect calls, improve type safety and in general clean up the code
+    a bit.
+    
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Reviewed-by: Brian Foster <bfoster@redhat.com>
+    Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+
+diff --git a/fs/xfs/libxfs/xfs_defer.c b/fs/xfs/libxfs/xfs_defer.c
+index 8a38da602b7d..56d1357f9d13 100644
+--- a/fs/xfs/libxfs/xfs_defer.c
++++ b/fs/xfs/libxfs/xfs_defer.c
+@@ -185,14 +185,12 @@ xfs_defer_create_intent(
+ 	bool				sort)
+ {
+ 	const struct xfs_defer_op_type	*ops = defer_op_types[dfp->dfp_type];
+-	struct list_head		*li;
+ 
+ 	if (sort)
+ 		list_sort(tp->t_mountp, &dfp->dfp_work, ops->diff_items);
+ 
+-	dfp->dfp_intent = ops->create_intent(tp, dfp->dfp_count);
+-	list_for_each(li, &dfp->dfp_work)
+-		ops->log_item(tp, dfp->dfp_intent, li);
++	dfp->dfp_intent = ops->create_intent(tp, &dfp->dfp_work,
++			dfp->dfp_count);
+ }
+ 
+ /*
+
+commit e046e949486ec92d83b2ccdf0e7e9144f74ef028
+Author: Christoph Hellwig <hch@lst.de>
+Date:   Thu Apr 30 12:52:20 2020 -0700
+
+    xfs: factor out a xfs_defer_create_intent helper
+    
+    Create a helper that encapsulates the whole logic to create a defer
+    intent.  This reorders some of the work that was done, but none of
+    that has an affect on the operation as only fields that don't directly
+    interact are affected.
+    
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Reviewed-by: Brian Foster <bfoster@redhat.com>
+    Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+
+diff --git a/fs/xfs/libxfs/xfs_defer.c b/fs/xfs/libxfs/xfs_defer.c
+index 22557527cfdb..8a38da602b7d 100644
+--- a/fs/xfs/libxfs/xfs_defer.c
++++ b/fs/xfs/libxfs/xfs_defer.c
+@@ -178,6 +178,23 @@ static const struct xfs_defer_op_type *defer_op_types[] = {
+ 	[XFS_DEFER_OPS_TYPE_AGFL_FREE]	= &xfs_agfl_free_defer_type,
+ };
+ 
++static void
++xfs_defer_create_intent(
++	struct xfs_trans		*tp,
++	struct xfs_defer_pending	*dfp,
++	bool				sort)
++{
++	const struct xfs_defer_op_type	*ops = defer_op_types[dfp->dfp_type];
++	struct list_head		*li;
++
++	if (sort)
++		list_sort(tp->t_mountp, &dfp->dfp_work, ops->diff_items);
++
++	dfp->dfp_intent = ops->create_intent(tp, dfp->dfp_count);
++	list_for_each(li, &dfp->dfp_work)
++		ops->log_item(tp, dfp->dfp_intent, li);
++}
++
+ /*
+  * For each pending item in the intake list, log its intent item and the
+  * associated extents, then add the entire intake list to the end of
+@@ -187,17 +204,11 @@ STATIC void
+ xfs_defer_create_intents(
+ 	struct xfs_trans		*tp)
+ {
+-	struct list_head		*li;
+ 	struct xfs_defer_pending	*dfp;
+-	const struct xfs_defer_op_type	*ops;
+ 
+ 	list_for_each_entry(dfp, &tp->t_dfops, dfp_list) {
+-		ops = defer_op_types[dfp->dfp_type];
+-		dfp->dfp_intent = ops->create_intent(tp, dfp->dfp_count);
+ 		trace_xfs_defer_create_intent(tp->t_mountp, dfp);
+-		list_sort(tp->t_mountp, &dfp->dfp_work, ops->diff_items);
+-		list_for_each(li, &dfp->dfp_work)
+-			ops->log_item(tp, dfp->dfp_intent, li);
++		xfs_defer_create_intent(tp, dfp, true);
+ 	}
+ }
+ 
+@@ -419,17 +430,13 @@ xfs_defer_finish_noroll(
+ 		}
+ 		if (error == -EAGAIN) {
+ 			/*
+-			 * Caller wants a fresh transaction, so log a
+-			 * new log intent item to replace the old one
+-			 * and roll the transaction.  See "Requesting
+-			 * a Fresh Transaction while Finishing
+-			 * Deferred Work" above.
++			 * Caller wants a fresh transaction, so log a new log
++			 * intent item to replace the old one and roll the
++			 * transaction.  See "Requesting a Fresh Transaction
++			 * while Finishing Deferred Work" above.
+ 			 */
+-			dfp->dfp_intent = ops->create_intent(*tp,
+-					dfp->dfp_count);
+ 			dfp->dfp_done = NULL;
+-			list_for_each(li, &dfp->dfp_work)
+-				ops->log_item(*tp, dfp->dfp_intent, li);
++			xfs_defer_create_intent(*tp, dfp, false);
+ 		} else {
+ 			/* Done with the dfp, free it. */
+ 			list_del(&dfp->dfp_list);
+
+commit 707e0ddaf67e8942448ebdd16b523e409ebe40ce
+Author: Tetsuo Handa <penguin-kernel@I-love.SAKURA.ne.jp>
+Date:   Mon Aug 26 12:06:22 2019 -0700
+
+    fs: xfs: Remove KM_NOSLEEP and KM_SLEEP.
+    
+    Since no caller is using KM_NOSLEEP and no callee branches on KM_SLEEP,
+    we can remove KM_NOSLEEP and replace KM_SLEEP with 0.
+    
+    Signed-off-by: Tetsuo Handa <penguin-kernel@I-love.SAKURA.ne.jp>
+    Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+
+diff --git a/fs/xfs/libxfs/xfs_defer.c b/fs/xfs/libxfs/xfs_defer.c
+index eb2be2a6a25a..22557527cfdb 100644
+--- a/fs/xfs/libxfs/xfs_defer.c
++++ b/fs/xfs/libxfs/xfs_defer.c
+@@ -517,7 +517,7 @@ xfs_defer_add(
+ 	}
+ 	if (!dfp) {
+ 		dfp = kmem_alloc(sizeof(struct xfs_defer_pending),
+-				KM_SLEEP | KM_NOFS);
++				KM_NOFS);
+ 		dfp->dfp_type = type;
+ 		dfp->dfp_intent = NULL;
+ 		dfp->dfp_done = NULL;
+
+commit 250d4b4c409778bc44577dfc59909935c92fd006
+Author: Eric Sandeen <sandeen@sandeen.net>
+Date:   Fri Jun 28 19:30:43 2019 -0700
+
+    xfs: remove unused header files
+    
+    There are many, many xfs header files which are included but
+    unneeded (or included twice) in the xfs code, so remove them.
+    
+    nb: xfs_linux.h includes about 9 headers for everyone, so those
+    explicit includes get removed by this.  I'm not sure what the
+    preference is, but if we wanted explicit includes everywhere,
+    a followup patch could remove those xfs_*.h includes from
+    xfs_linux.h and move them into the files that need them.
+    Or it could be left as-is.
+    
+    Signed-off-by: Eric Sandeen <sandeen@redhat.com>
+    Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+
+diff --git a/fs/xfs/libxfs/xfs_defer.c b/fs/xfs/libxfs/xfs_defer.c
+index 1c6bf2105939..eb2be2a6a25a 100644
+--- a/fs/xfs/libxfs/xfs_defer.c
++++ b/fs/xfs/libxfs/xfs_defer.c
+@@ -9,8 +9,6 @@
+ #include "xfs_format.h"
+ #include "xfs_log_format.h"
+ #include "xfs_trans_resv.h"
+-#include "xfs_bit.h"
+-#include "xfs_sb.h"
+ #include "xfs_mount.h"
+ #include "xfs_defer.h"
+ #include "xfs_trans.h"
+
+commit 710d707d2fa9cf4c2aa9def129e71e99513466ea
+Author: Darrick J. Wong <darrick.wong@oracle.com>
+Date:   Wed Apr 24 09:27:41 2019 -0700
+
+    xfs: always rejoin held resources during defer roll
+    
+    During testing of xfs/141 on a V4 filesystem, I observed some
+    inconsistent behavior with regards to resources that are held (i.e.
+    remain locked) across a defer roll.  The transaction roll always gives
+    the defer roll function a new transaction, even if committing the old
+    transaction fails.  However, the defer roll function only rejoins the
+    held resources if the transaction commit succeedied.  This means that
+    callers of defer roll have to figure out whether the held resources are
+    attached to the transaction being passed back.
+    
+    Worse yet, if the defer roll was part of a defer finish call, we have a
+    third possibility: the defer finish could pass back a dirty transaction
+    with dirty held resources and an error code.
+    
+    The only sane way to handle all of these scenarios is to require that
+    the code that held the resource either cancel the transaction before
+    unlocking and releasing the resources, or use functions that detach
+    resources from a transaction properly (e.g.  xfs_trans_brelse) if they
+    need to drop the reference before committing or cancelling the
+    transaction.
+    
+    In order to make this so, change the defer roll code to join held
+    resources to the new transaction unconditionally and fix all the bhold
+    callers to release the held buffers correctly.
+    
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Reviewed-by: Brian Foster <bfoster@redhat.com>
+
+diff --git a/fs/xfs/libxfs/xfs_defer.c b/fs/xfs/libxfs/xfs_defer.c
+index 94f00427de98..1c6bf2105939 100644
+--- a/fs/xfs/libxfs/xfs_defer.c
++++ b/fs/xfs/libxfs/xfs_defer.c
+@@ -274,13 +274,15 @@ xfs_defer_trans_roll(
+ 
+ 	trace_xfs_defer_trans_roll(tp, _RET_IP_);
+ 
+-	/* Roll the transaction. */
++	/*
++	 * Roll the transaction.  Rolling always given a new transaction (even
++	 * if committing the old one fails!) to hand back to the caller, so we
++	 * join the held resources to the new transaction so that we always
++	 * return with the held resources joined to @tpp, no matter what
++	 * happened.
++	 */
+ 	error = xfs_trans_roll(tpp);
+ 	tp = *tpp;
+-	if (error) {
+-		trace_xfs_defer_trans_roll_error(tp, error);
+-		return error;
+-	}
+ 
+ 	/* Rejoin the joined inodes. */
+ 	for (i = 0; i < ipcount; i++)
+@@ -292,6 +294,8 @@ xfs_defer_trans_roll(
+ 		xfs_trans_bhold(tp, bplist[i]);
+ 	}
+ 
++	if (error)
++		trace_xfs_defer_trans_roll_error(tp, error);
+ 	return error;
+ }
+ 
+
+commit 02b100fb83f9b0f8719deef6c4ed973b4d9ce00c
+Author: Darrick J. Wong <darrick.wong@oracle.com>
+Date:   Wed Dec 12 08:46:22 2018 -0800
+
+    xfs: streamline defer op type handling
+    
+    There's no need to bundle a pointer to the defer op type into the defer
+    op control structure.  Instead, store the defer op type enum, which
+    enables us to shorten some of the lines.
+    
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Reviewed-by: Eric Sandeen <sandeen@redhat.com>
+    Reviewed-by: Brian Foster <bfoster@redhat.com>
+
+diff --git a/fs/xfs/libxfs/xfs_defer.c b/fs/xfs/libxfs/xfs_defer.c
+index 277117a8ad13..94f00427de98 100644
+--- a/fs/xfs/libxfs/xfs_defer.c
++++ b/fs/xfs/libxfs/xfs_defer.c
+@@ -191,15 +191,15 @@ xfs_defer_create_intents(
+ {
+ 	struct list_head		*li;
+ 	struct xfs_defer_pending	*dfp;
++	const struct xfs_defer_op_type	*ops;
+ 
+ 	list_for_each_entry(dfp, &tp->t_dfops, dfp_list) {
+-		dfp->dfp_intent = dfp->dfp_type->create_intent(tp,
+-				dfp->dfp_count);
++		ops = defer_op_types[dfp->dfp_type];
++		dfp->dfp_intent = ops->create_intent(tp, dfp->dfp_count);
+ 		trace_xfs_defer_create_intent(tp->t_mountp, dfp);
+-		list_sort(tp->t_mountp, &dfp->dfp_work,
+-				dfp->dfp_type->diff_items);
++		list_sort(tp->t_mountp, &dfp->dfp_work, ops->diff_items);
+ 		list_for_each(li, &dfp->dfp_work)
+-			dfp->dfp_type->log_item(tp, dfp->dfp_intent, li);
++			ops->log_item(tp, dfp->dfp_intent, li);
+ 	}
+ }
+ 
+@@ -210,14 +210,16 @@ xfs_defer_trans_abort(
+ 	struct list_head		*dop_pending)
+ {
+ 	struct xfs_defer_pending	*dfp;
++	const struct xfs_defer_op_type	*ops;
+ 
+ 	trace_xfs_defer_trans_abort(tp, _RET_IP_);
+ 
+ 	/* Abort intent items that don't have a done item. */
+ 	list_for_each_entry(dfp, dop_pending, dfp_list) {
++		ops = defer_op_types[dfp->dfp_type];
+ 		trace_xfs_defer_pending_abort(tp->t_mountp, dfp);
+ 		if (dfp->dfp_intent && !dfp->dfp_done) {
+-			dfp->dfp_type->abort_intent(dfp->dfp_intent);
++			ops->abort_intent(dfp->dfp_intent);
+ 			dfp->dfp_intent = NULL;
+ 		}
+ 	}
+@@ -321,18 +323,20 @@ xfs_defer_cancel_list(
+ 	struct xfs_defer_pending	*pli;
+ 	struct list_head		*pwi;
+ 	struct list_head		*n;
++	const struct xfs_defer_op_type	*ops;
+ 
+ 	/*
+ 	 * Free the pending items.  Caller should already have arranged
+ 	 * for the intent items to be released.
+ 	 */
+ 	list_for_each_entry_safe(dfp, pli, dop_list, dfp_list) {
++		ops = defer_op_types[dfp->dfp_type];
+ 		trace_xfs_defer_cancel_list(mp, dfp);
+ 		list_del(&dfp->dfp_list);
+ 		list_for_each_safe(pwi, n, &dfp->dfp_work) {
+ 			list_del(pwi);
+ 			dfp->dfp_count--;
+-			dfp->dfp_type->cancel_item(pwi);
++			ops->cancel_item(pwi);
+ 		}
+ 		ASSERT(dfp->dfp_count == 0);
+ 		kmem_free(dfp);
+@@ -356,7 +360,7 @@ xfs_defer_finish_noroll(
+ 	struct list_head		*n;
+ 	void				*state;
+ 	int				error = 0;
+-	void				(*cleanup_fn)(struct xfs_trans *, void *, int);
++	const struct xfs_defer_op_type	*ops;
+ 	LIST_HEAD(dop_pending);
+ 
+ 	ASSERT((*tp)->t_flags & XFS_TRANS_PERM_LOG_RES);
+@@ -379,18 +383,18 @@ xfs_defer_finish_noroll(
+ 		/* Log an intent-done item for the first pending item. */
+ 		dfp = list_first_entry(&dop_pending, struct xfs_defer_pending,
+ 				       dfp_list);
++		ops = defer_op_types[dfp->dfp_type];
+ 		trace_xfs_defer_pending_finish((*tp)->t_mountp, dfp);
+-		dfp->dfp_done = dfp->dfp_type->create_done(*tp, dfp->dfp_intent,
++		dfp->dfp_done = ops->create_done(*tp, dfp->dfp_intent,
+ 				dfp->dfp_count);
+-		cleanup_fn = dfp->dfp_type->finish_cleanup;
+ 
+ 		/* Finish the work items. */
+ 		state = NULL;
+ 		list_for_each_safe(li, n, &dfp->dfp_work) {
+ 			list_del(li);
+ 			dfp->dfp_count--;
+-			error = dfp->dfp_type->finish_item(*tp, li,
+-					dfp->dfp_done, &state);
++			error = ops->finish_item(*tp, li, dfp->dfp_done,
++					&state);
+ 			if (error == -EAGAIN) {
+ 				/*
+ 				 * Caller wants a fresh transaction;
+@@ -406,8 +410,8 @@ xfs_defer_finish_noroll(
+ 				 * xfs_defer_cancel will take care of freeing
+ 				 * all these lists and stuff.
+ 				 */
+-				if (cleanup_fn)
+-					cleanup_fn(*tp, state, error);
++				if (ops->finish_cleanup)
++					ops->finish_cleanup(*tp, state, error);
+ 				goto out;
+ 			}
+ 		}
+@@ -419,20 +423,19 @@ xfs_defer_finish_noroll(
+ 			 * a Fresh Transaction while Finishing
+ 			 * Deferred Work" above.
+ 			 */
+-			dfp->dfp_intent = dfp->dfp_type->create_intent(*tp,
++			dfp->dfp_intent = ops->create_intent(*tp,
+ 					dfp->dfp_count);
+ 			dfp->dfp_done = NULL;
+ 			list_for_each(li, &dfp->dfp_work)
+-				dfp->dfp_type->log_item(*tp, dfp->dfp_intent,
+-						li);
++				ops->log_item(*tp, dfp->dfp_intent, li);
+ 		} else {
+ 			/* Done with the dfp, free it. */
+ 			list_del(&dfp->dfp_list);
+ 			kmem_free(dfp);
+ 		}
+ 
+-		if (cleanup_fn)
+-			cleanup_fn(*tp, state, error);
++		if (ops->finish_cleanup)
++			ops->finish_cleanup(*tp, state, error);
+ 	}
+ 
+ out:
+@@ -492,6 +495,7 @@ xfs_defer_add(
+ 	struct list_head		*li)
+ {
+ 	struct xfs_defer_pending	*dfp = NULL;
++	const struct xfs_defer_op_type	*ops;
+ 
+ 	ASSERT(tp->t_flags & XFS_TRANS_PERM_LOG_RES);
+ 	BUILD_BUG_ON(ARRAY_SIZE(defer_op_types) != XFS_DEFER_OPS_TYPE_MAX);
+@@ -504,15 +508,15 @@ xfs_defer_add(
+ 	if (!list_empty(&tp->t_dfops)) {
+ 		dfp = list_last_entry(&tp->t_dfops,
+ 				struct xfs_defer_pending, dfp_list);
+-		if (dfp->dfp_type->type != type ||
+-		    (dfp->dfp_type->max_items &&
+-		     dfp->dfp_count >= dfp->dfp_type->max_items))
++		ops = defer_op_types[dfp->dfp_type];
++		if (dfp->dfp_type != type ||
++		    (ops->max_items && dfp->dfp_count >= ops->max_items))
+ 			dfp = NULL;
+ 	}
+ 	if (!dfp) {
+ 		dfp = kmem_alloc(sizeof(struct xfs_defer_pending),
+ 				KM_SLEEP | KM_NOFS);
+-		dfp->dfp_type = defer_op_types[type];
++		dfp->dfp_type = type;
+ 		dfp->dfp_intent = NULL;
+ 		dfp->dfp_done = NULL;
+ 		dfp->dfp_count = 0;
+
+commit bc9f2b7c8a732d896753709cc9d495780ba7e9f9
+Author: Darrick J. Wong <darrick.wong@oracle.com>
+Date:   Wed Dec 12 08:46:22 2018 -0800
+
+    xfs: idiotproof defer op type configuration
+    
+    Recently, we forgot to port a new defer op type to xfsprogs, which
+    caused us some userspace pain.  Reorganize the way we make libxfs
+    clients supply defer op type information so that all type information
+    has to be provided at build time instead of risky runtime dynamic
+    configuration.
+    
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Reviewed-by: Eric Sandeen <sandeen@redhat.com>
+    Reviewed-by: Brian Foster <bfoster@redhat.com>
+
+diff --git a/fs/xfs/libxfs/xfs_defer.c b/fs/xfs/libxfs/xfs_defer.c
+index e792b167150a..277117a8ad13 100644
+--- a/fs/xfs/libxfs/xfs_defer.c
++++ b/fs/xfs/libxfs/xfs_defer.c
+@@ -172,7 +172,13 @@
+  * reoccur.
+  */
+ 
+-static const struct xfs_defer_op_type *defer_op_types[XFS_DEFER_OPS_TYPE_MAX];
++static const struct xfs_defer_op_type *defer_op_types[] = {
++	[XFS_DEFER_OPS_TYPE_BMAP]	= &xfs_bmap_update_defer_type,
++	[XFS_DEFER_OPS_TYPE_REFCOUNT]	= &xfs_refcount_update_defer_type,
++	[XFS_DEFER_OPS_TYPE_RMAP]	= &xfs_rmap_update_defer_type,
++	[XFS_DEFER_OPS_TYPE_FREE]	= &xfs_extent_free_defer_type,
++	[XFS_DEFER_OPS_TYPE_AGFL_FREE]	= &xfs_agfl_free_defer_type,
++};
+ 
+ /*
+  * For each pending item in the intake list, log its intent item and the
+@@ -488,6 +494,7 @@ xfs_defer_add(
+ 	struct xfs_defer_pending	*dfp = NULL;
+ 
+ 	ASSERT(tp->t_flags & XFS_TRANS_PERM_LOG_RES);
++	BUILD_BUG_ON(ARRAY_SIZE(defer_op_types) != XFS_DEFER_OPS_TYPE_MAX);
+ 
+ 	/*
+ 	 * Add the item to a pending item at the end of the intake list.
+@@ -517,14 +524,6 @@ xfs_defer_add(
+ 	dfp->dfp_count++;
+ }
+ 
+-/* Initialize a deferred operation list. */
+-void
+-xfs_defer_init_op_type(
+-	const struct xfs_defer_op_type	*type)
+-{
+-	defer_op_types[type->type] = type;
+-}
+-
+ /*
+  * Move deferred ops from one transaction to another and reset the source to
+  * initial state. This is primarily used to carry state forward across
+
+commit 9d9e6233859706875c392707efd6d516cfb764fb
+Author: Brian Foster <bfoster@redhat.com>
+Date:   Wed Aug 1 07:20:35 2018 -0700
+
+    xfs: fold dfops into the transaction
+    
+    struct xfs_defer_ops has now been reduced to a single list_head. The
+    external dfops mechanism is unused and thus everywhere a (permanent)
+    transaction is accessible the associated dfops structure is as well.
+    
+    Remove the xfs_defer_ops structure and fold the list_head into the
+    transaction. Also remove the last remnant of external dfops in
+    xfs_trans_dup().
+    
+    Signed-off-by: Brian Foster <bfoster@redhat.com>
+    Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Reviewed-by: Christoph Hellwig <hch@lst.de>
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+
+diff --git a/fs/xfs/libxfs/xfs_defer.c b/fs/xfs/libxfs/xfs_defer.c
+index ce2286763531..e792b167150a 100644
+--- a/fs/xfs/libxfs/xfs_defer.c
++++ b/fs/xfs/libxfs/xfs_defer.c
+@@ -183,11 +183,10 @@ STATIC void
+ xfs_defer_create_intents(
+ 	struct xfs_trans		*tp)
+ {
+-	struct xfs_defer_ops		*dop = tp->t_dfops;
+ 	struct list_head		*li;
+ 	struct xfs_defer_pending	*dfp;
+ 
+-	list_for_each_entry(dfp, &dop->dop_intake, dfp_list) {
++	list_for_each_entry(dfp, &tp->t_dfops, dfp_list) {
+ 		dfp->dfp_intent = dfp->dfp_type->create_intent(tp,
+ 				dfp->dfp_count);
+ 		trace_xfs_defer_create_intent(tp->t_mountp, dfp);
+@@ -204,10 +203,9 @@ xfs_defer_trans_abort(
+ 	struct xfs_trans		*tp,
+ 	struct list_head		*dop_pending)
+ {
+-	struct xfs_defer_ops		*dop = tp->t_dfops;
+ 	struct xfs_defer_pending	*dfp;
+ 
+-	trace_xfs_defer_trans_abort(tp->t_mountp, dop, _RET_IP_);
++	trace_xfs_defer_trans_abort(tp, _RET_IP_);
+ 
+ 	/* Abort intent items that don't have a done item. */
+ 	list_for_each_entry(dfp, dop_pending, dfp_list) {
+@@ -266,14 +264,13 @@ xfs_defer_trans_roll(
+ 		}
+ 	}
+ 
+-	trace_xfs_defer_trans_roll(tp->t_mountp, tp->t_dfops, _RET_IP_);
++	trace_xfs_defer_trans_roll(tp, _RET_IP_);
+ 
+ 	/* Roll the transaction. */
+ 	error = xfs_trans_roll(tpp);
+ 	tp = *tpp;
+ 	if (error) {
+-		trace_xfs_defer_trans_roll_error(tp->t_mountp,
+-						 tp->t_dfops, error);
++		trace_xfs_defer_trans_roll_error(tp, error);
+ 		return error;
+ 	}
+ 
+@@ -297,7 +294,7 @@ static void
+ xfs_defer_reset(
+ 	struct xfs_trans	*tp)
+ {
+-	ASSERT(list_empty(&tp->t_dfops->dop_intake));
++	ASSERT(list_empty(&tp->t_dfops));
+ 
+ 	/*
+ 	 * Low mode state transfers across transaction rolls to mirror dfops
+@@ -358,15 +355,13 @@ xfs_defer_finish_noroll(
+ 
+ 	ASSERT((*tp)->t_flags & XFS_TRANS_PERM_LOG_RES);
+ 
+-	trace_xfs_defer_finish((*tp)->t_mountp, (*tp)->t_dfops, _RET_IP_);
++	trace_xfs_defer_finish(*tp, _RET_IP_);
+ 
+ 	/* Until we run out of pending work to finish... */
+-	while (!list_empty(&dop_pending) ||
+-	       !list_empty(&(*tp)->t_dfops->dop_intake)) {
++	while (!list_empty(&dop_pending) || !list_empty(&(*tp)->t_dfops)) {
+ 		/* log intents and pull in intake items */
+ 		xfs_defer_create_intents(*tp);
+-		list_splice_tail_init(&(*tp)->t_dfops->dop_intake,
+-				      &dop_pending);
++		list_splice_tail_init(&(*tp)->t_dfops, &dop_pending);
+ 
+ 		/*
+ 		 * Roll the transaction.
+@@ -438,14 +433,13 @@ xfs_defer_finish_noroll(
+ 	if (error) {
+ 		xfs_defer_trans_abort(*tp, &dop_pending);
+ 		xfs_force_shutdown((*tp)->t_mountp, SHUTDOWN_CORRUPT_INCORE);
+-		trace_xfs_defer_finish_error((*tp)->t_mountp, (*tp)->t_dfops,
+-					     error);
++		trace_xfs_defer_finish_error(*tp, error);
+ 		xfs_defer_cancel_list((*tp)->t_mountp, &dop_pending);
+ 		xfs_defer_cancel(*tp);
+ 		return error;
+ 	}
+ 
+-	trace_xfs_defer_finish_done((*tp)->t_mountp, (*tp)->t_dfops, _RET_IP_);
++	trace_xfs_defer_finish_done(*tp, _RET_IP_);
+ 	return 0;
+ }
+ 
+@@ -480,8 +474,8 @@ xfs_defer_cancel(
+ {
+ 	struct xfs_mount	*mp = tp->t_mountp;
+ 
+-	trace_xfs_defer_cancel(mp, tp->t_dfops, _RET_IP_);
+-	xfs_defer_cancel_list(mp, &tp->t_dfops->dop_intake);
++	trace_xfs_defer_cancel(tp, _RET_IP_);
++	xfs_defer_cancel_list(mp, &tp->t_dfops);
+ }
+ 
+ /* Add an item for later deferred processing. */
+@@ -491,7 +485,6 @@ xfs_defer_add(
+ 	enum xfs_defer_ops_type		type,
+ 	struct list_head		*li)
+ {
+-	struct xfs_defer_ops		*dop = tp->t_dfops;
+ 	struct xfs_defer_pending	*dfp = NULL;
+ 
+ 	ASSERT(tp->t_flags & XFS_TRANS_PERM_LOG_RES);
+@@ -501,8 +494,8 @@ xfs_defer_add(
+ 	 * If the last pending item has the same type, reuse it.  Else,
+ 	 * create a new pending item at the end of the intake list.
+ 	 */
+-	if (!list_empty(&dop->dop_intake)) {
+-		dfp = list_last_entry(&dop->dop_intake,
++	if (!list_empty(&tp->t_dfops)) {
++		dfp = list_last_entry(&tp->t_dfops,
+ 				struct xfs_defer_pending, dfp_list);
+ 		if (dfp->dfp_type->type != type ||
+ 		    (dfp->dfp_type->max_items &&
+@@ -517,7 +510,7 @@ xfs_defer_add(
+ 		dfp->dfp_done = NULL;
+ 		dfp->dfp_count = 0;
+ 		INIT_LIST_HEAD(&dfp->dfp_work);
+-		list_add_tail(&dfp->dfp_list, &dop->dop_intake);
++		list_add_tail(&dfp->dfp_list, &tp->t_dfops);
+ 	}
+ 
+ 	list_add_tail(li, &dfp->dfp_work);
+@@ -532,39 +525,17 @@ xfs_defer_init_op_type(
+ 	defer_op_types[type->type] = type;
+ }
+ 
+-/* Initialize a deferred operation. */
+-void
+-xfs_defer_init(
+-	struct xfs_trans		*tp,
+-	struct xfs_defer_ops		*dop)
+-{
+-	struct xfs_mount		*mp = NULL;
+-
+-	memset(dop, 0, sizeof(struct xfs_defer_ops));
+-	INIT_LIST_HEAD(&dop->dop_intake);
+-	if (tp) {
+-		ASSERT(tp->t_firstblock == NULLFSBLOCK);
+-		tp->t_dfops = dop;
+-		mp = tp->t_mountp;
+-	}
+-	trace_xfs_defer_init(mp, dop, _RET_IP_);
+-}
+-
+ /*
+- * Move state from one xfs_defer_ops to another and reset the source to initial
+- * state. This is primarily used to carry state forward across transaction rolls
+- * with internal dfops.
++ * Move deferred ops from one transaction to another and reset the source to
++ * initial state. This is primarily used to carry state forward across
++ * transaction rolls with pending dfops.
+  */
+ void
+ xfs_defer_move(
+ 	struct xfs_trans	*dtp,
+ 	struct xfs_trans	*stp)
+ {
+-	struct xfs_defer_ops	*dst = dtp->t_dfops;
+-	struct xfs_defer_ops	*src = stp->t_dfops;
+-	ASSERT(dst != src);
+-
+-	list_splice_init(&src->dop_intake, &dst->dop_intake);
++	list_splice_init(&stp->t_dfops, &dtp->t_dfops);
+ 
+ 	/*
+ 	 * Low free space mode was historically controlled by a dfops field.
+
+commit 0f37d1780c3d864599fb377dcb47ad1aa0686b4e
+Author: Brian Foster <bfoster@redhat.com>
+Date:   Wed Aug 1 07:20:34 2018 -0700
+
+    xfs: pass transaction to xfs_defer_add()
+    
+    The majority of remaining references to struct xfs_defer_ops in XFS
+    are associated with xfs_defer_add(). At this point, there are no
+    more external xfs_defer_ops users left. All instances of
+    xfs_defer_ops are embedded in the transaction, which means we can
+    safely pass the transaction down to the dfops add interface.
+    
+    Update xfs_defer_add() to receive the transaction as a parameter.
+    Various subsystems implement wrappers to allocate and construct the
+    context specific data structures for the associated deferred
+    operation type. Update these to also carry the transaction down as
+    needed and clean up unused dfops parameters along the way.
+    
+    This removes most of the remaining references to struct
+    xfs_defer_ops throughout the code and facilitates removal of the
+    structure.
+    
+    Signed-off-by: Brian Foster <bfoster@redhat.com>
+    Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Reviewed-by: Christoph Hellwig <hch@lst.de>
+    [darrick: fix unused variable warnings with ftrace disabled]
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+
+diff --git a/fs/xfs/libxfs/xfs_defer.c b/fs/xfs/libxfs/xfs_defer.c
+index 1cbddcf539da..ce2286763531 100644
+--- a/fs/xfs/libxfs/xfs_defer.c
++++ b/fs/xfs/libxfs/xfs_defer.c
+@@ -487,12 +487,15 @@ xfs_defer_cancel(
+ /* Add an item for later deferred processing. */
+ void
+ xfs_defer_add(
+-	struct xfs_defer_ops		*dop,
++	struct xfs_trans		*tp,
+ 	enum xfs_defer_ops_type		type,
+ 	struct list_head		*li)
+ {
++	struct xfs_defer_ops		*dop = tp->t_dfops;
+ 	struct xfs_defer_pending	*dfp = NULL;
+ 
++	ASSERT(tp->t_flags & XFS_TRANS_PERM_LOG_RES);
++
+ 	/*
+ 	 * Add the item to a pending item at the end of the intake list.
+ 	 * If the last pending item has the same type, reuse it.  Else,
+
+commit 1ae093cbea3d1ef04e1344b9e3996a9e1763a91b
+Author: Brian Foster <bfoster@redhat.com>
+Date:   Wed Aug 1 07:20:34 2018 -0700
+
+    xfs: replace xfs_defer_ops ->dop_pending with on-stack list
+    
+    The xfs_defer_ops ->dop_pending list is used to track active
+    deferred operations once intents are logged. These items must be
+    aborted in the event of an error. The list is populated as intents
+    are logged and items are removed as they complete (or are aborted).
+    
+    Now that xfs_defer_finish() cancels on error, there is no need to
+    ever access ->dop_pending outside of xfs_defer_finish(). The list is
+    only ever populated after xfs_defer_finish() begins and is either
+    completed or cancelled before it returns.
+    
+    Remove ->dop_pending from xfs_defer_ops and replace it with a local
+    list in the xfs_defer_finish() path. Pass the local list to the
+    various helpers now that it is not accessible via dfops. Note that
+    we have to check for NULL in the abort case as the final tx roll
+    occurs outside of the scope of the new local list (once the dfops
+    has completed and thus drained the list).
+    
+    Signed-off-by: Brian Foster <bfoster@redhat.com>
+    Reviewed-by: Christoph Hellwig <hch@lst.de>
+    Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+
+diff --git a/fs/xfs/libxfs/xfs_defer.c b/fs/xfs/libxfs/xfs_defer.c
+index b656a399cd71..1cbddcf539da 100644
+--- a/fs/xfs/libxfs/xfs_defer.c
++++ b/fs/xfs/libxfs/xfs_defer.c
+@@ -180,7 +180,7 @@ static const struct xfs_defer_op_type *defer_op_types[XFS_DEFER_OPS_TYPE_MAX];
+  * the pending list.
+  */
+ STATIC void
+-xfs_defer_intake_work(
++xfs_defer_create_intents(
+ 	struct xfs_trans		*tp)
+ {
+ 	struct xfs_defer_ops		*dop = tp->t_dfops;
+@@ -190,21 +190,19 @@ xfs_defer_intake_work(
+ 	list_for_each_entry(dfp, &dop->dop_intake, dfp_list) {
+ 		dfp->dfp_intent = dfp->dfp_type->create_intent(tp,
+ 				dfp->dfp_count);
+-		trace_xfs_defer_intake_work(tp->t_mountp, dfp);
++		trace_xfs_defer_create_intent(tp->t_mountp, dfp);
+ 		list_sort(tp->t_mountp, &dfp->dfp_work,
+ 				dfp->dfp_type->diff_items);
+ 		list_for_each(li, &dfp->dfp_work)
+ 			dfp->dfp_type->log_item(tp, dfp->dfp_intent, li);
+ 	}
+-
+-	list_splice_tail_init(&dop->dop_intake, &dop->dop_pending);
+ }
+ 
+ /* Abort all the intents that were committed. */
+ STATIC void
+ xfs_defer_trans_abort(
+ 	struct xfs_trans		*tp,
+-	int				error)
++	struct list_head		*dop_pending)
+ {
+ 	struct xfs_defer_ops		*dop = tp->t_dfops;
+ 	struct xfs_defer_pending	*dfp;
+@@ -212,24 +210,21 @@ xfs_defer_trans_abort(
+ 	trace_xfs_defer_trans_abort(tp->t_mountp, dop, _RET_IP_);
+ 
+ 	/* Abort intent items that don't have a done item. */
+-	list_for_each_entry(dfp, &dop->dop_pending, dfp_list) {
++	list_for_each_entry(dfp, dop_pending, dfp_list) {
+ 		trace_xfs_defer_pending_abort(tp->t_mountp, dfp);
+ 		if (dfp->dfp_intent && !dfp->dfp_done) {
+ 			dfp->dfp_type->abort_intent(dfp->dfp_intent);
+ 			dfp->dfp_intent = NULL;
+ 		}
+ 	}
+-
+-	/* Shut down FS. */
+-	xfs_force_shutdown(tp->t_mountp, (error == -EFSCORRUPTED) ?
+-			SHUTDOWN_CORRUPT_INCORE : SHUTDOWN_META_IO_ERROR);
+ }
+ 
+ /* Roll a transaction so we can do some deferred op processing. */
+ STATIC int
+ xfs_defer_trans_roll(
+-	struct xfs_trans		**tp)
++	struct xfs_trans		**tpp)
+ {
++	struct xfs_trans		*tp = *tpp;
+ 	struct xfs_buf_log_item		*bli;
+ 	struct xfs_inode_log_item	*ili;
+ 	struct xfs_log_item		*lip;
+@@ -239,7 +234,7 @@ xfs_defer_trans_roll(
+ 	int				i;
+ 	int				error;
+ 
+-	list_for_each_entry(lip, &(*tp)->t_items, li_trans) {
++	list_for_each_entry(lip, &tp->t_items, li_trans) {
+ 		switch (lip->li_type) {
+ 		case XFS_LI_BUF:
+ 			bli = container_of(lip, struct xfs_buf_log_item,
+@@ -249,7 +244,7 @@ xfs_defer_trans_roll(
+ 					ASSERT(0);
+ 					return -EFSCORRUPTED;
+ 				}
+-				xfs_trans_dirty_buf(*tp, bli->bli_buf);
++				xfs_trans_dirty_buf(tp, bli->bli_buf);
+ 				bplist[bpcount++] = bli->bli_buf;
+ 			}
+ 			break;
+@@ -261,7 +256,7 @@ xfs_defer_trans_roll(
+ 					ASSERT(0);
+ 					return -EFSCORRUPTED;
+ 				}
+-				xfs_trans_log_inode(*tp, ili->ili_inode,
++				xfs_trans_log_inode(tp, ili->ili_inode,
+ 						    XFS_ILOG_CORE);
+ 				iplist[ipcount++] = ili->ili_inode;
+ 			}
+@@ -271,39 +266,30 @@ xfs_defer_trans_roll(
+ 		}
+ 	}
+ 
+-	trace_xfs_defer_trans_roll((*tp)->t_mountp, (*tp)->t_dfops, _RET_IP_);
++	trace_xfs_defer_trans_roll(tp->t_mountp, tp->t_dfops, _RET_IP_);
+ 
+ 	/* Roll the transaction. */
+-	error = xfs_trans_roll(tp);
++	error = xfs_trans_roll(tpp);
++	tp = *tpp;
+ 	if (error) {
+-		trace_xfs_defer_trans_roll_error((*tp)->t_mountp,
+-						 (*tp)->t_dfops, error);
+-		xfs_defer_trans_abort(*tp,  error);
++		trace_xfs_defer_trans_roll_error(tp->t_mountp,
++						 tp->t_dfops, error);
+ 		return error;
+ 	}
+ 
+ 	/* Rejoin the joined inodes. */
+ 	for (i = 0; i < ipcount; i++)
+-		xfs_trans_ijoin(*tp, iplist[i], 0);
++		xfs_trans_ijoin(tp, iplist[i], 0);
+ 
+ 	/* Rejoin the buffers and dirty them so the log moves forward. */
+ 	for (i = 0; i < bpcount; i++) {
+-		xfs_trans_bjoin(*tp, bplist[i]);
+-		xfs_trans_bhold(*tp, bplist[i]);
++		xfs_trans_bjoin(tp, bplist[i]);
++		xfs_trans_bhold(tp, bplist[i]);
+ 	}
+ 
+ 	return error;
+ }
+ 
+-/* Do we have any work items to finish? */
+-bool
+-xfs_defer_has_unfinished_work(
+-	struct xfs_trans		*tp)
+-{
+-	return !list_empty(&tp->t_dfops->dop_pending) ||
+-		!list_empty(&tp->t_dfops->dop_intake);
+-}
+-
+ /*
+  * Reset an already used dfops after finish.
+  */
+@@ -311,7 +297,7 @@ static void
+ xfs_defer_reset(
+ 	struct xfs_trans	*tp)
+ {
+-	ASSERT(!xfs_defer_has_unfinished_work(tp));
++	ASSERT(list_empty(&tp->t_dfops->dop_intake));
+ 
+ 	/*
+ 	 * Low mode state transfers across transaction rolls to mirror dfops
+@@ -320,6 +306,36 @@ xfs_defer_reset(
+ 	tp->t_flags &= ~XFS_TRANS_LOWMODE;
+ }
+ 
++/*
++ * Free up any items left in the list.
++ */
++static void
++xfs_defer_cancel_list(
++	struct xfs_mount		*mp,
++	struct list_head		*dop_list)
++{
++	struct xfs_defer_pending	*dfp;
++	struct xfs_defer_pending	*pli;
++	struct list_head		*pwi;
++	struct list_head		*n;
++
++	/*
++	 * Free the pending items.  Caller should already have arranged
++	 * for the intent items to be released.
++	 */
++	list_for_each_entry_safe(dfp, pli, dop_list, dfp_list) {
++		trace_xfs_defer_cancel_list(mp, dfp);
++		list_del(&dfp->dfp_list);
++		list_for_each_safe(pwi, n, &dfp->dfp_work) {
++			list_del(pwi);
++			dfp->dfp_count--;
++			dfp->dfp_type->cancel_item(pwi);
++		}
++		ASSERT(dfp->dfp_count == 0);
++		kmem_free(dfp);
++	}
++}
++
+ /*
+  * Finish all the pending work.  This involves logging intent items for
+  * any work items that wandered in since the last transaction roll (if
+@@ -338,15 +354,19 @@ xfs_defer_finish_noroll(
+ 	void				*state;
+ 	int				error = 0;
+ 	void				(*cleanup_fn)(struct xfs_trans *, void *, int);
++	LIST_HEAD(dop_pending);
+ 
+ 	ASSERT((*tp)->t_flags & XFS_TRANS_PERM_LOG_RES);
+ 
+ 	trace_xfs_defer_finish((*tp)->t_mountp, (*tp)->t_dfops, _RET_IP_);
+ 
+ 	/* Until we run out of pending work to finish... */
+-	while (xfs_defer_has_unfinished_work(*tp)) {
+-		/* Log intents for work items sitting in the intake. */
+-		xfs_defer_intake_work(*tp);
++	while (!list_empty(&dop_pending) ||
++	       !list_empty(&(*tp)->t_dfops->dop_intake)) {
++		/* log intents and pull in intake items */
++		xfs_defer_create_intents(*tp);
++		list_splice_tail_init(&(*tp)->t_dfops->dop_intake,
++				      &dop_pending);
+ 
+ 		/*
+ 		 * Roll the transaction.
+@@ -356,8 +376,8 @@ xfs_defer_finish_noroll(
+ 			goto out;
+ 
+ 		/* Log an intent-done item for the first pending item. */
+-		dfp = list_first_entry(&(*tp)->t_dfops->dop_pending,
+-				struct xfs_defer_pending, dfp_list);
++		dfp = list_first_entry(&dop_pending, struct xfs_defer_pending,
++				       dfp_list);
+ 		trace_xfs_defer_pending_finish((*tp)->t_mountp, dfp);
+ 		dfp->dfp_done = dfp->dfp_type->create_done(*tp, dfp->dfp_intent,
+ 				dfp->dfp_count);
+@@ -387,7 +407,6 @@ xfs_defer_finish_noroll(
+ 				 */
+ 				if (cleanup_fn)
+ 					cleanup_fn(*tp, state, error);
+-				xfs_defer_trans_abort(*tp, error);
+ 				goto out;
+ 			}
+ 		}
+@@ -417,8 +436,11 @@ xfs_defer_finish_noroll(
+ 
+ out:
+ 	if (error) {
++		xfs_defer_trans_abort(*tp, &dop_pending);
++		xfs_force_shutdown((*tp)->t_mountp, SHUTDOWN_CORRUPT_INCORE);
+ 		trace_xfs_defer_finish_error((*tp)->t_mountp, (*tp)->t_dfops,
+ 					     error);
++		xfs_defer_cancel_list((*tp)->t_mountp, &dop_pending);
+ 		xfs_defer_cancel(*tp);
+ 		return error;
+ 	}
+@@ -442,54 +464,24 @@ xfs_defer_finish(
+ 		return error;
+ 	if ((*tp)->t_flags & XFS_TRANS_DIRTY) {
+ 		error = xfs_defer_trans_roll(tp);
+-		if (error)
++		if (error) {
++			xfs_force_shutdown((*tp)->t_mountp,
++					   SHUTDOWN_CORRUPT_INCORE);
+ 			return error;
++		}
+ 	}
+ 	xfs_defer_reset(*tp);
+ 	return 0;
+ }
+ 
+-/*
+- * Free up any items left in the list.
+- */
+ void
+ xfs_defer_cancel(
+-	struct xfs_trans		*tp)
++	struct xfs_trans	*tp)
+ {
+-	struct xfs_defer_ops		*dop = tp->t_dfops;
+-	struct xfs_defer_pending	*dfp;
+-	struct xfs_defer_pending	*pli;
+-	struct list_head		*pwi;
+-	struct list_head		*n;
++	struct xfs_mount	*mp = tp->t_mountp;
+ 
+-	trace_xfs_defer_cancel(NULL, dop, _RET_IP_);
+-
+-	/*
+-	 * Free the pending items.  Caller should already have arranged
+-	 * for the intent items to be released.
+-	 */
+-	list_for_each_entry_safe(dfp, pli, &dop->dop_intake, dfp_list) {
+-		trace_xfs_defer_intake_cancel(NULL, dfp);
+-		list_del(&dfp->dfp_list);
+-		list_for_each_safe(pwi, n, &dfp->dfp_work) {
+-			list_del(pwi);
+-			dfp->dfp_count--;
+-			dfp->dfp_type->cancel_item(pwi);
+-		}
+-		ASSERT(dfp->dfp_count == 0);
+-		kmem_free(dfp);
+-	}
+-	list_for_each_entry_safe(dfp, pli, &dop->dop_pending, dfp_list) {
+-		trace_xfs_defer_pending_cancel(NULL, dfp);
+-		list_del(&dfp->dfp_list);
+-		list_for_each_safe(pwi, n, &dfp->dfp_work) {
+-			list_del(pwi);
+-			dfp->dfp_count--;
+-			dfp->dfp_type->cancel_item(pwi);
+-		}
+-		ASSERT(dfp->dfp_count == 0);
+-		kmem_free(dfp);
+-	}
++	trace_xfs_defer_cancel(mp, tp->t_dfops, _RET_IP_);
++	xfs_defer_cancel_list(mp, &tp->t_dfops->dop_intake);
+ }
+ 
+ /* Add an item for later deferred processing. */
+@@ -547,7 +539,6 @@ xfs_defer_init(
+ 
+ 	memset(dop, 0, sizeof(struct xfs_defer_ops));
+ 	INIT_LIST_HEAD(&dop->dop_intake);
+-	INIT_LIST_HEAD(&dop->dop_pending);
+ 	if (tp) {
+ 		ASSERT(tp->t_firstblock == NULLFSBLOCK);
+ 		tp->t_dfops = dop;
+@@ -571,7 +562,6 @@ xfs_defer_move(
+ 	ASSERT(dst != src);
+ 
+ 	list_splice_init(&src->dop_intake, &dst->dop_intake);
+-	list_splice_init(&src->dop_pending, &dst->dop_pending);
+ 
+ 	/*
+ 	 * Low free space mode was historically controlled by a dfops field.
+
+commit 9b1f4e9831df29776031e86e112e68784f1fc079
+Author: Brian Foster <bfoster@redhat.com>
+Date:   Wed Aug 1 07:20:33 2018 -0700
+
+    xfs: cancel dfops on xfs_defer_finish() error
+    
+    The current semantics of xfs_defer_finish() require the caller to
+    call xfs_defer_cancel() on error. This is slightly inconsistent with
+    transaction commit error handling where a failed commit cleans up
+    the transaction before returning.
+    
+    More significantly, the only requirement for exposure of
+    ->dop_pending outside of xfs_defer_finish() is so that
+    xfs_defer_cancel() can drain it on error. Since the only recourse of
+    xfs_defer_finish() errors is cancellation, mirror the transaction
+    logic and cancel remaining dfops before returning from
+    xfs_defer_finish() with an error.
+    
+    Beside simplifying xfs_defer_finish() semantics, this ensures that
+    xfs_defer_finish() always returns with an empty ->dop_pending and
+    thus facilitates removal of the list from xfs_defer_ops.
+    
+    Signed-off-by: Brian Foster <bfoster@redhat.com>
+    Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Reviewed-by: Christoph Hellwig <hch@lst.de>
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+
+diff --git a/fs/xfs/libxfs/xfs_defer.c b/fs/xfs/libxfs/xfs_defer.c
+index 7079f534c735..b656a399cd71 100644
+--- a/fs/xfs/libxfs/xfs_defer.c
++++ b/fs/xfs/libxfs/xfs_defer.c
+@@ -416,14 +416,15 @@ xfs_defer_finish_noroll(
+ 	}
+ 
+ out:
+-	if (error)
++	if (error) {
+ 		trace_xfs_defer_finish_error((*tp)->t_mountp, (*tp)->t_dfops,
+ 					     error);
+-	 else
+-		trace_xfs_defer_finish_done((*tp)->t_mountp, (*tp)->t_dfops,
+-					    _RET_IP_);
++		xfs_defer_cancel(*tp);
++		return error;
++	}
+ 
+-	return error;
++	trace_xfs_defer_finish_done((*tp)->t_mountp, (*tp)->t_dfops, _RET_IP_);
++	return 0;
+ }
+ 
+ int
+
+commit 60f31a609ed3d28791acb2bc24188cb7e2259176
+Author: Brian Foster <bfoster@redhat.com>
+Date:   Wed Aug 1 07:20:33 2018 -0700
+
+    xfs: clean out superfluous dfops dop params/vars
+    
+    The dfops code still passes around the xfs_defer_ops pointer
+    superfluously in a few places. Clean this up wherever the
+    transaction will suffice.
+    
+    Signed-off-by: Brian Foster <bfoster@redhat.com>
+    Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Reviewed-by: Christoph Hellwig <hch@lst.de>
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+
+diff --git a/fs/xfs/libxfs/xfs_defer.c b/fs/xfs/libxfs/xfs_defer.c
+index 66ef9341813b..7079f534c735 100644
+--- a/fs/xfs/libxfs/xfs_defer.c
++++ b/fs/xfs/libxfs/xfs_defer.c
+@@ -181,9 +181,9 @@ static const struct xfs_defer_op_type *defer_op_types[XFS_DEFER_OPS_TYPE_MAX];
+  */
+ STATIC void
+ xfs_defer_intake_work(
+-	struct xfs_trans		*tp,
+-	struct xfs_defer_ops		*dop)
++	struct xfs_trans		*tp)
+ {
++	struct xfs_defer_ops		*dop = tp->t_dfops;
+ 	struct list_head		*li;
+ 	struct xfs_defer_pending	*dfp;
+ 
+@@ -204,9 +204,9 @@ xfs_defer_intake_work(
+ STATIC void
+ xfs_defer_trans_abort(
+ 	struct xfs_trans		*tp,
+-	struct xfs_defer_ops		*dop,
+ 	int				error)
+ {
++	struct xfs_defer_ops		*dop = tp->t_dfops;
+ 	struct xfs_defer_pending	*dfp;
+ 
+ 	trace_xfs_defer_trans_abort(tp->t_mountp, dop, _RET_IP_);
+@@ -230,7 +230,6 @@ STATIC int
+ xfs_defer_trans_roll(
+ 	struct xfs_trans		**tp)
+ {
+-	struct xfs_defer_ops		*dop = (*tp)->t_dfops;
+ 	struct xfs_buf_log_item		*bli;
+ 	struct xfs_inode_log_item	*ili;
+ 	struct xfs_log_item		*lip;
+@@ -272,14 +271,14 @@ xfs_defer_trans_roll(
+ 		}
+ 	}
+ 
+-	trace_xfs_defer_trans_roll((*tp)->t_mountp, dop, _RET_IP_);
++	trace_xfs_defer_trans_roll((*tp)->t_mountp, (*tp)->t_dfops, _RET_IP_);
+ 
+ 	/* Roll the transaction. */
+ 	error = xfs_trans_roll(tp);
+-	dop = (*tp)->t_dfops;
+ 	if (error) {
+-		trace_xfs_defer_trans_roll_error((*tp)->t_mountp, dop, error);
+-		xfs_defer_trans_abort(*tp, dop, error);
++		trace_xfs_defer_trans_roll_error((*tp)->t_mountp,
++						 (*tp)->t_dfops, error);
++		xfs_defer_trans_abort(*tp,  error);
+ 		return error;
+ 	}
+ 
+@@ -299,9 +298,10 @@ xfs_defer_trans_roll(
+ /* Do we have any work items to finish? */
+ bool
+ xfs_defer_has_unfinished_work(
+-	struct xfs_defer_ops		*dop)
++	struct xfs_trans		*tp)
+ {
+-	return !list_empty(&dop->dop_pending) || !list_empty(&dop->dop_intake);
++	return !list_empty(&tp->t_dfops->dop_pending) ||
++		!list_empty(&tp->t_dfops->dop_intake);
+ }
+ 
+ /*
+@@ -311,7 +311,7 @@ static void
+ xfs_defer_reset(
+ 	struct xfs_trans	*tp)
+ {
+-	ASSERT(!xfs_defer_has_unfinished_work(tp->t_dfops));
++	ASSERT(!xfs_defer_has_unfinished_work(tp));
+ 
+ 	/*
+ 	 * Low mode state transfers across transaction rolls to mirror dfops
+@@ -332,7 +332,6 @@ int
+ xfs_defer_finish_noroll(
+ 	struct xfs_trans		**tp)
+ {
+-	struct xfs_defer_ops		*dop = (*tp)->t_dfops;
+ 	struct xfs_defer_pending	*dfp;
+ 	struct list_head		*li;
+ 	struct list_head		*n;
+@@ -342,24 +341,22 @@ xfs_defer_finish_noroll(
+ 
+ 	ASSERT((*tp)->t_flags & XFS_TRANS_PERM_LOG_RES);
+ 
+-	trace_xfs_defer_finish((*tp)->t_mountp, dop, _RET_IP_);
++	trace_xfs_defer_finish((*tp)->t_mountp, (*tp)->t_dfops, _RET_IP_);
+ 
+ 	/* Until we run out of pending work to finish... */
+-	while (xfs_defer_has_unfinished_work(dop)) {
++	while (xfs_defer_has_unfinished_work(*tp)) {
+ 		/* Log intents for work items sitting in the intake. */
+-		xfs_defer_intake_work(*tp, dop);
++		xfs_defer_intake_work(*tp);
+ 
+ 		/*
+-		 * Roll the transaction and update dop in case dfops was
+-		 * embedded in the transaction.
++		 * Roll the transaction.
+ 		 */
+ 		error = xfs_defer_trans_roll(tp);
+ 		if (error)
+ 			goto out;
+-		dop = (*tp)->t_dfops;
+ 
+ 		/* Log an intent-done item for the first pending item. */
+-		dfp = list_first_entry(&dop->dop_pending,
++		dfp = list_first_entry(&(*tp)->t_dfops->dop_pending,
+ 				struct xfs_defer_pending, dfp_list);
+ 		trace_xfs_defer_pending_finish((*tp)->t_mountp, dfp);
+ 		dfp->dfp_done = dfp->dfp_type->create_done(*tp, dfp->dfp_intent,
+@@ -390,7 +387,7 @@ xfs_defer_finish_noroll(
+ 				 */
+ 				if (cleanup_fn)
+ 					cleanup_fn(*tp, state, error);
+-				xfs_defer_trans_abort(*tp, dop, error);
++				xfs_defer_trans_abort(*tp, error);
+ 				goto out;
+ 			}
+ 		}
+@@ -420,9 +417,11 @@ xfs_defer_finish_noroll(
+ 
+ out:
+ 	if (error)
+-		trace_xfs_defer_finish_error((*tp)->t_mountp, dop, error);
++		trace_xfs_defer_finish_error((*tp)->t_mountp, (*tp)->t_dfops,
++					     error);
+ 	 else
+-		trace_xfs_defer_finish_done((*tp)->t_mountp, dop, _RET_IP_);
++		trace_xfs_defer_finish_done((*tp)->t_mountp, (*tp)->t_dfops,
++					    _RET_IP_);
+ 
+ 	return error;
+ }
+
+commit 7dbddbaccd189e63c39c9e22c728c4548b9893bb
+Author: Brian Foster <bfoster@redhat.com>
+Date:   Wed Aug 1 07:20:32 2018 -0700
+
+    xfs: drop dop param from xfs_defer_op_type ->finish_item() callback
+    
+    The dfops infrastructure ->finish_item() callback passes the
+    transaction and dfops as separate parameters. Since dfops is always
+    part of a transaction, the latter parameter is no longer necessary.
+    Remove it from the various callbacks.
+    
+    Signed-off-by: Brian Foster <bfoster@redhat.com>
+    Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Reviewed-by: Christoph Hellwig <hch@lst.de>
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+
+diff --git a/fs/xfs/libxfs/xfs_defer.c b/fs/xfs/libxfs/xfs_defer.c
+index 1e7073252a5e..66ef9341813b 100644
+--- a/fs/xfs/libxfs/xfs_defer.c
++++ b/fs/xfs/libxfs/xfs_defer.c
+@@ -371,7 +371,7 @@ xfs_defer_finish_noroll(
+ 		list_for_each_safe(li, n, &dfp->dfp_work) {
+ 			list_del(li);
+ 			dfp->dfp_count--;
+-			error = dfp->dfp_type->finish_item(*tp, dop, li,
++			error = dfp->dfp_type->finish_item(*tp, li,
+ 					dfp->dfp_done, &state);
+ 			if (error == -EAGAIN) {
+ 				/*
+
+commit a8198666fb755e129c2fe92819774256ec26c79c
+Author: Brian Foster <bfoster@redhat.com>
+Date:   Wed Aug 1 07:20:32 2018 -0700
+
+    xfs: automatic dfops inode relogging
+    
+    Inodes that are held across deferred operations are explicitly
+    joined to the dfops structure to ensure appropriate relogging.
+    While inodes are currently joined explicitly, we can detect the
+    conditions that require relogging at dfops finish time by inspecting
+    the transaction item list for inodes with ili_lock_flags == 0.
+    
+    Replace the xfs_defer_ijoin() infrastructure with such detection and
+    automatic relogging of held inodes. This eliminates the need for the
+    per-dfops inode list, replaced by an on-stack variant in
+    xfs_defer_trans_roll().
+    
+    Signed-off-by: Brian Foster <bfoster@redhat.com>
+    Reviewed-by: Christoph Hellwig <hch@lst.de>
+    Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+
+diff --git a/fs/xfs/libxfs/xfs_defer.c b/fs/xfs/libxfs/xfs_defer.c
+index e9b7671d289a..1e7073252a5e 100644
+--- a/fs/xfs/libxfs/xfs_defer.c
++++ b/fs/xfs/libxfs/xfs_defer.c
+@@ -15,6 +15,8 @@
+ #include "xfs_defer.h"
+ #include "xfs_trans.h"
+ #include "xfs_buf_item.h"
++#include "xfs_inode.h"
++#include "xfs_inode_item.h"
+ #include "xfs_trace.h"
+ 
+ /*
+@@ -230,16 +232,14 @@ xfs_defer_trans_roll(
+ {
+ 	struct xfs_defer_ops		*dop = (*tp)->t_dfops;
+ 	struct xfs_buf_log_item		*bli;
++	struct xfs_inode_log_item	*ili;
+ 	struct xfs_log_item		*lip;
+ 	struct xfs_buf			*bplist[XFS_DEFER_OPS_NR_BUFS];
+-	int				bpcount = 0;
++	struct xfs_inode		*iplist[XFS_DEFER_OPS_NR_INODES];
++	int				bpcount = 0, ipcount = 0;
+ 	int				i;
+ 	int				error;
+ 
+-	/* Log all the joined inodes. */
+-	for (i = 0; i < XFS_DEFER_OPS_NR_INODES && dop->dop_inodes[i]; i++)
+-		xfs_trans_log_inode(*tp, dop->dop_inodes[i], XFS_ILOG_CORE);
+-
+ 	list_for_each_entry(lip, &(*tp)->t_items, li_trans) {
+ 		switch (lip->li_type) {
+ 		case XFS_LI_BUF:
+@@ -254,6 +254,19 @@ xfs_defer_trans_roll(
+ 				bplist[bpcount++] = bli->bli_buf;
+ 			}
+ 			break;
++		case XFS_LI_INODE:
++			ili = container_of(lip, struct xfs_inode_log_item,
++					   ili_item);
++			if (ili->ili_lock_flags == 0) {
++				if (ipcount >= XFS_DEFER_OPS_NR_INODES) {
++					ASSERT(0);
++					return -EFSCORRUPTED;
++				}
++				xfs_trans_log_inode(*tp, ili->ili_inode,
++						    XFS_ILOG_CORE);
++				iplist[ipcount++] = ili->ili_inode;
++			}
++			break;
+ 		default:
+ 			break;
+ 		}
+@@ -271,8 +284,8 @@ xfs_defer_trans_roll(
+ 	}
+ 
+ 	/* Rejoin the joined inodes. */
+-	for (i = 0; i < XFS_DEFER_OPS_NR_INODES && dop->dop_inodes[i]; i++)
+-		xfs_trans_ijoin(*tp, dop->dop_inodes[i], 0);
++	for (i = 0; i < ipcount; i++)
++		xfs_trans_ijoin(*tp, iplist[i], 0);
+ 
+ 	/* Rejoin the buffers and dirty them so the log moves forward. */
+ 	for (i = 0; i < bpcount; i++) {
+@@ -291,30 +304,6 @@ xfs_defer_has_unfinished_work(
+ 	return !list_empty(&dop->dop_pending) || !list_empty(&dop->dop_intake);
+ }
+ 
+-/*
+- * Add this inode to the deferred op.  Each joined inode is relogged
+- * each time we roll the transaction.
+- */
+-int
+-xfs_defer_ijoin(
+-	struct xfs_defer_ops		*dop,
+-	struct xfs_inode		*ip)
+-{
+-	int				i;
+-
+-	for (i = 0; i < XFS_DEFER_OPS_NR_INODES; i++) {
+-		if (dop->dop_inodes[i] == ip)
+-			return 0;
+-		else if (dop->dop_inodes[i] == NULL) {
+-			dop->dop_inodes[i] = ip;
+-			return 0;
+-		}
+-	}
+-
+-	ASSERT(0);
+-	return -EFSCORRUPTED;
+-}
+-
+ /*
+  * Reset an already used dfops after finish.
+  */
+@@ -322,11 +311,7 @@ static void
+ xfs_defer_reset(
+ 	struct xfs_trans	*tp)
+ {
+-	struct xfs_defer_ops	*dop = tp->t_dfops;
+-
+-	ASSERT(!xfs_defer_has_unfinished_work(dop));
+-
+-	memset(dop->dop_inodes, 0, sizeof(dop->dop_inodes));
++	ASSERT(!xfs_defer_has_unfinished_work(tp->t_dfops));
+ 
+ 	/*
+ 	 * Low mode state transfers across transaction rolls to mirror dfops
+@@ -588,8 +573,6 @@ xfs_defer_move(
+ 	list_splice_init(&src->dop_intake, &dst->dop_intake);
+ 	list_splice_init(&src->dop_pending, &dst->dop_pending);
+ 
+-	memcpy(dst->dop_inodes, src->dop_inodes, sizeof(dst->dop_inodes));
+-
+ 	/*
+ 	 * Low free space mode was historically controlled by a dfops field.
+ 	 * This meant that low mode state potentially carried across multiple
+
+commit 82ff27bc52a88cb5cc400bfa64e210d3ec8dfebd
+Author: Brian Foster <bfoster@redhat.com>
+Date:   Wed Aug 1 07:20:32 2018 -0700
+
+    xfs: automatic dfops buffer relogging
+    
+    Buffers that are held across deferred operations are explicitly
+    joined to the dfops structure to ensure appropriate relogging.
+    While buffers are currently joined explicitly, we can detect the
+    conditions that require relogging at dfops finish time by inspecting
+    the transaction item list for held buffers.
+    
+    Replace the xfs_defer_bjoin() infrastructure with such detection and
+    automatic relogging of held buffers. This eliminates the need for
+    the per-dfops buffer list, replaced by an on-stack variant in
+    xfs_defer_trans_roll().
+    
+    Signed-off-by: Brian Foster <bfoster@redhat.com>
+    Reviewed-by: Christoph Hellwig <hch@lst.de>
+    Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+
+diff --git a/fs/xfs/libxfs/xfs_defer.c b/fs/xfs/libxfs/xfs_defer.c
+index 64e1abc60edc..e9b7671d289a 100644
+--- a/fs/xfs/libxfs/xfs_defer.c
++++ b/fs/xfs/libxfs/xfs_defer.c
+@@ -14,6 +14,7 @@
+ #include "xfs_mount.h"
+ #include "xfs_defer.h"
+ #include "xfs_trans.h"
++#include "xfs_buf_item.h"
+ #include "xfs_trace.h"
+ 
+ /*
+@@ -228,6 +229,10 @@ xfs_defer_trans_roll(
+ 	struct xfs_trans		**tp)
+ {
+ 	struct xfs_defer_ops		*dop = (*tp)->t_dfops;
++	struct xfs_buf_log_item		*bli;
++	struct xfs_log_item		*lip;
++	struct xfs_buf			*bplist[XFS_DEFER_OPS_NR_BUFS];
++	int				bpcount = 0;
+ 	int				i;
+ 	int				error;
+ 
+@@ -235,9 +240,24 @@ xfs_defer_trans_roll(
+ 	for (i = 0; i < XFS_DEFER_OPS_NR_INODES && dop->dop_inodes[i]; i++)
+ 		xfs_trans_log_inode(*tp, dop->dop_inodes[i], XFS_ILOG_CORE);
+ 
+-	/* Hold the (previously bjoin'd) buffer locked across the roll. */
+-	for (i = 0; i < XFS_DEFER_OPS_NR_BUFS && dop->dop_bufs[i]; i++)
+-		xfs_trans_dirty_buf(*tp, dop->dop_bufs[i]);
++	list_for_each_entry(lip, &(*tp)->t_items, li_trans) {
++		switch (lip->li_type) {
++		case XFS_LI_BUF:
++			bli = container_of(lip, struct xfs_buf_log_item,
++					   bli_item);
++			if (bli->bli_flags & XFS_BLI_HOLD) {
++				if (bpcount >= XFS_DEFER_OPS_NR_BUFS) {
++					ASSERT(0);
++					return -EFSCORRUPTED;
++				}
++				xfs_trans_dirty_buf(*tp, bli->bli_buf);
++				bplist[bpcount++] = bli->bli_buf;
++			}
++			break;
++		default:
++			break;
++		}
++	}
+ 
+ 	trace_xfs_defer_trans_roll((*tp)->t_mountp, dop, _RET_IP_);
+ 
+@@ -255,9 +275,9 @@ xfs_defer_trans_roll(
+ 		xfs_trans_ijoin(*tp, dop->dop_inodes[i], 0);
+ 
+ 	/* Rejoin the buffers and dirty them so the log moves forward. */
+-	for (i = 0; i < XFS_DEFER_OPS_NR_BUFS && dop->dop_bufs[i]; i++) {
+-		xfs_trans_bjoin(*tp, dop->dop_bufs[i]);
+-		xfs_trans_bhold(*tp, dop->dop_bufs[i]);
++	for (i = 0; i < bpcount; i++) {
++		xfs_trans_bjoin(*tp, bplist[i]);
++		xfs_trans_bhold(*tp, bplist[i]);
+ 	}
+ 
+ 	return error;
+@@ -295,30 +315,6 @@ xfs_defer_ijoin(
+ 	return -EFSCORRUPTED;
+ }
+ 
+-/*
+- * Add this buffer to the deferred op.  Each joined buffer is relogged
+- * each time we roll the transaction.
+- */
+-int
+-xfs_defer_bjoin(
+-	struct xfs_defer_ops		*dop,
+-	struct xfs_buf			*bp)
+-{
+-	int				i;
+-
+-	for (i = 0; i < XFS_DEFER_OPS_NR_BUFS; i++) {
+-		if (dop->dop_bufs[i] == bp)
+-			return 0;
+-		else if (dop->dop_bufs[i] == NULL) {
+-			dop->dop_bufs[i] = bp;
+-			return 0;
+-		}
+-	}
+-
+-	ASSERT(0);
+-	return -EFSCORRUPTED;
+-}
+-
+ /*
+  * Reset an already used dfops after finish.
+  */
+@@ -331,7 +327,6 @@ xfs_defer_reset(
+ 	ASSERT(!xfs_defer_has_unfinished_work(dop));
+ 
+ 	memset(dop->dop_inodes, 0, sizeof(dop->dop_inodes));
+-	memset(dop->dop_bufs, 0, sizeof(dop->dop_bufs));
+ 
+ 	/*
+ 	 * Low mode state transfers across transaction rolls to mirror dfops
+@@ -594,7 +589,6 @@ xfs_defer_move(
+ 	list_splice_init(&src->dop_pending, &dst->dop_pending);
+ 
+ 	memcpy(dst->dop_inodes, src->dop_inodes, sizeof(dst->dop_inodes));
+-	memcpy(dst->dop_bufs, src->dop_bufs, sizeof(dst->dop_bufs));
+ 
+ 	/*
+ 	 * Low free space mode was historically controlled by a dfops field.
+
+commit 1214f1cf663b0939fbb8f1bccdc74c1d1e452d53
+Author: Brian Foster <bfoster@redhat.com>
+Date:   Wed Aug 1 07:20:31 2018 -0700
+
+    xfs: replace dop_low with transaction flag
+    
+    The dop_low field enables the low free space allocation mode when a
+    previous allocation has detected difficulty allocating blocks. It
+    has historically been part of the xfs_defer_ops structure, which
+    means if enabled, it remains enabled across a set of transactions
+    until the deferred operations have completed and the dfops is reset.
+    
+    Now that the dfops is embedded in the transaction, we can save a bit
+    more space by using a transaction flag rather than a standalone
+    boolean. Drop the ->dop_low field and replace it with a transaction
+    flag that is set at the same points, carried across rolling
+    transactions and cleared on completion of deferred operations. This
+    essentially emulates the behavior of ->dop_low and so should not
+    change behavior.
+    
+    Signed-off-by: Brian Foster <bfoster@redhat.com>
+    Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Reviewed-by: Christoph Hellwig <hch@lst.de>
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+
+diff --git a/fs/xfs/libxfs/xfs_defer.c b/fs/xfs/libxfs/xfs_defer.c
+index e3517a53c525..64e1abc60edc 100644
+--- a/fs/xfs/libxfs/xfs_defer.c
++++ b/fs/xfs/libxfs/xfs_defer.c
+@@ -330,9 +330,14 @@ xfs_defer_reset(
+ 
+ 	ASSERT(!xfs_defer_has_unfinished_work(dop));
+ 
+-	dop->dop_low = false;
+ 	memset(dop->dop_inodes, 0, sizeof(dop->dop_inodes));
+ 	memset(dop->dop_bufs, 0, sizeof(dop->dop_bufs));
++
++	/*
++	 * Low mode state transfers across transaction rolls to mirror dfops
++	 * lifetime. Clear it now that dfops is reset.
++	 */
++	tp->t_flags &= ~XFS_TRANS_LOWMODE;
+ }
+ 
+ /*
+@@ -590,7 +595,14 @@ xfs_defer_move(
+ 
+ 	memcpy(dst->dop_inodes, src->dop_inodes, sizeof(dst->dop_inodes));
+ 	memcpy(dst->dop_bufs, src->dop_bufs, sizeof(dst->dop_bufs));
+-	dst->dop_low = src->dop_low;
++
++	/*
++	 * Low free space mode was historically controlled by a dfops field.
++	 * This meant that low mode state potentially carried across multiple
++	 * transaction rolls. Transfer low mode on a dfops move to preserve
++	 * that behavior.
++	 */
++	dtp->t_flags |= (stp->t_flags & XFS_TRANS_LOWMODE);
+ 
+ 	xfs_defer_reset(stp);
+ }
+
+commit ce356d64772f920f26cd6c1b02878a737a275638
+Author: Brian Foster <bfoster@redhat.com>
+Date:   Wed Aug 1 07:20:30 2018 -0700
+
+    xfs: pass transaction to dfops reset/move helpers
+    
+    All callers pass ->t_dfops of the associated transactions. Refactor
+    the helpers to receive the transactions and facilitate further
+    cleanups between xfs_defer_ops and xfs_trans.
+    
+    Signed-off-by: Brian Foster <bfoster@redhat.com>
+    Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Reviewed-by: Christoph Hellwig <hch@lst.de>
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+
+diff --git a/fs/xfs/libxfs/xfs_defer.c b/fs/xfs/libxfs/xfs_defer.c
+index ebead781613f..e3517a53c525 100644
+--- a/fs/xfs/libxfs/xfs_defer.c
++++ b/fs/xfs/libxfs/xfs_defer.c
+@@ -324,9 +324,12 @@ xfs_defer_bjoin(
+  */
+ static void
+ xfs_defer_reset(
+-	struct xfs_defer_ops	*dop)
++	struct xfs_trans	*tp)
+ {
++	struct xfs_defer_ops	*dop = tp->t_dfops;
++
+ 	ASSERT(!xfs_defer_has_unfinished_work(dop));
++
+ 	dop->dop_low = false;
+ 	memset(dop->dop_inodes, 0, sizeof(dop->dop_inodes));
+ 	memset(dop->dop_bufs, 0, sizeof(dop->dop_bufs));
+@@ -457,7 +460,7 @@ xfs_defer_finish(
+ 		if (error)
+ 			return error;
+ 	}
+-	xfs_defer_reset((*tp)->t_dfops);
++	xfs_defer_reset(*tp);
+ 	return 0;
+ }
+ 
+@@ -575,9 +578,11 @@ xfs_defer_init(
+  */
+ void
+ xfs_defer_move(
+-	struct xfs_defer_ops	*dst,
+-	struct xfs_defer_ops	*src)
++	struct xfs_trans	*dtp,
++	struct xfs_trans	*stp)
+ {
++	struct xfs_defer_ops	*dst = dtp->t_dfops;
++	struct xfs_defer_ops	*src = stp->t_dfops;
+ 	ASSERT(dst != src);
+ 
+ 	list_splice_init(&src->dop_intake, &dst->dop_intake);
+@@ -587,5 +592,5 @@ xfs_defer_move(
+ 	memcpy(dst->dop_bufs, src->dop_bufs, sizeof(dst->dop_bufs));
+ 	dst->dop_low = src->dop_low;
+ 
+-	xfs_defer_reset(src);
++	xfs_defer_reset(stp);
+ }
+
+commit 7279aa13b8fb954f50073a672f912898198efd14
+Author: Brian Foster <bfoster@redhat.com>
+Date:   Wed Aug 1 07:20:30 2018 -0700
+
+    xfs: remove unused __xfs_defer_cancel() internal helper
+    
+    With no more external dfops users, there is no need for an
+    xfs_defer_ops cancel wrapper.
+    
+    Signed-off-by: Brian Foster <bfoster@redhat.com>
+    Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Reviewed-by: Christoph Hellwig <hch@lst.de>
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+
+diff --git a/fs/xfs/libxfs/xfs_defer.c b/fs/xfs/libxfs/xfs_defer.c
+index a5f7dc18a62f..ebead781613f 100644
+--- a/fs/xfs/libxfs/xfs_defer.c
++++ b/fs/xfs/libxfs/xfs_defer.c
+@@ -465,9 +465,10 @@ xfs_defer_finish(
+  * Free up any items left in the list.
+  */
+ void
+-__xfs_defer_cancel(
+-	struct xfs_defer_ops		*dop)
++xfs_defer_cancel(
++	struct xfs_trans		*tp)
+ {
++	struct xfs_defer_ops		*dop = tp->t_dfops;
+ 	struct xfs_defer_pending	*dfp;
+ 	struct xfs_defer_pending	*pli;
+ 	struct list_head		*pwi;
+
+commit b277c37f43dd387f7430a2186deda0e58c943087
+Author: Brian Foster <bfoster@redhat.com>
+Date:   Tue Jul 24 13:43:15 2018 -0700
+
+    xfs: bypass final dfops roll in trans commit path
+    
+    Once xfs_defer_finish() has completed all deferred operations, it
+    checks the dirty state of the transaction and rolls it once more to
+    return a clean transaction for the caller. This primarily to cover
+    the case where repeated xfs_defer_finish() calls are made in a loop
+    and we need to make sure that the caller starts the next iteration
+    with a clean transaction. Otherwise we risk transaction reservation
+    overrun.
+    
+    This final transaction roll is not required in the transaction
+    commit path, however, because the transaction is immediately
+    committed and freed after dfops completion. Refactor the final roll
+    into a separate helper such that we can avoid it in the transaction
+    commit path.  Lift the dfops reset as well so dfops remains valid
+    until after the last call to xfs_defer_trans_roll(). The reset is
+    also unnecessary in the transaction commit path because the
+    transaction is about to complete.
+    
+    This eliminates unnecessary regrants of transactions where the
+    associated transaction roll can be replaced by a transaction commit.
+    
+    Signed-off-by: Brian Foster <bfoster@redhat.com>
+    Reviewed-by: Bill O'Donnell <billodo@redhat.com>
+    Reviewed-by: Christoph Hellwig <hch@lst.de>
+    Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+
+diff --git a/fs/xfs/libxfs/xfs_defer.c b/fs/xfs/libxfs/xfs_defer.c
+index cbee0a86c978..a5f7dc18a62f 100644
+--- a/fs/xfs/libxfs/xfs_defer.c
++++ b/fs/xfs/libxfs/xfs_defer.c
+@@ -341,7 +341,7 @@ xfs_defer_reset(
+  * If an inode is provided, relog it to the new transaction.
+  */
+ int
+-xfs_defer_finish(
++xfs_defer_finish_noroll(
+ 	struct xfs_trans		**tp)
+ {
+ 	struct xfs_defer_ops		*dop = (*tp)->t_dfops;
+@@ -430,25 +430,37 @@ xfs_defer_finish(
+ 			cleanup_fn(*tp, state, error);
+ 	}
+ 
+-	/*
+-	 * Roll the transaction once more to avoid returning to the caller
+-	 * with a dirty transaction.
+-	 */
+-	if ((*tp)->t_flags & XFS_TRANS_DIRTY) {
+-		error = xfs_defer_trans_roll(tp);
+-		dop = (*tp)->t_dfops;
+-	}
+ out:
+-	if (error) {
++	if (error)
+ 		trace_xfs_defer_finish_error((*tp)->t_mountp, dop, error);
+-	} else {
++	 else
+ 		trace_xfs_defer_finish_done((*tp)->t_mountp, dop, _RET_IP_);
+-		xfs_defer_reset(dop);
+-	}
+ 
+ 	return error;
+ }
+ 
++int
++xfs_defer_finish(
++	struct xfs_trans	**tp)
++{
++	int			error;
++
++	/*
++	 * Finish and roll the transaction once more to avoid returning to the
++	 * caller with a dirty transaction.
++	 */
++	error = xfs_defer_finish_noroll(tp);
++	if (error)
++		return error;
++	if ((*tp)->t_flags & XFS_TRANS_DIRTY) {
++		error = xfs_defer_trans_roll(tp);
++		if (error)
++			return error;
++	}
++	xfs_defer_reset((*tp)->t_dfops);
++	return 0;
++}
++
+ /*
+  * Free up any items left in the list.
+  */
+
+commit 9e28a242be65b8274742425ca5d146f366205a90
+Author: Brian Foster <bfoster@redhat.com>
+Date:   Tue Jul 24 13:43:15 2018 -0700
+
+    xfs: drop unnecessary xfs_defer_finish() dfops parameter
+    
+    Every caller of xfs_defer_finish() now passes the transaction and
+    its associated ->t_dfops. The xfs_defer_ops parameter is therefore
+    no longer necessary and can be removed.
+    
+    Since most xfs_defer_finish() callers also have to consider
+    xfs_defer_cancel() on error, update the latter to also receive the
+    transaction for consistency. The log recovery code contains an
+    outlier case that cancels a dfops directly without an available
+    transaction. Retain an internal wrapper to support this outlier case
+    for the time being.
+    
+    Signed-off-by: Brian Foster <bfoster@redhat.com>
+    Reviewed-by: Bill O'Donnell <billodo@redhat.com>
+    Reviewed-by: Christoph Hellwig <hch@lst.de>
+    Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+
+diff --git a/fs/xfs/libxfs/xfs_defer.c b/fs/xfs/libxfs/xfs_defer.c
+index b63cc9e730da..cbee0a86c978 100644
+--- a/fs/xfs/libxfs/xfs_defer.c
++++ b/fs/xfs/libxfs/xfs_defer.c
+@@ -342,9 +342,9 @@ xfs_defer_reset(
+  */
+ int
+ xfs_defer_finish(
+-	struct xfs_trans		**tp,
+-	struct xfs_defer_ops		*dop)
++	struct xfs_trans		**tp)
+ {
++	struct xfs_defer_ops		*dop = (*tp)->t_dfops;
+ 	struct xfs_defer_pending	*dfp;
+ 	struct list_head		*li;
+ 	struct list_head		*n;
+@@ -353,7 +353,6 @@ xfs_defer_finish(
+ 	void				(*cleanup_fn)(struct xfs_trans *, void *, int);
+ 
+ 	ASSERT((*tp)->t_flags & XFS_TRANS_PERM_LOG_RES);
+-	ASSERT((*tp)->t_dfops == dop);
+ 
+ 	trace_xfs_defer_finish((*tp)->t_mountp, dop, _RET_IP_);
+ 
+@@ -454,7 +453,7 @@ xfs_defer_finish(
+  * Free up any items left in the list.
+  */
+ void
+-xfs_defer_cancel(
++__xfs_defer_cancel(
+ 	struct xfs_defer_ops		*dop)
+ {
+ 	struct xfs_defer_pending	*dfp;
+
+commit e021a2e5fc520d930f949f303e7307038e258645
+Author: Brian Foster <bfoster@redhat.com>
+Date:   Tue Jul 24 13:43:11 2018 -0700
+
+    xfs: support embedded dfops in transaction
+    
+    The dfops structure used by multi-transaction operations is
+    typically stored on the stack and carried around by the associated
+    transaction. The lifecycle of dfops does not quite match that of the
+    transaction, but they are tightly related in that the former depends
+    on the latter.
+    
+    The relationship of these objects is tight enough that we can avoid
+    the cumbersome boilerplate code required in most cases to manage
+    them separately by just embedding an xfs_defer_ops in the
+    transaction itself. This means that a transaction allocation returns
+    with an initialized dfops, a transaction commit finishes pending
+    deferred items before the tx commit, a transaction cancel cancels
+    the dfops before the transaction and a transaction dup operation
+    transfers the current dfops state to the new transaction.
+    
+    The dup operation is slightly complicated by the fact that we can no
+    longer just copy a dfops pointer from the old transaction to the new
+    transaction. This is solved through a dfops move helper that
+    transfers the pending items and other dfops state across the
+    transactions. This also requires that transaction rolling code
+    always refer to the transaction for the current dfops reference.
+    
+    Finally, to facilitate incremental conversion to the internal dfops
+    and continue to support the current external dfops mode of
+    operation, create the new ->t_dfops_internal field with a layer of
+    indirection. On allocation, ->t_dfops points to the internal dfops.
+    This state is overridden by callers who re-init a local dfops on the
+    transaction. Once ->t_dfops is overridden, the external dfops
+    reference is maintained as the transaction rolls.
+    
+    This patch adds the fundamental ability to support an internal
+    dfops. All codepaths that perform deferred processing continue to
+    override the internal dfops until they are converted over in
+    subsequent patches.
+    
+    Signed-off-by: Brian Foster <bfoster@redhat.com>
+    Reviewed-by: Bill O'Donnell <billodo@redhat.com>
+    Reviewed-by: Christoph Hellwig <hch@lst.de>
+    Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+
+diff --git a/fs/xfs/libxfs/xfs_defer.c b/fs/xfs/libxfs/xfs_defer.c
+index 23f2a52b088e..b63cc9e730da 100644
+--- a/fs/xfs/libxfs/xfs_defer.c
++++ b/fs/xfs/libxfs/xfs_defer.c
+@@ -555,3 +555,25 @@ xfs_defer_init(
+ 	}
+ 	trace_xfs_defer_init(mp, dop, _RET_IP_);
+ }
++
++/*
++ * Move state from one xfs_defer_ops to another and reset the source to initial
++ * state. This is primarily used to carry state forward across transaction rolls
++ * with internal dfops.
++ */
++void
++xfs_defer_move(
++	struct xfs_defer_ops	*dst,
++	struct xfs_defer_ops	*src)
++{
++	ASSERT(dst != src);
++
++	list_splice_init(&src->dop_intake, &dst->dop_intake);
++	list_splice_init(&src->dop_pending, &dst->dop_pending);
++
++	memcpy(dst->dop_inodes, src->dop_inodes, sizeof(dst->dop_inodes));
++	memcpy(dst->dop_bufs, src->dop_bufs, sizeof(dst->dop_bufs));
++	dst->dop_low = src->dop_low;
++
++	xfs_defer_reset(src);
++}
+
+commit 509308b413c9e4e3140b4bc524522255d126787e
+Author: Brian Foster <bfoster@redhat.com>
+Date:   Tue Jul 24 13:43:10 2018 -0700
+
+    xfs: reset dfops to initial state after finish
+    
+    xfs_defer_init() is currently used in two particular situations. The
+    first and most obvious case is raw initialization of an
+    xfs_defer_ops struct. The other case is partial reinit of
+    xfs_defer_ops on reuse due to iteration.
+    
+    Most instances of the first case will be replaced by a single init
+    of a dfops embedded in the transaction. Init calls are still
+    technically required for the second case because the dfops may have
+    low space mode enabled or have joined items that need to be reset
+    before the dfops should be reused.
+    
+    Since the current dfops usage expects either a final transaction
+    commit after xfs_defer_finish() or xfs_defer_init() if dfops is to
+    be reused, we can shift some of the init logic into
+    xfs_defer_finish() such that the latter returns with a reinitialized
+    dfops. This eliminates the second dependency noted above such that a
+    dfops is immediately ready for reuse after an xfs_defer_finish()
+    without the need to change any calling code.
+    
+    Signed-off-by: Brian Foster <bfoster@redhat.com>
+    Reviewed-by: Christoph Hellwig <hch@lst.de>
+    Reviewed-by: Bill O'Donnell <billodo@redhat.com>
+    Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+
+diff --git a/fs/xfs/libxfs/xfs_defer.c b/fs/xfs/libxfs/xfs_defer.c
+index 0df09c094e42..23f2a52b088e 100644
+--- a/fs/xfs/libxfs/xfs_defer.c
++++ b/fs/xfs/libxfs/xfs_defer.c
+@@ -319,6 +319,19 @@ xfs_defer_bjoin(
+ 	return -EFSCORRUPTED;
+ }
+ 
++/*
++ * Reset an already used dfops after finish.
++ */
++static void
++xfs_defer_reset(
++	struct xfs_defer_ops	*dop)
++{
++	ASSERT(!xfs_defer_has_unfinished_work(dop));
++	dop->dop_low = false;
++	memset(dop->dop_inodes, 0, sizeof(dop->dop_inodes));
++	memset(dop->dop_bufs, 0, sizeof(dop->dop_bufs));
++}
++
+ /*
+  * Finish all the pending work.  This involves logging intent items for
+  * any work items that wandered in since the last transaction roll (if
+@@ -427,10 +440,13 @@ xfs_defer_finish(
+ 		dop = (*tp)->t_dfops;
+ 	}
+ out:
+-	if (error)
++	if (error) {
+ 		trace_xfs_defer_finish_error((*tp)->t_mountp, dop, error);
+-	else
++	} else {
+ 		trace_xfs_defer_finish_done((*tp)->t_mountp, dop, _RET_IP_);
++		xfs_defer_reset(dop);
++	}
++
+ 	return error;
+ }
+ 
+
+commit 83200bfac6082a46cc962366478d050052e50450
+Author: Brian Foster <bfoster@redhat.com>
+Date:   Tue Jul 24 13:43:09 2018 -0700
+
+    xfs: remove unused deferred ops committed field
+    
+    dop_committed is set when deferred item processing rolls the
+    transaction at least once, but is only ever accessed in tracepoints.
+    The transaction roll/commit events are already available via
+    independent tracepoints, so remove the otherwise unused field.
+    
+    Signed-off-by: Brian Foster <bfoster@redhat.com>
+    Reviewed-by: Christoph Hellwig <hch@lst.de>
+    Reviewed-by: Bill O'Donnell <billodo@redhat.com>
+    Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+
+diff --git a/fs/xfs/libxfs/xfs_defer.c b/fs/xfs/libxfs/xfs_defer.c
+index ee734a8b3fa9..0df09c094e42 100644
+--- a/fs/xfs/libxfs/xfs_defer.c
++++ b/fs/xfs/libxfs/xfs_defer.c
+@@ -249,7 +249,6 @@ xfs_defer_trans_roll(
+ 		xfs_defer_trans_abort(*tp, dop, error);
+ 		return error;
+ 	}
+-	dop->dop_committed = true;
+ 
+ 	/* Rejoin the joined inodes. */
+ 	for (i = 0; i < XFS_DEFER_OPS_NR_INODES && dop->dop_inodes[i]; i++)
+
+commit 03f4e4b26cd5f6eed728f82d90039a19d1b51ce3
+Author: Brian Foster <bfoster@redhat.com>
+Date:   Tue Jul 24 13:43:09 2018 -0700
+
+    xfs: make deferred processing safe for embedded dfops
+    
+    xfs_defer_finish() has a couple quirks that are not safe with
+    respect to the upcoming internal dfops functionality. First,
+    xfs_defer_finish() attaches the passed in dfops structure to
+    ->t_dfops and caches and restores the original value. Second, it
+    continues to use the initial dfops reference before and after the
+    transaction roll.
+    
+    These behaviors assume that dop is an independent memory allocation
+    from the transaction itself, which may not always be true once
+    transactions begin to use an embedded dfops structure. In the latter
+    model, dfops processing creates a new xfs_defer_ops structure with
+    each transaction and the associated state is migrated across to the
+    new transaction.
+    
+    Fix up xfs_defer_finish() to handle the possibility of the current
+    dfops changing after a transaction roll. Since ->t_dfops is used
+    unconditionally in this path, it is no longer necessary to
+    attach/restore ->t_dfops and pass it explicitly down to
+    xfs_defer_trans_roll(). Update dop in the latter function and the
+    caller to ensure that it always refers to the current dfops
+    structure.
+    
+    Signed-off-by: Brian Foster <bfoster@redhat.com>
+    Reviewed-by: Christoph Hellwig <hch@lst.de>
+    Reviewed-by: Bill O'Donnell <billodo@redhat.com>
+    Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+
+diff --git a/fs/xfs/libxfs/xfs_defer.c b/fs/xfs/libxfs/xfs_defer.c
+index c4b0eaeb5190..ee734a8b3fa9 100644
+--- a/fs/xfs/libxfs/xfs_defer.c
++++ b/fs/xfs/libxfs/xfs_defer.c
+@@ -225,9 +225,9 @@ xfs_defer_trans_abort(
+ /* Roll a transaction so we can do some deferred op processing. */
+ STATIC int
+ xfs_defer_trans_roll(
+-	struct xfs_trans		**tp,
+-	struct xfs_defer_ops		*dop)
++	struct xfs_trans		**tp)
+ {
++	struct xfs_defer_ops		*dop = (*tp)->t_dfops;
+ 	int				i;
+ 	int				error;
+ 
+@@ -243,6 +243,7 @@ xfs_defer_trans_roll(
+ 
+ 	/* Roll the transaction. */
+ 	error = xfs_trans_roll(tp);
++	dop = (*tp)->t_dfops;
+ 	if (error) {
+ 		trace_xfs_defer_trans_roll_error((*tp)->t_mountp, dop, error);
+ 		xfs_defer_trans_abort(*tp, dop, error);
+@@ -338,31 +339,25 @@ xfs_defer_finish(
+ 	void				*state;
+ 	int				error = 0;
+ 	void				(*cleanup_fn)(struct xfs_trans *, void *, int);
+-	struct xfs_defer_ops		*orig_dop;
+ 
+ 	ASSERT((*tp)->t_flags & XFS_TRANS_PERM_LOG_RES);
++	ASSERT((*tp)->t_dfops == dop);
+ 
+ 	trace_xfs_defer_finish((*tp)->t_mountp, dop, _RET_IP_);
+ 
+-	/*
+-	 * Attach dfops to the transaction during deferred ops processing. This
+-	 * explicitly causes calls into the allocator to defer AGFL block frees.
+-	 * Note that this code can go away once all dfops users attach to the
+-	 * associated tp.
+-	 */
+-	ASSERT(!(*tp)->t_dfops || ((*tp)->t_dfops == dop));
+-	orig_dop = (*tp)->t_dfops;
+-	(*tp)->t_dfops = dop;
+-
+ 	/* Until we run out of pending work to finish... */
+ 	while (xfs_defer_has_unfinished_work(dop)) {
+ 		/* Log intents for work items sitting in the intake. */
+ 		xfs_defer_intake_work(*tp, dop);
+ 
+-		/* Roll the transaction. */
+-		error = xfs_defer_trans_roll(tp, dop);
++		/*
++		 * Roll the transaction and update dop in case dfops was
++		 * embedded in the transaction.
++		 */
++		error = xfs_defer_trans_roll(tp);
+ 		if (error)
+ 			goto out;
++		dop = (*tp)->t_dfops;
+ 
+ 		/* Log an intent-done item for the first pending item. */
+ 		dfp = list_first_entry(&dop->dop_pending,
+@@ -428,10 +423,11 @@ xfs_defer_finish(
+ 	 * Roll the transaction once more to avoid returning to the caller
+ 	 * with a dirty transaction.
+ 	 */
+-	if ((*tp)->t_flags & XFS_TRANS_DIRTY)
+-		error = xfs_defer_trans_roll(tp, dop);
++	if ((*tp)->t_flags & XFS_TRANS_DIRTY) {
++		error = xfs_defer_trans_roll(tp);
++		dop = (*tp)->t_dfops;
++	}
+ out:
+-	(*tp)->t_dfops = orig_dop;
+ 	if (error)
+ 		trace_xfs_defer_finish_error((*tp)->t_mountp, dop, error);
+ 	else
+
+commit 81b549aa626b650bbf00423c084c0fd5581169b9
+Author: Darrick J. Wong <darrick.wong@oracle.com>
+Date:   Thu Jul 19 12:25:47 2018 -0700
+
+    xfs: return from _defer_finish with a clean transaction
+    
+    The following assertion was seen on generic/051:
+    
+    XFS: Assertion failed: tp->t_firstblock == NULLFSBLOCK, file: fs/xfs/libxfs5
+    ------------[ cut here ]------------
+    kernel BUG at fs/xfs/xfs_message.c:102!
+    invalid opcode: 0000 [#1] SMP PTI
+    CPU: 2 PID: 20757 Comm: fsstress Not tainted 4.18.0-rc4+ #3969
+    Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS 1.11.1-1 04/01/4
+    RIP: 0010:assfail+0x23/0x30
+    Code: c3 66 0f 1f 44 00 00 48 89 f1 41 89 d0 48 c7 c6 88 e0 8c 82 48 89 fa
+    RSP: 0018:ffff88012dc43c08 EFLAGS: 00010202
+    RAX: 0000000000000000 RBX: ffff88012dc43ca0 RCX: 0000000000000000
+    RDX: 00000000ffffffc0 RSI: 000000000000000a RDI: ffffffff828480eb
+    RBP: ffff88012aa92758 R08: 0000000000000000 R09: 0000000000000000
+    R10: 0000000000000000 R11: f000000000000000 R12: 0000000000000000
+    R13: ffff88012dc43d48 R14: ffff88013092e7e8 R15: 0000000000000014
+    FS:  00007f8d689b8e80(0000) GS:ffff88013fd00000(0000) knlGS:0000000000000000
+    CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+    CR2: 00007f8d689c7000 CR3: 000000012ba6a000 CR4: 00000000000006e0
+    Call Trace:
+     xfs_defer_init+0xff/0x160
+     xfs_reflink_remap_extent+0x31b/0xa00
+     xfs_reflink_remap_blocks+0xec/0x4a0
+     xfs_reflink_remap_range+0x3a1/0x650
+     xfs_file_dedupe_range+0x39/0x50
+     vfs_dedupe_file_range+0x218/0x260
+     do_vfs_ioctl+0x262/0x6a0
+     ? __se_sys_newfstat+0x3c/0x60
+     ksys_ioctl+0x35/0x60
+     __x64_sys_ioctl+0x11/0x20
+     do_syscall_64+0x4b/0x190
+     entry_SYSCALL_64_after_hwframe+0x49/0xbe
+    
+    The root cause of the assertion failure is that xfs_defer_finish doesn't
+    roll the transaction after processing all the deferred items.  Therefore
+    it returns a dirty transaction to the caller, which leaves the caller at
+    risk of exceeding the transaction reservation if it logs more items.
+    
+    Brian Foster's patchset to move the defer_ops firstblock into the
+    transaction requires t_firstblock == NULLFSBLOCK upon defer_ops
+    initialization, which is how this was noticed at all.
+    
+    Reported-by: Christoph Hellwig <hch@lst.de>
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Reviewed-by: Brian Foster <bfoster@redhat.com>
+    Reviewed-by: Christoph Hellwig <hch@lst.de>
+
+diff --git a/fs/xfs/libxfs/xfs_defer.c b/fs/xfs/libxfs/xfs_defer.c
+index 2713e2d808a7..c4b0eaeb5190 100644
+--- a/fs/xfs/libxfs/xfs_defer.c
++++ b/fs/xfs/libxfs/xfs_defer.c
+@@ -424,6 +424,12 @@ xfs_defer_finish(
+ 			cleanup_fn(*tp, state, error);
+ 	}
+ 
++	/*
++	 * Roll the transaction once more to avoid returning to the caller
++	 * with a dirty transaction.
++	 */
++	if ((*tp)->t_flags & XFS_TRANS_DIRTY)
++		error = xfs_defer_trans_roll(tp, dop);
+ out:
+ 	(*tp)->t_dfops = orig_dop;
+ 	if (error)
+
+commit 5fdd97944ee5ae0fcdd88227224d0c2c87aa6db9
+Author: Brian Foster <bfoster@redhat.com>
+Date:   Wed Jul 11 22:26:33 2018 -0700
+
+    xfs: remove xfs_defer_init() firstblock param
+    
+    All but one caller of xfs_defer_init() passes in the ->t_firstblock
+    of the associated transaction. The one outlier is
+    xlog_recover_process_intents(), which simply passes a dummy value
+    because a valid pointer is required. This firstblock variable can
+    simply be removed.
+    
+    At this point we could remove the xfs_defer_init() firstblock
+    parameter and initialize ->t_firstblock directly. Even that is not
+    necessary, however, because ->t_firstblock is automatically
+    reinitialized in the new transaction on a transaction roll. Since
+    xfs_defer_init() should never occur more than once on a particular
+    transaction (since the corresponding finish will roll it), replace
+    the reinit from xfs_defer_init() with an assert that verifies the
+    transaction has a NULLFSBLOCK firstblock.
+    
+    Signed-off-by: Brian Foster <bfoster@redhat.com>
+    Reviewed-by: Christoph Hellwig <hch@lst.de>
+    Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+
+diff --git a/fs/xfs/libxfs/xfs_defer.c b/fs/xfs/libxfs/xfs_defer.c
+index 6b25a9436829..2713e2d808a7 100644
+--- a/fs/xfs/libxfs/xfs_defer.c
++++ b/fs/xfs/libxfs/xfs_defer.c
+@@ -524,16 +524,15 @@ xfs_defer_init_op_type(
+ void
+ xfs_defer_init(
+ 	struct xfs_trans		*tp,
+-	struct xfs_defer_ops		*dop,
+-	xfs_fsblock_t			*fbp)
++	struct xfs_defer_ops		*dop)
+ {
+ 	struct xfs_mount		*mp = NULL;
+ 
+ 	memset(dop, 0, sizeof(struct xfs_defer_ops));
+-	*fbp = NULLFSBLOCK;
+ 	INIT_LIST_HEAD(&dop->dop_intake);
+ 	INIT_LIST_HEAD(&dop->dop_pending);
+ 	if (tp) {
++		ASSERT(tp->t_firstblock == NULLFSBLOCK);
+ 		tp->t_dfops = dop;
+ 		mp = tp->t_mountp;
+ 	}
+
+commit bcd2c9f33559764e0d306e226a8aa88bc2e1e6fb
+Author: Brian Foster <bfoster@redhat.com>
+Date:   Wed Jul 11 22:26:19 2018 -0700
+
+    xfs: refactor dfops init to attach to transaction
+    
+    Most callers of xfs_defer_init() immediately attach the dfops
+    structure to a transaction. Add a transaction parameter to eliminate
+    much of this boilerplate code. This also helps self-document the
+    fact that many codepaths now expect a dfops pointer implicitly via
+    xfs_trans->t_dfops.
+    
+    Signed-off-by: Brian Foster <bfoster@redhat.com>
+    Reviewed-by: Christoph Hellwig <hch@lst.de>
+    Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+
+diff --git a/fs/xfs/libxfs/xfs_defer.c b/fs/xfs/libxfs/xfs_defer.c
+index 560a7d178c1e..6b25a9436829 100644
+--- a/fs/xfs/libxfs/xfs_defer.c
++++ b/fs/xfs/libxfs/xfs_defer.c
+@@ -523,12 +523,19 @@ xfs_defer_init_op_type(
+ /* Initialize a deferred operation. */
+ void
+ xfs_defer_init(
++	struct xfs_trans		*tp,
+ 	struct xfs_defer_ops		*dop,
+ 	xfs_fsblock_t			*fbp)
+ {
++	struct xfs_mount		*mp = NULL;
++
+ 	memset(dop, 0, sizeof(struct xfs_defer_ops));
+ 	*fbp = NULLFSBLOCK;
+ 	INIT_LIST_HEAD(&dop->dop_intake);
+ 	INIT_LIST_HEAD(&dop->dop_pending);
+-	trace_xfs_defer_init(NULL, dop, _RET_IP_);
++	if (tp) {
++		tp->t_dfops = dop;
++		mp = tp->t_mountp;
++	}
++	trace_xfs_defer_init(mp, dop, _RET_IP_);
+ }
+
+commit 6aa6718439ac6907b3c34cbe7ac2c71408f84f6e
+Author: Brian Foster <bfoster@redhat.com>
+Date:   Wed Jul 11 22:26:07 2018 -0700
+
+    xfs: rename xfs_trans ->t_agfl_dfops to ->t_dfops
+    
+    The ->t_agfl_dfops field is currently used to defer agfl block frees
+    from associated transaction contexts. While all known problematic
+    contexts have already been updated to use ->t_agfl_dfops, the
+    broader goal is defer agfl frees from all callers that already use a
+    deferred operations structure. Further, the transaction field
+    facilitates a good amount of code clean up where the transaction and
+    dfops have historically been passed down through the stack
+    separately.
+    
+    Rename the field to something more generic to prepare to use it as
+    such throughout XFS. This patch does not change behavior.
+    Signed-off-by: Brian Foster <bfoster@redhat.com>
+    Reviewed-by: Christoph Hellwig <hch@lst.de>
+    Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+
+diff --git a/fs/xfs/libxfs/xfs_defer.c b/fs/xfs/libxfs/xfs_defer.c
+index c3e5bffda4f5..560a7d178c1e 100644
+--- a/fs/xfs/libxfs/xfs_defer.c
++++ b/fs/xfs/libxfs/xfs_defer.c
+@@ -350,9 +350,9 @@ xfs_defer_finish(
+ 	 * Note that this code can go away once all dfops users attach to the
+ 	 * associated tp.
+ 	 */
+-	ASSERT(!(*tp)->t_agfl_dfops || ((*tp)->t_agfl_dfops == dop));
+-	orig_dop = (*tp)->t_agfl_dfops;
+-	(*tp)->t_agfl_dfops = dop;
++	ASSERT(!(*tp)->t_dfops || ((*tp)->t_dfops == dop));
++	orig_dop = (*tp)->t_dfops;
++	(*tp)->t_dfops = dop;
+ 
+ 	/* Until we run out of pending work to finish... */
+ 	while (xfs_defer_has_unfinished_work(dop)) {
+@@ -425,7 +425,7 @@ xfs_defer_finish(
+ 	}
+ 
+ out:
+-	(*tp)->t_agfl_dfops = orig_dop;
++	(*tp)->t_dfops = orig_dop;
+ 	if (error)
+ 		trace_xfs_defer_finish_error((*tp)->t_mountp, dop, error);
+ 	else
+
+commit 0b61f8a4079d904b1b1d47946cca898313de8c26
+Author: Dave Chinner <dchinner@redhat.com>
+Date:   Tue Jun 5 19:42:14 2018 -0700
+
+    xfs: convert to SPDX license tags
+    
+    Remove the verbose license text from XFS files and replace them
+    with SPDX tags. This does not change the license of any of the code,
+    merely refers to the common, up-to-date license files in LICENSES/
+    
+    This change was mostly scripted. fs/xfs/Makefile and
+    fs/xfs/libxfs/xfs_fs.h were modified by hand, the rest were detected
+    and modified by the following command:
+    
+    for f in `git grep -l "GNU General" fs/xfs/` ; do
+            echo $f
+            cat $f | awk -f hdr.awk > $f.new
+            mv -f $f.new $f
+    done
+    
+    And the hdr.awk script that did the modification (including
+    detecting the difference between GPL-2.0 and GPL-2.0+ licenses)
+    is as follows:
+    
+    $ cat hdr.awk
+    BEGIN {
+            hdr = 1.0
+            tag = "GPL-2.0"
+            str = ""
+    }
+    
+    /^ \* This program is free software/ {
+            hdr = 2.0;
+            next
+    }
+    
+    /any later version./ {
+            tag = "GPL-2.0+"
+            next
+    }
+    
+    /^ \*\// {
+            if (hdr > 0.0) {
+                    print "// SPDX-License-Identifier: " tag
+                    print str
+                    print $0
+                    str=""
+                    hdr = 0.0
+                    next
+            }
+            print $0
+            next
+    }
+    
+    /^ \* / {
+            if (hdr > 1.0)
+                    next
+            if (hdr > 0.0) {
+                    if (str != "")
+                            str = str "\n"
+                    str = str $0
+                    next
+            }
+            print $0
+            next
+    }
+    
+    /^ \*/ {
+            if (hdr > 0.0)
+                    next
+            print $0
+            next
+    }
+    
+    // {
+            if (hdr > 0.0) {
+                    if (str != "")
+                            str = str "\n"
+                    str = str $0
+                    next
+            }
+            print $0
+    }
+    
+    END { }
+    $
+    
+    Signed-off-by: Dave Chinner <dchinner@redhat.com>
+    Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+
+diff --git a/fs/xfs/libxfs/xfs_defer.c b/fs/xfs/libxfs/xfs_defer.c
+index 3daf175e2535..c3e5bffda4f5 100644
+--- a/fs/xfs/libxfs/xfs_defer.c
++++ b/fs/xfs/libxfs/xfs_defer.c
+@@ -1,21 +1,7 @@
++// SPDX-License-Identifier: GPL-2.0+
+ /*
+  * Copyright (C) 2016 Oracle.  All Rights Reserved.
+- *
+  * Author: Darrick J. Wong <darrick.wong@oracle.com>
+- *
+- * This program is free software; you can redistribute it and/or
+- * modify it under the terms of the GNU General Public License
+- * as published by the Free Software Foundation; either version 2
+- * of the License, or (at your option) any later version.
+- *
+- * This program is distributed in the hope that it would be useful,
+- * but WITHOUT ANY WARRANTY; without even the implied warranty of
+- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+- * GNU General Public License for more details.
+- *
+- * You should have received a copy of the GNU General Public License
+- * along with this program; if not, write the Free Software Foundation,
+- * Inc.,  51 Franklin St, Fifth Floor, Boston, MA  02110-1301, USA.
+  */
+ #include "xfs.h"
+ #include "xfs_fs.h"
+
+commit e632a5690c734a383a83272a502be79cb2c040e5
+Author: Dave Chinner <dchinner@redhat.com>
+Date:   Wed May 9 07:48:52 2018 -0700
+
+    xfs: adder caller IP to xfs_defer* tracepoints
+    
+    So it's clear in the trace where they are being called from.
+    
+    Signed-Off-By: Dave Chinner <dchinner@redhat.com>
+    Reviewed-by: Christoph Hellwig <hch@lst.de>
+    Reviewed-by: Brian Foster <bfoster@redhat.com>
+    Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+
+diff --git a/fs/xfs/libxfs/xfs_defer.c b/fs/xfs/libxfs/xfs_defer.c
+index 4d87d9661907..3daf175e2535 100644
+--- a/fs/xfs/libxfs/xfs_defer.c
++++ b/fs/xfs/libxfs/xfs_defer.c
+@@ -220,7 +220,7 @@ xfs_defer_trans_abort(
+ {
+ 	struct xfs_defer_pending	*dfp;
+ 
+-	trace_xfs_defer_trans_abort(tp->t_mountp, dop);
++	trace_xfs_defer_trans_abort(tp->t_mountp, dop, _RET_IP_);
+ 
+ 	/* Abort intent items that don't have a done item. */
+ 	list_for_each_entry(dfp, &dop->dop_pending, dfp_list) {
+@@ -253,7 +253,7 @@ xfs_defer_trans_roll(
+ 	for (i = 0; i < XFS_DEFER_OPS_NR_BUFS && dop->dop_bufs[i]; i++)
+ 		xfs_trans_dirty_buf(*tp, dop->dop_bufs[i]);
+ 
+-	trace_xfs_defer_trans_roll((*tp)->t_mountp, dop);
++	trace_xfs_defer_trans_roll((*tp)->t_mountp, dop, _RET_IP_);
+ 
+ 	/* Roll the transaction. */
+ 	error = xfs_trans_roll(tp);
+@@ -356,7 +356,7 @@ xfs_defer_finish(
+ 
+ 	ASSERT((*tp)->t_flags & XFS_TRANS_PERM_LOG_RES);
+ 
+-	trace_xfs_defer_finish((*tp)->t_mountp, dop);
++	trace_xfs_defer_finish((*tp)->t_mountp, dop, _RET_IP_);
+ 
+ 	/*
+ 	 * Attach dfops to the transaction during deferred ops processing. This
+@@ -443,7 +443,7 @@ xfs_defer_finish(
+ 	if (error)
+ 		trace_xfs_defer_finish_error((*tp)->t_mountp, dop, error);
+ 	else
+-		trace_xfs_defer_finish_done((*tp)->t_mountp, dop);
++		trace_xfs_defer_finish_done((*tp)->t_mountp, dop, _RET_IP_);
+ 	return error;
+ }
+ 
+@@ -459,7 +459,7 @@ xfs_defer_cancel(
+ 	struct list_head		*pwi;
+ 	struct list_head		*n;
+ 
+-	trace_xfs_defer_cancel(NULL, dop);
++	trace_xfs_defer_cancel(NULL, dop, _RET_IP_);
+ 
+ 	/*
+ 	 * Free the pending items.  Caller should already have arranged
+@@ -544,5 +544,5 @@ xfs_defer_init(
+ 	*fbp = NULLFSBLOCK;
+ 	INIT_LIST_HEAD(&dop->dop_intake);
+ 	INIT_LIST_HEAD(&dop->dop_pending);
+-	trace_xfs_defer_init(NULL, dop);
++	trace_xfs_defer_init(NULL, dop, _RET_IP_);
+ }
+
+commit 2bc5eba8b6957824631205aeffc75db8dbb5426a
+Author: Brian Foster <bfoster@redhat.com>
+Date:   Mon May 7 17:38:47 2018 -0700
+
+    xfs: defer agfl block frees from deferred ops processing context
+    
+    Now that AGFL block frees are deferred when dfops is set in the
+    transaction, start deferring AGFL block frees from contexts that are
+    known to push the limits of existing log reservations.
+    
+    The first such context is deferred operation processing itself. This
+    primarily targets deferred extent frees (such as file extents and
+    inode chunks), but in doing so covers all allocation operations that
+    occur in deferred operation processing context.
+    
+    Update xfs_defer_finish() to set and reset ->t_agfl_dfops across the
+    processing sequence. This means that any AGFL block frees due to
+    allocation events result in the addition of new EFIs to the dfops
+    rather than being processed immediately. xfs_defer_finish() rolls
+    the transaction at least once more to process the frees of the AGFL
+    blocks back to the allocation btrees and returns once the AGFL is
+    rectified.
+    
+    Signed-off-by: Brian Foster <bfoster@redhat.com>
+    Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+
+diff --git a/fs/xfs/libxfs/xfs_defer.c b/fs/xfs/libxfs/xfs_defer.c
+index 087fea02c389..4d87d9661907 100644
+--- a/fs/xfs/libxfs/xfs_defer.c
++++ b/fs/xfs/libxfs/xfs_defer.c
+@@ -352,11 +352,22 @@ xfs_defer_finish(
+ 	void				*state;
+ 	int				error = 0;
+ 	void				(*cleanup_fn)(struct xfs_trans *, void *, int);
++	struct xfs_defer_ops		*orig_dop;
+ 
+ 	ASSERT((*tp)->t_flags & XFS_TRANS_PERM_LOG_RES);
+ 
+ 	trace_xfs_defer_finish((*tp)->t_mountp, dop);
+ 
++	/*
++	 * Attach dfops to the transaction during deferred ops processing. This
++	 * explicitly causes calls into the allocator to defer AGFL block frees.
++	 * Note that this code can go away once all dfops users attach to the
++	 * associated tp.
++	 */
++	ASSERT(!(*tp)->t_agfl_dfops || ((*tp)->t_agfl_dfops == dop));
++	orig_dop = (*tp)->t_agfl_dfops;
++	(*tp)->t_agfl_dfops = dop;
++
+ 	/* Until we run out of pending work to finish... */
+ 	while (xfs_defer_has_unfinished_work(dop)) {
+ 		/* Log intents for work items sitting in the intake. */
+@@ -428,6 +439,7 @@ xfs_defer_finish(
+ 	}
+ 
+ out:
++	(*tp)->t_agfl_dfops = orig_dop;
+ 	if (error)
+ 		trace_xfs_defer_finish_error((*tp)->t_mountp, dop, error);
+ 	else
+
+commit b7b2846fe26f2c0d7f317c874a13d3ecf22670ff
+Author: Darrick J. Wong <darrick.wong@oracle.com>
+Date:   Thu Dec 7 19:07:02 2017 -0800
+
+    xfs: add the ability to join a held buffer to a defer_ops
+    
+    In certain cases, defer_ops callers will lock a buffer and want to hold
+    the lock across transaction rolls.  Similar to ijoined inodes, we want
+    to dirty & join the buffer with each transaction roll in defer_finish so
+    that afterwards the caller still owns the buffer lock and we haven't
+    inadvertently pinned the log.
+    
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Reviewed-by: Christoph Hellwig <hch@lst.de>
+
+diff --git a/fs/xfs/libxfs/xfs_defer.c b/fs/xfs/libxfs/xfs_defer.c
+index 072ebfe1d6ae..087fea02c389 100644
+--- a/fs/xfs/libxfs/xfs_defer.c
++++ b/fs/xfs/libxfs/xfs_defer.c
+@@ -249,6 +249,10 @@ xfs_defer_trans_roll(
+ 	for (i = 0; i < XFS_DEFER_OPS_NR_INODES && dop->dop_inodes[i]; i++)
+ 		xfs_trans_log_inode(*tp, dop->dop_inodes[i], XFS_ILOG_CORE);
+ 
++	/* Hold the (previously bjoin'd) buffer locked across the roll. */
++	for (i = 0; i < XFS_DEFER_OPS_NR_BUFS && dop->dop_bufs[i]; i++)
++		xfs_trans_dirty_buf(*tp, dop->dop_bufs[i]);
++
+ 	trace_xfs_defer_trans_roll((*tp)->t_mountp, dop);
+ 
+ 	/* Roll the transaction. */
+@@ -264,6 +268,12 @@ xfs_defer_trans_roll(
+ 	for (i = 0; i < XFS_DEFER_OPS_NR_INODES && dop->dop_inodes[i]; i++)
+ 		xfs_trans_ijoin(*tp, dop->dop_inodes[i], 0);
+ 
++	/* Rejoin the buffers and dirty them so the log moves forward. */
++	for (i = 0; i < XFS_DEFER_OPS_NR_BUFS && dop->dop_bufs[i]; i++) {
++		xfs_trans_bjoin(*tp, dop->dop_bufs[i]);
++		xfs_trans_bhold(*tp, dop->dop_bufs[i]);
++	}
++
+ 	return error;
+ }
+ 
+@@ -295,6 +305,31 @@ xfs_defer_ijoin(
+ 		}
+ 	}
+ 
++	ASSERT(0);
++	return -EFSCORRUPTED;
++}
++
++/*
++ * Add this buffer to the deferred op.  Each joined buffer is relogged
++ * each time we roll the transaction.
++ */
++int
++xfs_defer_bjoin(
++	struct xfs_defer_ops		*dop,
++	struct xfs_buf			*bp)
++{
++	int				i;
++
++	for (i = 0; i < XFS_DEFER_OPS_NR_BUFS; i++) {
++		if (dop->dop_bufs[i] == bp)
++			return 0;
++		else if (dop->dop_bufs[i] == NULL) {
++			dop->dop_bufs[i] = bp;
++			return 0;
++		}
++	}
++
++	ASSERT(0);
+ 	return -EFSCORRUPTED;
+ }
+ 
+@@ -493,9 +528,7 @@ xfs_defer_init(
+ 	struct xfs_defer_ops		*dop,
+ 	xfs_fsblock_t			*fbp)
+ {
+-	dop->dop_committed = false;
+-	dop->dop_low = false;
+-	memset(&dop->dop_inodes, 0, sizeof(dop->dop_inodes));
++	memset(dop, 0, sizeof(struct xfs_defer_ops));
+ 	*fbp = NULLFSBLOCK;
+ 	INIT_LIST_HEAD(&dop->dop_intake);
+ 	INIT_LIST_HEAD(&dop->dop_pending);
+
+commit 8ad7c629b18695ec1ee8654fb27599864049862b
+Author: Christoph Hellwig <hch@lst.de>
+Date:   Mon Aug 28 10:21:04 2017 -0700
+
+    xfs: remove the ip argument to xfs_defer_finish
+    
+    And instead require callers to explicitly join the inode using
+    xfs_defer_ijoin.  Also consolidate the defer error handling in
+    a few places using a goto label.
+    
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+
+diff --git a/fs/xfs/libxfs/xfs_defer.c b/fs/xfs/libxfs/xfs_defer.c
+index 6c0da24c68c9..072ebfe1d6ae 100644
+--- a/fs/xfs/libxfs/xfs_defer.c
++++ b/fs/xfs/libxfs/xfs_defer.c
+@@ -277,8 +277,7 @@ xfs_defer_has_unfinished_work(
+ 
+ /*
+  * Add this inode to the deferred op.  Each joined inode is relogged
+- * each time we roll the transaction, in addition to any inode passed
+- * to xfs_defer_finish().
++ * each time we roll the transaction.
+  */
+ int
+ xfs_defer_ijoin(
+@@ -310,8 +309,7 @@ xfs_defer_ijoin(
+ int
+ xfs_defer_finish(
+ 	struct xfs_trans		**tp,
+-	struct xfs_defer_ops		*dop,
+-	struct xfs_inode		*ip)
++	struct xfs_defer_ops		*dop)
+ {
+ 	struct xfs_defer_pending	*dfp;
+ 	struct list_head		*li;
+@@ -324,8 +322,6 @@ xfs_defer_finish(
+ 
+ 	trace_xfs_defer_finish((*tp)->t_mountp, dop);
+ 
+-	xfs_defer_ijoin(dop, ip);
+-
+ 	/* Until we run out of pending work to finish... */
+ 	while (xfs_defer_has_unfinished_work(dop)) {
+ 		/* Log intents for work items sitting in the intake. */
+
+commit 882d8785fb87f691000a0b33c215364d74bd2ceb
+Author: Christoph Hellwig <hch@lst.de>
+Date:   Mon Aug 28 10:21:03 2017 -0700
+
+    xfs: rename xfs_defer_join to xfs_defer_ijoin
+    
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Reviewed-by: Dave Chinner <dchinner@redhat.com>
+    Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+
+diff --git a/fs/xfs/libxfs/xfs_defer.c b/fs/xfs/libxfs/xfs_defer.c
+index 4ea2f068d95c..6c0da24c68c9 100644
+--- a/fs/xfs/libxfs/xfs_defer.c
++++ b/fs/xfs/libxfs/xfs_defer.c
+@@ -281,7 +281,7 @@ xfs_defer_has_unfinished_work(
+  * to xfs_defer_finish().
+  */
+ int
+-xfs_defer_join(
++xfs_defer_ijoin(
+ 	struct xfs_defer_ops		*dop,
+ 	struct xfs_inode		*ip)
+ {
+@@ -324,7 +324,7 @@ xfs_defer_finish(
+ 
+ 	trace_xfs_defer_finish((*tp)->t_mountp, dop);
+ 
+-	xfs_defer_join(dop, ip);
++	xfs_defer_ijoin(dop, ip);
+ 
+ 	/* Until we run out of pending work to finish... */
+ 	while (xfs_defer_has_unfinished_work(dop)) {
+
+commit 411350df14a3d6f1c769ea64a8b43a71f8d9760e
+Author: Christoph Hellwig <hch@lst.de>
+Date:   Mon Aug 28 10:21:03 2017 -0700
+
+    xfs: refactor xfs_trans_roll
+    
+    Split xfs_trans_roll into a low-level helper that just rolls the
+    actual transaction and a new higher level xfs_trans_roll_inode
+    that takes care of logging and rejoining the inode.  This gets
+    rid of the NULL inode case, and allows to simplify the special
+    cases in the deferred operation code.
+    
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+
+diff --git a/fs/xfs/libxfs/xfs_defer.c b/fs/xfs/libxfs/xfs_defer.c
+index 5c2929f94bd3..4ea2f068d95c 100644
+--- a/fs/xfs/libxfs/xfs_defer.c
++++ b/fs/xfs/libxfs/xfs_defer.c
+@@ -240,23 +240,19 @@ xfs_defer_trans_abort(
+ STATIC int
+ xfs_defer_trans_roll(
+ 	struct xfs_trans		**tp,
+-	struct xfs_defer_ops		*dop,
+-	struct xfs_inode		*ip)
++	struct xfs_defer_ops		*dop)
+ {
+ 	int				i;
+ 	int				error;
+ 
+-	/* Log all the joined inodes except the one we passed in. */
+-	for (i = 0; i < XFS_DEFER_OPS_NR_INODES && dop->dop_inodes[i]; i++) {
+-		if (dop->dop_inodes[i] == ip)
+-			continue;
++	/* Log all the joined inodes. */
++	for (i = 0; i < XFS_DEFER_OPS_NR_INODES && dop->dop_inodes[i]; i++)
+ 		xfs_trans_log_inode(*tp, dop->dop_inodes[i], XFS_ILOG_CORE);
+-	}
+ 
+ 	trace_xfs_defer_trans_roll((*tp)->t_mountp, dop);
+ 
+ 	/* Roll the transaction. */
+-	error = xfs_trans_roll(tp, ip);
++	error = xfs_trans_roll(tp);
+ 	if (error) {
+ 		trace_xfs_defer_trans_roll_error((*tp)->t_mountp, dop, error);
+ 		xfs_defer_trans_abort(*tp, dop, error);
+@@ -264,12 +260,9 @@ xfs_defer_trans_roll(
+ 	}
+ 	dop->dop_committed = true;
+ 
+-	/* Rejoin the joined inodes except the one we passed in. */
+-	for (i = 0; i < XFS_DEFER_OPS_NR_INODES && dop->dop_inodes[i]; i++) {
+-		if (dop->dop_inodes[i] == ip)
+-			continue;
++	/* Rejoin the joined inodes. */
++	for (i = 0; i < XFS_DEFER_OPS_NR_INODES && dop->dop_inodes[i]; i++)
+ 		xfs_trans_ijoin(*tp, dop->dop_inodes[i], 0);
+-	}
+ 
+ 	return error;
+ }
+@@ -331,13 +324,15 @@ xfs_defer_finish(
+ 
+ 	trace_xfs_defer_finish((*tp)->t_mountp, dop);
+ 
++	xfs_defer_join(dop, ip);
++
+ 	/* Until we run out of pending work to finish... */
+ 	while (xfs_defer_has_unfinished_work(dop)) {
+ 		/* Log intents for work items sitting in the intake. */
+ 		xfs_defer_intake_work(*tp, dop);
+ 
+ 		/* Roll the transaction. */
+-		error = xfs_defer_trans_roll(tp, dop, ip);
++		error = xfs_defer_trans_roll(tp, dop);
+ 		if (error)
+ 			goto out;
+ 
+
+commit b77428b12b55437b28deae738d9ce8b2e0663b55
+Author: Darrick J. Wong <darrick.wong@oracle.com>
+Date:   Mon Oct 24 14:21:18 2016 +1100
+
+    xfs: defer should abort intent items if the trans roll fails
+    
+    If the deferred ops transaction roll fails, we need to abort the intent
+    items if we haven't already logged a done item for it, regardless of
+    whether or not the deferred ops has had a transaction committed.  Dave
+    found this while running generic/388.
+    
+    Move the tracepoint to make it easier to track object lifetimes.
+    
+    Reported-by: Dave Chinner <david@fromorbit.com>
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Reviewed-by: Dave Chinner <dchinner@redhat.com>
+    Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+diff --git a/fs/xfs/libxfs/xfs_defer.c b/fs/xfs/libxfs/xfs_defer.c
+index 613c5cf19436..5c2929f94bd3 100644
+--- a/fs/xfs/libxfs/xfs_defer.c
++++ b/fs/xfs/libxfs/xfs_defer.c
+@@ -199,9 +199,9 @@ xfs_defer_intake_work(
+ 	struct xfs_defer_pending	*dfp;
+ 
+ 	list_for_each_entry(dfp, &dop->dop_intake, dfp_list) {
+-		trace_xfs_defer_intake_work(tp->t_mountp, dfp);
+ 		dfp->dfp_intent = dfp->dfp_type->create_intent(tp,
+ 				dfp->dfp_count);
++		trace_xfs_defer_intake_work(tp->t_mountp, dfp);
+ 		list_sort(tp->t_mountp, &dfp->dfp_work,
+ 				dfp->dfp_type->diff_items);
+ 		list_for_each(li, &dfp->dfp_work)
+@@ -221,21 +221,14 @@ xfs_defer_trans_abort(
+ 	struct xfs_defer_pending	*dfp;
+ 
+ 	trace_xfs_defer_trans_abort(tp->t_mountp, dop);
+-	/*
+-	 * If the transaction was committed, drop the intent reference
+-	 * since we're bailing out of here. The other reference is
+-	 * dropped when the intent hits the AIL.  If the transaction
+-	 * was not committed, the intent is freed by the intent item
+-	 * unlock handler on abort.
+-	 */
+-	if (!dop->dop_committed)
+-		return;
+ 
+-	/* Abort intent items. */
++	/* Abort intent items that don't have a done item. */
+ 	list_for_each_entry(dfp, &dop->dop_pending, dfp_list) {
+ 		trace_xfs_defer_pending_abort(tp->t_mountp, dfp);
+-		if (!dfp->dfp_done)
++		if (dfp->dfp_intent && !dfp->dfp_done) {
+ 			dfp->dfp_type->abort_intent(dfp->dfp_intent);
++			dfp->dfp_intent = NULL;
++		}
+ 	}
+ 
+ 	/* Shut down FS. */
+
+commit 385d655861d221bb43ae69a9cfa9adbefe31ad00
+Author: Darrick J. Wong <darrick.wong@oracle.com>
+Date:   Mon Sep 19 10:26:25 2016 +1000
+
+    xfs: defer should allow ->finish_item to request a new transaction
+    
+    When xfs_defer_finish calls ->finish_item, it's possible that
+    (refcount) won't be able to finish all the work in a single
+    transaction.  When this happens, the ->finish_item handler should
+    shorten the log done item's list count, update the work item to
+    reflect where work should continue, and return -EAGAIN so that
+    defer_finish knows to retain the pending item on the pending list,
+    roll the transaction, and restart processing where we left off.
+    
+    Plumb in the code and document how this mechanism is supposed to work.
+    
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+
+diff --git a/fs/xfs/libxfs/xfs_defer.c b/fs/xfs/libxfs/xfs_defer.c
+index c221d0ecd52e..613c5cf19436 100644
+--- a/fs/xfs/libxfs/xfs_defer.c
++++ b/fs/xfs/libxfs/xfs_defer.c
+@@ -81,6 +81,10 @@
+  *   - For each work item attached to the log intent item,
+  *     * Perform the described action.
+  *     * Attach the work item to the log done item.
++ *     * If the result of doing the work was -EAGAIN, ->finish work
++ *       wants a new transaction.  See the "Requesting a Fresh
++ *       Transaction while Finishing Deferred Work" section below for
++ *       details.
+  *
+  * The key here is that we must log an intent item for all pending
+  * work items every time we roll the transaction, and that we must log
+@@ -88,6 +92,34 @@
+  * we can perform complex remapping operations, chaining intent items
+  * as needed.
+  *
++ * Requesting a Fresh Transaction while Finishing Deferred Work
++ *
++ * If ->finish_item decides that it needs a fresh transaction to
++ * finish the work, it must ask its caller (xfs_defer_finish) for a
++ * continuation.  The most likely cause of this circumstance are the
++ * refcount adjust functions deciding that they've logged enough items
++ * to be at risk of exceeding the transaction reservation.
++ *
++ * To get a fresh transaction, we want to log the existing log done
++ * item to prevent the log intent item from replaying, immediately log
++ * a new log intent item with the unfinished work items, roll the
++ * transaction, and re-call ->finish_item wherever it left off.  The
++ * log done item and the new log intent item must be in the same
++ * transaction or atomicity cannot be guaranteed; defer_finish ensures
++ * that this happens.
++ *
++ * This requires some coordination between ->finish_item and
++ * defer_finish.  Upon deciding to request a new transaction,
++ * ->finish_item should update the current work item to reflect the
++ * unfinished work.  Next, it should reset the log done item's list
++ * count to the number of items finished, and return -EAGAIN.
++ * defer_finish sees the -EAGAIN, logs the new log intent item
++ * with the remaining work items, and leaves the xfs_defer_pending
++ * item at the head of the dop_work queue.  Then it rolls the
++ * transaction and picks up processing where it left off.  It is
++ * required that ->finish_item must be careful to leave enough
++ * transaction reservation to fit the new log intent item.
++ *
+  * This is an example of remapping the extent (E, E+B) into file X at
+  * offset A and dealing with the extent (C, C+B) already being mapped
+  * there:
+@@ -104,21 +136,26 @@
+  * | Intent to add rmap (X, E, A, B)                 |
+  * +-------------------------------------------------+
+  * | Reduce refcount for extent (C, B)               | t2
+- * | Done reducing refcount for extent (C, B)        |
++ * | Done reducing refcount for extent (C, 9)        |
++ * | Intent to reduce refcount for extent (C+9, B-9) |
++ * | (ran out of space after 9 refcount updates)     |
++ * +-------------------------------------------------+
++ * | Reduce refcount for extent (C+9, B+9)           | t3
++ * | Done reducing refcount for extent (C+9, B-9)    |
+  * | Increase refcount for extent (E, B)             |
+  * | Done increasing refcount for extent (E, B)      |
+  * | Intent to free extent (C, B)                    |
+  * | Intent to free extent (F, 1) (refcountbt block) |
+  * | Intent to remove rmap (F, 1, REFC)              |
+  * +-------------------------------------------------+
+- * | Remove rmap (X, C, A, B)                        | t3
++ * | Remove rmap (X, C, A, B)                        | t4
+  * | Done removing rmap (X, C, A, B)                 |
+  * | Add rmap (X, E, A, B)                           |
+  * | Done adding rmap (X, E, A, B)                   |
+  * | Remove rmap (F, 1, REFC)                        |
+  * | Done removing rmap (F, 1, REFC)                 |
+  * +-------------------------------------------------+
+- * | Free extent (C, B)                              | t4
++ * | Free extent (C, B)                              | t5
+  * | Done freeing extent (C, B)                      |
+  * | Free extent (D, 1)                              |
+  * | Done freeing extent (D, 1)                      |
+@@ -141,6 +178,9 @@
+  * - Intent to free extent (C, B)
+  * - Intent to free extent (F, 1) (refcountbt block)
+  * - Intent to remove rmap (F, 1, REFC)
++ *
++ * Note that the continuation requested between t2 and t3 is likely to
++ * reoccur.
+  */
+ 
+ static const struct xfs_defer_op_type *defer_op_types[XFS_DEFER_OPS_TYPE_MAX];
+@@ -323,7 +363,16 @@ xfs_defer_finish(
+ 			dfp->dfp_count--;
+ 			error = dfp->dfp_type->finish_item(*tp, dop, li,
+ 					dfp->dfp_done, &state);
+-			if (error) {
++			if (error == -EAGAIN) {
++				/*
++				 * Caller wants a fresh transaction;
++				 * put the work item back on the list
++				 * and jump out.
++				 */
++				list_add(li, &dfp->dfp_work);
++				dfp->dfp_count++;
++				break;
++			} else if (error) {
+ 				/*
+ 				 * Clean up after ourselves and jump out.
+ 				 * xfs_defer_cancel will take care of freeing
+@@ -335,9 +384,25 @@ xfs_defer_finish(
+ 				goto out;
+ 			}
+ 		}
+-		/* Done with the dfp, free it. */
+-		list_del(&dfp->dfp_list);
+-		kmem_free(dfp);
++		if (error == -EAGAIN) {
++			/*
++			 * Caller wants a fresh transaction, so log a
++			 * new log intent item to replace the old one
++			 * and roll the transaction.  See "Requesting
++			 * a Fresh Transaction while Finishing
++			 * Deferred Work" above.
++			 */
++			dfp->dfp_intent = dfp->dfp_type->create_intent(*tp,
++					dfp->dfp_count);
++			dfp->dfp_done = NULL;
++			list_for_each(li, &dfp->dfp_work)
++				dfp->dfp_type->log_item(*tp, dfp->dfp_intent,
++						li);
++		} else {
++			/* Done with the dfp, free it. */
++			list_del(&dfp->dfp_list);
++			kmem_free(dfp);
++		}
+ 
+ 		if (cleanup_fn)
+ 			cleanup_fn(*tp, state, error);
+
+commit ea78d80866ce375defb2fdd1c8a3aafec95e0f85
+Author: Darrick J. Wong <darrick.wong@oracle.com>
+Date:   Tue Aug 30 13:51:39 2016 +1000
+
+    xfs: track log done items directly in the deferred pending work item
+    
+    Christoph reports slab corruption when a deferred refcount update
+    aborts during _defer_finish().  The cause of this was broken log item
+    state tracking in xfs_defer_pending -- upon an abort,
+    _defer_trans_abort() will call abort_intent on all intent items,
+    including the ones that have already had a done item attached.
+    
+    This is incorrect because each intent item has 2 refcount: the first
+    is released when the intent item is committed to the log; and the
+    second is released when the _done_ item is committed to the log, or
+    by the intent creator if there is no done item.  In other words, once
+    we log the done item, responsibility for releasing the intent item's
+    second refcount is transferred to the done item and /must not/ be
+    performed by anything else.
+    
+    The dfp_committed flag should have been tracking whether or not we had
+    a done item so that _defer_trans_abort could decide if it needs to
+    abort the intent item, but due to a thinko this was not the case.  Rip
+    it out and track the done item directly so that we do the right thing
+    w.r.t. intent item freeing.
+    
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Reported-by: Christoph Hellwig <hch@infradead.org>
+    Reviewed-by: Dave Chinner <dchinner@redhat.com>
+    Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+diff --git a/fs/xfs/libxfs/xfs_defer.c b/fs/xfs/libxfs/xfs_defer.c
+index 054a2032fdb3..c221d0ecd52e 100644
+--- a/fs/xfs/libxfs/xfs_defer.c
++++ b/fs/xfs/libxfs/xfs_defer.c
+@@ -194,7 +194,7 @@ xfs_defer_trans_abort(
+ 	/* Abort intent items. */
+ 	list_for_each_entry(dfp, &dop->dop_pending, dfp_list) {
+ 		trace_xfs_defer_pending_abort(tp->t_mountp, dfp);
+-		if (dfp->dfp_committed)
++		if (!dfp->dfp_done)
+ 			dfp->dfp_type->abort_intent(dfp->dfp_intent);
+ 	}
+ 
+@@ -290,7 +290,6 @@ xfs_defer_finish(
+ 	struct xfs_defer_pending	*dfp;
+ 	struct list_head		*li;
+ 	struct list_head		*n;
+-	void				*done_item = NULL;
+ 	void				*state;
+ 	int				error = 0;
+ 	void				(*cleanup_fn)(struct xfs_trans *, void *, int);
+@@ -309,19 +308,11 @@ xfs_defer_finish(
+ 		if (error)
+ 			goto out;
+ 
+-		/* Mark all pending intents as committed. */
+-		list_for_each_entry_reverse(dfp, &dop->dop_pending, dfp_list) {
+-			if (dfp->dfp_committed)
+-				break;
+-			trace_xfs_defer_pending_commit((*tp)->t_mountp, dfp);
+-			dfp->dfp_committed = true;
+-		}
+-
+ 		/* Log an intent-done item for the first pending item. */
+ 		dfp = list_first_entry(&dop->dop_pending,
+ 				struct xfs_defer_pending, dfp_list);
+ 		trace_xfs_defer_pending_finish((*tp)->t_mountp, dfp);
+-		done_item = dfp->dfp_type->create_done(*tp, dfp->dfp_intent,
++		dfp->dfp_done = dfp->dfp_type->create_done(*tp, dfp->dfp_intent,
+ 				dfp->dfp_count);
+ 		cleanup_fn = dfp->dfp_type->finish_cleanup;
+ 
+@@ -331,7 +322,7 @@ xfs_defer_finish(
+ 			list_del(li);
+ 			dfp->dfp_count--;
+ 			error = dfp->dfp_type->finish_item(*tp, dop, li,
+-					done_item, &state);
++					dfp->dfp_done, &state);
+ 			if (error) {
+ 				/*
+ 				 * Clean up after ourselves and jump out.
+@@ -428,8 +419,8 @@ xfs_defer_add(
+ 		dfp = kmem_alloc(sizeof(struct xfs_defer_pending),
+ 				KM_SLEEP | KM_NOFS);
+ 		dfp->dfp_type = defer_op_types[type];
+-		dfp->dfp_committed = false;
+ 		dfp->dfp_intent = NULL;
++		dfp->dfp_done = NULL;
+ 		dfp->dfp_count = 0;
+ 		INIT_LIST_HEAD(&dfp->dfp_work);
+ 		list_add_tail(&dfp->dfp_list, &dop->dop_intake);
+
+commit 3cd48abcc1f76d6cd5ce61f3540801849a6c82e0
+Author: Darrick J. Wong <darrick.wong@oracle.com>
+Date:   Wed Aug 3 11:13:02 2016 +1000
+
+    xfs: add tracepoints for the deferred ops mechanism
+    
+    Add tracepoints for the internals of the deferred ops mechanism
+    and tracepoint classes for clients of the dops, to make debugging
+    easier.
+    
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Reviewed-by: Brian Foster <bfoster@redhat.com>
+    Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+diff --git a/fs/xfs/libxfs/xfs_defer.c b/fs/xfs/libxfs/xfs_defer.c
+index 2809db75e0d3..054a2032fdb3 100644
+--- a/fs/xfs/libxfs/xfs_defer.c
++++ b/fs/xfs/libxfs/xfs_defer.c
+@@ -159,6 +159,7 @@ xfs_defer_intake_work(
+ 	struct xfs_defer_pending	*dfp;
+ 
+ 	list_for_each_entry(dfp, &dop->dop_intake, dfp_list) {
++		trace_xfs_defer_intake_work(tp->t_mountp, dfp);
+ 		dfp->dfp_intent = dfp->dfp_type->create_intent(tp,
+ 				dfp->dfp_count);
+ 		list_sort(tp->t_mountp, &dfp->dfp_work,
+@@ -179,6 +180,7 @@ xfs_defer_trans_abort(
+ {
+ 	struct xfs_defer_pending	*dfp;
+ 
++	trace_xfs_defer_trans_abort(tp->t_mountp, dop);
+ 	/*
+ 	 * If the transaction was committed, drop the intent reference
+ 	 * since we're bailing out of here. The other reference is
+@@ -191,6 +193,7 @@ xfs_defer_trans_abort(
+ 
+ 	/* Abort intent items. */
+ 	list_for_each_entry(dfp, &dop->dop_pending, dfp_list) {
++		trace_xfs_defer_pending_abort(tp->t_mountp, dfp);
+ 		if (dfp->dfp_committed)
+ 			dfp->dfp_type->abort_intent(dfp->dfp_intent);
+ 	}
+@@ -217,9 +220,12 @@ xfs_defer_trans_roll(
+ 		xfs_trans_log_inode(*tp, dop->dop_inodes[i], XFS_ILOG_CORE);
+ 	}
+ 
++	trace_xfs_defer_trans_roll((*tp)->t_mountp, dop);
++
+ 	/* Roll the transaction. */
+ 	error = xfs_trans_roll(tp, ip);
+ 	if (error) {
++		trace_xfs_defer_trans_roll_error((*tp)->t_mountp, dop, error);
+ 		xfs_defer_trans_abort(*tp, dop, error);
+ 		return error;
+ 	}
+@@ -291,6 +297,8 @@ xfs_defer_finish(
+ 
+ 	ASSERT((*tp)->t_flags & XFS_TRANS_PERM_LOG_RES);
+ 
++	trace_xfs_defer_finish((*tp)->t_mountp, dop);
++
+ 	/* Until we run out of pending work to finish... */
+ 	while (xfs_defer_has_unfinished_work(dop)) {
+ 		/* Log intents for work items sitting in the intake. */
+@@ -305,12 +313,14 @@ xfs_defer_finish(
+ 		list_for_each_entry_reverse(dfp, &dop->dop_pending, dfp_list) {
+ 			if (dfp->dfp_committed)
+ 				break;
++			trace_xfs_defer_pending_commit((*tp)->t_mountp, dfp);
+ 			dfp->dfp_committed = true;
+ 		}
+ 
+ 		/* Log an intent-done item for the first pending item. */
+ 		dfp = list_first_entry(&dop->dop_pending,
+ 				struct xfs_defer_pending, dfp_list);
++		trace_xfs_defer_pending_finish((*tp)->t_mountp, dfp);
+ 		done_item = dfp->dfp_type->create_done(*tp, dfp->dfp_intent,
+ 				dfp->dfp_count);
+ 		cleanup_fn = dfp->dfp_type->finish_cleanup;
+@@ -343,6 +353,10 @@ xfs_defer_finish(
+ 	}
+ 
+ out:
++	if (error)
++		trace_xfs_defer_finish_error((*tp)->t_mountp, dop, error);
++	else
++		trace_xfs_defer_finish_done((*tp)->t_mountp, dop);
+ 	return error;
+ }
+ 
+@@ -358,11 +372,14 @@ xfs_defer_cancel(
+ 	struct list_head		*pwi;
+ 	struct list_head		*n;
+ 
++	trace_xfs_defer_cancel(NULL, dop);
++
+ 	/*
+ 	 * Free the pending items.  Caller should already have arranged
+ 	 * for the intent items to be released.
+ 	 */
+ 	list_for_each_entry_safe(dfp, pli, &dop->dop_intake, dfp_list) {
++		trace_xfs_defer_intake_cancel(NULL, dfp);
+ 		list_del(&dfp->dfp_list);
+ 		list_for_each_safe(pwi, n, &dfp->dfp_work) {
+ 			list_del(pwi);
+@@ -373,6 +390,7 @@ xfs_defer_cancel(
+ 		kmem_free(dfp);
+ 	}
+ 	list_for_each_entry_safe(dfp, pli, &dop->dop_pending, dfp_list) {
++		trace_xfs_defer_pending_cancel(NULL, dfp);
+ 		list_del(&dfp->dfp_list);
+ 		list_for_each_safe(pwi, n, &dfp->dfp_work) {
+ 			list_del(pwi);
+@@ -441,4 +459,5 @@ xfs_defer_init(
+ 	*fbp = NULLFSBLOCK;
+ 	INIT_LIST_HEAD(&dop->dop_intake);
+ 	INIT_LIST_HEAD(&dop->dop_pending);
++	trace_xfs_defer_init(NULL, dop);
+ }
+
+commit 4e0cc29b91a8056f902f0974b49084b07491905f
+Author: Darrick J. Wong <darrick.wong@oracle.com>
+Date:   Wed Aug 3 11:12:25 2016 +1000
+
+    xfs: move deferred operations into a separate file
+    
+    All the code around struct xfs_bmap_free basically implements a
+    deferred operation framework through which we can roll transactions
+    (to unlock buffers and avoid violating lock order rules) while
+    managing all the necessary log redo items.  Previously we only used
+    this code to free extents after some sort of mapping operation, but
+    with the advent of rmap and reflink, we suddenly need to do more than
+    that.
+    
+    With that in mind, xfs_bmap_free really becomes a deferred ops control
+    structure.  Rename the structure and move the deferred ops into their
+    own file to avoid further bloating of the bmap code.
+    
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Reviewed-by: Brian Foster <bfoster@redhat.com>
+    Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+diff --git a/fs/xfs/libxfs/xfs_defer.c b/fs/xfs/libxfs/xfs_defer.c
+new file mode 100644
+index 000000000000..2809db75e0d3
+--- /dev/null
++++ b/fs/xfs/libxfs/xfs_defer.c
+@@ -0,0 +1,444 @@
++/*
++ * Copyright (C) 2016 Oracle.  All Rights Reserved.
++ *
++ * Author: Darrick J. Wong <darrick.wong@oracle.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version 2
++ * of the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it would be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write the Free Software Foundation,
++ * Inc.,  51 Franklin St, Fifth Floor, Boston, MA  02110-1301, USA.
++ */
++#include "xfs.h"
++#include "xfs_fs.h"
++#include "xfs_shared.h"
++#include "xfs_format.h"
++#include "xfs_log_format.h"
++#include "xfs_trans_resv.h"
++#include "xfs_bit.h"
++#include "xfs_sb.h"
++#include "xfs_mount.h"
++#include "xfs_defer.h"
++#include "xfs_trans.h"
++#include "xfs_trace.h"
++
++/*
++ * Deferred Operations in XFS
++ *
++ * Due to the way locking rules work in XFS, certain transactions (block
++ * mapping and unmapping, typically) have permanent reservations so that
++ * we can roll the transaction to adhere to AG locking order rules and
++ * to unlock buffers between metadata updates.  Prior to rmap/reflink,
++ * the mapping code had a mechanism to perform these deferrals for
++ * extents that were going to be freed; this code makes that facility
++ * more generic.
++ *
++ * When adding the reverse mapping and reflink features, it became
++ * necessary to perform complex remapping multi-transactions to comply
++ * with AG locking order rules, and to be able to spread a single
++ * refcount update operation (an operation on an n-block extent can
++ * update as many as n records!) among multiple transactions.  XFS can
++ * roll a transaction to facilitate this, but using this facility
++ * requires us to log "intent" items in case log recovery needs to
++ * redo the operation, and to log "done" items to indicate that redo
++ * is not necessary.
++ *
++ * Deferred work is tracked in xfs_defer_pending items.  Each pending
++ * item tracks one type of deferred work.  Incoming work items (which
++ * have not yet had an intent logged) are attached to a pending item
++ * on the dop_intake list, where they wait for the caller to finish
++ * the deferred operations.
++ *
++ * Finishing a set of deferred operations is an involved process.  To
++ * start, we define "rolling a deferred-op transaction" as follows:
++ *
++ * > For each xfs_defer_pending item on the dop_intake list,
++ *   - Sort the work items in AG order.  XFS locking
++ *     order rules require us to lock buffers in AG order.
++ *   - Create a log intent item for that type.
++ *   - Attach it to the pending item.
++ *   - Move the pending item from the dop_intake list to the
++ *     dop_pending list.
++ * > Roll the transaction.
++ *
++ * NOTE: To avoid exceeding the transaction reservation, we limit the
++ * number of items that we attach to a given xfs_defer_pending.
++ *
++ * The actual finishing process looks like this:
++ *
++ * > For each xfs_defer_pending in the dop_pending list,
++ *   - Roll the deferred-op transaction as above.
++ *   - Create a log done item for that type, and attach it to the
++ *     log intent item.
++ *   - For each work item attached to the log intent item,
++ *     * Perform the described action.
++ *     * Attach the work item to the log done item.
++ *
++ * The key here is that we must log an intent item for all pending
++ * work items every time we roll the transaction, and that we must log
++ * a done item as soon as the work is completed.  With this mechanism
++ * we can perform complex remapping operations, chaining intent items
++ * as needed.
++ *
++ * This is an example of remapping the extent (E, E+B) into file X at
++ * offset A and dealing with the extent (C, C+B) already being mapped
++ * there:
++ * +-------------------------------------------------+
++ * | Unmap file X startblock C offset A length B     | t0
++ * | Intent to reduce refcount for extent (C, B)     |
++ * | Intent to remove rmap (X, C, A, B)              |
++ * | Intent to free extent (D, 1) (bmbt block)       |
++ * | Intent to map (X, A, B) at startblock E         |
++ * +-------------------------------------------------+
++ * | Map file X startblock E offset A length B       | t1
++ * | Done mapping (X, E, A, B)                       |
++ * | Intent to increase refcount for extent (E, B)   |
++ * | Intent to add rmap (X, E, A, B)                 |
++ * +-------------------------------------------------+
++ * | Reduce refcount for extent (C, B)               | t2
++ * | Done reducing refcount for extent (C, B)        |
++ * | Increase refcount for extent (E, B)             |
++ * | Done increasing refcount for extent (E, B)      |
++ * | Intent to free extent (C, B)                    |
++ * | Intent to free extent (F, 1) (refcountbt block) |
++ * | Intent to remove rmap (F, 1, REFC)              |
++ * +-------------------------------------------------+
++ * | Remove rmap (X, C, A, B)                        | t3
++ * | Done removing rmap (X, C, A, B)                 |
++ * | Add rmap (X, E, A, B)                           |
++ * | Done adding rmap (X, E, A, B)                   |
++ * | Remove rmap (F, 1, REFC)                        |
++ * | Done removing rmap (F, 1, REFC)                 |
++ * +-------------------------------------------------+
++ * | Free extent (C, B)                              | t4
++ * | Done freeing extent (C, B)                      |
++ * | Free extent (D, 1)                              |
++ * | Done freeing extent (D, 1)                      |
++ * | Free extent (F, 1)                              |
++ * | Done freeing extent (F, 1)                      |
++ * +-------------------------------------------------+
++ *
++ * If we should crash before t2 commits, log recovery replays
++ * the following intent items:
++ *
++ * - Intent to reduce refcount for extent (C, B)
++ * - Intent to remove rmap (X, C, A, B)
++ * - Intent to free extent (D, 1) (bmbt block)
++ * - Intent to increase refcount for extent (E, B)
++ * - Intent to add rmap (X, E, A, B)
++ *
++ * In the process of recovering, it should also generate and take care
++ * of these intent items:
++ *
++ * - Intent to free extent (C, B)
++ * - Intent to free extent (F, 1) (refcountbt block)
++ * - Intent to remove rmap (F, 1, REFC)
++ */
++
++static const struct xfs_defer_op_type *defer_op_types[XFS_DEFER_OPS_TYPE_MAX];
++
++/*
++ * For each pending item in the intake list, log its intent item and the
++ * associated extents, then add the entire intake list to the end of
++ * the pending list.
++ */
++STATIC void
++xfs_defer_intake_work(
++	struct xfs_trans		*tp,
++	struct xfs_defer_ops		*dop)
++{
++	struct list_head		*li;
++	struct xfs_defer_pending	*dfp;
++
++	list_for_each_entry(dfp, &dop->dop_intake, dfp_list) {
++		dfp->dfp_intent = dfp->dfp_type->create_intent(tp,
++				dfp->dfp_count);
++		list_sort(tp->t_mountp, &dfp->dfp_work,
++				dfp->dfp_type->diff_items);
++		list_for_each(li, &dfp->dfp_work)
++			dfp->dfp_type->log_item(tp, dfp->dfp_intent, li);
++	}
++
++	list_splice_tail_init(&dop->dop_intake, &dop->dop_pending);
++}
++
++/* Abort all the intents that were committed. */
++STATIC void
++xfs_defer_trans_abort(
++	struct xfs_trans		*tp,
++	struct xfs_defer_ops		*dop,
++	int				error)
++{
++	struct xfs_defer_pending	*dfp;
++
++	/*
++	 * If the transaction was committed, drop the intent reference
++	 * since we're bailing out of here. The other reference is
++	 * dropped when the intent hits the AIL.  If the transaction
++	 * was not committed, the intent is freed by the intent item
++	 * unlock handler on abort.
++	 */
++	if (!dop->dop_committed)
++		return;
++
++	/* Abort intent items. */
++	list_for_each_entry(dfp, &dop->dop_pending, dfp_list) {
++		if (dfp->dfp_committed)
++			dfp->dfp_type->abort_intent(dfp->dfp_intent);
++	}
++
++	/* Shut down FS. */
++	xfs_force_shutdown(tp->t_mountp, (error == -EFSCORRUPTED) ?
++			SHUTDOWN_CORRUPT_INCORE : SHUTDOWN_META_IO_ERROR);
++}
++
++/* Roll a transaction so we can do some deferred op processing. */
++STATIC int
++xfs_defer_trans_roll(
++	struct xfs_trans		**tp,
++	struct xfs_defer_ops		*dop,
++	struct xfs_inode		*ip)
++{
++	int				i;
++	int				error;
++
++	/* Log all the joined inodes except the one we passed in. */
++	for (i = 0; i < XFS_DEFER_OPS_NR_INODES && dop->dop_inodes[i]; i++) {
++		if (dop->dop_inodes[i] == ip)
++			continue;
++		xfs_trans_log_inode(*tp, dop->dop_inodes[i], XFS_ILOG_CORE);
++	}
++
++	/* Roll the transaction. */
++	error = xfs_trans_roll(tp, ip);
++	if (error) {
++		xfs_defer_trans_abort(*tp, dop, error);
++		return error;
++	}
++	dop->dop_committed = true;
++
++	/* Rejoin the joined inodes except the one we passed in. */
++	for (i = 0; i < XFS_DEFER_OPS_NR_INODES && dop->dop_inodes[i]; i++) {
++		if (dop->dop_inodes[i] == ip)
++			continue;
++		xfs_trans_ijoin(*tp, dop->dop_inodes[i], 0);
++	}
++
++	return error;
++}
++
++/* Do we have any work items to finish? */
++bool
++xfs_defer_has_unfinished_work(
++	struct xfs_defer_ops		*dop)
++{
++	return !list_empty(&dop->dop_pending) || !list_empty(&dop->dop_intake);
++}
++
++/*
++ * Add this inode to the deferred op.  Each joined inode is relogged
++ * each time we roll the transaction, in addition to any inode passed
++ * to xfs_defer_finish().
++ */
++int
++xfs_defer_join(
++	struct xfs_defer_ops		*dop,
++	struct xfs_inode		*ip)
++{
++	int				i;
++
++	for (i = 0; i < XFS_DEFER_OPS_NR_INODES; i++) {
++		if (dop->dop_inodes[i] == ip)
++			return 0;
++		else if (dop->dop_inodes[i] == NULL) {
++			dop->dop_inodes[i] = ip;
++			return 0;
++		}
++	}
++
++	return -EFSCORRUPTED;
++}
++
++/*
++ * Finish all the pending work.  This involves logging intent items for
++ * any work items that wandered in since the last transaction roll (if
++ * one has even happened), rolling the transaction, and finishing the
++ * work items in the first item on the logged-and-pending list.
++ *
++ * If an inode is provided, relog it to the new transaction.
++ */
++int
++xfs_defer_finish(
++	struct xfs_trans		**tp,
++	struct xfs_defer_ops		*dop,
++	struct xfs_inode		*ip)
++{
++	struct xfs_defer_pending	*dfp;
++	struct list_head		*li;
++	struct list_head		*n;
++	void				*done_item = NULL;
++	void				*state;
++	int				error = 0;
++	void				(*cleanup_fn)(struct xfs_trans *, void *, int);
++
++	ASSERT((*tp)->t_flags & XFS_TRANS_PERM_LOG_RES);
++
++	/* Until we run out of pending work to finish... */
++	while (xfs_defer_has_unfinished_work(dop)) {
++		/* Log intents for work items sitting in the intake. */
++		xfs_defer_intake_work(*tp, dop);
++
++		/* Roll the transaction. */
++		error = xfs_defer_trans_roll(tp, dop, ip);
++		if (error)
++			goto out;
++
++		/* Mark all pending intents as committed. */
++		list_for_each_entry_reverse(dfp, &dop->dop_pending, dfp_list) {
++			if (dfp->dfp_committed)
++				break;
++			dfp->dfp_committed = true;
++		}
++
++		/* Log an intent-done item for the first pending item. */
++		dfp = list_first_entry(&dop->dop_pending,
++				struct xfs_defer_pending, dfp_list);
++		done_item = dfp->dfp_type->create_done(*tp, dfp->dfp_intent,
++				dfp->dfp_count);
++		cleanup_fn = dfp->dfp_type->finish_cleanup;
++
++		/* Finish the work items. */
++		state = NULL;
++		list_for_each_safe(li, n, &dfp->dfp_work) {
++			list_del(li);
++			dfp->dfp_count--;
++			error = dfp->dfp_type->finish_item(*tp, dop, li,
++					done_item, &state);
++			if (error) {
++				/*
++				 * Clean up after ourselves and jump out.
++				 * xfs_defer_cancel will take care of freeing
++				 * all these lists and stuff.
++				 */
++				if (cleanup_fn)
++					cleanup_fn(*tp, state, error);
++				xfs_defer_trans_abort(*tp, dop, error);
++				goto out;
++			}
++		}
++		/* Done with the dfp, free it. */
++		list_del(&dfp->dfp_list);
++		kmem_free(dfp);
++
++		if (cleanup_fn)
++			cleanup_fn(*tp, state, error);
++	}
++
++out:
++	return error;
++}
++
++/*
++ * Free up any items left in the list.
++ */
++void
++xfs_defer_cancel(
++	struct xfs_defer_ops		*dop)
++{
++	struct xfs_defer_pending	*dfp;
++	struct xfs_defer_pending	*pli;
++	struct list_head		*pwi;
++	struct list_head		*n;
++
++	/*
++	 * Free the pending items.  Caller should already have arranged
++	 * for the intent items to be released.
++	 */
++	list_for_each_entry_safe(dfp, pli, &dop->dop_intake, dfp_list) {
++		list_del(&dfp->dfp_list);
++		list_for_each_safe(pwi, n, &dfp->dfp_work) {
++			list_del(pwi);
++			dfp->dfp_count--;
++			dfp->dfp_type->cancel_item(pwi);
++		}
++		ASSERT(dfp->dfp_count == 0);
++		kmem_free(dfp);
++	}
++	list_for_each_entry_safe(dfp, pli, &dop->dop_pending, dfp_list) {
++		list_del(&dfp->dfp_list);
++		list_for_each_safe(pwi, n, &dfp->dfp_work) {
++			list_del(pwi);
++			dfp->dfp_count--;
++			dfp->dfp_type->cancel_item(pwi);
++		}
++		ASSERT(dfp->dfp_count == 0);
++		kmem_free(dfp);
++	}
++}
++
++/* Add an item for later deferred processing. */
++void
++xfs_defer_add(
++	struct xfs_defer_ops		*dop,
++	enum xfs_defer_ops_type		type,
++	struct list_head		*li)
++{
++	struct xfs_defer_pending	*dfp = NULL;
++
++	/*
++	 * Add the item to a pending item at the end of the intake list.
++	 * If the last pending item has the same type, reuse it.  Else,
++	 * create a new pending item at the end of the intake list.
++	 */
++	if (!list_empty(&dop->dop_intake)) {
++		dfp = list_last_entry(&dop->dop_intake,
++				struct xfs_defer_pending, dfp_list);
++		if (dfp->dfp_type->type != type ||
++		    (dfp->dfp_type->max_items &&
++		     dfp->dfp_count >= dfp->dfp_type->max_items))
++			dfp = NULL;
++	}
++	if (!dfp) {
++		dfp = kmem_alloc(sizeof(struct xfs_defer_pending),
++				KM_SLEEP | KM_NOFS);
++		dfp->dfp_type = defer_op_types[type];
++		dfp->dfp_committed = false;
++		dfp->dfp_intent = NULL;
++		dfp->dfp_count = 0;
++		INIT_LIST_HEAD(&dfp->dfp_work);
++		list_add_tail(&dfp->dfp_list, &dop->dop_intake);
++	}
++
++	list_add_tail(li, &dfp->dfp_work);
++	dfp->dfp_count++;
++}
++
++/* Initialize a deferred operation list. */
++void
++xfs_defer_init_op_type(
++	const struct xfs_defer_op_type	*type)
++{
++	defer_op_types[type->type] = type;
++}
++
++/* Initialize a deferred operation. */
++void
++xfs_defer_init(
++	struct xfs_defer_ops		*dop,
++	xfs_fsblock_t			*fbp)
++{
++	dop->dop_committed = false;
++	dop->dop_low = false;
++	memset(&dop->dop_inodes, 0, sizeof(dop->dop_inodes));
++	*fbp = NULLFSBLOCK;
++	INIT_LIST_HEAD(&dop->dop_intake);
++	INIT_LIST_HEAD(&dop->dop_pending);
++}

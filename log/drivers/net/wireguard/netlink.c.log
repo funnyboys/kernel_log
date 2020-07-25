@@ -1,0 +1,1063 @@
+commit 900575aa33a3eaaef802b31de187a85c4a4b4bd0
+Author: Jason A. Donenfeld <Jason@zx2c4.com>
+Date:   Tue Jun 23 03:59:45 2020 -0600
+
+    wireguard: device: avoid circular netns references
+    
+    Before, we took a reference to the creating netns if the new netns was
+    different. This caused issues with circular references, with two
+    wireguard interfaces swapping namespaces. The solution is to rather not
+    take any extra references at all, but instead simply invalidate the
+    creating netns pointer when that netns is deleted.
+    
+    In order to prevent this from happening again, this commit improves the
+    rough object leak tracking by allowing it to account for created and
+    destroyed interfaces, aside from just peers and keys. That then makes it
+    possible to check for the object leak when having two interfaces take a
+    reference to each others' namespaces.
+    
+    Fixes: e7096c131e51 ("net: WireGuard secure network tunnel")
+    Signed-off-by: Jason A. Donenfeld <Jason@zx2c4.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/wireguard/netlink.c b/drivers/net/wireguard/netlink.c
+index 802099c8828a..20a4f3c0a0a1 100644
+--- a/drivers/net/wireguard/netlink.c
++++ b/drivers/net/wireguard/netlink.c
+@@ -511,11 +511,15 @@ static int wg_set_device(struct sk_buff *skb, struct genl_info *info)
+ 	if (flags & ~__WGDEVICE_F_ALL)
+ 		goto out;
+ 
+-	ret = -EPERM;
+-	if ((info->attrs[WGDEVICE_A_LISTEN_PORT] ||
+-	     info->attrs[WGDEVICE_A_FWMARK]) &&
+-	    !ns_capable(wg->creating_net->user_ns, CAP_NET_ADMIN))
+-		goto out;
++	if (info->attrs[WGDEVICE_A_LISTEN_PORT] || info->attrs[WGDEVICE_A_FWMARK]) {
++		struct net *net;
++		rcu_read_lock();
++		net = rcu_dereference(wg->creating_net);
++		ret = !net || !ns_capable(net->user_ns, CAP_NET_ADMIN) ? -EPERM : 0;
++		rcu_read_unlock();
++		if (ret)
++			goto out;
++	}
+ 
+ 	++wg->device_update_gen;
+ 
+
+commit 11a7686aa99c7fe4b3f80f6dcccd54129817984d
+Author: Jason A. Donenfeld <Jason@zx2c4.com>
+Date:   Wed Mar 18 18:30:47 2020 -0600
+
+    wireguard: noise: error out precomputed DH during handshake rather than config
+    
+    We precompute the static-static ECDH during configuration time, in order
+    to save an expensive computation later when receiving network packets.
+    However, not all ECDH computations yield a contributory result. Prior,
+    we were just not letting those peers be added to the interface. However,
+    this creates a strange inconsistency, since it was still possible to add
+    other weird points, like a valid public key plus a low-order point, and,
+    like points that result in zeros, a handshake would not complete. In
+    order to make the behavior more uniform and less surprising, simply
+    allow all peers to be added. Then, we'll error out later when doing the
+    crypto if there's an issue. This also adds more separation between the
+    crypto layer and the configuration layer.
+    
+    Discussed-with: Mathias Hall-Andersen <mathias@hall-andersen.dk>
+    Signed-off-by: Jason A. Donenfeld <Jason@zx2c4.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/wireguard/netlink.c b/drivers/net/wireguard/netlink.c
+index bda26405497c..802099c8828a 100644
+--- a/drivers/net/wireguard/netlink.c
++++ b/drivers/net/wireguard/netlink.c
+@@ -411,11 +411,7 @@ static int set_peer(struct wg_device *wg, struct nlattr **attrs)
+ 
+ 		peer = wg_peer_create(wg, public_key, preshared_key);
+ 		if (IS_ERR(peer)) {
+-			/* Similar to the above, if the key is invalid, we skip
+-			 * it without fanfare, so that services don't need to
+-			 * worry about doing key validation themselves.
+-			 */
+-			ret = PTR_ERR(peer) == -EKEYREJECTED ? 0 : PTR_ERR(peer);
++			ret = PTR_ERR(peer);
+ 			peer = NULL;
+ 			goto out;
+ 		}
+@@ -569,7 +565,7 @@ static int wg_set_device(struct sk_buff *skb, struct genl_info *info)
+ 							 private_key);
+ 		list_for_each_entry_safe(peer, temp, &wg->peer_list,
+ 					 peer_list) {
+-			BUG_ON(!wg_noise_precompute_static_static(peer));
++			wg_noise_precompute_static_static(peer);
+ 			wg_noise_expire_current_peer_keypairs(peer);
+ 		}
+ 		wg_cookie_checker_precompute_device_keys(&wg->cookie_checker);
+
+commit ec31c2676a10e064878927b243fada8c2fb0c03c
+Author: Jason A. Donenfeld <Jason@zx2c4.com>
+Date:   Tue Feb 4 22:17:26 2020 +0100
+
+    wireguard: noise: reject peers with low order public keys
+    
+    Our static-static calculation returns a failure if the public key is of
+    low order. We check for this when peers are added, and don't allow them
+    to be added if they're low order, except in the case where we haven't
+    yet been given a private key. In that case, we would defer the removal
+    of the peer until we're given a private key, since at that point we're
+    doing new static-static calculations which incur failures we can act on.
+    This meant, however, that we wound up removing peers rather late in the
+    configuration flow.
+    
+    Syzkaller points out that peer_remove calls flush_workqueue, which in
+    turn might then wait for sending a handshake initiation to complete.
+    Since handshake initiation needs the static identity lock, holding the
+    static identity lock while calling peer_remove can result in a rare
+    deadlock. We have precisely this case in this situation of late-stage
+    peer removal based on an invalid public key. We can't drop the lock when
+    removing, because then incoming handshakes might interact with a bogus
+    static-static calculation.
+    
+    While the band-aid patch for this would involve breaking up the peer
+    removal into two steps like wg_peer_remove_all does, in order to solve
+    the locking issue, there's actually a much more elegant way of fixing
+    this:
+    
+    If the static-static calculation succeeds with one private key, it
+    *must* succeed with all others, because all 32-byte strings map to valid
+    private keys, thanks to clamping. That means we can get rid of this
+    silly dance and locking headaches of removing peers late in the
+    configuration flow, and instead just reject them early on, regardless of
+    whether the device has yet been assigned a private key. For the case
+    where the device doesn't yet have a private key, we safely use zeros
+    just for the purposes of checking for low order points by way of
+    checking the output of the calculation.
+    
+    The following PoC will trigger the deadlock:
+    
+    ip link add wg0 type wireguard
+    ip addr add 10.0.0.1/24 dev wg0
+    ip link set wg0 up
+    ping -f 10.0.0.2 &
+    while true; do
+            wg set wg0 private-key /dev/null peer AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= allowed-ips 10.0.0.0/24 endpoint 10.0.0.3:1234
+            wg set wg0 private-key <(echo AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=)
+    done
+    
+    [    0.949105] ======================================================
+    [    0.949550] WARNING: possible circular locking dependency detected
+    [    0.950143] 5.5.0-debug+ #18 Not tainted
+    [    0.950431] ------------------------------------------------------
+    [    0.950959] wg/89 is trying to acquire lock:
+    [    0.951252] ffff8880333e2128 ((wq_completion)wg-kex-wg0){+.+.}, at: flush_workqueue+0xe3/0x12f0
+    [    0.951865]
+    [    0.951865] but task is already holding lock:
+    [    0.952280] ffff888032819bc0 (&wg->static_identity.lock){++++}, at: wg_set_device+0x95d/0xcc0
+    [    0.953011]
+    [    0.953011] which lock already depends on the new lock.
+    [    0.953011]
+    [    0.953651]
+    [    0.953651] the existing dependency chain (in reverse order) is:
+    [    0.954292]
+    [    0.954292] -> #2 (&wg->static_identity.lock){++++}:
+    [    0.954804]        lock_acquire+0x127/0x350
+    [    0.955133]        down_read+0x83/0x410
+    [    0.955428]        wg_noise_handshake_create_initiation+0x97/0x700
+    [    0.955885]        wg_packet_send_handshake_initiation+0x13a/0x280
+    [    0.956401]        wg_packet_handshake_send_worker+0x10/0x20
+    [    0.956841]        process_one_work+0x806/0x1500
+    [    0.957167]        worker_thread+0x8c/0xcb0
+    [    0.957549]        kthread+0x2ee/0x3b0
+    [    0.957792]        ret_from_fork+0x24/0x30
+    [    0.958234]
+    [    0.958234] -> #1 ((work_completion)(&peer->transmit_handshake_work)){+.+.}:
+    [    0.958808]        lock_acquire+0x127/0x350
+    [    0.959075]        process_one_work+0x7ab/0x1500
+    [    0.959369]        worker_thread+0x8c/0xcb0
+    [    0.959639]        kthread+0x2ee/0x3b0
+    [    0.959896]        ret_from_fork+0x24/0x30
+    [    0.960346]
+    [    0.960346] -> #0 ((wq_completion)wg-kex-wg0){+.+.}:
+    [    0.960945]        check_prev_add+0x167/0x1e20
+    [    0.961351]        __lock_acquire+0x2012/0x3170
+    [    0.961725]        lock_acquire+0x127/0x350
+    [    0.961990]        flush_workqueue+0x106/0x12f0
+    [    0.962280]        peer_remove_after_dead+0x160/0x220
+    [    0.962600]        wg_set_device+0xa24/0xcc0
+    [    0.962994]        genl_rcv_msg+0x52f/0xe90
+    [    0.963298]        netlink_rcv_skb+0x111/0x320
+    [    0.963618]        genl_rcv+0x1f/0x30
+    [    0.963853]        netlink_unicast+0x3f6/0x610
+    [    0.964245]        netlink_sendmsg+0x700/0xb80
+    [    0.964586]        __sys_sendto+0x1dd/0x2c0
+    [    0.964854]        __x64_sys_sendto+0xd8/0x1b0
+    [    0.965141]        do_syscall_64+0x90/0xd9a
+    [    0.965408]        entry_SYSCALL_64_after_hwframe+0x49/0xbe
+    [    0.965769]
+    [    0.965769] other info that might help us debug this:
+    [    0.965769]
+    [    0.966337] Chain exists of:
+    [    0.966337]   (wq_completion)wg-kex-wg0 --> (work_completion)(&peer->transmit_handshake_work) --> &wg->static_identity.lock
+    [    0.966337]
+    [    0.967417]  Possible unsafe locking scenario:
+    [    0.967417]
+    [    0.967836]        CPU0                    CPU1
+    [    0.968155]        ----                    ----
+    [    0.968497]   lock(&wg->static_identity.lock);
+    [    0.968779]                                lock((work_completion)(&peer->transmit_handshake_work));
+    [    0.969345]                                lock(&wg->static_identity.lock);
+    [    0.969809]   lock((wq_completion)wg-kex-wg0);
+    [    0.970146]
+    [    0.970146]  *** DEADLOCK ***
+    [    0.970146]
+    [    0.970531] 5 locks held by wg/89:
+    [    0.970908]  #0: ffffffff827433c8 (cb_lock){++++}, at: genl_rcv+0x10/0x30
+    [    0.971400]  #1: ffffffff82743480 (genl_mutex){+.+.}, at: genl_rcv_msg+0x642/0xe90
+    [    0.971924]  #2: ffffffff827160c0 (rtnl_mutex){+.+.}, at: wg_set_device+0x9f/0xcc0
+    [    0.972488]  #3: ffff888032819de0 (&wg->device_update_lock){+.+.}, at: wg_set_device+0xb0/0xcc0
+    [    0.973095]  #4: ffff888032819bc0 (&wg->static_identity.lock){++++}, at: wg_set_device+0x95d/0xcc0
+    [    0.973653]
+    [    0.973653] stack backtrace:
+    [    0.973932] CPU: 1 PID: 89 Comm: wg Not tainted 5.5.0-debug+ #18
+    [    0.974476] Call Trace:
+    [    0.974638]  dump_stack+0x97/0xe0
+    [    0.974869]  check_noncircular+0x312/0x3e0
+    [    0.975132]  ? print_circular_bug+0x1f0/0x1f0
+    [    0.975410]  ? __kernel_text_address+0x9/0x30
+    [    0.975727]  ? unwind_get_return_address+0x51/0x90
+    [    0.976024]  check_prev_add+0x167/0x1e20
+    [    0.976367]  ? graph_lock+0x70/0x160
+    [    0.976682]  __lock_acquire+0x2012/0x3170
+    [    0.976998]  ? register_lock_class+0x1140/0x1140
+    [    0.977323]  lock_acquire+0x127/0x350
+    [    0.977627]  ? flush_workqueue+0xe3/0x12f0
+    [    0.977890]  flush_workqueue+0x106/0x12f0
+    [    0.978147]  ? flush_workqueue+0xe3/0x12f0
+    [    0.978410]  ? find_held_lock+0x2c/0x110
+    [    0.978662]  ? lock_downgrade+0x6e0/0x6e0
+    [    0.978919]  ? queue_rcu_work+0x60/0x60
+    [    0.979166]  ? netif_napi_del+0x151/0x3b0
+    [    0.979501]  ? peer_remove_after_dead+0x160/0x220
+    [    0.979871]  peer_remove_after_dead+0x160/0x220
+    [    0.980232]  wg_set_device+0xa24/0xcc0
+    [    0.980516]  ? deref_stack_reg+0x8e/0xc0
+    [    0.980801]  ? set_peer+0xe10/0xe10
+    [    0.981040]  ? __ww_mutex_check_waiters+0x150/0x150
+    [    0.981430]  ? __nla_validate_parse+0x163/0x270
+    [    0.981719]  ? genl_family_rcv_msg_attrs_parse+0x13f/0x310
+    [    0.982078]  genl_rcv_msg+0x52f/0xe90
+    [    0.982348]  ? genl_family_rcv_msg_attrs_parse+0x310/0x310
+    [    0.982690]  ? register_lock_class+0x1140/0x1140
+    [    0.983049]  netlink_rcv_skb+0x111/0x320
+    [    0.983298]  ? genl_family_rcv_msg_attrs_parse+0x310/0x310
+    [    0.983645]  ? netlink_ack+0x880/0x880
+    [    0.983888]  genl_rcv+0x1f/0x30
+    [    0.984168]  netlink_unicast+0x3f6/0x610
+    [    0.984443]  ? netlink_detachskb+0x60/0x60
+    [    0.984729]  ? find_held_lock+0x2c/0x110
+    [    0.984976]  netlink_sendmsg+0x700/0xb80
+    [    0.985220]  ? netlink_broadcast_filtered+0xa60/0xa60
+    [    0.985533]  __sys_sendto+0x1dd/0x2c0
+    [    0.985763]  ? __x64_sys_getpeername+0xb0/0xb0
+    [    0.986039]  ? sockfd_lookup_light+0x17/0x160
+    [    0.986397]  ? __sys_recvmsg+0x8c/0xf0
+    [    0.986711]  ? __sys_recvmsg_sock+0xd0/0xd0
+    [    0.987018]  __x64_sys_sendto+0xd8/0x1b0
+    [    0.987283]  ? lockdep_hardirqs_on+0x39b/0x5a0
+    [    0.987666]  do_syscall_64+0x90/0xd9a
+    [    0.987903]  entry_SYSCALL_64_after_hwframe+0x49/0xbe
+    [    0.988223] RIP: 0033:0x7fe77c12003e
+    [    0.988508] Code: c3 8b 07 85 c0 75 24 49 89 fb 48 89 f0 48 89 d7 48 89 ce 4c 89 c2 4d 89 ca 4c 8b 44 24 08 4c 8b 4c 24 10 4c 4
+    [    0.989666] RSP: 002b:00007fffada2ed58 EFLAGS: 00000246 ORIG_RAX: 000000000000002c
+    [    0.990137] RAX: ffffffffffffffda RBX: 00007fe77c159d48 RCX: 00007fe77c12003e
+    [    0.990583] RDX: 0000000000000040 RSI: 000055fd1d38e020 RDI: 0000000000000004
+    [    0.991091] RBP: 000055fd1d38e020 R08: 000055fd1cb63358 R09: 000000000000000c
+    [    0.991568] R10: 0000000000000000 R11: 0000000000000246 R12: 000000000000002c
+    [    0.992014] R13: 0000000000000004 R14: 000055fd1d38e020 R15: 0000000000000001
+    
+    Signed-off-by: Jason A. Donenfeld <Jason@zx2c4.com>
+    Reported-by: syzbot <syzkaller@googlegroups.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/wireguard/netlink.c b/drivers/net/wireguard/netlink.c
+index 0fdbd1c45977..bda26405497c 100644
+--- a/drivers/net/wireguard/netlink.c
++++ b/drivers/net/wireguard/netlink.c
+@@ -569,10 +569,8 @@ static int wg_set_device(struct sk_buff *skb, struct genl_info *info)
+ 							 private_key);
+ 		list_for_each_entry_safe(peer, temp, &wg->peer_list,
+ 					 peer_list) {
+-			if (wg_noise_precompute_static_static(peer))
+-				wg_noise_expire_current_peer_keypairs(peer);
+-			else
+-				wg_peer_remove(peer);
++			BUG_ON(!wg_noise_precompute_static_static(peer));
++			wg_noise_expire_current_peer_keypairs(peer);
+ 		}
+ 		wg_cookie_checker_precompute_device_keys(&wg->cookie_checker);
+ 		up_write(&wg->static_identity.lock);
+
+commit e7096c131e5161fa3b8e52a650d7719d2857adfd
+Author: Jason A. Donenfeld <Jason@zx2c4.com>
+Date:   Mon Dec 9 00:27:34 2019 +0100
+
+    net: WireGuard secure network tunnel
+    
+    WireGuard is a layer 3 secure networking tunnel made specifically for
+    the kernel, that aims to be much simpler and easier to audit than IPsec.
+    Extensive documentation and description of the protocol and
+    considerations, along with formal proofs of the cryptography, are
+    available at:
+    
+      * https://www.wireguard.com/
+      * https://www.wireguard.com/papers/wireguard.pdf
+    
+    This commit implements WireGuard as a simple network device driver,
+    accessible in the usual RTNL way used by virtual network drivers. It
+    makes use of the udp_tunnel APIs, GRO, GSO, NAPI, and the usual set of
+    networking subsystem APIs. It has a somewhat novel multicore queueing
+    system designed for maximum throughput and minimal latency of encryption
+    operations, but it is implemented modestly using workqueues and NAPI.
+    Configuration is done via generic Netlink, and following a review from
+    the Netlink maintainer a year ago, several high profile userspace tools
+    have already implemented the API.
+    
+    This commit also comes with several different tests, both in-kernel
+    tests and out-of-kernel tests based on network namespaces, taking profit
+    of the fact that sockets used by WireGuard intentionally stay in the
+    namespace the WireGuard interface was originally created, exactly like
+    the semantics of userspace tun devices. See wireguard.com/netns/ for
+    pictures and examples.
+    
+    The source code is fairly short, but rather than combining everything
+    into a single file, WireGuard is developed as cleanly separable files,
+    making auditing and comprehension easier. Things are laid out as
+    follows:
+    
+      * noise.[ch], cookie.[ch], messages.h: These implement the bulk of the
+        cryptographic aspects of the protocol, and are mostly data-only in
+        nature, taking in buffers of bytes and spitting out buffers of
+        bytes. They also handle reference counting for their various shared
+        pieces of data, like keys and key lists.
+    
+      * ratelimiter.[ch]: Used as an integral part of cookie.[ch] for
+        ratelimiting certain types of cryptographic operations in accordance
+        with particular WireGuard semantics.
+    
+      * allowedips.[ch], peerlookup.[ch]: The main lookup structures of
+        WireGuard, the former being trie-like with particular semantics, an
+        integral part of the design of the protocol, and the latter just
+        being nice helper functions around the various hashtables we use.
+    
+      * device.[ch]: Implementation of functions for the netdevice and for
+        rtnl, responsible for maintaining the life of a given interface and
+        wiring it up to the rest of WireGuard.
+    
+      * peer.[ch]: Each interface has a list of peers, with helper functions
+        available here for creation, destruction, and reference counting.
+    
+      * socket.[ch]: Implementation of functions related to udp_socket and
+        the general set of kernel socket APIs, for sending and receiving
+        ciphertext UDP packets, and taking care of WireGuard-specific sticky
+        socket routing semantics for the automatic roaming.
+    
+      * netlink.[ch]: Userspace API entry point for configuring WireGuard
+        peers and devices. The API has been implemented by several userspace
+        tools and network management utility, and the WireGuard project
+        distributes the basic wg(8) tool.
+    
+      * queueing.[ch]: Shared function on the rx and tx path for handling
+        the various queues used in the multicore algorithms.
+    
+      * send.c: Handles encrypting outgoing packets in parallel on
+        multiple cores, before sending them in order on a single core, via
+        workqueues and ring buffers. Also handles sending handshake and cookie
+        messages as part of the protocol, in parallel.
+    
+      * receive.c: Handles decrypting incoming packets in parallel on
+        multiple cores, before passing them off in order to be ingested via
+        the rest of the networking subsystem with GRO via the typical NAPI
+        poll function. Also handles receiving handshake and cookie messages
+        as part of the protocol, in parallel.
+    
+      * timers.[ch]: Uses the timer wheel to implement protocol particular
+        event timeouts, and gives a set of very simple event-driven entry
+        point functions for callers.
+    
+      * main.c, version.h: Initialization and deinitialization of the module.
+    
+      * selftest/*.h: Runtime unit tests for some of the most security
+        sensitive functions.
+    
+      * tools/testing/selftests/wireguard/netns.sh: Aforementioned testing
+        script using network namespaces.
+    
+    This commit aims to be as self-contained as possible, implementing
+    WireGuard as a standalone module not needing much special handling or
+    coordination from the network subsystem. I expect for future
+    optimizations to the network stack to positively improve WireGuard, and
+    vice-versa, but for the time being, this exists as intentionally
+    standalone.
+    
+    We introduce a menu option for CONFIG_WIREGUARD, as well as providing a
+    verbose debug log and self-tests via CONFIG_WIREGUARD_DEBUG.
+    
+    Signed-off-by: Jason A. Donenfeld <Jason@zx2c4.com>
+    Cc: David Miller <davem@davemloft.net>
+    Cc: Greg KH <gregkh@linuxfoundation.org>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Herbert Xu <herbert@gondor.apana.org.au>
+    Cc: linux-crypto@vger.kernel.org
+    Cc: linux-kernel@vger.kernel.org
+    Cc: netdev@vger.kernel.org
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/wireguard/netlink.c b/drivers/net/wireguard/netlink.c
+new file mode 100644
+index 000000000000..0fdbd1c45977
+--- /dev/null
++++ b/drivers/net/wireguard/netlink.c
+@@ -0,0 +1,642 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright (C) 2015-2019 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.
++ */
++
++#include "netlink.h"
++#include "device.h"
++#include "peer.h"
++#include "socket.h"
++#include "queueing.h"
++#include "messages.h"
++
++#include <uapi/linux/wireguard.h>
++
++#include <linux/if.h>
++#include <net/genetlink.h>
++#include <net/sock.h>
++#include <crypto/algapi.h>
++
++static struct genl_family genl_family;
++
++static const struct nla_policy device_policy[WGDEVICE_A_MAX + 1] = {
++	[WGDEVICE_A_IFINDEX]		= { .type = NLA_U32 },
++	[WGDEVICE_A_IFNAME]		= { .type = NLA_NUL_STRING, .len = IFNAMSIZ - 1 },
++	[WGDEVICE_A_PRIVATE_KEY]	= { .type = NLA_EXACT_LEN, .len = NOISE_PUBLIC_KEY_LEN },
++	[WGDEVICE_A_PUBLIC_KEY]		= { .type = NLA_EXACT_LEN, .len = NOISE_PUBLIC_KEY_LEN },
++	[WGDEVICE_A_FLAGS]		= { .type = NLA_U32 },
++	[WGDEVICE_A_LISTEN_PORT]	= { .type = NLA_U16 },
++	[WGDEVICE_A_FWMARK]		= { .type = NLA_U32 },
++	[WGDEVICE_A_PEERS]		= { .type = NLA_NESTED }
++};
++
++static const struct nla_policy peer_policy[WGPEER_A_MAX + 1] = {
++	[WGPEER_A_PUBLIC_KEY]				= { .type = NLA_EXACT_LEN, .len = NOISE_PUBLIC_KEY_LEN },
++	[WGPEER_A_PRESHARED_KEY]			= { .type = NLA_EXACT_LEN, .len = NOISE_SYMMETRIC_KEY_LEN },
++	[WGPEER_A_FLAGS]				= { .type = NLA_U32 },
++	[WGPEER_A_ENDPOINT]				= { .type = NLA_MIN_LEN, .len = sizeof(struct sockaddr) },
++	[WGPEER_A_PERSISTENT_KEEPALIVE_INTERVAL]	= { .type = NLA_U16 },
++	[WGPEER_A_LAST_HANDSHAKE_TIME]			= { .type = NLA_EXACT_LEN, .len = sizeof(struct __kernel_timespec) },
++	[WGPEER_A_RX_BYTES]				= { .type = NLA_U64 },
++	[WGPEER_A_TX_BYTES]				= { .type = NLA_U64 },
++	[WGPEER_A_ALLOWEDIPS]				= { .type = NLA_NESTED },
++	[WGPEER_A_PROTOCOL_VERSION]			= { .type = NLA_U32 }
++};
++
++static const struct nla_policy allowedip_policy[WGALLOWEDIP_A_MAX + 1] = {
++	[WGALLOWEDIP_A_FAMILY]		= { .type = NLA_U16 },
++	[WGALLOWEDIP_A_IPADDR]		= { .type = NLA_MIN_LEN, .len = sizeof(struct in_addr) },
++	[WGALLOWEDIP_A_CIDR_MASK]	= { .type = NLA_U8 }
++};
++
++static struct wg_device *lookup_interface(struct nlattr **attrs,
++					  struct sk_buff *skb)
++{
++	struct net_device *dev = NULL;
++
++	if (!attrs[WGDEVICE_A_IFINDEX] == !attrs[WGDEVICE_A_IFNAME])
++		return ERR_PTR(-EBADR);
++	if (attrs[WGDEVICE_A_IFINDEX])
++		dev = dev_get_by_index(sock_net(skb->sk),
++				       nla_get_u32(attrs[WGDEVICE_A_IFINDEX]));
++	else if (attrs[WGDEVICE_A_IFNAME])
++		dev = dev_get_by_name(sock_net(skb->sk),
++				      nla_data(attrs[WGDEVICE_A_IFNAME]));
++	if (!dev)
++		return ERR_PTR(-ENODEV);
++	if (!dev->rtnl_link_ops || !dev->rtnl_link_ops->kind ||
++	    strcmp(dev->rtnl_link_ops->kind, KBUILD_MODNAME)) {
++		dev_put(dev);
++		return ERR_PTR(-EOPNOTSUPP);
++	}
++	return netdev_priv(dev);
++}
++
++static int get_allowedips(struct sk_buff *skb, const u8 *ip, u8 cidr,
++			  int family)
++{
++	struct nlattr *allowedip_nest;
++
++	allowedip_nest = nla_nest_start(skb, 0);
++	if (!allowedip_nest)
++		return -EMSGSIZE;
++
++	if (nla_put_u8(skb, WGALLOWEDIP_A_CIDR_MASK, cidr) ||
++	    nla_put_u16(skb, WGALLOWEDIP_A_FAMILY, family) ||
++	    nla_put(skb, WGALLOWEDIP_A_IPADDR, family == AF_INET6 ?
++		    sizeof(struct in6_addr) : sizeof(struct in_addr), ip)) {
++		nla_nest_cancel(skb, allowedip_nest);
++		return -EMSGSIZE;
++	}
++
++	nla_nest_end(skb, allowedip_nest);
++	return 0;
++}
++
++struct dump_ctx {
++	struct wg_device *wg;
++	struct wg_peer *next_peer;
++	u64 allowedips_seq;
++	struct allowedips_node *next_allowedip;
++};
++
++#define DUMP_CTX(cb) ((struct dump_ctx *)(cb)->args)
++
++static int
++get_peer(struct wg_peer *peer, struct sk_buff *skb, struct dump_ctx *ctx)
++{
++
++	struct nlattr *allowedips_nest, *peer_nest = nla_nest_start(skb, 0);
++	struct allowedips_node *allowedips_node = ctx->next_allowedip;
++	bool fail;
++
++	if (!peer_nest)
++		return -EMSGSIZE;
++
++	down_read(&peer->handshake.lock);
++	fail = nla_put(skb, WGPEER_A_PUBLIC_KEY, NOISE_PUBLIC_KEY_LEN,
++		       peer->handshake.remote_static);
++	up_read(&peer->handshake.lock);
++	if (fail)
++		goto err;
++
++	if (!allowedips_node) {
++		const struct __kernel_timespec last_handshake = {
++			.tv_sec = peer->walltime_last_handshake.tv_sec,
++			.tv_nsec = peer->walltime_last_handshake.tv_nsec
++		};
++
++		down_read(&peer->handshake.lock);
++		fail = nla_put(skb, WGPEER_A_PRESHARED_KEY,
++			       NOISE_SYMMETRIC_KEY_LEN,
++			       peer->handshake.preshared_key);
++		up_read(&peer->handshake.lock);
++		if (fail)
++			goto err;
++
++		if (nla_put(skb, WGPEER_A_LAST_HANDSHAKE_TIME,
++			    sizeof(last_handshake), &last_handshake) ||
++		    nla_put_u16(skb, WGPEER_A_PERSISTENT_KEEPALIVE_INTERVAL,
++				peer->persistent_keepalive_interval) ||
++		    nla_put_u64_64bit(skb, WGPEER_A_TX_BYTES, peer->tx_bytes,
++				      WGPEER_A_UNSPEC) ||
++		    nla_put_u64_64bit(skb, WGPEER_A_RX_BYTES, peer->rx_bytes,
++				      WGPEER_A_UNSPEC) ||
++		    nla_put_u32(skb, WGPEER_A_PROTOCOL_VERSION, 1))
++			goto err;
++
++		read_lock_bh(&peer->endpoint_lock);
++		if (peer->endpoint.addr.sa_family == AF_INET)
++			fail = nla_put(skb, WGPEER_A_ENDPOINT,
++				       sizeof(peer->endpoint.addr4),
++				       &peer->endpoint.addr4);
++		else if (peer->endpoint.addr.sa_family == AF_INET6)
++			fail = nla_put(skb, WGPEER_A_ENDPOINT,
++				       sizeof(peer->endpoint.addr6),
++				       &peer->endpoint.addr6);
++		read_unlock_bh(&peer->endpoint_lock);
++		if (fail)
++			goto err;
++		allowedips_node =
++			list_first_entry_or_null(&peer->allowedips_list,
++					struct allowedips_node, peer_list);
++	}
++	if (!allowedips_node)
++		goto no_allowedips;
++	if (!ctx->allowedips_seq)
++		ctx->allowedips_seq = peer->device->peer_allowedips.seq;
++	else if (ctx->allowedips_seq != peer->device->peer_allowedips.seq)
++		goto no_allowedips;
++
++	allowedips_nest = nla_nest_start(skb, WGPEER_A_ALLOWEDIPS);
++	if (!allowedips_nest)
++		goto err;
++
++	list_for_each_entry_from(allowedips_node, &peer->allowedips_list,
++				 peer_list) {
++		u8 cidr, ip[16] __aligned(__alignof(u64));
++		int family;
++
++		family = wg_allowedips_read_node(allowedips_node, ip, &cidr);
++		if (get_allowedips(skb, ip, cidr, family)) {
++			nla_nest_end(skb, allowedips_nest);
++			nla_nest_end(skb, peer_nest);
++			ctx->next_allowedip = allowedips_node;
++			return -EMSGSIZE;
++		}
++	}
++	nla_nest_end(skb, allowedips_nest);
++no_allowedips:
++	nla_nest_end(skb, peer_nest);
++	ctx->next_allowedip = NULL;
++	ctx->allowedips_seq = 0;
++	return 0;
++err:
++	nla_nest_cancel(skb, peer_nest);
++	return -EMSGSIZE;
++}
++
++static int wg_get_device_start(struct netlink_callback *cb)
++{
++	struct wg_device *wg;
++
++	wg = lookup_interface(genl_dumpit_info(cb)->attrs, cb->skb);
++	if (IS_ERR(wg))
++		return PTR_ERR(wg);
++	DUMP_CTX(cb)->wg = wg;
++	return 0;
++}
++
++static int wg_get_device_dump(struct sk_buff *skb, struct netlink_callback *cb)
++{
++	struct wg_peer *peer, *next_peer_cursor;
++	struct dump_ctx *ctx = DUMP_CTX(cb);
++	struct wg_device *wg = ctx->wg;
++	struct nlattr *peers_nest;
++	int ret = -EMSGSIZE;
++	bool done = true;
++	void *hdr;
++
++	rtnl_lock();
++	mutex_lock(&wg->device_update_lock);
++	cb->seq = wg->device_update_gen;
++	next_peer_cursor = ctx->next_peer;
++
++	hdr = genlmsg_put(skb, NETLINK_CB(cb->skb).portid, cb->nlh->nlmsg_seq,
++			  &genl_family, NLM_F_MULTI, WG_CMD_GET_DEVICE);
++	if (!hdr)
++		goto out;
++	genl_dump_check_consistent(cb, hdr);
++
++	if (!ctx->next_peer) {
++		if (nla_put_u16(skb, WGDEVICE_A_LISTEN_PORT,
++				wg->incoming_port) ||
++		    nla_put_u32(skb, WGDEVICE_A_FWMARK, wg->fwmark) ||
++		    nla_put_u32(skb, WGDEVICE_A_IFINDEX, wg->dev->ifindex) ||
++		    nla_put_string(skb, WGDEVICE_A_IFNAME, wg->dev->name))
++			goto out;
++
++		down_read(&wg->static_identity.lock);
++		if (wg->static_identity.has_identity) {
++			if (nla_put(skb, WGDEVICE_A_PRIVATE_KEY,
++				    NOISE_PUBLIC_KEY_LEN,
++				    wg->static_identity.static_private) ||
++			    nla_put(skb, WGDEVICE_A_PUBLIC_KEY,
++				    NOISE_PUBLIC_KEY_LEN,
++				    wg->static_identity.static_public)) {
++				up_read(&wg->static_identity.lock);
++				goto out;
++			}
++		}
++		up_read(&wg->static_identity.lock);
++	}
++
++	peers_nest = nla_nest_start(skb, WGDEVICE_A_PEERS);
++	if (!peers_nest)
++		goto out;
++	ret = 0;
++	/* If the last cursor was removed via list_del_init in peer_remove, then
++	 * we just treat this the same as there being no more peers left. The
++	 * reason is that seq_nr should indicate to userspace that this isn't a
++	 * coherent dump anyway, so they'll try again.
++	 */
++	if (list_empty(&wg->peer_list) ||
++	    (ctx->next_peer && list_empty(&ctx->next_peer->peer_list))) {
++		nla_nest_cancel(skb, peers_nest);
++		goto out;
++	}
++	lockdep_assert_held(&wg->device_update_lock);
++	peer = list_prepare_entry(ctx->next_peer, &wg->peer_list, peer_list);
++	list_for_each_entry_continue(peer, &wg->peer_list, peer_list) {
++		if (get_peer(peer, skb, ctx)) {
++			done = false;
++			break;
++		}
++		next_peer_cursor = peer;
++	}
++	nla_nest_end(skb, peers_nest);
++
++out:
++	if (!ret && !done && next_peer_cursor)
++		wg_peer_get(next_peer_cursor);
++	wg_peer_put(ctx->next_peer);
++	mutex_unlock(&wg->device_update_lock);
++	rtnl_unlock();
++
++	if (ret) {
++		genlmsg_cancel(skb, hdr);
++		return ret;
++	}
++	genlmsg_end(skb, hdr);
++	if (done) {
++		ctx->next_peer = NULL;
++		return 0;
++	}
++	ctx->next_peer = next_peer_cursor;
++	return skb->len;
++
++	/* At this point, we can't really deal ourselves with safely zeroing out
++	 * the private key material after usage. This will need an additional API
++	 * in the kernel for marking skbs as zero_on_free.
++	 */
++}
++
++static int wg_get_device_done(struct netlink_callback *cb)
++{
++	struct dump_ctx *ctx = DUMP_CTX(cb);
++
++	if (ctx->wg)
++		dev_put(ctx->wg->dev);
++	wg_peer_put(ctx->next_peer);
++	return 0;
++}
++
++static int set_port(struct wg_device *wg, u16 port)
++{
++	struct wg_peer *peer;
++
++	if (wg->incoming_port == port)
++		return 0;
++	list_for_each_entry(peer, &wg->peer_list, peer_list)
++		wg_socket_clear_peer_endpoint_src(peer);
++	if (!netif_running(wg->dev)) {
++		wg->incoming_port = port;
++		return 0;
++	}
++	return wg_socket_init(wg, port);
++}
++
++static int set_allowedip(struct wg_peer *peer, struct nlattr **attrs)
++{
++	int ret = -EINVAL;
++	u16 family;
++	u8 cidr;
++
++	if (!attrs[WGALLOWEDIP_A_FAMILY] || !attrs[WGALLOWEDIP_A_IPADDR] ||
++	    !attrs[WGALLOWEDIP_A_CIDR_MASK])
++		return ret;
++	family = nla_get_u16(attrs[WGALLOWEDIP_A_FAMILY]);
++	cidr = nla_get_u8(attrs[WGALLOWEDIP_A_CIDR_MASK]);
++
++	if (family == AF_INET && cidr <= 32 &&
++	    nla_len(attrs[WGALLOWEDIP_A_IPADDR]) == sizeof(struct in_addr))
++		ret = wg_allowedips_insert_v4(
++			&peer->device->peer_allowedips,
++			nla_data(attrs[WGALLOWEDIP_A_IPADDR]), cidr, peer,
++			&peer->device->device_update_lock);
++	else if (family == AF_INET6 && cidr <= 128 &&
++		 nla_len(attrs[WGALLOWEDIP_A_IPADDR]) == sizeof(struct in6_addr))
++		ret = wg_allowedips_insert_v6(
++			&peer->device->peer_allowedips,
++			nla_data(attrs[WGALLOWEDIP_A_IPADDR]), cidr, peer,
++			&peer->device->device_update_lock);
++
++	return ret;
++}
++
++static int set_peer(struct wg_device *wg, struct nlattr **attrs)
++{
++	u8 *public_key = NULL, *preshared_key = NULL;
++	struct wg_peer *peer = NULL;
++	u32 flags = 0;
++	int ret;
++
++	ret = -EINVAL;
++	if (attrs[WGPEER_A_PUBLIC_KEY] &&
++	    nla_len(attrs[WGPEER_A_PUBLIC_KEY]) == NOISE_PUBLIC_KEY_LEN)
++		public_key = nla_data(attrs[WGPEER_A_PUBLIC_KEY]);
++	else
++		goto out;
++	if (attrs[WGPEER_A_PRESHARED_KEY] &&
++	    nla_len(attrs[WGPEER_A_PRESHARED_KEY]) == NOISE_SYMMETRIC_KEY_LEN)
++		preshared_key = nla_data(attrs[WGPEER_A_PRESHARED_KEY]);
++
++	if (attrs[WGPEER_A_FLAGS])
++		flags = nla_get_u32(attrs[WGPEER_A_FLAGS]);
++	ret = -EOPNOTSUPP;
++	if (flags & ~__WGPEER_F_ALL)
++		goto out;
++
++	ret = -EPFNOSUPPORT;
++	if (attrs[WGPEER_A_PROTOCOL_VERSION]) {
++		if (nla_get_u32(attrs[WGPEER_A_PROTOCOL_VERSION]) != 1)
++			goto out;
++	}
++
++	peer = wg_pubkey_hashtable_lookup(wg->peer_hashtable,
++					  nla_data(attrs[WGPEER_A_PUBLIC_KEY]));
++	ret = 0;
++	if (!peer) { /* Peer doesn't exist yet. Add a new one. */
++		if (flags & (WGPEER_F_REMOVE_ME | WGPEER_F_UPDATE_ONLY))
++			goto out;
++
++		/* The peer is new, so there aren't allowed IPs to remove. */
++		flags &= ~WGPEER_F_REPLACE_ALLOWEDIPS;
++
++		down_read(&wg->static_identity.lock);
++		if (wg->static_identity.has_identity &&
++		    !memcmp(nla_data(attrs[WGPEER_A_PUBLIC_KEY]),
++			    wg->static_identity.static_public,
++			    NOISE_PUBLIC_KEY_LEN)) {
++			/* We silently ignore peers that have the same public
++			 * key as the device. The reason we do it silently is
++			 * that we'd like for people to be able to reuse the
++			 * same set of API calls across peers.
++			 */
++			up_read(&wg->static_identity.lock);
++			ret = 0;
++			goto out;
++		}
++		up_read(&wg->static_identity.lock);
++
++		peer = wg_peer_create(wg, public_key, preshared_key);
++		if (IS_ERR(peer)) {
++			/* Similar to the above, if the key is invalid, we skip
++			 * it without fanfare, so that services don't need to
++			 * worry about doing key validation themselves.
++			 */
++			ret = PTR_ERR(peer) == -EKEYREJECTED ? 0 : PTR_ERR(peer);
++			peer = NULL;
++			goto out;
++		}
++		/* Take additional reference, as though we've just been
++		 * looked up.
++		 */
++		wg_peer_get(peer);
++	}
++
++	if (flags & WGPEER_F_REMOVE_ME) {
++		wg_peer_remove(peer);
++		goto out;
++	}
++
++	if (preshared_key) {
++		down_write(&peer->handshake.lock);
++		memcpy(&peer->handshake.preshared_key, preshared_key,
++		       NOISE_SYMMETRIC_KEY_LEN);
++		up_write(&peer->handshake.lock);
++	}
++
++	if (attrs[WGPEER_A_ENDPOINT]) {
++		struct sockaddr *addr = nla_data(attrs[WGPEER_A_ENDPOINT]);
++		size_t len = nla_len(attrs[WGPEER_A_ENDPOINT]);
++
++		if ((len == sizeof(struct sockaddr_in) &&
++		     addr->sa_family == AF_INET) ||
++		    (len == sizeof(struct sockaddr_in6) &&
++		     addr->sa_family == AF_INET6)) {
++			struct endpoint endpoint = { { { 0 } } };
++
++			memcpy(&endpoint.addr, addr, len);
++			wg_socket_set_peer_endpoint(peer, &endpoint);
++		}
++	}
++
++	if (flags & WGPEER_F_REPLACE_ALLOWEDIPS)
++		wg_allowedips_remove_by_peer(&wg->peer_allowedips, peer,
++					     &wg->device_update_lock);
++
++	if (attrs[WGPEER_A_ALLOWEDIPS]) {
++		struct nlattr *attr, *allowedip[WGALLOWEDIP_A_MAX + 1];
++		int rem;
++
++		nla_for_each_nested(attr, attrs[WGPEER_A_ALLOWEDIPS], rem) {
++			ret = nla_parse_nested(allowedip, WGALLOWEDIP_A_MAX,
++					       attr, allowedip_policy, NULL);
++			if (ret < 0)
++				goto out;
++			ret = set_allowedip(peer, allowedip);
++			if (ret < 0)
++				goto out;
++		}
++	}
++
++	if (attrs[WGPEER_A_PERSISTENT_KEEPALIVE_INTERVAL]) {
++		const u16 persistent_keepalive_interval = nla_get_u16(
++				attrs[WGPEER_A_PERSISTENT_KEEPALIVE_INTERVAL]);
++		const bool send_keepalive =
++			!peer->persistent_keepalive_interval &&
++			persistent_keepalive_interval &&
++			netif_running(wg->dev);
++
++		peer->persistent_keepalive_interval = persistent_keepalive_interval;
++		if (send_keepalive)
++			wg_packet_send_keepalive(peer);
++	}
++
++	if (netif_running(wg->dev))
++		wg_packet_send_staged_packets(peer);
++
++out:
++	wg_peer_put(peer);
++	if (attrs[WGPEER_A_PRESHARED_KEY])
++		memzero_explicit(nla_data(attrs[WGPEER_A_PRESHARED_KEY]),
++				 nla_len(attrs[WGPEER_A_PRESHARED_KEY]));
++	return ret;
++}
++
++static int wg_set_device(struct sk_buff *skb, struct genl_info *info)
++{
++	struct wg_device *wg = lookup_interface(info->attrs, skb);
++	u32 flags = 0;
++	int ret;
++
++	if (IS_ERR(wg)) {
++		ret = PTR_ERR(wg);
++		goto out_nodev;
++	}
++
++	rtnl_lock();
++	mutex_lock(&wg->device_update_lock);
++
++	if (info->attrs[WGDEVICE_A_FLAGS])
++		flags = nla_get_u32(info->attrs[WGDEVICE_A_FLAGS]);
++	ret = -EOPNOTSUPP;
++	if (flags & ~__WGDEVICE_F_ALL)
++		goto out;
++
++	ret = -EPERM;
++	if ((info->attrs[WGDEVICE_A_LISTEN_PORT] ||
++	     info->attrs[WGDEVICE_A_FWMARK]) &&
++	    !ns_capable(wg->creating_net->user_ns, CAP_NET_ADMIN))
++		goto out;
++
++	++wg->device_update_gen;
++
++	if (info->attrs[WGDEVICE_A_FWMARK]) {
++		struct wg_peer *peer;
++
++		wg->fwmark = nla_get_u32(info->attrs[WGDEVICE_A_FWMARK]);
++		list_for_each_entry(peer, &wg->peer_list, peer_list)
++			wg_socket_clear_peer_endpoint_src(peer);
++	}
++
++	if (info->attrs[WGDEVICE_A_LISTEN_PORT]) {
++		ret = set_port(wg,
++			nla_get_u16(info->attrs[WGDEVICE_A_LISTEN_PORT]));
++		if (ret)
++			goto out;
++	}
++
++	if (flags & WGDEVICE_F_REPLACE_PEERS)
++		wg_peer_remove_all(wg);
++
++	if (info->attrs[WGDEVICE_A_PRIVATE_KEY] &&
++	    nla_len(info->attrs[WGDEVICE_A_PRIVATE_KEY]) ==
++		    NOISE_PUBLIC_KEY_LEN) {
++		u8 *private_key = nla_data(info->attrs[WGDEVICE_A_PRIVATE_KEY]);
++		u8 public_key[NOISE_PUBLIC_KEY_LEN];
++		struct wg_peer *peer, *temp;
++
++		if (!crypto_memneq(wg->static_identity.static_private,
++				   private_key, NOISE_PUBLIC_KEY_LEN))
++			goto skip_set_private_key;
++
++		/* We remove before setting, to prevent race, which means doing
++		 * two 25519-genpub ops.
++		 */
++		if (curve25519_generate_public(public_key, private_key)) {
++			peer = wg_pubkey_hashtable_lookup(wg->peer_hashtable,
++							  public_key);
++			if (peer) {
++				wg_peer_put(peer);
++				wg_peer_remove(peer);
++			}
++		}
++
++		down_write(&wg->static_identity.lock);
++		wg_noise_set_static_identity_private_key(&wg->static_identity,
++							 private_key);
++		list_for_each_entry_safe(peer, temp, &wg->peer_list,
++					 peer_list) {
++			if (wg_noise_precompute_static_static(peer))
++				wg_noise_expire_current_peer_keypairs(peer);
++			else
++				wg_peer_remove(peer);
++		}
++		wg_cookie_checker_precompute_device_keys(&wg->cookie_checker);
++		up_write(&wg->static_identity.lock);
++	}
++skip_set_private_key:
++
++	if (info->attrs[WGDEVICE_A_PEERS]) {
++		struct nlattr *attr, *peer[WGPEER_A_MAX + 1];
++		int rem;
++
++		nla_for_each_nested(attr, info->attrs[WGDEVICE_A_PEERS], rem) {
++			ret = nla_parse_nested(peer, WGPEER_A_MAX, attr,
++					       peer_policy, NULL);
++			if (ret < 0)
++				goto out;
++			ret = set_peer(wg, peer);
++			if (ret < 0)
++				goto out;
++		}
++	}
++	ret = 0;
++
++out:
++	mutex_unlock(&wg->device_update_lock);
++	rtnl_unlock();
++	dev_put(wg->dev);
++out_nodev:
++	if (info->attrs[WGDEVICE_A_PRIVATE_KEY])
++		memzero_explicit(nla_data(info->attrs[WGDEVICE_A_PRIVATE_KEY]),
++				 nla_len(info->attrs[WGDEVICE_A_PRIVATE_KEY]));
++	return ret;
++}
++
++static const struct genl_ops genl_ops[] = {
++	{
++		.cmd = WG_CMD_GET_DEVICE,
++		.start = wg_get_device_start,
++		.dumpit = wg_get_device_dump,
++		.done = wg_get_device_done,
++		.flags = GENL_UNS_ADMIN_PERM
++	}, {
++		.cmd = WG_CMD_SET_DEVICE,
++		.doit = wg_set_device,
++		.flags = GENL_UNS_ADMIN_PERM
++	}
++};
++
++static struct genl_family genl_family __ro_after_init = {
++	.ops = genl_ops,
++	.n_ops = ARRAY_SIZE(genl_ops),
++	.name = WG_GENL_NAME,
++	.version = WG_GENL_VERSION,
++	.maxattr = WGDEVICE_A_MAX,
++	.module = THIS_MODULE,
++	.policy = device_policy,
++	.netnsok = true
++};
++
++int __init wg_genetlink_init(void)
++{
++	return genl_register_family(&genl_family);
++}
++
++void __exit wg_genetlink_uninit(void)
++{
++	genl_unregister_family(&genl_family);
++}

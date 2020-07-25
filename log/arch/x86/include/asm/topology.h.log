@@ -1,0 +1,4564 @@
+commit 918229cdd5abb50d8a2edfcd8dc6b6bc53afd765
+Author: Giovanni Gherdovich <ggherdovich@suse.cz>
+Date:   Wed Jan 22 16:16:17 2020 +0100
+
+    x86/intel_pstate: Handle runtime turbo disablement/enablement in frequency invariance
+    
+    On some platforms such as the Dell XPS 13 laptop the firmware disables turbo
+    when the machine is disconnected from AC, and viceversa it enables it again
+    when it's reconnected. In these cases a _PPC ACPI notification is issued.
+    
+    The scheduler needs to know freq_max for frequency-invariant calculations.
+    To account for turbo availability to come and go, record freq_max at boot as
+    if turbo was available and store it in a helper variable. Use a setter
+    function to swap between freq_base and freq_max every time turbo goes off or on.
+    
+    Signed-off-by: Giovanni Gherdovich <ggherdovich@suse.cz>
+    Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+    Acked-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+    Link: https://lkml.kernel.org/r/20200122151617.531-7-ggherdovich@suse.cz
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index 2ebf7b7b2126..79d8d5496330 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -211,6 +211,11 @@ static inline long arch_scale_freq_capacity(int cpu)
+ extern void arch_scale_freq_tick(void);
+ #define arch_scale_freq_tick arch_scale_freq_tick
+ 
++extern void arch_set_max_freq_ratio(bool turbo_disabled);
++#else
++static inline void arch_set_max_freq_ratio(bool turbo_disabled)
++{
++}
+ #endif
+ 
+ #endif /* _ASM_X86_TOPOLOGY_H */
+
+commit 1567c3e3467cddeb019a7b53ec632f834b6a9239
+Author: Giovanni Gherdovich <ggherdovich@suse.cz>
+Date:   Wed Jan 22 16:16:12 2020 +0100
+
+    x86, sched: Add support for frequency invariance
+    
+    Implement arch_scale_freq_capacity() for 'modern' x86. This function
+    is used by the scheduler to correctly account usage in the face of
+    DVFS.
+    
+    The present patch addresses Intel processors specifically and has positive
+    performance and performance-per-watt implications for the schedutil cpufreq
+    governor, bringing it closer to, if not on-par with, the powersave governor
+    from the intel_pstate driver/framework.
+    
+    Large performance gains are obtained when the machine is lightly loaded and
+    no regression are observed at saturation. The benchmarks with the largest
+    gains are kernel compilation, tbench (the networking version of dbench) and
+    shell-intensive workloads.
+    
+    1. FREQUENCY INVARIANCE: MOTIVATION
+       * Without it, a task looks larger if the CPU runs slower
+    
+    2. PECULIARITIES OF X86
+       * freq invariance accounting requires knowing the ratio freq_curr/freq_max
+       2.1 CURRENT FREQUENCY
+           * Use delta_APERF / delta_MPERF * freq_base (a.k.a "BusyMHz")
+       2.2 MAX FREQUENCY
+           * It varies with time (turbo). As an approximation, we set it to a
+             constant, i.e. 4-cores turbo frequency.
+    
+    3. EFFECTS ON THE SCHEDUTIL FREQUENCY GOVERNOR
+       * The invariant schedutil's formula has no feedback loop and reacts faster
+         to utilization changes
+    
+    4. KNOWN LIMITATIONS
+       * In some cases tasks can't reach max util despite how hard they try
+    
+    5. PERFORMANCE TESTING
+       5.1 MACHINES
+           * Skylake, Broadwell, Haswell
+       5.2 SETUP
+           * baseline Linux v5.2 w/ non-invariant schedutil. Tested freq_max = 1-2-3-4-8-12
+             active cores turbo w/ invariant schedutil, and intel_pstate/powersave
+       5.3 BENCHMARK RESULTS
+           5.3.1 NEUTRAL BENCHMARKS
+                 * NAS Parallel Benchmark (HPC), hackbench
+           5.3.2 NON-NEUTRAL BENCHMARKS
+                 * tbench (10-30% better), kernbench (10-15% better),
+                   shell-intensive-scripts (30-50% better)
+                 * no regressions
+           5.3.3 SELECTION OF DETAILED RESULTS
+           5.3.4 POWER CONSUMPTION, PERFORMANCE-PER-WATT
+                 * dbench (5% worse on one machine), kernbench (3% worse),
+                   tbench (5-10% better), shell-intensive-scripts (10-40% better)
+    
+    6. MICROARCH'ES ADDRESSED HERE
+       * Xeon Core before Scalable Performance processors line (Xeon Gold/Platinum
+         etc have different MSRs semantic for querying turbo levels)
+    
+    7. REFERENCES
+       * MMTests performance testing framework, github.com/gormanm/mmtests
+    
+     +-------------------------------------------------------------------------+
+     | 1. FREQUENCY INVARIANCE: MOTIVATION
+     +-------------------------------------------------------------------------+
+    
+    For example; suppose a CPU has two frequencies: 500 and 1000 Mhz. When
+    running a task that would consume 1/3rd of a CPU at 1000 MHz, it would
+    appear to consume 2/3rd (or 66.6%) when running at 500 MHz, giving the
+    false impression this CPU is almost at capacity, even though it can go
+    faster [*]. In a nutshell, without frequency scale-invariance tasks look
+    larger just because the CPU is running slower.
+    
+    [*] (footnote: this assumes a linear frequency/performance relation; which
+    everybody knows to be false, but given realities its the best approximation
+    we can make.)
+    
+     +-------------------------------------------------------------------------+
+     | 2. PECULIARITIES OF X86
+     +-------------------------------------------------------------------------+
+    
+    Accounting for frequency changes in PELT signals requires the computation of
+    the ratio freq_curr / freq_max. On x86 neither of those terms is readily
+    available.
+    
+    2.1 CURRENT FREQUENCY
+    ====================
+    
+    Since modern x86 has hardware control over the actual frequency we run
+    at (because amongst other things, Turbo-Mode), we cannot simply use
+    the frequency as requested through cpufreq.
+    
+    Instead we use the APERF/MPERF MSRs to compute the effective frequency
+    over the recent past. Also, because reading MSRs is expensive, don't
+    do so every time we need the value, but amortize the cost by doing it
+    every tick.
+    
+    2.2 MAX FREQUENCY
+    =================
+    
+    Obtaining freq_max is also non-trivial because at any time the hardware can
+    provide a frequency boost to a selected subset of cores if the package has
+    enough power to spare (eg: Turbo Boost). This means that the maximum frequency
+    available to a given core changes with time.
+    
+    The approach taken in this change is to arbitrarily set freq_max to a constant
+    value at boot. The value chosen is the "4-cores (4C) turbo frequency" on most
+    microarchitectures, after evaluating the following candidates:
+    
+        * 1-core (1C) turbo frequency (the fastest turbo state available)
+        * around base frequency (a.k.a. max P-state)
+        * something in between, such as 4C turbo
+    
+    To interpret these options, consider that this is the denominator in
+    freq_curr/freq_max, and that ratio will be used to scale PELT signals such as
+    util_avg and load_avg. A large denominator will undershoot (util_avg looks a
+    bit smaller than it really is), viceversa with a smaller denominator PELT
+    signals will tend to overshoot. Given that PELT drives frequency selection
+    in the schedutil governor, we will have:
+    
+        freq_max set to     | effect on DVFS
+        --------------------+------------------
+        1C turbo            | power efficiency (lower freq choices)
+        base freq           | performance (higher util_avg, higher freq requests)
+        4C turbo            | a bit of both
+    
+    4C turbo proves to be a good compromise in a number of benchmarks (see below).
+    
+     +-------------------------------------------------------------------------+
+     | 3. EFFECTS ON THE SCHEDUTIL FREQUENCY GOVERNOR
+     +-------------------------------------------------------------------------+
+    
+    Once an architecture implements a frequency scale-invariant utilization (the
+    PELT signal util_avg), schedutil switches its frequency selection formula from
+    
+        freq_next = 1.25 * freq_curr * util            [non-invariant util signal]
+    
+    to
+    
+        freq_next = 1.25 * freq_max * util             [invariant util signal]
+    
+    where, in the second formula, freq_max is set to the 1C turbo frequency (max
+    turbo). The advantage of the second formula, whose usage we unlock with this
+    patch, is that freq_next doesn't depend on the current frequency in an
+    iterative fashion, but can jump to any frequency in a single update. This
+    absence of feedback in the formula makes it quicker to react to utilization
+    changes and more robust against pathological instabilities.
+    
+    Compare it to the update formula of intel_pstate/powersave:
+    
+        freq_next = 1.25 * freq_max * Busy%
+    
+    where again freq_max is 1C turbo and Busy% is the percentage of time not spent
+    idling (calculated with delta_MPERF / delta_TSC); essentially the same as
+    invariant schedutil, and largely responsible for intel_pstate/powersave good
+    reputation. The non-invariant schedutil formula is derived from the invariant
+    one by approximating util_inv with util_raw * freq_curr / freq_max, but this
+    has limitations.
+    
+    Testing shows improved performances due to better frequency selections when
+    the machine is lightly loaded, and essentially no change in behaviour at
+    saturation / overutilization.
+    
+     +-------------------------------------------------------------------------+
+     | 4. KNOWN LIMITATIONS
+     +-------------------------------------------------------------------------+
+    
+    It's been shown that it is possible to create pathological scenarios where a
+    CPU-bound task cannot reach max utilization, if the normalizing factor
+    freq_max is fixed to a constant value (see [Lelli-2018]).
+    
+    If freq_max is set to 4C turbo as we do here, one needs to peg at least 5
+    cores in a package doing some busywork, and observe that none of those task
+    will ever reach max util (1024) because they're all running at less than the
+    4C turbo frequency.
+    
+    While this concern still applies, we believe the performance benefit of
+    frequency scale-invariant PELT signals outweights the cost of this limitation.
+    
+     [Lelli-2018]
+     https://lore.kernel.org/lkml/20180517150418.GF22493@localhost.localdomain/
+    
+     +-------------------------------------------------------------------------+
+     | 5. PERFORMANCE TESTING
+     +-------------------------------------------------------------------------+
+    
+    5.1 MACHINES
+    ============
+    
+    We tested the patch on three machines, with Skylake, Broadwell and Haswell
+    CPUs. The details are below, together with the available turbo ratios as
+    reported by the appropriate MSRs.
+    
+    * 8x-SKYLAKE-UMA:
+      Single socket E3-1240 v5, Skylake 4 cores/8 threads
+      Max EFFiciency, BASE frequency and available turbo levels (MHz):
+    
+        EFFIC    800 |********
+        BASE    3500 |***********************************
+        4C      3700 |*************************************
+        3C      3800 |**************************************
+        2C      3900 |***************************************
+        1C      3900 |***************************************
+    
+    * 80x-BROADWELL-NUMA:
+      Two sockets E5-2698 v4, 2x Broadwell 20 cores/40 threads
+      Max EFFiciency, BASE frequency and available turbo levels (MHz):
+    
+        EFFIC   1200 |************
+        BASE    2200 |**********************
+        8C      2900 |*****************************
+        7C      3000 |******************************
+        6C      3100 |*******************************
+        5C      3200 |********************************
+        4C      3300 |*********************************
+        3C      3400 |**********************************
+        2C      3600 |************************************
+        1C      3600 |************************************
+    
+    * 48x-HASWELL-NUMA
+      Two sockets E5-2670 v3, 2x Haswell 12 cores/24 threads
+      Max EFFiciency, BASE frequency and available turbo levels (MHz):
+    
+        EFFIC   1200 |************
+        BASE    2300 |***********************
+        12C     2600 |**************************
+        11C     2600 |**************************
+        10C     2600 |**************************
+        9C      2600 |**************************
+        8C      2600 |**************************
+        7C      2600 |**************************
+        6C      2600 |**************************
+        5C      2700 |***************************
+        4C      2800 |****************************
+        3C      2900 |*****************************
+        2C      3100 |*******************************
+        1C      3100 |*******************************
+    
+    5.2 SETUP
+    =========
+    
+    * The baseline is Linux v5.2 with schedutil (non-invariant) and the intel_pstate
+      driver in passive mode.
+    * The rationale for choosing the various freq_max values to test have been to
+      try all the 1-2-3-4C turbo levels (note that 1C and 2C turbo are identical
+      on all machines), plus one more value closer to base_freq but still in the
+      turbo range (8C turbo for both 80x-BROADWELL-NUMA and 48x-HASWELL-NUMA).
+    * In addition we've run all tests with intel_pstate/powersave for comparison.
+    * The filesystem is always XFS, the userspace is openSUSE Leap 15.1.
+    * 8x-SKYLAKE-UMA is capable of HWP (Hardware-Managed P-States), so the runs
+      with active intel_pstate on this machine use that.
+    
+    This gives, in terms of combinations tested on each machine:
+    
+    * 8x-SKYLAKE-UMA
+      * Baseline: Linux v5.2, non-invariant schedutil, intel_pstate passive
+      * intel_pstate active + powersave + HWP
+      * invariant schedutil, freq_max = 1C turbo
+      * invariant schedutil, freq_max = 3C turbo
+      * invariant schedutil, freq_max = 4C turbo
+    
+    * both 80x-BROADWELL-NUMA and 48x-HASWELL-NUMA
+      * [same as 8x-SKYLAKE-UMA, but no HWP capable]
+      * invariant schedutil, freq_max = 8C turbo
+        (which on 48x-HASWELL-NUMA is the same as 12C turbo, or "all cores turbo")
+    
+    5.3 BENCHMARK RESULTS
+    =====================
+    
+    5.3.1 NEUTRAL BENCHMARKS
+    ------------------------
+    
+    Tests that didn't show any measurable difference in performance on any of the
+    test machines between non-invariant schedutil and our patch are:
+    
+    * NAS Parallel Benchmarks (NPB) using either MPI or openMP for IPC, any
+      computational kernel
+    * flexible I/O (FIO)
+    * hackbench (using threads or processes, and using pipes or sockets)
+    
+    5.3.2 NON-NEUTRAL BENCHMARKS
+    ----------------------------
+    
+    What follow are summary tables where each benchmark result is given a score.
+    
+    * A tilde (~) means a neutral result, i.e. no difference from baseline.
+    * Scores are computed with the ratio result_new / result_baseline, so a tilde
+      means a score of 1.00.
+    * The results in the score ratio are the geometric means of results running
+      the benchmark with different parameters (eg: for kernbench: using 1, 2, 4,
+      ... number of processes; for pgbench: varying the number of clients, and so
+      on).
+    * The first three tables show higher-is-better kind of tests (i.e. measured in
+      operations/second), the subsequent three show lower-is-better kind of tests
+      (i.e. the workload is fixed and we measure elapsed time, think kernbench).
+    * "gitsource" is a name we made up for the test consisting in running the
+      entire unit tests suite of the Git SCM and measuring how long it takes. We
+      take it as a typical example of shell-intensive serialized workload.
+    * In the "I_PSTATE" column we have the results for intel_pstate/powersave. Other
+      columns show invariant schedutil for different values of freq_max. 4C turbo
+      is circled as it's the value we've chosen for the final implementation.
+    
+    80x-BROADWELL-NUMA (comparison ratio; higher is better)
+                                             +------+
+                     I_PSTATE   1C     3C    | 4C   |  8C
+    pgbench-ro           1.14   ~      ~     | 1.11 |  1.14
+    pgbench-rw           ~      ~      ~     | ~    |  ~
+    netperf-udp          1.06   ~      1.06  | 1.05 |  1.07
+    netperf-tcp          ~      1.03   ~     | 1.01 |  1.02
+    tbench4              1.57   1.18   1.22  | 1.30 |  1.56
+                                             +------+
+    
+    8x-SKYLAKE-UMA (comparison ratio; higher is better)
+                                             +------+
+                 I_PSTATE/HWP   1C     3C    | 4C   |
+    pgbench-ro           ~      ~      ~     | ~    |
+    pgbench-rw           ~      ~      ~     | ~    |
+    netperf-udp          ~      ~      ~     | ~    |
+    netperf-tcp          ~      ~      ~     | ~    |
+    tbench4              1.30   1.14   1.14  | 1.16 |
+                                             +------+
+    
+    48x-HASWELL-NUMA (comparison ratio; higher is better)
+                                             +------+
+                     I_PSTATE   1C     3C    | 4C   |  12C
+    pgbench-ro           1.15   ~      ~     | 1.06 |  1.16
+    pgbench-rw           ~      ~      ~     | ~    |  ~
+    netperf-udp          1.05   0.97   1.04  | 1.04 |  1.02
+    netperf-tcp          0.96   1.01   1.01  | 1.01 |  1.01
+    tbench4              1.50   1.05   1.13  | 1.13 |  1.25
+                                             +------+
+    
+    In the table above we see that active intel_pstate is slightly better than our
+    4C-turbo patch (both in reference to the baseline non-invariant schedutil) on
+    read-only pgbench and much better on tbench. Both cases are notable in which
+    it shows that lowering our freq_max (to 8C-turbo and 12C-turbo on
+    80x-BROADWELL-NUMA and 48x-HASWELL-NUMA respectively) helps invariant
+    schedutil to get closer.
+    
+    If we ignore active intel_pstate and focus on the comparison with baseline
+    alone, there are several instances of double-digit performance improvement.
+    
+    80x-BROADWELL-NUMA (comparison ratio; lower is better)
+                                             +------+
+                     I_PSTATE   1C     3C    | 4C   |  8C
+    dbench4              1.23   0.95   0.95  | 0.95 |  0.95
+    kernbench            0.93   0.83   0.83  | 0.83 |  0.82
+    gitsource            0.98   0.49   0.49  | 0.49 |  0.48
+                                             +------+
+    
+    8x-SKYLAKE-UMA (comparison ratio; lower is better)
+                                             +------+
+                 I_PSTATE/HWP   1C     3C    | 4C   |
+    dbench4              ~      ~      ~     | ~    |
+    kernbench            ~      ~      ~     | ~    |
+    gitsource            0.92   0.55   0.55  | 0.55 |
+                                             +------+
+    
+    48x-HASWELL-NUMA (comparison ratio; lower is better)
+                                             +------+
+                     I_PSTATE   1C     3C    | 4C   |  8C
+    dbench4              ~      ~      ~     | ~    |  ~
+    kernbench            0.94   0.90   0.89  | 0.90 |  0.90
+    gitsource            0.97   0.69   0.69  | 0.69 |  0.69
+                                             +------+
+    
+    dbench is not very remarkable here, unless we notice how poorly active
+    intel_pstate is performing on 80x-BROADWELL-NUMA: 23% regression versus
+    non-invariant schedutil. We repeated that run getting consistent results. Out
+    of scope for the patch at hand, but deserving future investigation. Other than
+    that, we previously ran this campaign with Linux v5.0 and saw the patch doing
+    better on dbench a the time. We haven't checked closely and can only speculate
+    at this point.
+    
+    On the NUMA boxes kernbench gets 10-15% improvements on average; we'll see in
+    the detailed tables that the gains concentrate on low process counts (lightly
+    loaded machines).
+    
+    The test we call "gitsource" (running the git unit test suite, a long-running
+    single-threaded shell script) appears rather spectacular in this table (gains
+    of 30-50% depending on the machine). It is to be noted, however, that
+    gitsource has no adjustable parameters (such as the number of jobs in
+    kernbench, which we average over in order to get a single-number summary
+    score) and is exactly the kind of low-parallelism workload that benefits the
+    most from this patch. When looking at the detailed tables of kernbench or
+    tbench4, at low process or client counts one can see similar numbers.
+    
+    5.3.3 SELECTION OF DETAILED RESULTS
+    -----------------------------------
+    
+    Machine            : 48x-HASWELL-NUMA
+    Benchmark          : tbench4 (i.e. dbench4 over the network, actually loopback)
+    Varying parameter  : number of clients
+    Unit               : MB/sec (higher is better)
+    
+                       5.2.0 vanilla (BASELINE)               5.2.0 intel_pstate                   5.2.0 1C-turbo
+    - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+    Hmean  1        126.73  +- 0.31% (        )      315.91  +- 0.66% ( 149.28%)      125.03  +- 0.76% (  -1.34%)
+    Hmean  2        258.04  +- 0.62% (        )      614.16  +- 0.51% ( 138.01%)      269.58  +- 1.45% (   4.47%)
+    Hmean  4        514.30  +- 0.67% (        )     1146.58  +- 0.54% ( 122.94%)      533.84  +- 1.99% (   3.80%)
+    Hmean  8       1111.38  +- 2.52% (        )     2159.78  +- 0.38% (  94.33%)     1359.92  +- 1.56% (  22.36%)
+    Hmean  16      2286.47  +- 1.36% (        )     3338.29  +- 0.21% (  46.00%)     2720.20  +- 0.52% (  18.97%)
+    Hmean  32      4704.84  +- 0.35% (        )     4759.03  +- 0.43% (   1.15%)     4774.48  +- 0.30% (   1.48%)
+    Hmean  64      7578.04  +- 0.27% (        )     7533.70  +- 0.43% (  -0.59%)     7462.17  +- 0.65% (  -1.53%)
+    Hmean  128     6998.52  +- 0.16% (        )     6987.59  +- 0.12% (  -0.16%)     6909.17  +- 0.14% (  -1.28%)
+    Hmean  192     6901.35  +- 0.25% (        )     6913.16  +- 0.10% (   0.17%)     6855.47  +- 0.21% (  -0.66%)
+    
+                                 5.2.0 3C-turbo                   5.2.0 4C-turbo                  5.2.0 12C-turbo
+    - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+    Hmean  1        128.43  +- 0.28% (   1.34%)      130.64  +- 3.81% (   3.09%)      153.71  +- 5.89% (  21.30%)
+    Hmean  2        311.70  +- 6.15% (  20.79%)      281.66  +- 3.40% (   9.15%)      305.08  +- 5.70% (  18.23%)
+    Hmean  4        641.98  +- 2.32% (  24.83%)      623.88  +- 5.28% (  21.31%)      906.84  +- 4.65% (  76.32%)
+    Hmean  8       1633.31  +- 1.56% (  46.96%)     1714.16  +- 0.93% (  54.24%)     2095.74  +- 0.47% (  88.57%)
+    Hmean  16      3047.24  +- 0.42% (  33.27%)     3155.02  +- 0.30% (  37.99%)     3634.58  +- 0.15% (  58.96%)
+    Hmean  32      4734.31  +- 0.60% (   0.63%)     4804.38  +- 0.23% (   2.12%)     4674.62  +- 0.27% (  -0.64%)
+    Hmean  64      7699.74  +- 0.35% (   1.61%)     7499.72  +- 0.34% (  -1.03%)     7659.03  +- 0.25% (   1.07%)
+    Hmean  128     6935.18  +- 0.15% (  -0.91%)     6942.54  +- 0.10% (  -0.80%)     7004.85  +- 0.12% (   0.09%)
+    Hmean  192     6901.62  +- 0.12% (   0.00%)     6856.93  +- 0.10% (  -0.64%)     6978.74  +- 0.10% (   1.12%)
+    
+    This is one of the cases where the patch still can't surpass active
+    intel_pstate, not even when freq_max is as low as 12C-turbo. Otherwise, gains are
+    visible up to 16 clients and the saturated scenario is the same as baseline.
+    
+    The scores in the summary table from the previous sections are ratios of
+    geometric means of the results over different clients, as seen in this table.
+    
+    Machine            : 80x-BROADWELL-NUMA
+    Benchmark          : kernbench (kernel compilation)
+    Varying parameter  : number of jobs
+    Unit               : seconds (lower is better)
+    
+                       5.2.0 vanilla (BASELINE)               5.2.0 intel_pstate                   5.2.0 1C-turbo
+    - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+    Amean  2        379.68  +- 0.06% (        )      330.20  +- 0.43% (  13.03%)      285.93  +- 0.07% (  24.69%)
+    Amean  4        200.15  +- 0.24% (        )      175.89  +- 0.22% (  12.12%)      153.78  +- 0.25% (  23.17%)
+    Amean  8        106.20  +- 0.31% (        )       95.54  +- 0.23% (  10.03%)       86.74  +- 0.10% (  18.32%)
+    Amean  16        56.96  +- 1.31% (        )       53.25  +- 1.22% (   6.50%)       48.34  +- 1.73% (  15.13%)
+    Amean  32        34.80  +- 2.46% (        )       33.81  +- 0.77% (   2.83%)       30.28  +- 1.59% (  12.99%)
+    Amean  64        26.11  +- 1.63% (        )       25.04  +- 1.07% (   4.10%)       22.41  +- 2.37% (  14.16%)
+    Amean  128       24.80  +- 1.36% (        )       23.57  +- 1.23% (   4.93%)       21.44  +- 1.37% (  13.55%)
+    Amean  160       24.85  +- 0.56% (        )       23.85  +- 1.17% (   4.06%)       21.25  +- 1.12% (  14.49%)
+    
+                                 5.2.0 3C-turbo                   5.2.0 4C-turbo                   5.2.0 8C-turbo
+    - - - - - - - -  - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+    Amean  2        284.08  +- 0.13% (  25.18%)      283.96  +- 0.51% (  25.21%)      285.05  +- 0.21% (  24.92%)
+    Amean  4        153.18  +- 0.22% (  23.47%)      154.70  +- 1.64% (  22.71%)      153.64  +- 0.30% (  23.24%)
+    Amean  8         87.06  +- 0.28% (  18.02%)       86.77  +- 0.46% (  18.29%)       86.78  +- 0.22% (  18.28%)
+    Amean  16        48.03  +- 0.93% (  15.68%)       47.75  +- 1.99% (  16.17%)       47.52  +- 1.61% (  16.57%)
+    Amean  32        30.23  +- 1.20% (  13.14%)       30.08  +- 1.67% (  13.57%)       30.07  +- 1.67% (  13.60%)
+    Amean  64        22.59  +- 2.02% (  13.50%)       22.63  +- 0.81% (  13.32%)       22.42  +- 0.76% (  14.12%)
+    Amean  128       21.37  +- 0.67% (  13.82%)       21.31  +- 1.15% (  14.07%)       21.17  +- 1.93% (  14.63%)
+    Amean  160       21.68  +- 0.57% (  12.76%)       21.18  +- 1.74% (  14.77%)       21.22  +- 1.00% (  14.61%)
+    
+    The patch outperform active intel_pstate (and baseline) by a considerable
+    margin; the summary table from the previous section says 4C turbo and active
+    intel_pstate are 0.83 and 0.93 against baseline respectively, so 4C turbo is
+    0.83/0.93=0.89 against intel_pstate (~10% better on average). There is no
+    noticeable difference with regard to the value of freq_max.
+    
+    Machine            : 8x-SKYLAKE-UMA
+    Benchmark          : gitsource (time to run the git unit test suite)
+    Varying parameter  : none
+    Unit               : seconds (lower is better)
+    
+                                5.2.0 vanilla           5.2.0 intel_pstate/hwp         5.2.0 1C-turbo
+    - - - - - - - -  - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+    Amean         858.85  +- 1.16% (        )      791.94  +- 0.21% (   7.79%)      474.95 (  44.70%)
+    
+                               5.2.0 3C-turbo                   5.2.0 4C-turbo
+    - - - - - - - -  - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+    Amean         475.26  +- 0.20% (  44.66%)      474.34  +- 0.13% (  44.77%)
+    
+    In this test, which is of interest as representing shell-intensive
+    (i.e. fork-intensive) serialized workloads, invariant schedutil outperforms
+    intel_pstate/powersave by a whopping 40% margin.
+    
+    5.3.4 POWER CONSUMPTION, PERFORMANCE-PER-WATT
+    ---------------------------------------------
+    
+    The following table shows average power consumption in watt for each
+    benchmark. Data comes from turbostat (package average), which in turn is read
+    from the RAPL interface on CPUs. We know the patch affects CPU frequencies so
+    it's reasonable to ignore other power consumers (such as memory or I/O). Also,
+    we don't have a power meter available in the lab so RAPL is the best we have.
+    
+    turbostat sampled average power every 10 seconds for the entire duration of
+    each benchmark. We took all those values and averaged them (i.e. with don't
+    have detail on a per-parameter granularity, only on whole benchmarks).
+    
+    80x-BROADWELL-NUMA (power consumption, watts)
+                                                        +--------+
+                   BASELINE I_PSTATE       1C       3C  |     4C |      8C
+    pgbench-ro       130.01   142.77   131.11   132.45  | 134.65 |  136.84
+    pgbench-rw        68.30    60.83    71.45    71.70  |  71.65 |   72.54
+    dbench4           90.25    59.06   101.43    99.89  | 101.10 |  102.94
+    netperf-udp       65.70    69.81    66.02    68.03  |  68.27 |   68.95
+    netperf-tcp       88.08    87.96    88.97    88.89  |  88.85 |   88.20
+    tbench4          142.32   176.73   153.02   163.91  | 165.58 |  176.07
+    kernbench         92.94   101.95   114.91   115.47  | 115.52 |  115.10
+    gitsource         40.92    41.87    75.14    75.20  |  75.40 |   75.70
+                                                        +--------+
+    8x-SKYLAKE-UMA (power consumption, watts)
+                                                        +--------+
+                  BASELINE I_PSTATE/HWP    1C       3C  |     4C |
+    pgbench-ro        46.49    46.68    46.56    46.59  |  46.52 |
+    pgbench-rw        29.34    31.38    30.98    31.00  |  31.00 |
+    dbench4           27.28    27.37    27.49    27.41  |  27.38 |
+    netperf-udp       22.33    22.41    22.36    22.35  |  22.36 |
+    netperf-tcp       27.29    27.29    27.30    27.31  |  27.33 |
+    tbench4           41.13    45.61    43.10    43.33  |  43.56 |
+    kernbench         42.56    42.63    43.01    43.01  |  43.01 |
+    gitsource         13.32    13.69    17.33    17.30  |  17.35 |
+                                                        +--------+
+    48x-HASWELL-NUMA (power consumption, watts)
+                                                        +--------+
+                   BASELINE I_PSTATE       1C       3C  |     4C |     12C
+    pgbench-ro       128.84   136.04   129.87   132.43  | 132.30 |  134.86
+    pgbench-rw        37.68    37.92    37.17    37.74  |  37.73 |   37.31
+    dbench4           28.56    28.73    28.60    28.73  |  28.70 |   28.79
+    netperf-udp       56.70    60.44    56.79    57.42  |  57.54 |   57.52
+    netperf-tcp       75.49    75.27    75.87    76.02  |  76.01 |   75.95
+    tbench4          115.44   139.51   119.53   123.07  | 123.97 |  130.22
+    kernbench         83.23    91.55    95.58    95.69  |  95.72 |   96.04
+    gitsource         36.79    36.99    39.99    40.34  |  40.35 |   40.23
+                                                        +--------+
+    
+    A lower power consumption isn't necessarily better, it depends on what is done
+    with that energy. Here are tables with the ratio of performance-per-watt on
+    each machine and benchmark. Higher is always better; a tilde (~) means a
+    neutral ratio (i.e. 1.00).
+    
+    80x-BROADWELL-NUMA (performance-per-watt ratios; higher is better)
+                                         +------+
+                 I_PSTATE     1C     3C  |   4C |    8C
+    pgbench-ro       1.04   1.06   0.94  | 1.07 |  1.08
+    pgbench-rw       1.10   0.97   0.96  | 0.96 |  0.97
+    dbench4          1.24   0.94   0.95  | 0.94 |  0.92
+    netperf-udp      ~      1.02   1.02  | ~    |  1.02
+    netperf-tcp      ~      1.02   ~     | ~    |  1.02
+    tbench4          1.26   1.10   1.06  | 1.12 |  1.26
+    kernbench        0.98   0.97   0.97  | 0.97 |  0.98
+    gitsource        ~      1.11   1.11  | 1.11 |  1.13
+                                         +------+
+    
+    8x-SKYLAKE-UMA (performance-per-watt ratios; higher is better)
+                                         +------+
+             I_PSTATE/HWP     1C     3C  |   4C |
+    pgbench-ro       ~      ~      ~     | ~    |
+    pgbench-rw       0.95   0.97   0.96  | 0.96 |
+    dbench4          ~      ~      ~     | ~    |
+    netperf-udp      ~      ~      ~     | ~    |
+    netperf-tcp      ~      ~      ~     | ~    |
+    tbench4          1.17   1.09   1.08  | 1.10 |
+    kernbench        ~      ~      ~     | ~    |
+    gitsource        1.06   1.40   1.40  | 1.40 |
+                                         +------+
+    
+    48x-HASWELL-NUMA  (performance-per-watt ratios; higher is better)
+                                         +------+
+                 I_PSTATE     1C     3C  |   4C |   12C
+    pgbench-ro       1.09   ~      1.09  | 1.03 |  1.11
+    pgbench-rw       ~      0.86   ~     | ~    |  0.86
+    dbench4          ~      1.02   1.02  | 1.02 |  ~
+    netperf-udp      ~      0.97   1.03  | 1.02 |  ~
+    netperf-tcp      0.96   ~      ~     | ~    |  ~
+    tbench4          1.24   ~      1.06  | 1.05 |  1.11
+    kernbench        0.97   0.97   0.98  | 0.97 |  0.96
+    gitsource        1.03   1.33   1.32  | 1.32 |  1.33
+                                         +------+
+    
+    These results are overall pleasing: in plenty of cases we observe
+    performance-per-watt improvements. The few regressions (read/write pgbench and
+    dbench on the Broadwell machine) are of small magnitude. kernbench loses a few
+    percentage points (it has a 10-15% performance improvement, but apparently the
+    increase in power consumption is larger than that). tbench4 and gitsource, which
+    benefit the most from the patch, keep a positive score in this table which is
+    a welcome surprise; that suggests that in those particular workloads the
+    non-invariant schedutil (and active intel_pstate, too) makes some rather
+    suboptimal frequency selections.
+    
+    +-------------------------------------------------------------------------+
+    | 6. MICROARCH'ES ADDRESSED HERE
+    +-------------------------------------------------------------------------+
+    
+    The patch addresses Xeon Core processors that use MSR_PLATFORM_INFO and
+    MSR_TURBO_RATIO_LIMIT to advertise their base frequency and turbo frequencies
+    respectively. This excludes the recent Xeon Scalable Performance processors
+    line (Xeon Gold, Platinum etc) whose MSRs have to be parsed differently.
+    
+    Subsequent patches will address:
+    
+    * Xeon Scalable Performance processors and Atom Goldmont/Goldmont Plus
+    * Xeon Phi (Knights Landing, Knights Mill)
+    * Atom Silvermont
+    
+    +-------------------------------------------------------------------------+
+    | 7. REFERENCES
+    +-------------------------------------------------------------------------+
+    
+    Tests have been run with the help of the MMTests performance testing
+    framework, see github.com/gormanm/mmtests. The configuration file names for
+    the benchmark used are:
+    
+        db-pgbench-timed-ro-small-xfs
+        db-pgbench-timed-rw-small-xfs
+        io-dbench4-async-xfs
+        network-netperf-unbound
+        network-tbench
+        scheduler-unbound
+        workload-kerndevel-xfs
+        workload-shellscripts-xfs
+        hpc-nas-c-class-mpi-full-xfs
+        hpc-nas-c-class-omp-full
+    
+    All those benchmarks are generally available on the web:
+    
+    pgbench: https://www.postgresql.org/docs/10/pgbench.html
+    netperf: https://hewlettpackard.github.io/netperf/
+    dbench/tbench: https://dbench.samba.org/
+    gitsource: git unit test suite, github.com/git/git
+    NAS Parallel Benchmarks: https://www.nas.nasa.gov/publications/npb.html
+    hackbench: https://people.redhat.com/mingo/cfs-scheduler/tools/hackbench.c
+    
+    Suggested-by: Peter Zijlstra <peterz@infradead.org>
+    Signed-off-by: Giovanni Gherdovich <ggherdovich@suse.cz>
+    Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+    Acked-by: Doug Smythies <dsmythies@telus.net>
+    Acked-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+    Link: https://lkml.kernel.org/r/20200122151617.531-2-ggherdovich@suse.cz
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index 4b14d2318251..2ebf7b7b2126 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -193,4 +193,24 @@ static inline void sched_clear_itmt_support(void)
+ }
+ #endif /* CONFIG_SCHED_MC_PRIO */
+ 
++#ifdef CONFIG_SMP
++#include <asm/cpufeature.h>
++
++DECLARE_STATIC_KEY_FALSE(arch_scale_freq_key);
++
++#define arch_scale_freq_invariant() static_branch_likely(&arch_scale_freq_key)
++
++DECLARE_PER_CPU(unsigned long, arch_freq_scale);
++
++static inline long arch_scale_freq_capacity(int cpu)
++{
++	return per_cpu(arch_freq_scale, cpu);
++}
++#define arch_scale_freq_capacity arch_scale_freq_capacity
++
++extern void arch_scale_freq_tick(void);
++#define arch_scale_freq_tick arch_scale_freq_tick
++
++#endif
++
+ #endif /* _ASM_X86_TOPOLOGY_H */
+
+commit 2e4c54dac7b360c3820399bdf06cde9134a4495b
+Author: Len Brown <len.brown@intel.com>
+Date:   Mon May 13 13:58:56 2019 -0400
+
+    topology: Create core_cpus and die_cpus sysfs attributes
+    
+    Create CPU topology sysfs attributes: "core_cpus" and "core_cpus_list"
+    
+    These attributes represent all of the logical CPUs that share the
+    same core.
+    
+    These attriutes is synonymous with the existing "thread_siblings" and
+    "thread_siblings_list" attribute, which will be deprecated.
+    
+    Create CPU topology sysfs attributes: "die_cpus" and "die_cpus_list".
+    These attributes represent all of the logical CPUs that share the
+    same die.
+    
+    Suggested-by: Brice Goglin <Brice.Goglin@inria.fr>
+    Signed-off-by: Len Brown <len.brown@intel.com>
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Reviewed-by: Ingo Molnar <mingo@kernel.org>
+    Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+    Link: https://lkml.kernel.org/r/071c23a298cd27ede6ed0b6460cae190d193364f.1557769318.git.len.brown@intel.com
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index 9de16b4f6023..4b14d2318251 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -111,6 +111,7 @@ extern const struct cpumask *cpu_coregroup_mask(int cpu);
+ #define topology_core_id(cpu)			(cpu_data(cpu).cpu_core_id)
+ 
+ #ifdef CONFIG_SMP
++#define topology_die_cpumask(cpu)		(per_cpu(cpu_die_map, cpu))
+ #define topology_core_cpumask(cpu)		(per_cpu(cpu_core_map, cpu))
+ #define topology_sibling_cpumask(cpu)		(per_cpu(cpu_sibling_map, cpu))
+ 
+
+commit 212bf4fdb7f9eeeb99afd97ebad677d43e7b55ac
+Author: Len Brown <len.brown@intel.com>
+Date:   Mon May 13 13:58:49 2019 -0400
+
+    x86/topology: Define topology_logical_die_id()
+    
+    Define topology_logical_die_id() ala existing topology_logical_package_id()
+    
+    Signed-off-by: Len Brown <len.brown@intel.com>
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Tested-by: Zhang Rui <rui.zhang@intel.com>
+    Reviewed-by: Ingo Molnar <mingo@kernel.org>
+    Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+    Link: https://lkml.kernel.org/r/2f3526e25ae14fbeff26fb26e877d159df8946d9.1557769318.git.len.brown@intel.com
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index 3777dbe9c0ff..9de16b4f6023 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -106,6 +106,7 @@ extern const struct cpumask *cpu_coregroup_mask(int cpu);
+ 
+ #define topology_logical_package_id(cpu)	(cpu_data(cpu).logical_proc_id)
+ #define topology_physical_package_id(cpu)	(cpu_data(cpu).phys_proc_id)
++#define topology_logical_die_id(cpu)		(cpu_data(cpu).logical_die_id)
+ #define topology_die_id(cpu)			(cpu_data(cpu).cpu_die_id)
+ #define topology_core_id(cpu)			(cpu_data(cpu).cpu_core_id)
+ 
+@@ -131,13 +132,17 @@ static inline int topology_max_smt_threads(void)
+ }
+ 
+ int topology_update_package_map(unsigned int apicid, unsigned int cpu);
++int topology_update_die_map(unsigned int dieid, unsigned int cpu);
+ int topology_phys_to_logical_pkg(unsigned int pkg);
++int topology_phys_to_logical_die(unsigned int die, unsigned int cpu);
+ bool topology_is_primary_thread(unsigned int cpu);
+ bool topology_smt_supported(void);
+ #else
+ #define topology_max_packages()			(1)
+ static inline int
+ topology_update_package_map(unsigned int apicid, unsigned int cpu) { return 0; }
++static inline int
++topology_update_die_map(unsigned int dieid, unsigned int cpu) { return 0; }
+ static inline int topology_phys_to_logical_pkg(unsigned int pkg) { return 0; }
+ static inline int topology_phys_to_logical_die(unsigned int die,
+ 		unsigned int cpu) { return 0; }
+
+commit 306a0de329f77537f29022c2982006f9145d782d
+Author: Len Brown <len.brown@intel.com>
+Date:   Mon May 13 13:58:48 2019 -0400
+
+    x86/topology: Define topology_die_id()
+    
+    topology_die_id(cpu) is a simple macro for use inside the kernel to get the
+    die_id associated with the given cpu.
+    
+    Signed-off-by: Len Brown <len.brown@intel.com>
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Reviewed-by: Ingo Molnar <mingo@kernel.org>
+    Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+    Link: https://lkml.kernel.org/r/6463bc422b1b05445a502dc505c1d7c6756bda6a.1557769318.git.len.brown@intel.com
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index e0232f7042c3..3777dbe9c0ff 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -106,6 +106,7 @@ extern const struct cpumask *cpu_coregroup_mask(int cpu);
+ 
+ #define topology_logical_package_id(cpu)	(cpu_data(cpu).logical_proc_id)
+ #define topology_physical_package_id(cpu)	(cpu_data(cpu).phys_proc_id)
++#define topology_die_id(cpu)			(cpu_data(cpu).cpu_die_id)
+ #define topology_core_id(cpu)			(cpu_data(cpu).cpu_core_id)
+ 
+ #ifdef CONFIG_SMP
+
+commit 14d96d6c06b5d8116b8d52c9c5530f5528ef1e61
+Author: Len Brown <len.brown@intel.com>
+Date:   Mon May 13 13:58:46 2019 -0400
+
+    x86/topology: Create topology_max_die_per_package()
+    
+    topology_max_packages() is available to size resources to cover all
+    packages in the system.
+    
+    But now multi-die/package systems are coming up, and some resources are
+    per-die.
+    
+    Create topology_max_die_per_package(), for detecting multi-die/package
+    systems, and sizing any per-die resources.
+    
+    Signed-off-by: Len Brown <len.brown@intel.com>
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Reviewed-by: Ingo Molnar <mingo@kernel.org>
+    Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+    Link: https://lkml.kernel.org/r/e6eaf384571ae52ac7d0ca41510b7fb7d2fda0e4.1557769318.git.len.brown@intel.com
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index 453cf38a1c33..e0232f7042c3 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -115,6 +115,13 @@ extern const struct cpumask *cpu_coregroup_mask(int cpu);
+ extern unsigned int __max_logical_packages;
+ #define topology_max_packages()			(__max_logical_packages)
+ 
++extern unsigned int __max_die_per_package;
++
++static inline int topology_max_die_per_package(void)
++{
++	return __max_die_per_package;
++}
++
+ extern int __max_smt_threads;
+ 
+ static inline int topology_max_smt_threads(void)
+@@ -131,6 +138,9 @@ bool topology_smt_supported(void);
+ static inline int
+ topology_update_package_map(unsigned int apicid, unsigned int cpu) { return 0; }
+ static inline int topology_phys_to_logical_pkg(unsigned int pkg) { return 0; }
++static inline int topology_phys_to_logical_die(unsigned int die,
++		unsigned int cpu) { return 0; }
++static inline int topology_max_die_per_package(void) { return 1; }
+ static inline int topology_max_smt_threads(void) { return 1; }
+ static inline bool topology_is_primary_thread(unsigned int cpu) { return true; }
+ static inline bool topology_smt_supported(void) { return false; }
+
+commit f048c399e0f7490ab7296bc2c255d37eb14a9675
+Author: Thomas Gleixner <tglx@linutronix.de>
+Date:   Thu Jun 21 10:37:20 2018 +0200
+
+    x86/topology: Provide topology_smt_supported()
+    
+    Provide information whether SMT is supoorted by the CPUs. Preparatory patch
+    for SMT control mechanism.
+    
+    Suggested-by: Dave Hansen <dave.hansen@intel.com>
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Acked-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index 661e361a12a6..453cf38a1c33 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -125,6 +125,7 @@ static inline int topology_max_smt_threads(void)
+ int topology_update_package_map(unsigned int apicid, unsigned int cpu);
+ int topology_phys_to_logical_pkg(unsigned int pkg);
+ bool topology_is_primary_thread(unsigned int cpu);
++bool topology_smt_supported(void);
+ #else
+ #define topology_max_packages()			(1)
+ static inline int
+@@ -132,6 +133,7 @@ topology_update_package_map(unsigned int apicid, unsigned int cpu) { return 0; }
+ static inline int topology_phys_to_logical_pkg(unsigned int pkg) { return 0; }
+ static inline int topology_max_smt_threads(void) { return 1; }
+ static inline bool topology_is_primary_thread(unsigned int cpu) { return true; }
++static inline bool topology_smt_supported(void) { return false; }
+ #endif
+ 
+ static inline void arch_fix_phys_package_id(int num, u32 slot)
+
+commit 6a4d2657e048f096c7ffcad254010bd94891c8c0
+Author: Thomas Gleixner <tglx@linutronix.de>
+Date:   Tue May 29 17:50:22 2018 +0200
+
+    x86/smp: Provide topology_is_primary_thread()
+    
+    If the CPU is supporting SMT then the primary thread can be found by
+    checking the lower APIC ID bits for zero. smp_num_siblings is used to build
+    the mask for the APIC ID bits which need to be taken into account.
+    
+    This uses the MPTABLE or ACPI/MADT supplied APIC ID, which can be different
+    than the initial APIC ID in CPUID. But according to AMD the lower bits have
+    to be consistent. Intel gave a tentative confirmation as well.
+    
+    Preparatory patch to support disabling SMT at boot/runtime.
+    
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Reviewed-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+    Acked-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index c1d2a9892352..661e361a12a6 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -123,13 +123,15 @@ static inline int topology_max_smt_threads(void)
+ }
+ 
+ int topology_update_package_map(unsigned int apicid, unsigned int cpu);
+-extern int topology_phys_to_logical_pkg(unsigned int pkg);
++int topology_phys_to_logical_pkg(unsigned int pkg);
++bool topology_is_primary_thread(unsigned int cpu);
+ #else
+ #define topology_max_packages()			(1)
+ static inline int
+ topology_update_package_map(unsigned int apicid, unsigned int cpu) { return 0; }
+ static inline int topology_phys_to_logical_pkg(unsigned int pkg) { return 0; }
+ static inline int topology_max_smt_threads(void) { return 1; }
++static inline bool topology_is_primary_thread(unsigned int cpu) { return true; }
+ #endif
+ 
+ static inline void arch_fix_phys_package_id(int num, u32 slot)
+
+commit dbe04493eddfaa89756ec9af8dde56206290182a
+Author: Dou Liyang <douly.fnst@cn.fujitsu.com>
+Date:   Wed Jul 26 21:34:35 2017 +0800
+
+    x86/topology: Remove the unused parent_node() macro
+    
+    Commit:
+    
+      a7be6e5a7f8d ("mm: drop useless local parameters of __register_one_node()")
+    
+    ... removed the last user of parent_node(), so remove the macro.
+    
+    Reported-by: Michael Ellerman <mpe@ellerman.id.au>
+    Signed-off-by: Dou Liyang <douly.fnst@cn.fujitsu.com>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Link: http://lkml.kernel.org/r/1501076076-1974-11-git-send-email-douly.fnst@cn.fujitsu.com
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index 6358a85e2270..c1d2a9892352 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -75,12 +75,6 @@ static inline const struct cpumask *cpumask_of_node(int node)
+ 
+ extern void setup_node_to_cpumask_map(void);
+ 
+-/*
+- * Returns the number of the node containing Node 'node'. This
+- * architecture is flat, so it is a pretty simple function!
+- */
+-#define parent_node(node) (node)
+-
+ #define pcibus_to_node(bus) __pcibus_to_node(bus)
+ 
+ extern int __node_distance(int, int);
+
+commit de966cf4a4fa8d4e0357b08204bc791f34deb3fb
+Author: Tim Chen <tim.c.chen@linux.intel.com>
+Date:   Tue Nov 29 10:43:27 2016 -0800
+
+    sched/x86: Change CONFIG_SCHED_ITMT to CONFIG_SCHED_MC_PRIO
+    
+    Rename CONFIG_SCHED_ITMT for Intel Turbo Boost Max Technology 3.0
+    to CONFIG_SCHED_MC_PRIO.  This makes the configuration extensible
+    in future to other architectures that wish to similarly establish
+    CPU core priorities support in the scheduler.
+    
+    The description in Kconfig is updated to reflect this change with
+    added details for better clarity.  The configuration is explicitly
+    default-y, to enable the feature on CPUs that have this feature.
+    
+    It has no effect on non-TBM3 CPUs.
+    
+    Signed-off-by: Tim Chen <tim.c.chen@linux.intel.com>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: bp@suse.de
+    Cc: jolsa@redhat.com
+    Cc: linux-acpi@vger.kernel.org
+    Cc: linux-pm@vger.kernel.org
+    Cc: rjw@rjwysocki.net
+    Link: http://lkml.kernel.org/r/2b2ee29d93e3f162922d72d0165a1405864fbb23.1480444902.git.tim.c.chen@linux.intel.com
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index 4813df5c21f0..6358a85e2270 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -148,7 +148,7 @@ void x86_pci_root_bus_resources(int bus, struct list_head *resources);
+ 
+ extern bool x86_topology_update;
+ 
+-#ifdef CONFIG_SCHED_ITMT
++#ifdef CONFIG_SCHED_MC_PRIO
+ #include <asm/percpu.h>
+ 
+ DECLARE_PER_CPU_READ_MOSTLY(int, sched_core_priority);
+@@ -163,7 +163,7 @@ int sched_set_itmt_support(void);
+ /* Interface to notify scheduler that system revokes ITMT support */
+ void sched_clear_itmt_support(void);
+ 
+-#else /* CONFIG_SCHED_ITMT */
++#else /* CONFIG_SCHED_MC_PRIO */
+ 
+ #define sysctl_sched_itmt_enabled	0
+ static inline void sched_set_itmt_core_prio(int prio, int core_cpu)
+@@ -176,6 +176,6 @@ static inline int sched_set_itmt_support(void)
+ static inline void sched_clear_itmt_support(void)
+ {
+ }
+-#endif /* CONFIG_SCHED_ITMT */
++#endif /* CONFIG_SCHED_MC_PRIO */
+ 
+ #endif /* _ASM_X86_TOPOLOGY_H */
+
+commit f9793e34952cda133caaa35738a4b46053331c96
+Author: Tim Chen <tim.c.chen@linux.intel.com>
+Date:   Tue Nov 22 12:23:56 2016 -0800
+
+    x86/sysctl: Add sysctl for ITMT scheduling feature
+    
+    Intel Turbo Boost Max Technology 3.0 (ITMT) feature
+    allows some cores to be boosted to higher turbo
+    frequency than others.
+    
+    Add /proc/sys/kernel/sched_itmt_enabled so operator
+    can enable/disable scheduling of tasks that favor cores
+    with higher turbo boost frequency potential.
+    
+    By default, system that is ITMT capable and single
+    socket has this feature turned on.  It is more likely
+    to be lightly loaded and operates in Turbo range.
+    
+    When there is a change in the ITMT scheduling operation
+    desired, a rebuild of the sched domain is initiated
+    so the scheduler can set up sched domains with appropriate
+    flag to enable/disable ITMT scheduling operations.
+    
+    Co-developed-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+    Co-developed-by: Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+    Signed-off-by: Tim Chen <tim.c.chen@linux.intel.com>
+    Cc: linux-pm@vger.kernel.org
+    Cc: peterz@infradead.org
+    Cc: jolsa@redhat.com
+    Cc: rjw@rjwysocki.net
+    Cc: linux-acpi@vger.kernel.org
+    Cc: Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+    Cc: bp@suse.de
+    Link: http://lkml.kernel.org/r/07cc62426a28bad57b01ab16bb903a9c84fa5421.1479844244.git.tim.c.chen@linux.intel.com
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index 8ace9511347c..4813df5c21f0 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -152,23 +152,26 @@ extern bool x86_topology_update;
+ #include <asm/percpu.h>
+ 
+ DECLARE_PER_CPU_READ_MOSTLY(int, sched_core_priority);
++extern unsigned int __read_mostly sysctl_sched_itmt_enabled;
+ 
+ /* Interface to set priority of a cpu */
+ void sched_set_itmt_core_prio(int prio, int core_cpu);
+ 
+ /* Interface to notify scheduler that system supports ITMT */
+-void sched_set_itmt_support(void);
++int sched_set_itmt_support(void);
+ 
+ /* Interface to notify scheduler that system revokes ITMT support */
+ void sched_clear_itmt_support(void);
+ 
+ #else /* CONFIG_SCHED_ITMT */
+ 
++#define sysctl_sched_itmt_enabled	0
+ static inline void sched_set_itmt_core_prio(int prio, int core_cpu)
+ {
+ }
+-static inline void sched_set_itmt_support(void)
++static inline int sched_set_itmt_support(void)
+ {
++	return 0;
+ }
+ static inline void sched_clear_itmt_support(void)
+ {
+
+commit 5e76b2ab36b40ca33023e78725bdc69eafd63134
+Author: Tim Chen <tim.c.chen@linux.intel.com>
+Date:   Tue Nov 22 12:23:55 2016 -0800
+
+    x86: Enable Intel Turbo Boost Max Technology 3.0
+    
+    On platforms supporting Intel Turbo Boost Max Technology 3.0, the maximum
+    turbo frequencies of some cores in a CPU package may be higher than for
+    the other cores in the same package.  In that case, better performance
+    (and possibly lower energy consumption as well) can be achieved by
+    making the scheduler prefer to run tasks on the CPUs with higher max
+    turbo frequencies.
+    
+    To that end, set up a core priority metric to abstract the core
+    preferences based on the maximum turbo frequency.  In that metric,
+    the cores with higher maximum turbo frequencies are higher-priority
+    than the other cores in the same package and that causes the scheduler
+    to favor them when making load-balancing decisions using the asymmertic
+    packing approach.  At the same time, the priority of SMT threads with a
+    higher CPU number is reduced so as to avoid scheduling tasks on all of
+    the threads that belong to a favored core before all of the other cores
+    have been given a task to run.
+    
+    The priority metric will be initialized by the P-state driver with the
+    help of the sched_set_itmt_core_prio() function.  The P-state driver
+    will also determine whether or not ITMT is supported by the platform
+    and will call sched_set_itmt_support() to indicate that.
+    
+    Co-developed-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+    Co-developed-by: Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+    Signed-off-by: Tim Chen <tim.c.chen@linux.intel.com>
+    Cc: linux-pm@vger.kernel.org
+    Cc: peterz@infradead.org
+    Cc: jolsa@redhat.com
+    Cc: rjw@rjwysocki.net
+    Cc: linux-acpi@vger.kernel.org
+    Cc: Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+    Cc: bp@suse.de
+    Link: http://lkml.kernel.org/r/cd401ccdff88f88c8349314febdc25d51f7c48f7.1479844244.git.tim.c.chen@linux.intel.com
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index a5ca88a22ca3..8ace9511347c 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -147,4 +147,32 @@ int x86_pci_root_bus_node(int bus);
+ void x86_pci_root_bus_resources(int bus, struct list_head *resources);
+ 
+ extern bool x86_topology_update;
++
++#ifdef CONFIG_SCHED_ITMT
++#include <asm/percpu.h>
++
++DECLARE_PER_CPU_READ_MOSTLY(int, sched_core_priority);
++
++/* Interface to set priority of a cpu */
++void sched_set_itmt_core_prio(int prio, int core_cpu);
++
++/* Interface to notify scheduler that system supports ITMT */
++void sched_set_itmt_support(void);
++
++/* Interface to notify scheduler that system revokes ITMT support */
++void sched_clear_itmt_support(void);
++
++#else /* CONFIG_SCHED_ITMT */
++
++static inline void sched_set_itmt_core_prio(int prio, int core_cpu)
++{
++}
++static inline void sched_set_itmt_support(void)
++{
++}
++static inline void sched_clear_itmt_support(void)
++{
++}
++#endif /* CONFIG_SCHED_ITMT */
++
+ #endif /* _ASM_X86_TOPOLOGY_H */
+
+commit 7d25127cef44924f1013d119ba385095ca4b4a83
+Author: Tim Chen <tim.c.chen@linux.intel.com>
+Date:   Tue Nov 22 12:23:54 2016 -0800
+
+    x86/topology: Define x86's arch_update_cpu_topology
+    
+    The scheduler calls arch_update_cpu_topology() to check whether the
+    scheduler domains have to be rebuilt.
+    
+    So far x86 has no requirement for this, but the upcoming ITMT support
+    makes this necessary.
+    
+    Request the rebuild when the x86 internal update flag is set.
+    
+    Suggested-by: Morten Rasmussen <morten.rasmussen@arm.com>
+    Signed-off-by: Tim Chen <tim.c.chen@linux.intel.com>
+    Cc: linux-pm@vger.kernel.org
+    Cc: peterz@infradead.org
+    Cc: jolsa@redhat.com
+    Cc: rjw@rjwysocki.net
+    Cc: linux-acpi@vger.kernel.org
+    Cc: Srinivas Pandruvada <srinivas.pandruvada@linux.intel.com>
+    Cc: bp@suse.de
+    Link: http://lkml.kernel.org/r/bfbf5591276ec60b2af2da798adc1060df1e2a5f.1479844244.git.tim.c.chen@linux.intel.com
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index cf75871d2f81..a5ca88a22ca3 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -146,4 +146,5 @@ struct pci_bus;
+ int x86_pci_root_bus_node(int bus);
+ void x86_pci_root_bus_resources(int bus, struct list_head *resources);
+ 
++extern bool x86_topology_update;
+ #endif /* _ASM_X86_TOPOLOGY_H */
+
+commit aeb35d6b74174ed08daab84e232b456bbd89d1d9
+Merge: 7a66ecfd319a a47177d360a2
+Author: Linus Torvalds <torvalds@linux-foundation.org>
+Date:   Mon Aug 1 14:23:42 2016 -0400
+
+    Merge branch 'x86-headers-for-linus' of git://git.kernel.org/pub/scm/linux/kernel/git/tip/tip
+    
+    Pull x86 header cleanups from Ingo Molnar:
+     "This tree is a cleanup of the x86 tree reducing spurious uses of
+      module.h - which should improve build performance a bit"
+    
+    * 'x86-headers-for-linus' of git://git.kernel.org/pub/scm/linux/kernel/git/tip/tip:
+      x86, crypto: Restore MODULE_LICENSE() to glue_helper.c so it loads
+      x86/apic: Remove duplicated include from probe_64.c
+      x86/ce4100: Remove duplicated include from ce4100.c
+      x86/headers: Include spinlock_types.h in x8664_ksyms_64.c for missing spinlock_t
+      x86/platform: Delete extraneous MODULE_* tags fromm ts5500
+      x86: Audit and remove any remaining unnecessary uses of module.h
+      x86/kvm: Audit and remove any unnecessary uses of module.h
+      x86/xen: Audit and remove any unnecessary uses of module.h
+      x86/platform: Audit and remove any unnecessary uses of module.h
+      x86/lib: Audit and remove any unnecessary uses of module.h
+      x86/kernel: Audit and remove any unnecessary uses of module.h
+      x86/mm: Audit and remove any unnecessary uses of module.h
+      x86: Don't use module.h just for AUTHOR / LICENSE tags
+
+commit 8e466955d6f78896cc6519b6f07e89173d3ba58b
+Merge: 2d724ffddd95 05f310e26fe9
+Author: Linus Torvalds <torvalds@linux-foundation.org>
+Date:   Mon Jul 25 19:15:35 2016 -0700
+
+    Merge branch 'x86-platform-for-linus' of git://git.kernel.org/pub/scm/linux/kernel/git/tip/tip
+    
+    Pull x86 platform updates from Ingo Molnar:
+     "The main changes in this cycle were:
+    
+       - Intel-SoC enhancements (Andy Shevchenko)
+    
+       - Intel CPU symbolic model definition rework (Dave Hansen)
+    
+       - ... other misc changes"
+    
+    * 'x86-platform-for-linus' of git://git.kernel.org/pub/scm/linux/kernel/git/tip/tip: (25 commits)
+      x86/sfi: Enable enumeration of SD devices
+      x86/pci: Use MRFLD abbreviation for Merrifield
+      x86/platform/intel-mid: Make vertical indentation consistent
+      x86/platform/intel-mid: Mark regulators explicitly defined
+      x86/platform/intel-mid: Rename mrfl.c to mrfld.c
+      x86/platform/intel-mid: Enable spidev on Intel Edison boards
+      x86/platform/intel-mid: Extend PWRMU to support Penwell
+      x86/pci, x86/platform/intel_mid_pci: Remove duplicate power off code
+      x86/platform/intel-mid: Add pinctrl for Intel Merrifield
+      x86/platform/intel-mid: Enable GPIO expanders on Edison
+      x86/platform/intel-mid: Add Power Management Unit driver
+      x86/platform/atom/punit: Enable support for Merrifield
+      x86/platform/intel_mid_pci: Rework IRQ0 workaround
+      x86, thermal: Clean up and fix CPU model detection for intel_soc_dts_thermal
+      x86, mmc: Use Intel family name macros for mmc driver
+      x86/intel_telemetry: Use Intel family name macros for telemetry driver
+      x86/acpi/lss: Use Intel family name macros for the acpi_lpss driver
+      x86/cpufreq: Use Intel family name macros for the intel_pstate cpufreq driver
+      x86/platform: Use new Intel model number macros
+      x86/intel_idle: Use Intel family macros for intel_idle
+      ...
+
+commit 186f43608a5c827f8284fe4559225b4dccaa49ef
+Author: Paul Gortmaker <paul.gortmaker@windriver.com>
+Date:   Wed Jul 13 20:18:56 2016 -0400
+
+    x86/kernel: Audit and remove any unnecessary uses of module.h
+    
+    Historically a lot of these existed because we did not have
+    a distinction between what was modular code and what was providing
+    support to modules via EXPORT_SYMBOL and friends.  That changed
+    when we forked out support for the latter into the export.h file.
+    
+    This means we should be able to reduce the usage of module.h
+    in code that is obj-y Makefile or bool Kconfig.  The advantage
+    in doing so is that module.h itself sources about 15 other headers;
+    adding significantly to what we feed cpp, and it can obscure what
+    headers we are effectively using.
+    
+    Since module.h was the source for init.h (for __init) and for
+    export.h (for EXPORT_SYMBOL) we consider each obj-y/bool instance
+    for the presence of either and replace as needed.  Build testing
+    revealed some implicit header usage that was fixed up accordingly.
+    
+    Note that some bool/obj-y instances remain since module.h is
+    the header for some exception table entry stuff, and for things
+    like __init_or_module (code that is tossed when MODULES=n).
+    
+    Signed-off-by: Paul Gortmaker <paul.gortmaker@windriver.com>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Link: http://lkml.kernel.org/r/20160714001901.31603-4-paul.gortmaker@windriver.com
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index c9a4ed73aef4..16e0cf92278b 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -36,6 +36,7 @@
+ #include <linux/cpumask.h>
+ 
+ #include <asm/mpspec.h>
++#include <asm/percpu.h>
+ 
+ /* Mappings between logical cpu number and node number */
+ DECLARE_EARLY_PER_CPU(int, x86_cpu_to_node_map);
+
+commit 70b8301f6b8f7bc053377a9cbd0c4e42e29d9807
+Author: Andi Kleen <ak@linux.intel.com>
+Date:   Thu May 19 17:09:55 2016 -0700
+
+    x86/topology: Add topology_max_smt_threads()
+    
+    For SMT specific workarounds it is useful to know if SMT is active
+    on any online CPU in the system. This currently requires a loop
+    over all online CPUs.
+    
+    Add a global variable that is updated with the maximum number
+    of smt threads on any CPU on online/offline, and use it for
+    topology_max_smt_threads()
+    
+    The single call is easier to use than a loop.
+    
+    Not exported to user space because user space already can use
+    the existing sibling interfaces to find this out.
+    
+    Signed-off-by: Andi Kleen <ak@linux.intel.com>
+    Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+    Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+    Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+    Cc: Jiri Olsa <jolsa@redhat.com>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Stephane Eranian <eranian@google.com>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Vince Weaver <vincent.weaver@maine.edu>
+    Cc: acme@kernel.org
+    Cc: jolsa@kernel.org
+    Link: http://lkml.kernel.org/r/1463703002-19686-2-git-send-email-andi@firstfloor.org
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index 7f991bd5031b..e346572841a0 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -129,6 +129,14 @@ extern const struct cpumask *cpu_coregroup_mask(int cpu);
+ 
+ extern unsigned int __max_logical_packages;
+ #define topology_max_packages()			(__max_logical_packages)
++
++extern int __max_smt_threads;
++
++static inline int topology_max_smt_threads(void)
++{
++	return __max_smt_threads;
++}
++
+ int topology_update_package_map(unsigned int apicid, unsigned int cpu);
+ extern int topology_phys_to_logical_pkg(unsigned int pkg);
+ #else
+@@ -136,6 +144,7 @@ extern int topology_phys_to_logical_pkg(unsigned int pkg);
+ static inline int
+ topology_update_package_map(unsigned int apicid, unsigned int cpu) { return 0; }
+ static inline int topology_phys_to_logical_pkg(unsigned int pkg) { return 0; }
++static inline int topology_max_smt_threads(void) { return 1; }
+ #endif
+ 
+ static inline void arch_fix_phys_package_id(int num, u32 slot)
+
+commit 3282e6b8f89eaeaf4915ee6cc57bcf06d1d6cead
+Author: Sudeep Holla <sudeep.holla@arm.com>
+Date:   Wed May 4 17:50:59 2016 +0100
+
+    x86/topology: Remove redundant ENABLE_TOPO_DEFINES
+    
+    Commit c8e56d20f2d1 ("x86: Kill CONFIG_X86_HT") removed CONFIG_X86_HT
+    and defined ENABLE_TOPO_DEFINES always if CONFIG_SMP, which makes
+    ENABLE_TOPO_DEFINES redundant.
+    
+    This patch removes the redundant ENABLE_TOPO_DEFINES and instead uses
+    CONFIG_SMP directly
+    
+    Signed-off-by: Sudeep Holla <sudeep.holla@arm.com>
+    Acked-by: Borislav Petkov <bp@suse.de>
+    Cc: Andy Lutomirski <luto@amacapital.net>
+    Cc: Borislav Petkov <bp@alien8.de>
+    Cc: Brian Gerst <brgerst@gmail.com>
+    Cc: Denys Vlasenko <dvlasenk@redhat.com>
+    Cc: H. Peter Anvin <hpa@zytor.com>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Link: http://lkml.kernel.org/r/1462380659-5968-1-git-send-email-sudeep.holla@arm.com
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index 7f991bd5031b..c9a4ed73aef4 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -25,16 +25,6 @@
+ #ifndef _ASM_X86_TOPOLOGY_H
+ #define _ASM_X86_TOPOLOGY_H
+ 
+-#ifdef CONFIG_X86_32
+-# ifdef CONFIG_SMP
+-#  define ENABLE_TOPO_DEFINES
+-# endif
+-#else
+-# ifdef CONFIG_SMP
+-#  define ENABLE_TOPO_DEFINES
+-# endif
+-#endif
+-
+ /*
+  * to preserve the visibility of NUMA_NO_NODE definition,
+  * moved to there from here.  May be used independent of
+@@ -123,7 +113,7 @@ extern const struct cpumask *cpu_coregroup_mask(int cpu);
+ #define topology_physical_package_id(cpu)	(cpu_data(cpu).phys_proc_id)
+ #define topology_core_id(cpu)			(cpu_data(cpu).cpu_core_id)
+ 
+-#ifdef ENABLE_TOPO_DEFINES
++#ifdef CONFIG_SMP
+ #define topology_core_cpumask(cpu)		(per_cpu(cpu_core_map, cpu))
+ #define topology_sibling_cpumask(cpu)		(per_cpu(cpu_sibling_map, cpu))
+ 
+
+commit 1f12e32f4cd5243ae46d8b933181be0d022c6793
+Author: Thomas Gleixner <tglx@linutronix.de>
+Date:   Mon Feb 22 22:19:15 2016 +0000
+
+    x86/topology: Create logical package id
+    
+    For per package oriented services we must be able to rely on the number of CPU
+    packages to be within bounds. Create a tracking facility, which
+    
+    - calculates the number of possible packages depending on nr_cpu_ids after boot
+    
+    - makes sure that the package id is within the number of possible packages. If
+      the apic id is outside we map it to a logical package id if there is enough
+      space available.
+    
+    Provide interfaces for drivers to query the mapping and do translations from
+    physcial to logical ids.
+    
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+    Cc: Andi Kleen <andi.kleen@intel.com>
+    Cc: Andrew Morton <akpm@linux-foundation.org>
+    Cc: Andy Lutomirski <luto@amacapital.net>
+    Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+    Cc: Borislav Petkov <bp@alien8.de>
+    Cc: Brian Gerst <brgerst@gmail.com>
+    Cc: Denys Vlasenko <dvlasenk@redhat.com>
+    Cc: H. Peter Anvin <hpa@zytor.com>
+    Cc: Harish Chegondi <harish.chegondi@intel.com>
+    Cc: Jacob Pan <jacob.jun.pan@linux.intel.com>
+    Cc: Jiri Olsa <jolsa@redhat.com>
+    Cc: Kan Liang <kan.liang@intel.com>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Luis R. Rodriguez <mcgrof@suse.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Stephane Eranian <eranian@google.com>
+    Cc: Toshi Kani <toshi.kani@hp.com>
+    Cc: Vince Weaver <vincent.weaver@maine.edu>
+    Cc: linux-kernel@vger.kernel.org
+    Link: http://lkml.kernel.org/r/20160222221011.541071755@linutronix.de
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index 0fb46482dfde..7f991bd5031b 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -119,12 +119,23 @@ static inline void setup_node_to_cpumask_map(void) { }
+ 
+ extern const struct cpumask *cpu_coregroup_mask(int cpu);
+ 
++#define topology_logical_package_id(cpu)	(cpu_data(cpu).logical_proc_id)
+ #define topology_physical_package_id(cpu)	(cpu_data(cpu).phys_proc_id)
+ #define topology_core_id(cpu)			(cpu_data(cpu).cpu_core_id)
+ 
+ #ifdef ENABLE_TOPO_DEFINES
+ #define topology_core_cpumask(cpu)		(per_cpu(cpu_core_map, cpu))
+ #define topology_sibling_cpumask(cpu)		(per_cpu(cpu_sibling_map, cpu))
++
++extern unsigned int __max_logical_packages;
++#define topology_max_packages()			(__max_logical_packages)
++int topology_update_package_map(unsigned int apicid, unsigned int cpu);
++extern int topology_phys_to_logical_pkg(unsigned int pkg);
++#else
++#define topology_max_packages()			(1)
++static inline int
++topology_update_package_map(unsigned int apicid, unsigned int cpu) { return 0; }
++static inline int topology_phys_to_logical_pkg(unsigned int pkg) { return 0; }
+ #endif
+ 
+ static inline void arch_fix_phys_package_id(int num, u32 slot)
+
+commit d70b3ef54ceaf1c7c92209f5a662a670d04cbed9
+Merge: 650ec5a6bd5d 7ef3d7d58d9d
+Author: Linus Torvalds <torvalds@linux-foundation.org>
+Date:   Mon Jun 22 17:59:09 2015 -0700
+
+    Merge branch 'x86-core-for-linus' of git://git.kernel.org/pub/scm/linux/kernel/git/tip/tip
+    
+    Pull x86 core updates from Ingo Molnar:
+     "There were so many changes in the x86/asm, x86/apic and x86/mm topics
+      in this cycle that the topical separation of -tip broke down somewhat -
+      so the result is a more traditional architecture pull request,
+      collected into the 'x86/core' topic.
+    
+      The topics were still maintained separately as far as possible, so
+      bisectability and conceptual separation should still be pretty good -
+      but there were a handful of merge points to avoid excessive
+      dependencies (and conflicts) that would have been poorly tested in the
+      end.
+    
+      The next cycle will hopefully be much more quiet (or at least will
+      have fewer dependencies).
+    
+      The main changes in this cycle were:
+    
+       * x86/apic changes, with related IRQ core changes: (Jiang Liu, Thomas
+         Gleixner)
+    
+         - This is the second and most intrusive part of changes to the x86
+           interrupt handling - full conversion to hierarchical interrupt
+           domains:
+    
+              [IOAPIC domain]   -----
+                                     |
+              [MSI domain]      --------[Remapping domain] ----- [ Vector domain ]
+                                     |   (optional)          |
+              [HPET MSI domain] -----                        |
+                                                             |
+              [DMAR domain]     -----------------------------
+                                                             |
+              [Legacy domain]   -----------------------------
+    
+           This now reflects the actual hardware and allowed us to distangle
+           the domain specific code from the underlying parent domain, which
+           can be optional in the case of interrupt remapping.  It's a clear
+           separation of functionality and removes quite some duct tape
+           constructs which plugged the remap code between ioapic/msi/hpet
+           and the vector management.
+    
+         - Intel IOMMU IRQ remapping enhancements, to allow direct interrupt
+           injection into guests (Feng Wu)
+    
+       * x86/asm changes:
+    
+         - Tons of cleanups and small speedups, micro-optimizations.  This
+           is in preparation to move a good chunk of the low level entry
+           code from assembly to C code (Denys Vlasenko, Andy Lutomirski,
+           Brian Gerst)
+    
+         - Moved all system entry related code to a new home under
+           arch/x86/entry/ (Ingo Molnar)
+    
+         - Removal of the fragile and ugly CFI dwarf debuginfo annotations.
+           Conversion to C will reintroduce many of them - but meanwhile
+           they are only getting in the way, and the upstream kernel does
+           not rely on them (Ingo Molnar)
+    
+         - NOP handling refinements. (Borislav Petkov)
+    
+       * x86/mm changes:
+    
+         - Big PAT and MTRR rework: making the code more robust and
+           preparing to phase out exposing direct MTRR interfaces to drivers -
+           in favor of using PAT driven interfaces (Toshi Kani, Luis R
+           Rodriguez, Borislav Petkov)
+    
+         - New ioremap_wt()/set_memory_wt() interfaces to support
+           Write-Through cached memory mappings.  This is especially
+           important for good performance on NVDIMM hardware (Toshi Kani)
+    
+       * x86/ras changes:
+    
+         - Add support for deferred errors on AMD (Aravind Gopalakrishnan)
+    
+           This is an important RAS feature which adds hardware support for
+           poisoned data.  That means roughly that the hardware marks data
+           which it has detected as corrupted but wasn't able to correct, as
+           poisoned data and raises an APIC interrupt to signal that in the
+           form of a deferred error.  It is the OS's responsibility then to
+           take proper recovery action and thus prolonge system lifetime as
+           far as possible.
+    
+         - Add support for Intel "Local MCE"s: upcoming CPUs will support
+           CPU-local MCE interrupts, as opposed to the traditional system-
+           wide broadcasted MCE interrupts (Ashok Raj)
+    
+         - Misc cleanups (Borislav Petkov)
+    
+       * x86/platform changes:
+    
+         - Intel Atom SoC updates
+    
+      ... and lots of other cleanups, fixlets and other changes - see the
+      shortlog and the Git log for details"
+    
+    * 'x86-core-for-linus' of git://git.kernel.org/pub/scm/linux/kernel/git/tip/tip: (222 commits)
+      x86/hpet: Use proper hpet device number for MSI allocation
+      x86/hpet: Check for irq==0 when allocating hpet MSI interrupts
+      x86/mm/pat, drivers/infiniband/ipath: Use arch_phys_wc_add() and require PAT disabled
+      x86/mm/pat, drivers/media/ivtv: Use arch_phys_wc_add() and require PAT disabled
+      x86/platform/intel/baytrail: Add comments about why we disabled HPET on Baytrail
+      genirq: Prevent crash in irq_move_irq()
+      genirq: Enhance irq_data_to_desc() to support hierarchy irqdomain
+      iommu, x86: Properly handle posted interrupts for IOMMU hotplug
+      iommu, x86: Provide irq_remapping_cap() interface
+      iommu, x86: Setup Posted-Interrupts capability for Intel iommu
+      iommu, x86: Add cap_pi_support() to detect VT-d PI capability
+      iommu, x86: Avoid migrating VT-d posted interrupts
+      iommu, x86: Save the mode (posted or remapped) of an IRTE
+      iommu, x86: Implement irq_set_vcpu_affinity for intel_ir_chip
+      iommu: dmar: Provide helper to copy shared irte fields
+      iommu: dmar: Extend struct irte for VT-d Posted-Interrupts
+      iommu: Add new member capability to struct irq_remap_ops
+      x86/asm/entry/64: Disentangle error_entry/exit gsbase/ebx/usermode code
+      x86/asm/entry/32: Shorten __audit_syscall_entry() args preparation
+      x86/asm/entry/32: Explain reloading of registers after __audit_syscall_entry()
+      ...
+
+commit c8e56d20f2d190d54c0615775dcb6a23c1091681
+Author: Borislav Petkov <bp@suse.de>
+Date:   Thu Jun 4 18:55:25 2015 +0200
+
+    x86: Kill CONFIG_X86_HT
+    
+    In talking to Aravind recently about making certain AMD topology
+    attributes available to the MCE injection module, it seemed like
+    that CONFIG_X86_HT thing is more or less superfluous. It is
+    def_bool y, depends on SMP and gets enabled in the majority of
+    .configs - distro and otherwise - out there.
+    
+    So let's kill it and make code behind it depend directly on SMP.
+    
+    Signed-off-by: Borislav Petkov <bp@suse.de>
+    Cc: Andrew Morton <akpm@linux-foundation.org>
+    Cc: Andy Lutomirski <luto@kernel.org>
+    Cc: Aravind Gopalakrishnan <Aravind.Gopalakrishnan@amd.com>
+    Cc: Bartosz Golaszewski <bgolaszewski@baylibre.com>
+    Cc: Catalin Marinas <catalin.marinas@arm.com>
+    Cc: Daniel Walter <dwalter@google.com>
+    Cc: Dave Hansen <dave.hansen@linux.intel.com>
+    Cc: Denys Vlasenko <dvlasenk@redhat.com>
+    Cc: H. Peter Anvin <hpa@zytor.com>
+    Cc: Igor Mammedov <imammedo@redhat.com>
+    Cc: Jacob Shin <jacob.w.shin@gmail.com>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Mel Gorman <mgorman@suse.de>
+    Cc: Peter Zijlstra (Intel) <peterz@infradead.org>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Link: http://lkml.kernel.org/r/1433436928-31903-18-git-send-email-bp@alien8.de
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index 0e8f04f2c26f..8d717faeed22 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -26,7 +26,7 @@
+ #define _ASM_X86_TOPOLOGY_H
+ 
+ #ifdef CONFIG_X86_32
+-# ifdef CONFIG_X86_HT
++# ifdef CONFIG_SMP
+ #  define ENABLE_TOPO_DEFINES
+ # endif
+ #else
+
+commit 06931e62246844c73fba24d7aeb4a5dc897a2739
+Author: Bartosz Golaszewski <bgolaszewski@baylibre.com>
+Date:   Tue May 26 15:11:28 2015 +0200
+
+    sched/topology: Rename topology_thread_cpumask() to topology_sibling_cpumask()
+    
+    Rename topology_thread_cpumask() to topology_sibling_cpumask()
+    for more consistency with scheduler code.
+    
+    Signed-off-by: Bartosz Golaszewski <bgolaszewski@baylibre.com>
+    Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+    Acked-by: Russell King <rmk+kernel@arm.linux.org.uk>
+    Acked-by: Catalin Marinas <catalin.marinas@arm.com>
+    Cc: Benoit Cousson <bcousson@baylibre.com>
+    Cc: Fenghua Yu <fenghua.yu@intel.com>
+    Cc: Guenter Roeck <linux@roeck-us.net>
+    Cc: Jean Delvare <jdelvare@suse.de>
+    Cc: Jonathan Corbet <corbet@lwn.net>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Oleg Drokin <oleg.drokin@intel.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Rafael J. Wysocki <rjw@rjwysocki.net>
+    Cc: Russell King <linux@arm.linux.org.uk>
+    Cc: Viresh Kumar <viresh.kumar@linaro.org>
+    Link: http://lkml.kernel.org/r/1432645896-12588-2-git-send-email-bgolaszewski@baylibre.com
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index 0e8f04f2c26f..5a77593fdace 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -124,7 +124,7 @@ extern const struct cpumask *cpu_coregroup_mask(int cpu);
+ 
+ #ifdef ENABLE_TOPO_DEFINES
+ #define topology_core_cpumask(cpu)		(per_cpu(cpu_core_map, cpu))
+-#define topology_thread_cpumask(cpu)		(per_cpu(cpu_sibling_map, cpu))
++#define topology_sibling_cpumask(cpu)		(per_cpu(cpu_sibling_map, cpu))
+ #endif
+ 
+ static inline void arch_fix_phys_package_id(int num, u32 slot)
+
+commit 4b1779c2cf030c68aefe939d946475e4136c1895
+Merge: 62ff577fa2fe 30723cbf6f7a
+Author: Linus Torvalds <torvalds@linux-foundation.org>
+Date:   Tue Apr 1 15:14:04 2014 -0700
+
+    Merge tag 'pci-v3.15-changes' of git://git.kernel.org/pub/scm/linux/kernel/git/helgaas/pci
+    
+    Pull PCI changes from Bjorn Helgaas:
+     "Enumeration
+       - Increment max correctly in pci_scan_bridge() (Andreas Noever)
+       - Clarify the "scan anyway" comment in pci_scan_bridge() (Andreas Noever)
+       - Assign CardBus bus number only during the second pass (Andreas Noever)
+       - Use request_resource_conflict() instead of insert_ for bus numbers (Andreas Noever)
+       - Make sure bus number resources stay within their parents bounds (Andreas Noever)
+       - Remove pci_fixup_parent_subordinate_busnr() (Andreas Noever)
+       - Check for child busses which use more bus numbers than allocated (Andreas Noever)
+       - Don't scan random busses in pci_scan_bridge() (Andreas Noever)
+       - x86: Drop pcibios_scan_root() check for bus already scanned (Bjorn Helgaas)
+       - x86: Use pcibios_scan_root() instead of pci_scan_bus_with_sysdata() (Bjorn Helgaas)
+       - x86: Use pcibios_scan_root() instead of pci_scan_bus_on_node() (Bjorn Helgaas)
+       - x86: Merge pci_scan_bus_on_node() into pcibios_scan_root() (Bjorn Helgaas)
+       - x86: Drop return value of pcibios_scan_root() (Bjorn Helgaas)
+    
+      NUMA
+       - x86: Add x86_pci_root_bus_node() to look up NUMA node from PCI bus (Bjorn Helgaas)
+       - x86: Use x86_pci_root_bus_node() instead of get_mp_bus_to_node() (Bjorn Helgaas)
+       - x86: Remove mp_bus_to_node[], set_mp_bus_to_node(), get_mp_bus_to_node() (Bjorn Helgaas)
+       - x86: Use NUMA_NO_NODE, not -1, for unknown node (Bjorn Helgaas)
+       - x86: Remove acpi_get_pxm() usage (Bjorn Helgaas)
+       - ia64: Use NUMA_NO_NODE, not MAX_NUMNODES, for unknown node (Bjorn Helgaas)
+       - ia64: Remove acpi_get_pxm() usage (Bjorn Helgaas)
+       - ACPI: Fix acpi_get_node() prototype (Bjorn Helgaas)
+    
+      Resource management
+       - i2o: Fix and refactor PCI space allocation (Bjorn Helgaas)
+       - Add resource_contains() (Bjorn Helgaas)
+       - Add %pR support for IORESOURCE_UNSET (Bjorn Helgaas)
+       - Mark resources as IORESOURCE_UNSET if we can't assign them (Bjorn Helgaas)
+       - Don't clear IORESOURCE_UNSET when updating BAR (Bjorn Helgaas)
+       - Check IORESOURCE_UNSET before updating BAR (Bjorn Helgaas)
+       - Don't try to claim IORESOURCE_UNSET resources (Bjorn Helgaas)
+       - Mark 64-bit resource as IORESOURCE_UNSET if we only support 32-bit (Bjorn Helgaas)
+       - Don't enable decoding if BAR hasn't been assigned an address (Bjorn Helgaas)
+       - Add "weak" generic pcibios_enable_device() implementation (Bjorn Helgaas)
+       - alpha, microblaze, sh, sparc, tile: Use default pcibios_enable_device() (Bjorn Helgaas)
+       - s390: Use generic pci_enable_resources() (Bjorn Helgaas)
+       - Don't check resource_size() in pci_bus_alloc_resource() (Bjorn Helgaas)
+       - Set type in __request_region() (Bjorn Helgaas)
+       - Check all IORESOURCE_TYPE_BITS in pci_bus_alloc_from_region() (Bjorn Helgaas)
+       - Change pci_bus_alloc_resource() type_mask to unsigned long (Bjorn Helgaas)
+       - Log IDE resource quirk in dmesg (Bjorn Helgaas)
+       - Revert "[PATCH] Insert GART region into resource map" (Bjorn Helgaas)
+    
+      PCI device hotplug
+       - Make check_link_active() non-static (Rajat Jain)
+       - Use link change notifications for hot-plug and removal (Rajat Jain)
+       - Enable link state change notifications (Rajat Jain)
+       - Don't disable the link permanently during removal (Rajat Jain)
+       - Don't check adapter or latch status while disabling (Rajat Jain)
+       - Disable link notification across slot reset (Rajat Jain)
+       - Ensure very fast hotplug events are also processed (Rajat Jain)
+       - Add hotplug_lock to serialize hotplug events (Rajat Jain)
+       - Remove a non-existent card, regardless of "surprise" capability (Rajat Jain)
+       - Don't turn slot off when hot-added device already exists (Yijing Wang)
+    
+      MSI
+       - Keep pci_enable_msi() documentation (Alexander Gordeev)
+       - ahci: Fix broken single MSI fallback (Alexander Gordeev)
+       - ahci, vfio: Use pci_enable_msi_range() (Alexander Gordeev)
+       - Check kmalloc() return value, fix leak of name (Greg Kroah-Hartman)
+       - Fix leak of msi_attrs (Greg Kroah-Hartman)
+       - Fix pci_msix_vec_count() htmldocs failure (Masanari Iida)
+    
+      Virtualization
+       - Device-specific ACS support (Alex Williamson)
+    
+      Freescale i.MX6
+       - Wait for retraining (Marek Vasut)
+    
+      Marvell MVEBU
+       - Use Device ID and revision from underlying endpoint (Andrew Lunn)
+       - Fix incorrect size for PCI aperture resources (Jason Gunthorpe)
+       - Call request_resource() on the apertures (Jason Gunthorpe)
+       - Fix potential issue in range parsing (Jean-Jacques Hiblot)
+    
+      Renesas R-Car
+       - Check platform_get_irq() return code (Ben Dooks)
+       - Add error interrupt handling (Ben Dooks)
+       - Fix bridge logic configuration accesses (Ben Dooks)
+       - Register each instance independently (Magnus Damm)
+       - Break out window size handling (Magnus Damm)
+       - Make the Kconfig dependencies more generic (Magnus Damm)
+    
+      Synopsys DesignWare
+       - Fix RC BAR to be single 64-bit non-prefetchable memory (Mohit Kumar)
+    
+      Miscellaneous
+       - Remove unused SR-IOV VF Migration support (Bjorn Helgaas)
+       - Enable INTx if BIOS left them disabled (Bjorn Helgaas)
+       - Fix hex vs decimal typo in cpqhpc_probe() (Dan Carpenter)
+       - Clean up par-arch object file list (Liviu Dudau)
+       - Set IORESOURCE_ROM_SHADOW only for the default VGA device (Sander Eikelenboom)
+       - ACPI, ARM, drm, powerpc, pcmcia, PCI: Use list_for_each_entry() for bus traversal (Yijing Wang)
+       - Fix pci_bus_b() build failure (Paul Gortmaker)"
+    
+    * tag 'pci-v3.15-changes' of git://git.kernel.org/pub/scm/linux/kernel/git/helgaas/pci: (108 commits)
+      Revert "[PATCH] Insert GART region into resource map"
+      PCI: Log IDE resource quirk in dmesg
+      PCI: Change pci_bus_alloc_resource() type_mask to unsigned long
+      PCI: Check all IORESOURCE_TYPE_BITS in pci_bus_alloc_from_region()
+      resources: Set type in __request_region()
+      PCI: Don't check resource_size() in pci_bus_alloc_resource()
+      s390/PCI: Use generic pci_enable_resources()
+      tile PCI RC: Use default pcibios_enable_device()
+      sparc/PCI: Use default pcibios_enable_device() (Leon only)
+      sh/PCI: Use default pcibios_enable_device()
+      microblaze/PCI: Use default pcibios_enable_device()
+      alpha/PCI: Use default pcibios_enable_device()
+      PCI: Add "weak" generic pcibios_enable_device() implementation
+      PCI: Don't enable decoding if BAR hasn't been assigned an address
+      PCI: Enable INTx in pci_reenable_device() only when MSI/MSI-X not enabled
+      PCI: Mark 64-bit resource as IORESOURCE_UNSET if we only support 32-bit
+      PCI: Don't try to claim IORESOURCE_UNSET resources
+      PCI: Check IORESOURCE_UNSET before updating BAR
+      PCI: Don't clear IORESOURCE_UNSET when updating BAR
+      PCI: Mark resources as IORESOURCE_UNSET if we can't assign them
+      ...
+    
+    Conflicts:
+            arch/x86/include/asm/topology.h
+            drivers/ata/ahci.c
+
+commit 971eae7c99212dd67b425a603f1fe3b763359907
+Merge: 8c292f117442 6037dd1a49f9
+Author: Linus Torvalds <torvalds@linux-foundation.org>
+Date:   Mon Mar 31 11:21:19 2014 -0700
+
+    Merge branch 'sched-core-for-linus' of git://git.kernel.org/pub/scm/linux/kernel/git/tip/tip
+    
+    Pull scheduler changes from Ingo Molnar:
+     "Bigger changes:
+    
+       - sched/idle restructuring: they are WIP preparation for deeper
+         integration between the scheduler and idle state selection, by
+         Nicolas Pitre.
+    
+       - add NUMA scheduling pseudo-interleaving, by Rik van Riel.
+    
+       - optimize cgroup context switches, by Peter Zijlstra.
+    
+       - RT scheduling enhancements, by Thomas Gleixner.
+    
+      The rest is smaller changes, non-urgnt fixes and cleanups"
+    
+    * 'sched-core-for-linus' of git://git.kernel.org/pub/scm/linux/kernel/git/tip/tip: (68 commits)
+      sched: Clean up the task_hot() function
+      sched: Remove double calculation in fix_small_imbalance()
+      sched: Fix broken setscheduler()
+      sparc64, sched: Remove unused sparc64_multi_core
+      sched: Remove unused mc_capable() and smt_capable()
+      sched/numa: Move task_numa_free() to __put_task_struct()
+      sched/fair: Fix endless loop in idle_balance()
+      sched/core: Fix endless loop in pick_next_task()
+      sched/fair: Push down check for high priority class task into idle_balance()
+      sched/rt: Fix picking RT and DL tasks from empty queue
+      trace: Replace hardcoding of 19 with MAX_NICE
+      sched: Guarantee task priority in pick_next_task()
+      sched/idle: Remove stale old file
+      sched: Put rq's sched_avg under CONFIG_FAIR_GROUP_SCHED
+      cpuidle/arm64: Remove redundant cpuidle_idle_call()
+      cpuidle/powernv: Remove redundant cpuidle_idle_call()
+      sched, nohz: Exclude isolated cores from load balancing
+      sched: Fix select_task_rq_fair() description comments
+      workqueue: Replace hardcoding of -20 and 19 with MIN_NICE and MAX_NICE
+      sys: Replace hardcoding of -20 and 19 with MIN_NICE and MAX_NICE
+      ...
+
+commit 825600c0f20e595daaa7a6dd8970f84fa2a2ee57
+Author: Artem Fetishev <artem_fetishev@epam.com>
+Date:   Fri Mar 28 13:33:39 2014 -0700
+
+    x86: fix boot on uniprocessor systems
+    
+    On x86 uniprocessor systems topology_physical_package_id() returns -1
+    which causes rapl_cpu_prepare() to leave rapl_pmu variable uninitialized
+    which leads to GPF in rapl_pmu_init().
+    
+    See arch/x86/kernel/cpu/perf_event_intel_rapl.c.
+    
+    It turns out that physical_package_id and core_id can actually be
+    retreived for uniprocessor systems too.  Enabling them also fixes
+    rapl_pmu code.
+    
+    Signed-off-by: Artem Fetishev <artem_fetishev@epam.com>
+    Cc: Stephane Eranian <eranian@google.com>
+    Cc: Ingo Molnar <mingo@elte.hu>
+    Cc: "H. Peter Anvin" <hpa@zytor.com>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Peter Zijlstra <a.p.zijlstra@chello.nl>
+    Cc: <stable@vger.kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index d35f24e231cd..1306d117967d 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -119,9 +119,10 @@ static inline void setup_node_to_cpumask_map(void) { }
+ 
+ extern const struct cpumask *cpu_coregroup_mask(int cpu);
+ 
+-#ifdef ENABLE_TOPO_DEFINES
+ #define topology_physical_package_id(cpu)	(cpu_data(cpu).phys_proc_id)
+ #define topology_core_id(cpu)			(cpu_data(cpu).cpu_core_id)
++
++#ifdef ENABLE_TOPO_DEFINES
+ #define topology_core_cpumask(cpu)		(per_cpu(cpu_core_map, cpu))
+ #define topology_thread_cpumask(cpu)		(per_cpu(cpu_sibling_map, cpu))
+ #endif
+
+commit 36fc5500bb1907bea7e9b4785dd00abf714d556f
+Author: Bjorn Helgaas <bhelgaas@google.com>
+Date:   Tue Mar 4 14:07:37 2014 -0700
+
+    sched: Remove unused mc_capable() and smt_capable()
+    
+    Remove mc_capable() and smt_capable().  Neither is used.
+    
+    Both were added by 5c45bf279d37 ("sched: mc/smt power savings sched
+    policy").  Uses of both were removed by 8e7fbcbc22c1 ("sched: Remove stale
+    power aware scheduling remnants and dysfunctional knobs").
+    
+    Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+    Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+    Acked-by: Thomas Gleixner <tglx@linutronix.de>
+    Acked-by: David S. Miller <davem@davemloft.net>
+    Acked-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+    Link: http://lkml.kernel.org/r/20140304210737.16893.54289.stgit@bhelgaas-glaptop.roam.corp.google.com
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index d35f24e231cd..9bcc724cafdd 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -133,12 +133,6 @@ static inline void arch_fix_phys_package_id(int num, u32 slot)
+ struct pci_bus;
+ void x86_pci_root_bus_resources(int bus, struct list_head *resources);
+ 
+-#ifdef CONFIG_SMP
+-#define mc_capable()	((boot_cpu_data.x86_max_cores > 1) && \
+-			(cpumask_weight(cpu_core_mask(0)) != nr_cpu_ids))
+-#define smt_capable()			(smp_num_siblings > 1)
+-#endif
+-
+ #ifdef CONFIG_NUMA
+ extern int get_mp_bus_to_node(int busnum);
+ extern void set_mp_bus_to_node(int busnum, int node);
+
+commit 25453e9e521382883b6588ef1748ed61efc77001
+Author: Bjorn Helgaas <bhelgaas@google.com>
+Date:   Fri Jan 24 11:56:06 2014 -0700
+
+    x86/PCI: Remove mp_bus_to_node[], set_mp_bus_to_node(), get_mp_bus_to_node()
+    
+    There are no callers of get_mp_bus_to_node(), so we no longer need
+    mp_bus_to_node[], get_mp_bus_to_node(), or set_mp_bus_to_node().
+    This removes them.
+    
+    Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+    Acked-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index 09046a1a6c35..c840571afa4e 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -140,17 +140,4 @@ void x86_pci_root_bus_resources(int bus, struct list_head *resources);
+ #define smt_capable()			(smp_num_siblings > 1)
+ #endif
+ 
+-#ifdef CONFIG_NUMA
+-extern int get_mp_bus_to_node(int busnum);
+-extern void set_mp_bus_to_node(int busnum, int node);
+-#else
+-static inline int get_mp_bus_to_node(int busnum)
+-{
+-	return 0;
+-}
+-static inline void set_mp_bus_to_node(int busnum, int node)
+-{
+-}
+-#endif
+-
+ #endif /* _ASM_X86_TOPOLOGY_H */
+
+commit afcf21c2beca6604dbdc24fed1624c2499a85e7d
+Author: Bjorn Helgaas <bhelgaas@google.com>
+Date:   Fri Jan 24 11:54:36 2014 -0700
+
+    x86/PCI: Add x86_pci_root_bus_node() to look up NUMA node from PCI bus
+    
+    The AMD early_fill_mp_bus_info() already allocates a struct pci_root_info
+    for each PCI host bridge it finds, and that structure contains the NUMA
+    node number.  We don't need to keep the same information in the
+    mp_bus_to_node[] table.
+    
+    This adds x86_pci_root_bus_node(), which returns the NUMA node number, or
+    NUMA_NO_NODE if the node is unknown.
+    
+    Note that unlike get_mp_bus_to_node(), x86_pci_root_bus_node() only works
+    for root buses.  For example, if amd_bus.c finds a host bridge on node 1 to
+    [bus 00-0f], get_mp_bus_to_node() returns 1 for any bus between 00 and 0f,
+    but x86_pci_root_bus_node() returns 1 for bus 00 and NUMA_NO_NODE for buses
+    01-0f.
+    
+    Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+    Acked-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index d35f24e231cd..09046a1a6c35 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -131,6 +131,7 @@ static inline void arch_fix_phys_package_id(int num, u32 slot)
+ }
+ 
+ struct pci_bus;
++int x86_pci_root_bus_node(int bus);
+ void x86_pci_root_bus_resources(int bus, struct list_head *resources);
+ 
+ #ifdef CONFIG_SMP
+
+commit 76f411fb3a62711de7f59e0f4c56456fe356675a
+Author: Hanjun Guo <hanjun.guo@linaro.org>
+Date:   Sat Jul 27 11:00:50 2013 +0800
+
+    x86 / cpu topology: remove the stale macro arch_provides_topology_pointers
+    
+    Macro arch_provides_topology_pointers is pointless now, remove it.
+    
+    Signed-off-by: Hanjun Guo <hanjun.guo@linaro.org>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index 095b21507b6a..d35f24e231cd 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -124,9 +124,6 @@ extern const struct cpumask *cpu_coregroup_mask(int cpu);
+ #define topology_core_id(cpu)			(cpu_data(cpu).cpu_core_id)
+ #define topology_core_cpumask(cpu)		(per_cpu(cpu_core_map, cpu))
+ #define topology_thread_cpumask(cpu)		(per_cpu(cpu_sibling_map, cpu))
+-
+-/* indicates that pointers to the topology cpumask_t maps are valid */
+-#define arch_provides_topology_pointers		yes
+ #endif
+ 
+ static inline void arch_fix_phys_package_id(int num, u32 slot)
+
+commit cb83b629bae0327cf9f44f096adc38d150ceb913
+Author: Peter Zijlstra <a.p.zijlstra@chello.nl>
+Date:   Tue Apr 17 15:49:36 2012 +0200
+
+    sched/numa: Rewrite the CONFIG_NUMA sched domain support
+    
+    The current code groups up to 16 nodes in a level and then puts an
+    ALLNODES domain spanning the entire tree on top of that. This doesn't
+    reflect the numa topology and esp for the smaller not-fully-connected
+    machines out there today this might make a difference.
+    
+    Therefore, build a proper numa topology based on node_distance().
+    
+    Since there's no fixed numa layers anymore, the static SD_NODE_INIT
+    and SD_ALLNODES_INIT aren't usable anymore, the new code tries to
+    construct something similar and scales some values either on the
+    number of cpus in the domain and/or the node_distance() ratio.
+    
+    Signed-off-by: Peter Zijlstra <a.p.zijlstra@chello.nl>
+    Cc: Anton Blanchard <anton@samba.org>
+    Cc: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+    Cc: Chris Metcalf <cmetcalf@tilera.com>
+    Cc: David Howells <dhowells@redhat.com>
+    Cc: "David S. Miller" <davem@davemloft.net>
+    Cc: Fenghua Yu <fenghua.yu@intel.com>
+    Cc: "H. Peter Anvin" <hpa@zytor.com>
+    Cc: Ivan Kokshaysky <ink@jurassic.park.msu.ru>
+    Cc: linux-alpha@vger.kernel.org
+    Cc: linux-ia64@vger.kernel.org
+    Cc: linux-kernel@vger.kernel.org
+    Cc: linux-mips@linux-mips.org
+    Cc: linuxppc-dev@lists.ozlabs.org
+    Cc: linux-sh@vger.kernel.org
+    Cc: Matt Turner <mattst88@gmail.com>
+    Cc: Paul Mackerras <paulus@samba.org>
+    Cc: Paul Mundt <lethal@linux-sh.org>
+    Cc: Ralf Baechle <ralf@linux-mips.org>
+    Cc: Richard Henderson <rth@twiddle.net>
+    Cc: sparclinux@vger.kernel.org
+    Cc: Tony Luck <tony.luck@intel.com>
+    Cc: x86@kernel.org
+    Cc: Dimitri Sivanich <sivanich@sgi.com>
+    Cc: Greg Pearson <greg.pearson@hp.com>
+    Cc: KAMEZAWA Hiroyuki <kamezawa.hiroyu@jp.fujitsu.com>
+    Cc: bob.picco@oracle.com
+    Cc: chris.mason@oracle.com
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Andrew Morton <akpm@linux-foundation.org>
+    Link: http://lkml.kernel.org/n/tip-r74n3n8hhuc2ynbrnp3vt954@git.kernel.org
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index b9676ae37ada..095b21507b6a 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -92,44 +92,6 @@ extern void setup_node_to_cpumask_map(void);
+ 
+ #define pcibus_to_node(bus) __pcibus_to_node(bus)
+ 
+-#ifdef CONFIG_X86_32
+-# define SD_CACHE_NICE_TRIES	1
+-# define SD_IDLE_IDX		1
+-#else
+-# define SD_CACHE_NICE_TRIES	2
+-# define SD_IDLE_IDX		2
+-#endif
+-
+-/* sched_domains SD_NODE_INIT for NUMA machines */
+-#define SD_NODE_INIT (struct sched_domain) {				\
+-	.min_interval		= 8,					\
+-	.max_interval		= 32,					\
+-	.busy_factor		= 32,					\
+-	.imbalance_pct		= 125,					\
+-	.cache_nice_tries	= SD_CACHE_NICE_TRIES,			\
+-	.busy_idx		= 3,					\
+-	.idle_idx		= SD_IDLE_IDX,				\
+-	.newidle_idx		= 0,					\
+-	.wake_idx		= 0,					\
+-	.forkexec_idx		= 0,					\
+-									\
+-	.flags			= 1*SD_LOAD_BALANCE			\
+-				| 1*SD_BALANCE_NEWIDLE			\
+-				| 1*SD_BALANCE_EXEC			\
+-				| 1*SD_BALANCE_FORK			\
+-				| 0*SD_BALANCE_WAKE			\
+-				| 1*SD_WAKE_AFFINE			\
+-				| 0*SD_PREFER_LOCAL			\
+-				| 0*SD_SHARE_CPUPOWER			\
+-				| 0*SD_POWERSAVINGS_BALANCE		\
+-				| 0*SD_SHARE_PKG_RESOURCES		\
+-				| 1*SD_SERIALIZE			\
+-				| 0*SD_PREFER_SIBLING			\
+-				,					\
+-	.last_balance		= jiffies,				\
+-	.balance_interval	= 1,					\
+-}
+-
+ extern int __node_distance(int, int);
+ #define node_distance(a, b) __node_distance(a, b)
+ 
+
+commit 7b67e751479d50b7f84d1a3cc5216eed5e534b66
+Merge: 9f13a1fd452f 76ccc297018d
+Author: Linus Torvalds <torvalds@linux-foundation.org>
+Date:   Wed Jan 11 18:50:26 2012 -0800
+
+    Merge branch 'linux-next' of git://git.kernel.org/pub/scm/linux/kernel/git/jbarnes/pci
+    
+    * 'linux-next' of git://git.kernel.org/pub/scm/linux/kernel/git/jbarnes/pci: (80 commits)
+      x86/PCI: Expand the x86_msi_ops to have a restore MSIs.
+      PCI: Increase resource array mask bit size in pcim_iomap_regions()
+      PCI: DEVICE_COUNT_RESOURCE should be equal to PCI_NUM_RESOURCES
+      PCI: pci_ids: add device ids for STA2X11 device (aka ConneXT)
+      PNP: work around Dell 1536/1546 BIOS MMCONFIG bug that breaks USB
+      x86/PCI: amd: factor out MMCONFIG discovery
+      PCI: Enable ATS at the device state restore
+      PCI: msi: fix imbalanced refcount of msi irq sysfs objects
+      PCI: kconfig: English typo in pci/pcie/Kconfig
+      PCI/PM/Runtime: make PCI traces quieter
+      PCI: remove pci_create_bus()
+      xtensa/PCI: convert to pci_scan_root_bus() for correct root bus resources
+      x86/PCI: convert to pci_create_root_bus() and pci_scan_root_bus()
+      x86/PCI: use pci_scan_bus() instead of pci_scan_bus_parented()
+      x86/PCI: read Broadcom CNB20LE host bridge info before PCI scan
+      sparc32, leon/PCI: convert to pci_scan_root_bus() for correct root bus resources
+      sparc/PCI: convert to pci_create_root_bus()
+      sh/PCI: convert to pci_scan_root_bus() for correct root bus resources
+      powerpc/PCI: convert to pci_create_root_bus()
+      powerpc/PCI: split PHB part out of pcibios_map_io_space()
+      ...
+    
+    Fix up conflicts in drivers/pci/msi.c and include/linux/pci_regs.h due
+    to the same patches being applied in other branches.
+
+commit 2cd6975a4ff92a75e46240109d01c1daf4682e5d
+Author: Bjorn Helgaas <bhelgaas@google.com>
+Date:   Fri Oct 28 16:28:14 2011 -0600
+
+    x86/PCI: convert to pci_create_root_bus() and pci_scan_root_bus()
+    
+    x86 has two kinds of PCI root bus scanning:
+    
+    (1) ACPI-based, using _CRS resources.  This used pci_create_bus(), not
+        pci_scan_bus(), because ACPI hotplug needed to split the
+        pci_bus_add_devices() into a separate host bridge .start() method.
+    
+        This patch parses the _CRS resources earlier, so we can build a list of
+        resources and pass it to pci_create_root_bus().
+    
+        Note that as before, we parse the _CRS even if we aren't going to use
+        it so we can print it for debugging purposes.
+    
+    (2) All other, which used either default resources (ioport_resource and
+        iomem_resource) or information read from the hardware via amd_bus.c or
+        similar.  This used pci_scan_bus().
+    
+        This patch converts x86_pci_root_bus_res_quirks() (previously called
+        from pcibios_fixup_bus()) to x86_pci_root_bus_resources(), which builds
+        a list of resources before we call pci_scan_root_bus().
+    
+        We also use x86_pci_root_bus_resources() if we have ACPI but are
+        ignoring _CRS.
+    
+    CC: Yinghai Lu <yinghai.lu@oracle.com>
+    Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+    Signed-off-by: Jesse Barnes <jbarnes@virtuousgeek.org>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index c00692476e9f..5f83b136dda7 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -174,7 +174,7 @@ static inline void arch_fix_phys_package_id(int num, u32 slot)
+ }
+ 
+ struct pci_bus;
+-void x86_pci_root_bus_res_quirks(struct pci_bus *b);
++void x86_pci_root_bus_resources(int bus, struct list_head *resources);
+ 
+ #ifdef CONFIG_SMP
+ #define mc_capable()	((boot_cpu_data.x86_max_cores > 1) && \
+
+commit 79f1ddd06471b094ae30eb17b33beb9f1234ca93
+Author: H Hartley Sweeten <hartleys@visionengravers.com>
+Date:   Tue Dec 6 12:22:03 2011 -0800
+
+    x86: Use the same node_distance for 32 and 64-bit
+    
+    The node_distance function is not x86 64-bit specific.  Having
+    the #ifdef around the extern function declaration and the
+     #define causes the default node_distance macro to be used in
+    asm-generic/topology.h. This also causes a sparse warning in
+    arch/x86/mm/numa.c when CONFIG_X86_64 is not set:
+    
+    warning: symbol '__node_distance' was not declared. Should it be
+    static?
+    
+    Remove the #ifdef to fix both issues.
+    
+    Signed-off-by: H Hartley Sweeten <hsweeten@visionengravers.com>
+    Signed-off-by: David Rientjes <rientjes@google.com>
+    Acked-by: Tejun Heo <tj@kernel.org>
+    Cc: Yinghai Lu <yinghai@kernel.org>
+    Link: http://lkml.kernel.org/r/alpine.DEB.2.00.1112061220310.28251@chino.kir.corp.google.com
+    Signed-off-by: Ingo Molnar <mingo@elte.hu>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index c00692476e9f..800f77c60051 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -130,10 +130,8 @@ extern void setup_node_to_cpumask_map(void);
+ 	.balance_interval	= 1,					\
+ }
+ 
+-#ifdef CONFIG_X86_64
+ extern int __node_distance(int, int);
+ #define node_distance(a, b) __node_distance(a, b)
+-#endif
+ 
+ #else /* !CONFIG_NUMA */
+ 
+
+commit bd6709a91a593d8fe35d08da542e9f93bb74a304
+Author: Tejun Heo <tj@kernel.org>
+Date:   Mon May 2 17:24:48 2011 +0200
+
+    x86, NUMA: Make 32bit use common NUMA init path
+    
+    With both _numa_init() methods converted and the rest of init code
+    adjusted, numa_32.c now can switch from the 32bit only init code to
+    the common one in numa.c.
+    
+    * Shim get_memcfg_*()'s are dropped and initmem_init() calls
+      x86_numa_init(), which is updated to handle NUMAQ.
+    
+    * All boilerplate operations including node range limiting, pgdat
+      alloc/init are handled by numa_init().  32bit only implementation is
+      removed.
+    
+    * 32bit numa_add_memblk(), numa_set_distance() and
+      memory_add_physaddr_to_nid() removed and common versions in
+      numa_32.c enabled for 32bit.
+    
+    This change causes the following behavior changes.
+    
+    * NODE_DATA()->node_start_pfn/node_spanned_pages properly initialized
+      for 32bit too.
+    
+    * Much more sanity checks and configuration cleanups.
+    
+    * Proper handling of node distances.
+    
+    * The same NUMA init messages as 64bit.
+    
+    Signed-off-by: Tejun Heo <tj@kernel.org>
+    Cc: Ingo Molnar <mingo@redhat.com>
+    Cc: Yinghai Lu <yinghai@kernel.org>
+    Cc: David Rientjes <rientjes@google.com>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: "H. Peter Anvin" <hpa@zytor.com>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index 8dba76972fd7..c00692476e9f 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -93,18 +93,11 @@ extern void setup_node_to_cpumask_map(void);
+ #define pcibus_to_node(bus) __pcibus_to_node(bus)
+ 
+ #ifdef CONFIG_X86_32
+-extern unsigned long node_start_pfn[];
+-extern unsigned long node_end_pfn[];
+-#define node_has_online_mem(nid) (node_start_pfn[nid] != node_end_pfn[nid])
+-
+ # define SD_CACHE_NICE_TRIES	1
+ # define SD_IDLE_IDX		1
+-
+ #else
+-
+ # define SD_CACHE_NICE_TRIES	2
+ # define SD_IDLE_IDX		2
+-
+ #endif
+ 
+ /* sched_domains SD_NODE_INIT for NUMA machines */
+
+commit 7210cf9217937e470a9acbc113a590f476b9c047
+Author: Tejun Heo <tj@kernel.org>
+Date:   Tue Apr 5 00:23:53 2011 +0200
+
+    x86-32, numa: Calculate remap size in common code
+    
+    Only pgdat and memmap use remap area and there isn't much benefit in
+    allowing per-node override.  In addition, the use of node_remap_size[]
+    is confusing in that it contains number of bytes before remap
+    initialization and then number of pages afterwards.
+    
+    Move remap size calculation for memap from specific NUMA config
+    implementations to init_alloc_remap() and make node_remap_size[]
+    static.
+    
+    The only behavior difference is that, before this patch, numaq_32
+    didn't consider max_pfn when calculating the memmap size but it's
+    enforced after this patch, which is the right thing to do.
+    
+    Signed-off-by: Tejun Heo <tj@kernel.org>
+    Link: http://lkml.kernel.org/r/1301955840-7246-8-git-send-email-tj@kernel.org
+    Acked-by: Yinghai Lu <yinghai@kernel.org>
+    Cc: David Rientjes <rientjes@google.com>
+    Signed-off-by: H. Peter Anvin <hpa@zytor.com>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index 910a7084f7f2..8dba76972fd7 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -95,7 +95,6 @@ extern void setup_node_to_cpumask_map(void);
+ #ifdef CONFIG_X86_32
+ extern unsigned long node_start_pfn[];
+ extern unsigned long node_end_pfn[];
+-extern unsigned long node_remap_size[];
+ #define node_has_online_mem(nid) (node_start_pfn[nid] != node_end_pfn[nid])
+ 
+ # define SD_CACHE_NICE_TRIES	1
+
+commit ac7136b611ee8f8bd6231ce2e1dbdd31ae3d39bc
+Author: Tejun Heo <tj@kernel.org>
+Date:   Wed Feb 16 17:11:09 2011 +0100
+
+    x86-64, NUMA: Implement generic node distance handling
+    
+    Node distance either used direct node comparison, ACPI PXM comparison
+    or ACPI SLIT table lookup.  This patch implements generic node
+    distance handling.  NUMA init methods can call numa_set_distance() to
+    set distance between nodes and the common __node_distance()
+    implementation will report the set distance.
+    
+    Due to the way NUMA emulation is implemented, the generic node
+    distance handling is used only when emulation is not used.  Later
+    patches will update NUMA emulation to use the generic distance
+    mechanism.
+    
+    Signed-off-by: Tejun Heo <tj@kernel.org>
+    Cc: Yinghai Lu <yinghai@kernel.org>
+    Cc: Brian Gerst <brgerst@gmail.com>
+    Cc: Cyrill Gorcunov <gorcunov@gmail.com>
+    Cc: Shaohui Zheng <shaohui.zheng@intel.com>
+    Cc: David Rientjes <rientjes@google.com>
+    Cc: Ingo Molnar <mingo@elte.hu>
+    Cc: H. Peter Anvin <hpa@linux.intel.com>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index b101c17861f5..910a7084f7f2 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -138,7 +138,7 @@ extern unsigned long node_remap_size[];
+ 	.balance_interval	= 1,					\
+ }
+ 
+-#ifdef CONFIG_X86_64_ACPI_NUMA
++#ifdef CONFIG_X86_64
+ extern int __node_distance(int, int);
+ #define node_distance(a, b) __node_distance(a, b)
+ #endif
+
+commit 645a79195f66eb68ef3ab2b21d9829ac3aa085a9
+Author: Tejun Heo <tj@kernel.org>
+Date:   Sun Jan 23 14:37:40 2011 +0100
+
+    x86: Unify CPU -> NUMA node mapping between 32 and 64bit
+    
+    Unlike 64bit, 32bit has been using its own cpu_to_node_map[] for
+    CPU -> NUMA node mapping.  Replace it with early_percpu variable
+    x86_cpu_to_node_map and share the mapping code with 64bit.
+    
+    * USE_PERCPU_NUMA_NODE_ID is now enabled for 32bit too.
+    
+    * x86_cpu_to_node_map and numa_set/clear_node() are moved from
+      numa_64 to numa.  For now, on 32bit, x86_cpu_to_node_map is initialized
+      with 0 instead of NUMA_NO_NODE.  This is to avoid introducing unexpected
+      behavior change and will be updated once init path is unified.
+    
+    * srat_detect_node() is now enabled for x86_32 too.  It calls
+      numa_set_node() and initializes the mapping making explicit
+      cpu_to_node_map[] updates from map/unmap_cpu_to_node() unnecessary.
+    
+    Signed-off-by: Tejun Heo <tj@kernel.org>
+    Cc: eric.dumazet@gmail.com
+    Cc: yinghai@kernel.org
+    Cc: brgerst@gmail.com
+    Cc: gorcunov@gmail.com
+    Cc: penberg@kernel.org
+    Cc: shaohui.zheng@intel.com
+    Cc: rientjes@google.com
+    LKML-Reference: <1295789862-25482-15-git-send-email-tj@kernel.org>
+    Signed-off-by: Ingo Molnar <mingo@elte.hu>
+    Cc: David Rientjes <rientjes@google.com>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index 21899cc31e52..b101c17861f5 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -47,21 +47,6 @@
+ 
+ #include <asm/mpspec.h>
+ 
+-#ifdef CONFIG_X86_32
+-
+-/* Mappings between logical cpu number and node number */
+-extern int cpu_to_node_map[];
+-
+-/* Returns the number of the node containing CPU 'cpu' */
+-static inline int __cpu_to_node(int cpu)
+-{
+-	return cpu_to_node_map[cpu];
+-}
+-#define early_cpu_to_node __cpu_to_node
+-#define cpu_to_node __cpu_to_node
+-
+-#else /* CONFIG_X86_64 */
+-
+ /* Mappings between logical cpu number and node number */
+ DECLARE_EARLY_PER_CPU(int, x86_cpu_to_node_map);
+ 
+@@ -84,8 +69,6 @@ static inline int early_cpu_to_node(int cpu)
+ 
+ #endif /* !CONFIG_DEBUG_PER_CPU_MAPS */
+ 
+-#endif /* CONFIG_X86_64 */
+-
+ /* Mappings between node number and cpus on that node. */
+ extern cpumask_var_t node_to_cpumask_map[MAX_NUMNODES];
+ 
+
+commit e534c7c5f8d6e9fc46f57fab067c7e48d8ceb172
+Author: Lee Schermerhorn <lee.schermerhorn@hp.com>
+Date:   Wed May 26 14:44:58 2010 -0700
+
+    numa: x86_64: use generic percpu var numa_node_id() implementation
+    
+    x86 arch specific changes to use generic numa_node_id() based on generic
+    percpu variable infrastructure.  Back out x86's custom version of
+    numa_node_id()
+    
+    Signed-off-by: Lee Schermerhorn <lee.schermerhorn@hp.com>
+    Cc: Tejun Heo <tj@kernel.org>
+    Cc: Mel Gorman <mel@csn.ul.ie>
+    Cc: Christoph Lameter <cl@linux-foundation.org>
+    Cc: Nick Piggin <npiggin@suse.de>
+    Cc: David Rientjes <rientjes@google.com>
+    Cc: Eric Whitney <eric.whitney@hp.com>
+    Cc: KAMEZAWA Hiroyuki <kamezawa.hiroyu@jp.fujitsu.com>
+    Cc: Ingo Molnar <mingo@elte.hu>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: "H. Peter Anvin" <hpa@zytor.com>
+    Cc: "Luck, Tony" <tony.luck@intel.com>
+    Cc: Pekka Enberg <penberg@cs.helsinki.fi>
+    Cc: <linux-arch@vger.kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index a2e629476b0e..21899cc31e52 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -53,33 +53,29 @@
+ extern int cpu_to_node_map[];
+ 
+ /* Returns the number of the node containing CPU 'cpu' */
+-static inline int cpu_to_node(int cpu)
++static inline int __cpu_to_node(int cpu)
+ {
+ 	return cpu_to_node_map[cpu];
+ }
+-#define early_cpu_to_node(cpu)	cpu_to_node(cpu)
++#define early_cpu_to_node __cpu_to_node
++#define cpu_to_node __cpu_to_node
+ 
+ #else /* CONFIG_X86_64 */
+ 
+ /* Mappings between logical cpu number and node number */
+ DECLARE_EARLY_PER_CPU(int, x86_cpu_to_node_map);
+ 
+-/* Returns the number of the current Node. */
+-DECLARE_PER_CPU(int, node_number);
+-#define numa_node_id()		percpu_read(node_number)
+-
+ #ifdef CONFIG_DEBUG_PER_CPU_MAPS
+-extern int cpu_to_node(int cpu);
++/*
++ * override generic percpu implementation of cpu_to_node
++ */
++extern int __cpu_to_node(int cpu);
++#define cpu_to_node __cpu_to_node
++
+ extern int early_cpu_to_node(int cpu);
+ 
+ #else	/* !CONFIG_DEBUG_PER_CPU_MAPS */
+ 
+-/* Returns the number of the node containing CPU 'cpu' */
+-static inline int cpu_to_node(int cpu)
+-{
+-	return per_cpu(x86_cpu_to_node_map, cpu);
+-}
+-
+ /* Same function but used if called before per_cpu areas are setup */
+ static inline int early_cpu_to_node(int cpu)
+ {
+
+commit 7281201922a0063fa60804ce39c277fc98142a47
+Author: Lee Schermerhorn <lee.schermerhorn@hp.com>
+Date:   Wed May 26 14:44:56 2010 -0700
+
+    numa: add generic percpu var numa_node_id() implementation
+    
+    Rework the generic version of the numa_node_id() function to use the new
+    generic percpu variable infrastructure.
+    
+    Guard the new implementation with a new config option:
+    
+            CONFIG_USE_PERCPU_NUMA_NODE_ID.
+    
+    Archs which support this new implemention will default this option to 'y'
+    when NUMA is configured.  This config option could be removed if/when all
+    archs switch over to the generic percpu implementation of numa_node_id().
+    Arch support involves:
+    
+      1) converting any existing per cpu variable implementations to use
+         this implementation.  x86_64 is an instance of such an arch.
+      2) archs that don't use a per cpu variable for numa_node_id() will
+         need to initialize the new per cpu variable "numa_node" as cpus
+         are brought on-line.  ia64 is an example.
+      3) Defining USE_PERCPU_NUMA_NODE_ID in arch dependent Kconfig--e.g.,
+         when NUMA is configured.  This is required because I have
+         retained the old implementation by default to allow archs to
+         be modified incrementally, as desired.
+    
+    Subsequent patches will convert x86_64 and ia64 to use this implemenation.
+    
+    Signed-off-by: Lee Schermerhorn <lee.schermerhorn@hp.com>
+    Cc: Tejun Heo <tj@kernel.org>
+    Cc: Mel Gorman <mel@csn.ul.ie>
+    Reviewed-by: Christoph Lameter <cl@linux-foundation.org>
+    Cc: Nick Piggin <npiggin@suse.de>
+    Cc: David Rientjes <rientjes@google.com>
+    Cc: Eric Whitney <eric.whitney@hp.com>
+    Cc: KAMEZAWA Hiroyuki <kamezawa.hiroyu@jp.fujitsu.com>
+    Cc: Ingo Molnar <mingo@elte.hu>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: "H. Peter Anvin" <hpa@zytor.com>
+    Cc: "Luck, Tony" <tony.luck@intel.com>
+    Cc: Pekka Enberg <penberg@cs.helsinki.fi>
+    Cc: <linux-arch@vger.kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index c5087d796587..a2e629476b0e 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -170,6 +170,10 @@ static inline int numa_node_id(void)
+ {
+ 	return 0;
+ }
++/*
++ * indicate override:
++ */
++#define numa_node_id numa_node_id
+ 
+ static inline int early_cpu_to_node(int cpu)
+ {
+
+commit 4e25b2576efda24c02e2d6b9bcb5965a3f865f33
+Author: Lee Schermerhorn <lee.schermerhorn@hp.com>
+Date:   Mon Dec 14 17:58:23 2009 -0800
+
+    hugetlb: add generic definition of NUMA_NO_NODE
+    
+    Move definition of NUMA_NO_NODE from ia64 and x86_64 arch specific headers
+    to generic header 'linux/numa.h' for use in generic code.  NUMA_NO_NODE
+    replaces bare '-1' where it's used in this series to indicate "no node id
+    specified".  Ultimately, it can be used to replace the -1 elsewhere where
+    it is used similarly.
+    
+    Signed-off-by: Lee Schermerhorn <lee.schermerhorn@hp.com>
+    Acked-by: David Rientjes <rientjes@google.com>
+    Acked-by: Mel Gorman <mel@csn.ul.ie>
+    Reviewed-by: Andi Kleen <andi@firstfloor.org>
+    Cc: KAMEZAWA Hiroyuki <kamezawa.hiroyu@jp.fujitsu.com>
+    Cc: Randy Dunlap <randy.dunlap@oracle.com>
+    Cc: Nishanth Aravamudan <nacc@us.ibm.com>
+    Cc: Adam Litke <agl@us.ibm.com>
+    Cc: Andy Whitcroft <apw@canonical.com>
+    Cc: Eric Whitney <eric.whitney@hp.com>
+    Cc: Christoph Lameter <cl@linux-foundation.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index 40e37b10c6c0..c5087d796587 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -35,11 +35,16 @@
+ # endif
+ #endif
+ 
+-/* Node not present */
+-#define NUMA_NO_NODE	(-1)
++/*
++ * to preserve the visibility of NUMA_NO_NODE definition,
++ * moved to there from here.  May be used independent of
++ * CONFIG_NUMA.
++ */
++#include <linux/numa.h>
+ 
+ #ifdef CONFIG_NUMA
+ #include <linux/cpumask.h>
++
+ #include <asm/mpspec.h>
+ 
+ #ifdef CONFIG_X86_32
+
+commit 6b9de613ae9c79b637e070136585dde029578065
+Author: Mike Galbraith <efault@gmx.de>
+Date:   Mon Nov 2 20:36:51 2009 +0100
+
+    sched: Disable SD_PREFER_LOCAL at node level
+    
+    Yanmin Zhang reported that SD_PREFER_LOCAL induces an order of
+    magnitude increase in select_task_rq_fair() overhead while
+    running heavy wakeup benchmarks (tbench and vmark).
+    
+    Since SD_BALANCE_WAKE is off at node level, turn SD_PREFER_LOCAL
+    off as well pending further investigation.
+    
+    Reported-by: Zhang, Yanmin <yanmin_zhang@linux.intel.com>
+    Signed-off-by: Mike Galbraith <efault@gmx.de>
+    Cc: Peter Zijlstra <a.p.zijlstra@chello.nl>
+    LKML-Reference: <new-submission>
+    Signed-off-by: Ingo Molnar <mingo@elte.hu>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index d823c245f63b..40e37b10c6c0 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -143,7 +143,7 @@ extern unsigned long node_remap_size[];
+ 				| 1*SD_BALANCE_FORK			\
+ 				| 0*SD_BALANCE_WAKE			\
+ 				| 1*SD_WAKE_AFFINE			\
+-				| 1*SD_PREFER_LOCAL			\
++				| 0*SD_PREFER_LOCAL			\
+ 				| 0*SD_SHARE_CPUPOWER			\
+ 				| 0*SD_POWERSAVINGS_BALANCE		\
+ 				| 0*SD_SHARE_PKG_RESOURCES		\
+
+commit 799e2205ec65e174f752b558c62a92c4752df313
+Author: Peter Zijlstra <a.p.zijlstra@chello.nl>
+Date:   Fri Oct 9 12:16:40 2009 +0200
+
+    sched: Disable SD_PREFER_LOCAL for MC/CPU domains
+    
+    Yanmin reported that both tbench and hackbench were significantly
+    hurt by trying to keep tasks local on these domains, esp on small
+    cache machines.
+    
+    So disable it in order to promote spreading outside of the cache
+    domains.
+    
+    Reported-by: "Zhang, Yanmin" <yanmin_zhang@linux.intel.com>
+    Signed-off-by: Peter Zijlstra <a.p.zijlstra@chello.nl>
+    CC: Mike Galbraith <efault@gmx.de>
+    LKML-Reference: <1255083400.8802.15.camel@laptop>
+    Signed-off-by: Ingo Molnar <mingo@elte.hu>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index 25a92842dd99..d823c245f63b 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -143,6 +143,7 @@ extern unsigned long node_remap_size[];
+ 				| 1*SD_BALANCE_FORK			\
+ 				| 0*SD_BALANCE_WAKE			\
+ 				| 1*SD_WAKE_AFFINE			\
++				| 1*SD_PREFER_LOCAL			\
+ 				| 0*SD_SHARE_CPUPOWER			\
+ 				| 0*SD_POWERSAVINGS_BALANCE		\
+ 				| 0*SD_SHARE_PKG_RESOURCES		\
+
+commit b0c6fbe458183cc7e1cab17be6efcbe7e435bad3
+Author: Rusty Russell <rusty@rustcorp.com.au>
+Date:   Thu Sep 24 17:48:44 2009 +0930
+
+    x86: Remove redundant non-NUMA topology functions
+    
+    arch/x86/include/asm/topology.h declares inline fns cpu_to_node and
+    cpumask_of_node for !NUMA, even though they are then declared as
+    macros by asm-generic/topology.h, which is #included just below.
+    
+    The macros (which are the same) end up being used; these functions
+    are just confusing.
+    
+    Noticed-by: Linus Torvalds <torvalds@linux-foundation.org>
+    Signed-off-by: Rusty Russell <rusty@rustcorp.com.au>
+    Cc: Jesse Barnes <jbarnes@virtuousgeek.org>
+    Cc: "Greg Kroah-Hartman" <gregkh@suse.de>
+    Cc: Yinghai Lu <yinghai@kernel.org>
+    Cc: Tejun Heo <tj@kernel.org>
+    LKML-Reference: <200909241748.45629.rusty@rustcorp.com.au>
+    Signed-off-by: Ingo Molnar <mingo@elte.hu>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index 6f0695d744bf..25a92842dd99 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -165,21 +165,11 @@ static inline int numa_node_id(void)
+ 	return 0;
+ }
+ 
+-static inline int cpu_to_node(int cpu)
+-{
+-	return 0;
+-}
+-
+ static inline int early_cpu_to_node(int cpu)
+ {
+ 	return 0;
+ }
+ 
+-static inline const struct cpumask *cpumask_of_node(int node)
+-{
+-	return cpu_online_mask;
+-}
+-
+ static inline void setup_node_to_cpumask_map(void) { }
+ 
+ #endif
+
+commit 182a85f8a119c789610a9d464f4129ded9f3c107
+Author: Peter Zijlstra <a.p.zijlstra@chello.nl>
+Date:   Wed Sep 16 13:24:49 2009 +0200
+
+    sched: Disable wakeup balancing
+    
+    Sysbench thinks SD_BALANCE_WAKE is too agressive and kbuild doesn't
+    really mind too much, SD_BALANCE_NEWIDLE picks up most of the
+    slack.
+    
+    On a dual socket, quad core, dual thread nehalem system:
+    
+    sysbench (--num_threads=16):
+    
+     SD_BALANCE_WAKE-: 13982 tx/s
+     SD_BALANCE_WAKE+: 15688 tx/s
+    
+    kbuild (-j16):
+    
+     SD_BALANCE_WAKE-: 47.648295846  seconds time elapsed   ( +-   0.312% )
+     SD_BALANCE_WAKE+: 47.608607360  seconds time elapsed   ( +-   0.026% )
+    
+    (same within noise)
+    
+    Signed-off-by: Peter Zijlstra <a.p.zijlstra@chello.nl>
+    LKML-Reference: <new-submission>
+    Signed-off-by: Ingo Molnar <mingo@elte.hu>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index 589f12383d78..6f0695d744bf 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -141,7 +141,7 @@ extern unsigned long node_remap_size[];
+ 				| 1*SD_BALANCE_NEWIDLE			\
+ 				| 1*SD_BALANCE_EXEC			\
+ 				| 1*SD_BALANCE_FORK			\
+-				| 1*SD_BALANCE_WAKE			\
++				| 0*SD_BALANCE_WAKE			\
+ 				| 1*SD_WAKE_AFFINE			\
+ 				| 0*SD_SHARE_CPUPOWER			\
+ 				| 0*SD_POWERSAVINGS_BALANCE		\
+
+commit b8a543ea5a5896830a9969bacfd047f9d15940b2
+Author: Peter Zijlstra <a.p.zijlstra@chello.nl>
+Date:   Tue Sep 15 15:22:03 2009 +0200
+
+    sched: Reduce forkexec_idx
+    
+    If we're looking to place a new task, we might as well find the
+    idlest position _now_, not 1 tick ago.
+    
+    Signed-off-by: Peter Zijlstra <a.p.zijlstra@chello.nl>
+    LKML-Reference: <new-submission>
+    Signed-off-by: Ingo Molnar <mingo@elte.hu>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index 7fafd1bc4149..589f12383d78 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -116,13 +116,11 @@ extern unsigned long node_remap_size[];
+ 
+ # define SD_CACHE_NICE_TRIES	1
+ # define SD_IDLE_IDX		1
+-# define SD_FORKEXEC_IDX	0
+ 
+ #else
+ 
+ # define SD_CACHE_NICE_TRIES	2
+ # define SD_IDLE_IDX		2
+-# define SD_FORKEXEC_IDX	1
+ 
+ #endif
+ 
+@@ -137,7 +135,7 @@ extern unsigned long node_remap_size[];
+ 	.idle_idx		= SD_IDLE_IDX,				\
+ 	.newidle_idx		= 0,					\
+ 	.wake_idx		= 0,					\
+-	.forkexec_idx		= SD_FORKEXEC_IDX,			\
++	.forkexec_idx		= 0,					\
+ 									\
+ 	.flags			= 1*SD_LOAD_BALANCE			\
+ 				| 1*SD_BALANCE_NEWIDLE			\
+
+commit 0ec9fab3d186d9cbb00c0f694d4a260d07c198d9
+Author: Mike Galbraith <efault@gmx.de>
+Date:   Tue Sep 15 15:07:03 2009 +0200
+
+    sched: Improve latencies and throughput
+    
+    Make the idle balancer more agressive, to improve a
+    x264 encoding workload provided by Jason Garrett-Glaser:
+    
+     NEXT_BUDDY NO_LB_BIAS
+     encoded 600 frames, 252.82 fps, 22096.60 kb/s
+     encoded 600 frames, 250.69 fps, 22096.60 kb/s
+     encoded 600 frames, 245.76 fps, 22096.60 kb/s
+    
+     NO_NEXT_BUDDY LB_BIAS
+     encoded 600 frames, 344.44 fps, 22096.60 kb/s
+     encoded 600 frames, 346.66 fps, 22096.60 kb/s
+     encoded 600 frames, 352.59 fps, 22096.60 kb/s
+    
+     NO_NEXT_BUDDY NO_LB_BIAS
+     encoded 600 frames, 425.75 fps, 22096.60 kb/s
+     encoded 600 frames, 425.45 fps, 22096.60 kb/s
+     encoded 600 frames, 422.49 fps, 22096.60 kb/s
+    
+    Peter pointed out that this is better done via newidle_idx,
+    not via LB_BIAS, newidle balancing should look for where
+    there is load _now_, not where there was load 2 ticks ago.
+    
+    Worst-case latencies are improved as well as no buddies
+    means less vruntime spread. (as per prior lkml discussions)
+    
+    This change improves kbuild-peak parallelism as well.
+    
+    Reported-by: Jason Garrett-Glaser <darkshikari@gmail.com>
+    Signed-off-by: Mike Galbraith <efault@gmx.de>
+    Signed-off-by: Peter Zijlstra <a.p.zijlstra@chello.nl>
+    LKML-Reference: <1253011667.9128.16.camel@marge.simson.net>
+    Signed-off-by: Ingo Molnar <mingo@elte.hu>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index 4b1b335097b5..7fafd1bc4149 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -116,14 +116,12 @@ extern unsigned long node_remap_size[];
+ 
+ # define SD_CACHE_NICE_TRIES	1
+ # define SD_IDLE_IDX		1
+-# define SD_NEWIDLE_IDX		2
+ # define SD_FORKEXEC_IDX	0
+ 
+ #else
+ 
+ # define SD_CACHE_NICE_TRIES	2
+ # define SD_IDLE_IDX		2
+-# define SD_NEWIDLE_IDX		2
+ # define SD_FORKEXEC_IDX	1
+ 
+ #endif
+@@ -137,7 +135,7 @@ extern unsigned long node_remap_size[];
+ 	.cache_nice_tries	= SD_CACHE_NICE_TRIES,			\
+ 	.busy_idx		= 3,					\
+ 	.idle_idx		= SD_IDLE_IDX,				\
+-	.newidle_idx		= SD_NEWIDLE_IDX,			\
++	.newidle_idx		= 0,					\
+ 	.wake_idx		= 0,					\
+ 	.forkexec_idx		= SD_FORKEXEC_IDX,			\
+ 									\
+
+commit 78e7ed53c9f42f04f9401ada6f7047db60781676
+Author: Peter Zijlstra <a.p.zijlstra@chello.nl>
+Date:   Thu Sep 3 13:16:51 2009 +0200
+
+    sched: Tweak wake_idx
+    
+    When merging select_task_rq_fair() and sched_balance_self() we lost
+    the use of wake_idx, restore that and set them to 0 to make wake
+    balancing more aggressive.
+    
+    Signed-off-by: Peter Zijlstra <a.p.zijlstra@chello.nl>
+    LKML-Reference: <new-submission>
+    Signed-off-by: Ingo Molnar <mingo@elte.hu>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index 966d58dc6274..4b1b335097b5 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -138,7 +138,7 @@ extern unsigned long node_remap_size[];
+ 	.busy_idx		= 3,					\
+ 	.idle_idx		= SD_IDLE_IDX,				\
+ 	.newidle_idx		= SD_NEWIDLE_IDX,			\
+-	.wake_idx		= 1,					\
++	.wake_idx		= 0,					\
+ 	.forkexec_idx		= SD_FORKEXEC_IDX,			\
+ 									\
+ 	.flags			= 1*SD_LOAD_BALANCE			\
+
+commit c88d5910890ad35af283344417891344604f0438
+Author: Peter Zijlstra <a.p.zijlstra@chello.nl>
+Date:   Thu Sep 10 13:50:02 2009 +0200
+
+    sched: Merge select_task_rq_fair() and sched_balance_self()
+    
+    The problem with wake_idle() is that is doesn't respect things like
+    cpu_power, which means it doesn't deal well with SMT nor the recent
+    RT interaction.
+    
+    To cure this, it needs to do what sched_balance_self() does, which
+    leads to the possibility of merging select_task_rq_fair() and
+    sched_balance_self().
+    
+    Modify sched_balance_self() to:
+    
+      - update_shares() when walking up the domain tree,
+        (it only called it for the top domain, but it should
+         have done this anyway), which allows us to remove
+        this ugly bit from try_to_wake_up().
+    
+      - do wake_affine() on the smallest domain that contains
+        both this (the waking) and the prev (the wakee) cpu for
+        WAKE invocations.
+    
+    Then use the top-down balance steps it had to replace wake_idle().
+    
+    This leads to the dissapearance of SD_WAKE_BALANCE and
+    SD_WAKE_IDLE_FAR, with SD_WAKE_IDLE replaced with SD_BALANCE_WAKE.
+    
+    SD_WAKE_AFFINE needs SD_BALANCE_WAKE to be effective.
+    
+    Touch all topology bits to replace the old with new SD flags --
+    platforms might need re-tuning, enabling SD_BALANCE_WAKE
+    conditionally on a NUMA distance seems like a good additional
+    feature, magny-core and small nehalem systems would want this
+    enabled, systems with slow interconnects would not.
+    
+    Signed-off-by: Peter Zijlstra <a.p.zijlstra@chello.nl>
+    LKML-Reference: <new-submission>
+    Signed-off-by: Ingo Molnar <mingo@elte.hu>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index 26d06e052a18..966d58dc6274 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -145,14 +145,12 @@ extern unsigned long node_remap_size[];
+ 				| 1*SD_BALANCE_NEWIDLE			\
+ 				| 1*SD_BALANCE_EXEC			\
+ 				| 1*SD_BALANCE_FORK			\
+-				| 0*SD_WAKE_IDLE			\
++				| 1*SD_BALANCE_WAKE			\
+ 				| 1*SD_WAKE_AFFINE			\
+-				| 1*SD_WAKE_BALANCE			\
+ 				| 0*SD_SHARE_CPUPOWER			\
+ 				| 0*SD_POWERSAVINGS_BALANCE		\
+ 				| 0*SD_SHARE_PKG_RESOURCES		\
+ 				| 1*SD_SERIALIZE			\
+-				| 1*SD_WAKE_IDLE_FAR			\
+ 				| 0*SD_PREFER_SIBLING			\
+ 				,					\
+ 	.last_balance		= jiffies,				\
+
+commit a8fae3ec5f118dc92517dcbed3ecf69ddb641d0f
+Author: Peter Zijlstra <a.p.zijlstra@chello.nl>
+Date:   Mon Sep 7 18:32:32 2009 +0200
+
+    sched: enable SD_WAKE_IDLE
+    
+    Now that SD_WAKE_IDLE doesn't make pipe-test suck anymore,
+    enable it by default for MC, CPU and NUMA domains.
+    
+    Signed-off-by: Peter Zijlstra <a.p.zijlstra@chello.nl>
+    LKML-Reference: <new-submission>
+    Signed-off-by: Ingo Molnar <mingo@elte.hu>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index ef7bc7fc2528..26d06e052a18 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -152,7 +152,7 @@ extern unsigned long node_remap_size[];
+ 				| 0*SD_POWERSAVINGS_BALANCE		\
+ 				| 0*SD_SHARE_PKG_RESOURCES		\
+ 				| 1*SD_SERIALIZE			\
+-				| 0*SD_WAKE_IDLE_FAR			\
++				| 1*SD_WAKE_IDLE_FAR			\
+ 				| 0*SD_PREFER_SIBLING			\
+ 				,					\
+ 	.last_balance		= jiffies,				\
+
+commit 840a0653100dbde599ae8ddf83fa214dfa5fd1aa
+Author: Ingo Molnar <mingo@elte.hu>
+Date:   Fri Sep 4 11:32:54 2009 +0200
+
+    sched: Turn on SD_BALANCE_NEWIDLE
+    
+    Start the re-tuning of the balancer by turning on newidle.
+    
+    It improves hackbench performance and parallelism on a 4x4 box.
+    The "perf stat --repeat 10" measurements give us:
+    
+      domain0             domain1
+      .......................................
+     -SD_BALANCE_NEWIDLE -SD_BALANCE_NEWIDLE:
+       2041.273208  task-clock-msecs         #      9.354 CPUs    ( +-   0.363% )
+    
+     +SD_BALANCE_NEWIDLE -SD_BALANCE_NEWIDLE:
+       2086.326925  task-clock-msecs         #     11.934 CPUs    ( +-   0.301% )
+    
+     +SD_BALANCE_NEWIDLE +SD_BALANCE_NEWIDLE:
+       2115.289791  task-clock-msecs         #     12.158 CPUs    ( +-   0.263% )
+    
+    Acked-by: Peter Zijlstra <a.p.zijlstra@chello.nl>
+    Cc: Andreas Herrmann <andreas.herrmann3@amd.com>
+    Cc: Andreas Herrmann <andreas.herrmann3@amd.com>
+    Cc: Gautham R Shenoy <ego@in.ibm.com>
+    Cc: Balbir Singh <balbir@in.ibm.com>
+    LKML-Reference: <new-submission>
+    Signed-off-by: Ingo Molnar <mingo@elte.hu>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index be29eb81fb06..ef7bc7fc2528 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -142,7 +142,7 @@ extern unsigned long node_remap_size[];
+ 	.forkexec_idx		= SD_FORKEXEC_IDX,			\
+ 									\
+ 	.flags			= 1*SD_LOAD_BALANCE			\
+-				| 0*SD_BALANCE_NEWIDLE			\
++				| 1*SD_BALANCE_NEWIDLE			\
+ 				| 1*SD_BALANCE_EXEC			\
+ 				| 1*SD_BALANCE_FORK			\
+ 				| 0*SD_WAKE_IDLE			\
+
+commit 47734f89be0614b5acbd6a532390f9c72f019648
+Author: Ingo Molnar <mingo@elte.hu>
+Date:   Fri Sep 4 11:21:24 2009 +0200
+
+    sched: Clean up topology.h
+    
+    Re-organize the flag settings so that it's visible at a glance
+    which sched-domains flags are set and which not.
+    
+    With the new balancer code we'll need to re-tune these details
+    anyway, so make it cleaner to make fewer mistakes down the
+    road ;-)
+    
+    Cc: Peter Zijlstra <a.p.zijlstra@chello.nl>
+    Cc: Andreas Herrmann <andreas.herrmann3@amd.com>
+    Cc: Andreas Herrmann <andreas.herrmann3@amd.com>
+    Cc: Gautham R Shenoy <ego@in.ibm.com>
+    Cc: Balbir Singh <balbir@in.ibm.com>
+    LKML-Reference: <new-submission>
+    Signed-off-by: Ingo Molnar <mingo@elte.hu>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index 066ef590d7e0..be29eb81fb06 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -129,25 +129,34 @@ extern unsigned long node_remap_size[];
+ #endif
+ 
+ /* sched_domains SD_NODE_INIT for NUMA machines */
+-#define SD_NODE_INIT (struct sched_domain) {		\
+-	.min_interval		= 8,			\
+-	.max_interval		= 32,			\
+-	.busy_factor		= 32,			\
+-	.imbalance_pct		= 125,			\
+-	.cache_nice_tries	= SD_CACHE_NICE_TRIES,	\
+-	.busy_idx		= 3,			\
+-	.idle_idx		= SD_IDLE_IDX,		\
+-	.newidle_idx		= SD_NEWIDLE_IDX,	\
+-	.wake_idx		= 1,			\
+-	.forkexec_idx		= SD_FORKEXEC_IDX,	\
+-	.flags			= SD_LOAD_BALANCE	\
+-				| SD_BALANCE_EXEC	\
+-				| SD_BALANCE_FORK	\
+-				| SD_WAKE_AFFINE	\
+-				| SD_WAKE_BALANCE	\
+-				| SD_SERIALIZE,		\
+-	.last_balance		= jiffies,		\
+-	.balance_interval	= 1,			\
++#define SD_NODE_INIT (struct sched_domain) {				\
++	.min_interval		= 8,					\
++	.max_interval		= 32,					\
++	.busy_factor		= 32,					\
++	.imbalance_pct		= 125,					\
++	.cache_nice_tries	= SD_CACHE_NICE_TRIES,			\
++	.busy_idx		= 3,					\
++	.idle_idx		= SD_IDLE_IDX,				\
++	.newidle_idx		= SD_NEWIDLE_IDX,			\
++	.wake_idx		= 1,					\
++	.forkexec_idx		= SD_FORKEXEC_IDX,			\
++									\
++	.flags			= 1*SD_LOAD_BALANCE			\
++				| 0*SD_BALANCE_NEWIDLE			\
++				| 1*SD_BALANCE_EXEC			\
++				| 1*SD_BALANCE_FORK			\
++				| 0*SD_WAKE_IDLE			\
++				| 1*SD_WAKE_AFFINE			\
++				| 1*SD_WAKE_BALANCE			\
++				| 0*SD_SHARE_CPUPOWER			\
++				| 0*SD_POWERSAVINGS_BALANCE		\
++				| 0*SD_SHARE_PKG_RESOURCES		\
++				| 1*SD_SERIALIZE			\
++				| 0*SD_WAKE_IDLE_FAR			\
++				| 0*SD_PREFER_SIBLING			\
++				,					\
++	.last_balance		= jiffies,				\
++	.balance_interval	= 1,					\
+ }
+ 
+ #ifdef CONFIG_X86_64_ACPI_NUMA
+
+commit 2ff799d3cff1ecb274049378b28120ee5c1c5e5f
+Author: Vaidyanathan Srinivasan <svaidy@linux.vnet.ibm.com>
+Date:   Mon May 11 20:09:14 2009 +0530
+
+    sched: Don't export sched_mc_power_savings on multi-socket single core system
+    
+    Fix to prevent sched_mc_power_saving from being exported through sysfs
+    for multi-scoket single core system. Max cores should be always greater than
+    one (1). My earlier patch that introduced fix for not exporting
+    'sched_mc_power_saving' on laptops  broke it on multi-socket single core
+    system. This fix addresses issue on both laptop and multi-socket single
+    core system.
+    Below are the Test results:
+    
+    1. Single socket - multi-core
+           Before Patch: Does not export 'sched_mc_power_saving'
+           After Patch: Does not export 'sched_mc_power_saving'
+           Result: Pass
+    
+    2. Multi Socket - single core
+          Before Patch: exports 'sched_mc_power_saving'
+          After Patch: Does not export 'sched_mc_power_saving'
+          Result: Pass
+    
+    3. Multi Socket - Multi core
+          Before Patch: exports 'sched_mc_power_saving'
+          After Patch: exports 'sched_mc_power_saving'
+    
+    [ Impact: make the sched_mc_power_saving control available more consistently ]
+    
+    Signed-off-by: Mahesh Salgaonkar <mahesh@linux.vnet.ibm.com>
+    Cc: Suresh B Siddha <suresh.b.siddha@intel.com>
+    Cc: Venkatesh Pallipadi <venkatesh.pallipadi@intel.com>
+    Cc: Peter Zijlstra <a.p.zijlstra@chello.nl>
+    LKML-Reference: <20090511143914.GB4853@dirshya.in.ibm.com>
+    Signed-off-by: Ingo Molnar <mingo@elte.hu>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index f44b49abca49..066ef590d7e0 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -203,7 +203,8 @@ struct pci_bus;
+ void x86_pci_root_bus_res_quirks(struct pci_bus *b);
+ 
+ #ifdef CONFIG_SMP
+-#define mc_capable()	(cpumask_weight(cpu_core_mask(0)) != nr_cpu_ids)
++#define mc_capable()	((boot_cpu_data.x86_max_cores > 1) && \
++			(cpumask_weight(cpu_core_mask(0)) != nr_cpu_ids))
+ #define smt_capable()			(smp_num_siblings > 1)
+ #endif
+ 
+
+commit 0e94ecd098347874e776f7818728613a335880d1
+Author: Yinghai Lu <yinghai@kernel.org>
+Date:   Sat Apr 18 10:11:25 2009 -0700
+
+    x86/PCI: set_pci_bus_resources_arch_default cleanups
+    
+    Rename set_pci_bus_resources_arch_default to x86_pci_root_bus_res_quirks, move
+    the weak version from common.c to i386.c, and before calling, make sure it's a
+    root bus.
+    
+    Reviewed-by: Matthew Wilcox <willy@linux.intel.com>
+    Signed-off-by: Yinghai Lu <yinghai@kernel.org>
+    Signed-off-by: Jesse Barnes <jbarnes@virtuousgeek.org>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index 892b119dba6f..f44b49abca49 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -200,7 +200,7 @@ static inline void arch_fix_phys_package_id(int num, u32 slot)
+ }
+ 
+ struct pci_bus;
+-void set_pci_bus_resources_arch_default(struct pci_bus *b);
++void x86_pci_root_bus_res_quirks(struct pci_bus *b);
+ 
+ #ifdef CONFIG_SMP
+ #define mc_capable()	(cpumask_weight(cpu_core_mask(0)) != nr_cpu_ids)
+
+commit 558f6ab9106e6be701acb0257e7171df1bbccf04
+Merge: 15f7176eb1cc 65fb0d23fcdd
+Author: Rusty Russell <rusty@rustcorp.com.au>
+Date:   Tue Mar 31 13:33:50 2009 +1030
+
+    Merge branch 'cpumask-for-linus' of git://git.kernel.org/pub/scm/linux/kernel/git/tip/linux-2.6-tip
+    
+    Conflicts:
+    
+            arch/x86/include/asm/topology.h
+            drivers/oprofile/buffer_sync.c
+    (Both cases: changed in Linus' tree, removed in Ingo's).
+
+commit 0451fb2ebc4f65c265bb51d71a2fc986ebf20218
+Author: Rusty Russell <rusty@rustcorp.com.au>
+Date:   Mon Mar 30 22:05:11 2009 -0600
+
+    cpumask: remove node_to_first_cpu
+    
+    Everyone defines it, and only one person uses it
+    (arch/mips/sgi-ip27/ip27-nmi.c).  So just open code it there.
+    
+    Signed-off-by: Rusty Russell <rusty@rustcorp.com.au>
+    Cc: linux-mips@linux-mips.org
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index 77cfb2cfb386..744299c0b774 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -217,10 +217,6 @@ static inline cpumask_t node_to_cpumask(int node)
+ {
+ 	return cpu_online_map;
+ }
+-static inline int node_to_first_cpu(int node)
+-{
+-	return first_cpu(cpu_online_map);
+-}
+ 
+ static inline void setup_node_to_cpumask_map(void) { }
+ 
+@@ -237,14 +233,6 @@ static inline void setup_node_to_cpumask_map(void) { }
+ 
+ #include <asm-generic/topology.h>
+ 
+-#ifdef CONFIG_NUMA
+-/* Returns the number of the first CPU on Node 'node'. */
+-static inline int node_to_first_cpu(int node)
+-{
+-	return cpumask_first(cpumask_of_node(node));
+-}
+-#endif
+-
+ extern cpumask_t cpu_coregroup_map(int cpu);
+ extern const struct cpumask *cpu_coregroup_mask(int cpu);
+ 
+
+commit 73e907de7d5cecef43d9949ab8f4fdca508168c7
+Author: Rusty Russell <rusty@rustcorp.com.au>
+Date:   Fri Mar 13 14:49:57 2009 +1030
+
+    cpumask: remove x86 cpumask_t uses.
+    
+    Impact: cleanup
+    
+    We are removing cpumask_t in favour of struct cpumask: mainly as a
+    marker of what code is now CONFIG_CPUMASK_OFFSTACK-safe.
+    
+    The only non-trivial change here is vector_allocation_domain():
+    explicitly clear the mask and set the first word, rather than using
+    assignment.
+    
+    Signed-off-by: Rusty Russell <rusty@rustcorp.com.au>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index 1ce1e1afa801..e3f4198371a9 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -89,7 +89,7 @@ static inline int early_cpu_to_node(int cpu)
+ extern cpumask_var_t node_to_cpumask_map[MAX_NUMNODES];
+ 
+ #ifdef CONFIG_DEBUG_PER_CPU_MAPS
+-extern const cpumask_t *cpumask_of_node(int node);
++extern const struct cpumask *cpumask_of_node(int node);
+ #else
+ /* Returns a pointer to the cpumask of CPUs on Node 'node'. */
+ static inline const struct cpumask *cpumask_of_node(int node)
+@@ -172,7 +172,7 @@ static inline int early_cpu_to_node(int cpu)
+ 	return 0;
+ }
+ 
+-static inline const cpumask_t *cpumask_of_node(int node)
++static inline const struct cpumask *cpumask_of_node(int node)
+ {
+ 	return cpu_online_mask;
+ }
+
+commit 4f0628963c86d2f97b8cb9acc024a7fe288a6a57
+Author: Rusty Russell <rusty@rustcorp.com.au>
+Date:   Fri Mar 13 14:49:54 2009 +1030
+
+    cpumask: use new cpumask functions throughout x86
+    
+    Impact: cleanup
+    
+    1) &cpu_online_map -> cpu_online_mask
+    2) first_cpu/next_cpu_nr -> cpumask_first/cpumask_next
+    3) cpu_*_map manipulation -> init_cpu_* / set_cpu_*
+    
+    Signed-off-by: Rusty Russell <rusty@rustcorp.com.au>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index f8b833e1257f..1ce1e1afa801 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -174,11 +174,11 @@ static inline int early_cpu_to_node(int cpu)
+ 
+ static inline const cpumask_t *cpumask_of_node(int node)
+ {
+-	return &cpu_online_map;
++	return cpu_online_mask;
+ }
+ static inline int node_to_first_cpu(int node)
+ {
+-	return first_cpu(cpu_online_map);
++	return cpumask_first(cpu_online_mask);
+ }
+ 
+ static inline void setup_node_to_cpumask_map(void) { }
+
+commit c032ef60d1aa9af33730b7a35bbea751b131adc1
+Author: Rusty Russell <rusty@rustcorp.com.au>
+Date:   Fri Mar 13 14:49:53 2009 +1030
+
+    cpumask: convert node_to_cpumask_map[] to cpumask_var_t
+    
+    Impact: reduce kernel memory usage when CONFIG_CPUMASK_OFFSTACK=y
+    
+    Straightforward conversion: done for 32 and 64 bit kernels.
+    node_to_cpumask_map is now a cpumask_var_t array.
+    
+    64-bit used to be a dynamic cpumask_t array, and 32-bit used to be a
+    static cpumask_t array.
+    
+    Signed-off-by: Rusty Russell <rusty@rustcorp.com.au>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index dc31d929da04..f8b833e1257f 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -86,15 +86,15 @@ static inline int early_cpu_to_node(int cpu)
+ #endif /* CONFIG_X86_64 */
+ 
+ /* Mappings between node number and cpus on that node. */
+-extern cpumask_t *node_to_cpumask_map;
++extern cpumask_var_t node_to_cpumask_map[MAX_NUMNODES];
+ 
+ #ifdef CONFIG_DEBUG_PER_CPU_MAPS
+ extern const cpumask_t *cpumask_of_node(int node);
+ #else
+ /* Returns a pointer to the cpumask of CPUs on Node 'node'. */
+-static inline const cpumask_t *cpumask_of_node(int node)
++static inline const struct cpumask *cpumask_of_node(int node)
+ {
+-	return &node_to_cpumask_map[node];
++	return node_to_cpumask_map[node];
+ }
+ #endif
+ 
+
+commit 71ee73e72228775a076a502b3c92028fa59e2889
+Author: Rusty Russell <rusty@rustcorp.com.au>
+Date:   Fri Mar 13 14:49:52 2009 +1030
+
+    x86: unify 32 and 64-bit node_to_cpumask_map
+    
+    Impact: cleanup
+    
+    We take the 64-bit code and use it on 32-bit as well.  The new file
+    is called mm/numa.c.
+    
+    In a minor cleanup, we use cpu_none_mask instead of declaring a local
+    cpu_mask_none.
+    
+    Signed-off-by: Rusty Russell <rusty@rustcorp.com.au>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index 216a960d4f10..dc31d929da04 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -44,9 +44,6 @@
+ 
+ #ifdef CONFIG_X86_32
+ 
+-/* Mappings between node number and cpus on that node. */
+-extern cpumask_t node_to_cpumask_map[];
+-
+ /* Mappings between logical cpu number and node number */
+ extern int cpu_to_node_map[];
+ 
+@@ -57,19 +54,8 @@ static inline int cpu_to_node(int cpu)
+ }
+ #define early_cpu_to_node(cpu)	cpu_to_node(cpu)
+ 
+-/* Returns a bitmask of CPUs on Node 'node'. */
+-static inline const struct cpumask *cpumask_of_node(int node)
+-{
+-	return &node_to_cpumask_map[node];
+-}
+-
+-static inline void setup_node_to_cpumask_map(void) { }
+-
+ #else /* CONFIG_X86_64 */
+ 
+-/* Mappings between node number and cpus on that node. */
+-extern cpumask_t *node_to_cpumask_map;
+-
+ /* Mappings between logical cpu number and node number */
+ DECLARE_EARLY_PER_CPU(int, x86_cpu_to_node_map);
+ 
+@@ -80,7 +66,6 @@ DECLARE_PER_CPU(int, node_number);
+ #ifdef CONFIG_DEBUG_PER_CPU_MAPS
+ extern int cpu_to_node(int cpu);
+ extern int early_cpu_to_node(int cpu);
+-extern const cpumask_t *cpumask_of_node(int node);
+ 
+ #else	/* !CONFIG_DEBUG_PER_CPU_MAPS */
+ 
+@@ -96,18 +81,25 @@ static inline int early_cpu_to_node(int cpu)
+ 	return early_per_cpu(x86_cpu_to_node_map, cpu);
+ }
+ 
++#endif /* !CONFIG_DEBUG_PER_CPU_MAPS */
++
++#endif /* CONFIG_X86_64 */
++
++/* Mappings between node number and cpus on that node. */
++extern cpumask_t *node_to_cpumask_map;
++
++#ifdef CONFIG_DEBUG_PER_CPU_MAPS
++extern const cpumask_t *cpumask_of_node(int node);
++#else
+ /* Returns a pointer to the cpumask of CPUs on Node 'node'. */
+ static inline const cpumask_t *cpumask_of_node(int node)
+ {
+ 	return &node_to_cpumask_map[node];
+ }
+-
+-#endif /* !CONFIG_DEBUG_PER_CPU_MAPS */
++#endif
+ 
+ extern void setup_node_to_cpumask_map(void);
+ 
+-#endif /* CONFIG_X86_64 */
+-
+ /*
+  * Returns the number of the node containing Node 'node'. This
+  * architecture is flat, so it is a pretty simple function!
+
+commit b9c4398ed43a7ed023e091610c23ba7412aec2a8
+Author: Rusty Russell <rusty@rustcorp.com.au>
+Date:   Fri Mar 13 14:49:52 2009 +1030
+
+    cpumask: remove x86's node_to_cpumask now everyone uses cpumask_of_node
+    
+    Impact: cleanup
+    
+    Signed-off-by: Rusty Russell <rusty@rustcorp.com.au>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index fa4aa42e976d..216a960d4f10 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -57,17 +57,6 @@ static inline int cpu_to_node(int cpu)
+ }
+ #define early_cpu_to_node(cpu)	cpu_to_node(cpu)
+ 
+-/* Returns a bitmask of CPUs on Node 'node'.
+- *
+- * Side note: this function creates the returned cpumask on the stack
+- * so with a high NR_CPUS count, excessive stack space is used.  The
+- * cpumask_of_node function should be used whenever possible.
+- */
+-static inline cpumask_t node_to_cpumask(int node)
+-{
+-	return node_to_cpumask_map[node];
+-}
+-
+ /* Returns a bitmask of CPUs on Node 'node'. */
+ static inline const struct cpumask *cpumask_of_node(int node)
+ {
+@@ -92,7 +81,6 @@ DECLARE_PER_CPU(int, node_number);
+ extern int cpu_to_node(int cpu);
+ extern int early_cpu_to_node(int cpu);
+ extern const cpumask_t *cpumask_of_node(int node);
+-extern cpumask_t node_to_cpumask(int node);
+ 
+ #else	/* !CONFIG_DEBUG_PER_CPU_MAPS */
+ 
+@@ -114,26 +102,10 @@ static inline const cpumask_t *cpumask_of_node(int node)
+ 	return &node_to_cpumask_map[node];
+ }
+ 
+-/* Returns a bitmask of CPUs on Node 'node'. */
+-static inline cpumask_t node_to_cpumask(int node)
+-{
+-	return node_to_cpumask_map[node];
+-}
+-
+ #endif /* !CONFIG_DEBUG_PER_CPU_MAPS */
+ 
+ extern void setup_node_to_cpumask_map(void);
+ 
+-/*
+- * Replace default node_to_cpumask_ptr with optimized version
+- * Deprecated: use "const struct cpumask *mask = cpumask_of_node(node)"
+- */
+-#define node_to_cpumask_ptr(v, node)		\
+-		const cpumask_t *v = cpumask_of_node(node)
+-
+-#define node_to_cpumask_ptr_next(v, node)	\
+-			   v = cpumask_of_node(node)
+-
+ #endif /* CONFIG_X86_64 */
+ 
+ /*
+@@ -212,10 +184,6 @@ static inline const cpumask_t *cpumask_of_node(int node)
+ {
+ 	return &cpu_online_map;
+ }
+-static inline cpumask_t node_to_cpumask(int node)
+-{
+-	return cpu_online_map;
+-}
+ static inline int node_to_first_cpu(int node)
+ {
+ 	return first_cpu(cpu_online_map);
+@@ -223,15 +191,6 @@ static inline int node_to_first_cpu(int node)
+ 
+ static inline void setup_node_to_cpumask_map(void) { }
+ 
+-/*
+- * Replace default node_to_cpumask_ptr with optimized version
+- * Deprecated: use "const struct cpumask *mask = cpumask_of_node(node)"
+- */
+-#define node_to_cpumask_ptr(v, node)		\
+-		const cpumask_t *v = cpumask_of_node(node)
+-
+-#define node_to_cpumask_ptr_next(v, node)	\
+-			   v = cpumask_of_node(node)
+ #endif
+ 
+ #include <asm-generic/topology.h>
+
+commit 7ad728f98162cb1af06a85b2a5fc422dddd4fb78
+Author: Rusty Russell <rusty@rustcorp.com.au>
+Date:   Fri Mar 13 14:49:50 2009 +1030
+
+    cpumask: x86: convert cpu_sibling_map/cpu_core_map to cpumask_var_t
+    
+    Impact: reduce per-cpu size for CONFIG_CPUMASK_OFFSTACK=y
+    
+    In most places it's cleaner to use the accessors cpu_sibling_mask()
+    and cpu_core_mask() wrappers which already exist.
+    
+    I couldn't avoid cleaning up the access in oprofile, either.
+    
+    Signed-off-by: Rusty Russell <rusty@rustcorp.com.au>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index f7c20d031422..fa4aa42e976d 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -249,8 +249,8 @@ extern const struct cpumask *cpu_coregroup_mask(int cpu);
+ #ifdef ENABLE_TOPO_DEFINES
+ #define topology_physical_package_id(cpu)	(cpu_data(cpu).phys_proc_id)
+ #define topology_core_id(cpu)			(cpu_data(cpu).cpu_core_id)
+-#define topology_core_cpumask(cpu)		(&per_cpu(cpu_core_map, cpu))
+-#define topology_thread_cpumask(cpu)		(&per_cpu(cpu_sibling_map, cpu))
++#define topology_core_cpumask(cpu)		(per_cpu(cpu_core_map, cpu))
++#define topology_thread_cpumask(cpu)		(per_cpu(cpu_sibling_map, cpu))
+ 
+ /* indicates that pointers to the topology cpumask_t maps are valid */
+ #define arch_provides_topology_pointers		yes
+@@ -264,7 +264,7 @@ struct pci_bus;
+ void set_pci_bus_resources_arch_default(struct pci_bus *b);
+ 
+ #ifdef CONFIG_SMP
+-#define mc_capable()	(cpus_weight(per_cpu(cpu_core_map, 0)) != nr_cpu_ids)
++#define mc_capable()	(cpumask_weight(cpu_core_mask(0)) != nr_cpu_ids)
+ #define smt_capable()			(smp_num_siblings > 1)
+ #endif
+ 
+
+commit d3d2e7f24384cccedd29a0582ad4b014ac646abc
+Author: Rusty Russell <rusty@rustcorp.com.au>
+Date:   Fri Mar 13 14:49:48 2009 +1030
+
+    cpumask: remove obsolete topology_core_siblings and topology_thread_siblings: x86
+    
+    Impact: cleanup
+    
+    There were replaced by topology_core_cpumask and topology_thread_cpumask.
+    
+    Signed-off-by: Rusty Russell <rusty@rustcorp.com.au>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index 6b954fbd7872..f7c20d031422 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -249,8 +249,6 @@ extern const struct cpumask *cpu_coregroup_mask(int cpu);
+ #ifdef ENABLE_TOPO_DEFINES
+ #define topology_physical_package_id(cpu)	(cpu_data(cpu).phys_proc_id)
+ #define topology_core_id(cpu)			(cpu_data(cpu).cpu_core_id)
+-#define topology_core_siblings(cpu)		(per_cpu(cpu_core_map, cpu))
+-#define topology_thread_siblings(cpu)		(per_cpu(cpu_sibling_map, cpu))
+ #define topology_core_cpumask(cpu)		(&per_cpu(cpu_core_map, cpu))
+ #define topology_thread_cpumask(cpu)		(&per_cpu(cpu_sibling_map, cpu))
+ 
+
+commit 23c5c9c66263311de1295b42382e5bc1e7c36c47
+Author: Rusty Russell <rusty@rustcorp.com.au>
+Date:   Fri Mar 13 14:49:48 2009 +1030
+
+    cpumask: remove cpu_coregroup_map: x86
+    
+    Impact: cleanup
+    
+    cpu_coregroup_mask is the New Hotness.
+    
+    Signed-off-by: Rusty Russell <rusty@rustcorp.com.au>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index d772facb263e..6b954fbd7872 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -244,7 +244,6 @@ static inline int node_to_first_cpu(int node)
+ }
+ #endif
+ 
+-extern cpumask_t cpu_coregroup_map(int cpu);
+ extern const struct cpumask *cpu_coregroup_mask(int cpu);
+ 
+ #ifdef ENABLE_TOPO_DEFINES
+
+commit cb3d560f36c1e4aa3c26a1d79e9b6e62ab69896c
+Author: Rusty Russell <rusty@rustcorp.com.au>
+Date:   Fri Mar 13 14:49:47 2009 +1030
+
+    cpumask: remove the now-obsoleted pcibus_to_cpumask(): x86
+    
+    Impact: reduce stack usage for large NR_CPUS
+    
+    cpumask_of_pcibus() is the new version.
+    
+    Signed-off-by: Rusty Russell <rusty@rustcorp.com.au>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index 77cfb2cfb386..d772facb263e 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -143,7 +143,6 @@ extern void setup_node_to_cpumask_map(void);
+ #define parent_node(node) (node)
+ 
+ #define pcibus_to_node(bus) __pcibus_to_node(bus)
+-#define pcibus_to_cpumask(bus) __pcibus_to_cpumask(bus)
+ 
+ #ifdef CONFIG_X86_32
+ extern unsigned long node_start_pfn[];
+
+commit 6470aff619fbb9dff8dfe8afa5033084cd55ca20
+Author: Brian Gerst <brgerst@gmail.com>
+Date:   Tue Jan 27 12:56:47 2009 +0900
+
+    x86: move 64-bit NUMA code
+    
+    Impact: Code movement, no functional change.
+    
+    Move the 64-bit NUMA code from setup_percpu.c to numa_64.c
+    
+    Signed-off-by: Brian Gerst <brgerst@gmail.com>
+    Signed-off-by: Tejun Heo <tj@kernel.org>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index 10022ed3a4b6..77cfb2cfb386 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -74,6 +74,8 @@ static inline const struct cpumask *cpumask_of_node(int node)
+ 	return &node_to_cpumask_map[node];
+ }
+ 
++static inline void setup_node_to_cpumask_map(void) { }
++
+ #else /* CONFIG_X86_64 */
+ 
+ /* Mappings between node number and cpus on that node. */
+@@ -120,6 +122,8 @@ static inline cpumask_t node_to_cpumask(int node)
+ 
+ #endif /* !CONFIG_DEBUG_PER_CPU_MAPS */
+ 
++extern void setup_node_to_cpumask_map(void);
++
+ /*
+  * Replace default node_to_cpumask_ptr with optimized version
+  * Deprecated: use "const struct cpumask *mask = cpumask_of_node(node)"
+@@ -218,6 +222,8 @@ static inline int node_to_first_cpu(int node)
+ 	return first_cpu(cpu_online_map);
+ }
+ 
++static inline void setup_node_to_cpumask_map(void) { }
++
+ /*
+  * Replace default node_to_cpumask_ptr with optimized version
+  * Deprecated: use "const struct cpumask *mask = cpumask_of_node(node)"
+
+commit 3eb3963fd1974c63e9bb3cfe774abc3e1995e479
+Merge: ae2b56b92bd3 5766b842b23c
+Author: Ingo Molnar <mingo@elte.hu>
+Date:   Wed Jan 21 10:14:17 2009 +0100
+
+    Merge branch 'cpus4096' into core/percpu
+    
+    Conflicts:
+            arch/x86/kernel/cpu/cpufreq/acpi-cpufreq.c
+            arch/x86/kernel/tlb_32.c
+    
+    Merge it here because both the cpumask changes and the ongoing percpu
+    work is touching the TLB code. The percpu changes take precedence, as
+    they eliminate tlb_32.c altogether.
+    
+    Signed-off-by: Ingo Molnar <mingo@elte.hu>
+
+commit e7a22c1ebcc1caa8178df1819d05128bb5b45ab9
+Author: Brian Gerst <brgerst@gmail.com>
+Date:   Mon Jan 19 00:38:59 2009 +0900
+
+    x86-64: Move nodenumber from PDA to per-cpu.
+    
+    tj: * s/nodenumber/node_number/
+        * removed now unused pda variable from pda_init()
+    
+    Signed-off-by: Brian Gerst <brgerst@gmail.com>
+    Signed-off-by: Tejun Heo <tj@kernel.org>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index 87ca3fd86e88..ffea1fe03a99 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -83,7 +83,8 @@ extern cpumask_t *node_to_cpumask_map;
+ DECLARE_EARLY_PER_CPU(int, x86_cpu_to_node_map);
+ 
+ /* Returns the number of the current Node. */
+-#define numa_node_id()		read_pda(nodenumber)
++DECLARE_PER_CPU(int, node_number);
++#define numa_node_id()		percpu_read(node_number)
+ 
+ #ifdef CONFIG_DEBUG_PER_CPU_MAPS
+ extern int cpu_to_node(int cpu);
+
+commit f10fcd47120e80f66665567dbe17f5071c7aef52
+Author: Tejun Heo <tj@kernel.org>
+Date:   Tue Jan 13 20:41:34 2009 +0900
+
+    x86: make early_per_cpu() a lvalue and use it
+    
+    Make early_per_cpu() a lvalue as per_cpu() is and use it where
+    applicable.
+    
+    Signed-off-by: Tejun Heo <tj@kernel.org>
+    Signed-off-by: Ingo Molnar <mingo@elte.hu>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index 4e2f2e0aab27..87ca3fd86e88 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -102,10 +102,7 @@ static inline int cpu_to_node(int cpu)
+ /* Same function but used if called before per_cpu areas are setup */
+ static inline int early_cpu_to_node(int cpu)
+ {
+-	if (early_per_cpu_ptr(x86_cpu_to_node_map))
+-		return early_per_cpu_ptr(x86_cpu_to_node_map)[cpu];
+-
+-	return per_cpu(x86_cpu_to_node_map, cpu);
++	return early_per_cpu(x86_cpu_to_node_map, cpu);
+ }
+ 
+ /* Returns a pointer to the cpumask of CPUs on Node 'node'. */
+
+commit f2a082711905312dc7b6675e913fee0c4689f7ae
+Author: Mike Travis <travis@sgi.com>
+Date:   Thu Jan 15 09:19:32 2009 -0800
+
+    x86: fix build warning when CONFIG_NUMA not defined.
+    
+    Impact: fix build warning
+    
+    The macro cpu_to_node did not reference it's argument, and instead
+    simply returned a 0.  This causes a "unused variable" warning if
+    it's the only reference in a function (show_cache_disable).
+    
+    Replace it with the more correct inline function.
+    
+    Signed-off-by: Mike Travis <travis@sgi.com>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index 4e2f2e0aab27..d0c68e291635 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -192,9 +192,20 @@ extern int __node_distance(int, int);
+ 
+ #else /* !CONFIG_NUMA */
+ 
+-#define numa_node_id()		0
+-#define	cpu_to_node(cpu)	0
+-#define	early_cpu_to_node(cpu)	0
++static inline int numa_node_id(void)
++{
++	return 0;
++}
++
++static inline int cpu_to_node(int cpu)
++{
++	return 0;
++}
++
++static inline int early_cpu_to_node(int cpu)
++{
++	return 0;
++}
+ 
+ static inline const cpumask_t *cpumask_of_node(int node)
+ {
+
+commit 7eb19553369c46cc1fa64caf120cbcab1b597f7c
+Merge: 6092848a2a23 8c384cdee3e0
+Author: Mike Travis <travis@sgi.com>
+Date:   Wed Dec 31 17:34:16 2008 -0800
+
+    Merge branch 'master' of git://git.kernel.org/pub/scm/linux/kernel/git/rusty/linux-2.6-cpumask into merge-rr-cpumask
+    
+    Conflicts:
+            arch/x86/kernel/io_apic.c
+            kernel/rcuclassic.c
+            kernel/sched.c
+            kernel/time/tick-sched.c
+    
+    Signed-off-by: Mike Travis <travis@sgi.com>
+    [ mingo@elte.hu: backmerged typo fix for io_apic.c ]
+    Signed-off-by: Ingo Molnar <mingo@elte.hu>
+
+commit 030bb203e01db12e3f2866799f4f03a114d06349
+Author: Rusty Russell <rusty@rustcorp.com.au>
+Date:   Fri Dec 26 22:23:41 2008 +1030
+
+    cpumask: cpu_coregroup_mask(): x86
+    
+    Impact: New API
+    
+    Like cpu_coregroup_map, but returns a (const) pointer.
+    
+    Signed-off-by: Rusty Russell <rusty@rustcorp.com.au>
+    Signed-off-by: Mike Travis <travis@sgi.com>
+    Cc: Ingo Molnar <mingo@redhat.com>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index 45da5dc50fc8..168203c0c316 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -231,6 +231,7 @@ static inline int node_to_first_cpu(int node)
+ #endif
+ 
+ extern cpumask_t cpu_coregroup_map(int cpu);
++extern const struct cpumask *cpu_coregroup_mask(int cpu);
+ 
+ #ifdef ENABLE_TOPO_DEFINES
+ #define topology_physical_package_id(cpu)	(cpu_data(cpu).phys_proc_id)
+
+commit 393d68fb9929817cde7ab31c82d66fcb28ad35fc
+Author: Rusty Russell <rusty@rustcorp.com.au>
+Date:   Fri Dec 26 22:23:38 2008 +1030
+
+    cpumask: x86: Introduce cpumask_of_{node,pcibus} to replace {node,pcibus}_to_cpumask
+    
+    Impact: New APIs
+    
+    The old node_to_cpumask/node_to_pcibus returned a cpumask_t: these
+    return a pointer to a struct cpumask.  Part of removing cpumasks from
+    the stack.
+    
+    Also makes __pcibus_to_node take a const pointer.
+    
+    Signed-off-by: Rusty Russell <rusty@rustcorp.com.au>
+    Acked-by: Ingo Molnar <mingo@elte.hu>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index ff386ff50ed7..45da5dc50fc8 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -61,13 +61,19 @@ static inline int cpu_to_node(int cpu)
+  *
+  * Side note: this function creates the returned cpumask on the stack
+  * so with a high NR_CPUS count, excessive stack space is used.  The
+- * node_to_cpumask_ptr function should be used whenever possible.
++ * cpumask_of_node function should be used whenever possible.
+  */
+ static inline cpumask_t node_to_cpumask(int node)
+ {
+ 	return node_to_cpumask_map[node];
+ }
+ 
++/* Returns a bitmask of CPUs on Node 'node'. */
++static inline const struct cpumask *cpumask_of_node(int node)
++{
++	return &node_to_cpumask_map[node];
++}
++
+ #else /* CONFIG_X86_64 */
+ 
+ /* Mappings between node number and cpus on that node. */
+@@ -82,7 +88,7 @@ DECLARE_EARLY_PER_CPU(int, x86_cpu_to_node_map);
+ #ifdef CONFIG_DEBUG_PER_CPU_MAPS
+ extern int cpu_to_node(int cpu);
+ extern int early_cpu_to_node(int cpu);
+-extern const cpumask_t *_node_to_cpumask_ptr(int node);
++extern const cpumask_t *cpumask_of_node(int node);
+ extern cpumask_t node_to_cpumask(int node);
+ 
+ #else	/* !CONFIG_DEBUG_PER_CPU_MAPS */
+@@ -103,7 +109,7 @@ static inline int early_cpu_to_node(int cpu)
+ }
+ 
+ /* Returns a pointer to the cpumask of CPUs on Node 'node'. */
+-static inline const cpumask_t *_node_to_cpumask_ptr(int node)
++static inline const cpumask_t *cpumask_of_node(int node)
+ {
+ 	return &node_to_cpumask_map[node];
+ }
+@@ -116,12 +122,15 @@ static inline cpumask_t node_to_cpumask(int node)
+ 
+ #endif /* !CONFIG_DEBUG_PER_CPU_MAPS */
+ 
+-/* Replace default node_to_cpumask_ptr with optimized version */
++/*
++ * Replace default node_to_cpumask_ptr with optimized version
++ * Deprecated: use "const struct cpumask *mask = cpumask_of_node(node)"
++ */
+ #define node_to_cpumask_ptr(v, node)		\
+-		const cpumask_t *v = _node_to_cpumask_ptr(node)
++		const cpumask_t *v = cpumask_of_node(node)
+ 
+ #define node_to_cpumask_ptr_next(v, node)	\
+-			   v = _node_to_cpumask_ptr(node)
++			   v = cpumask_of_node(node)
+ 
+ #endif /* CONFIG_X86_64 */
+ 
+@@ -187,7 +196,7 @@ extern int __node_distance(int, int);
+ #define	cpu_to_node(cpu)	0
+ #define	early_cpu_to_node(cpu)	0
+ 
+-static inline const cpumask_t *_node_to_cpumask_ptr(int node)
++static inline const cpumask_t *cpumask_of_node(int node)
+ {
+ 	return &cpu_online_map;
+ }
+@@ -200,12 +209,15 @@ static inline int node_to_first_cpu(int node)
+ 	return first_cpu(cpu_online_map);
+ }
+ 
+-/* Replace default node_to_cpumask_ptr with optimized version */
++/*
++ * Replace default node_to_cpumask_ptr with optimized version
++ * Deprecated: use "const struct cpumask *mask = cpumask_of_node(node)"
++ */
+ #define node_to_cpumask_ptr(v, node)		\
+-		const cpumask_t *v = _node_to_cpumask_ptr(node)
++		const cpumask_t *v = cpumask_of_node(node)
+ 
+ #define node_to_cpumask_ptr_next(v, node)	\
+-			   v = _node_to_cpumask_ptr(node)
++			   v = cpumask_of_node(node)
+ #endif
+ 
+ #include <asm-generic/topology.h>
+@@ -214,8 +226,7 @@ static inline int node_to_first_cpu(int node)
+ /* Returns the number of the first CPU on Node 'node'. */
+ static inline int node_to_first_cpu(int node)
+ {
+-	node_to_cpumask_ptr(mask, node);
+-	return first_cpu(*mask);
++	return cpumask_first(cpumask_of_node(node));
+ }
+ #endif
+ 
+
+commit 83b19597f793fd5f91533bda0dc2eb3d21936798
+Author: Mike Travis <travis@sgi.com>
+Date:   Tue Dec 16 17:34:06 2008 -0800
+
+    x86: Introduce topology_core_cpumask()/topology_thread_cpumask()
+    
+    Impact: new API
+    
+    The old topology_core_siblings() and topology_thread_siblings() return
+    a cpumask_t; these new ones return a (const) struct cpumask *.
+    
+    Signed-off-by: Rusty Russell <rusty@rustcorp.com.au>
+    Signed-off-by: Mike Travis <travis@sgi.com>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index ff386ff50ed7..79e31e9dcdda 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -226,6 +226,8 @@ extern cpumask_t cpu_coregroup_map(int cpu);
+ #define topology_core_id(cpu)			(cpu_data(cpu).cpu_core_id)
+ #define topology_core_siblings(cpu)		(per_cpu(cpu_core_map, cpu))
+ #define topology_thread_siblings(cpu)		(per_cpu(cpu_sibling_map, cpu))
++#define topology_core_cpumask(cpu)		(&per_cpu(cpu_core_map, cpu))
++#define topology_thread_cpumask(cpu)		(&per_cpu(cpu_sibling_map, cpu))
+ 
+ /* indicates that pointers to the topology cpumask_t maps are valid */
+ #define arch_provides_topology_pointers		yes
+
+commit 43714539eab42b2fa3653ea7bd667b36c2291b11
+Author: Mahesh Salgaonkar <mahesh@linux.vnet.ibm.com>
+Date:   Sat Nov 29 16:50:12 2008 +0530
+
+    sched: don't export sched_mc_power_savings in laptops
+    
+    Impact: do not expose a control that has no effect
+    
+    Fix to prevent sched_mc_power_saving from being exported through sysfs
+    on single-socket systems. (Say multicore single socket (Laptop))
+    
+    CPU core map of the boot cpu should be equal to possible number
+    of cpus for single socket system.
+    
+    This fix has been developed at FOSS.in kernel workout.
+    
+    Signed-off-by: Mahesh Salgaonkar <mahesh@linux.vnet.ibm.com>
+    Acked-by: Peter Zijlstra <peterz@infradead.org>
+    Signed-off-by: Ingo Molnar <mingo@elte.hu>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index 4850e4b02b61..ff386ff50ed7 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -239,7 +239,7 @@ struct pci_bus;
+ void set_pci_bus_resources_arch_default(struct pci_bus *b);
+ 
+ #ifdef CONFIG_SMP
+-#define mc_capable()			(boot_cpu_data.x86_max_cores > 1)
++#define mc_capable()	(cpus_weight(per_cpu(cpu_core_map, 0)) != nr_cpu_ids)
+ #define smt_capable()			(smp_num_siblings > 1)
+ #endif
+ 
+
+commit 9fcd18c9e63e325dbd2b4c726623f760788d5aa8
+Author: Ingo Molnar <mingo@elte.hu>
+Date:   Wed Nov 5 16:52:08 2008 +0100
+
+    sched: re-tune balancing
+    
+    Impact: improve wakeup affinity on NUMA systems, tweak SMP systems
+    
+    Given the fixes+tweaks to the wakeup-buddy code, re-tweak the domain
+    balancing defaults on NUMA and SMP systems.
+    
+    Turn on SD_WAKE_AFFINE which was off on x86 NUMA - there's no reason
+    why we would not want to have wakeup affinity across nodes as well.
+    (we already do this in the standard NUMA template.)
+    
+    lat_ctx on a NUMA box is particularly happy about this change:
+    
+    before:
+    
+     |   phoenix:~/l> ./lat_ctx -s 0 2
+     |   "size=0k ovr=2.60
+     |   2 5.70
+    
+    after:
+    
+     |   phoenix:~/l> ./lat_ctx -s 0 2
+     |   "size=0k ovr=2.65
+     |   2 2.07
+    
+    a 2.75x speedup.
+    
+    pipe-test is similarly happy about it too:
+    
+     |  phoenix:~/sched-tests> ./pipe-test
+     |   18.26 usecs/loop.
+     |   14.70 usecs/loop.
+     |   14.38 usecs/loop.
+     |   10.55 usecs/loop.              # +WAKE_AFFINE on domain0+domain1
+     |   8.63 usecs/loop.
+     |   8.59 usecs/loop.
+     |   9.03 usecs/loop.
+     |   8.94 usecs/loop.
+     |   8.96 usecs/loop.
+     |   8.63 usecs/loop.
+    
+    Also:
+    
+     - disable SD_BALANCE_NEWIDLE on NUMA and SMP domains (keep it for siblings)
+     - enable SD_WAKE_BALANCE on SMP domains
+    
+    Sysbench+postgresql improves all around the board, quite significantly:
+    
+               .28-rc3-11474e2c  .28-rc3-11474e2c-tune
+    -------------------------------------------------
+        1:             571              688    +17.08%
+        2:            1236             1206    -2.55%
+        4:            2381             2642    +9.89%
+        8:            4958             5164    +3.99%
+       16:            9580             9574    -0.07%
+       32:            7128             8118    +12.20%
+       64:            7342             8266    +11.18%
+      128:            7342             8064    +8.95%
+      256:            7519             7884    +4.62%
+      512:            7350             7731    +4.93%
+    -------------------------------------------------
+      SUM:           55412            59341    +6.62%
+    
+    So it's a win both for the runup portion, the peak area and the tail.
+    
+    Signed-off-by: Ingo Molnar <mingo@elte.hu>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index 90ac7718469a..4850e4b02b61 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -154,7 +154,7 @@ extern unsigned long node_remap_size[];
+ 
+ #endif
+ 
+-/* sched_domains SD_NODE_INIT for NUMAQ machines */
++/* sched_domains SD_NODE_INIT for NUMA machines */
+ #define SD_NODE_INIT (struct sched_domain) {		\
+ 	.min_interval		= 8,			\
+ 	.max_interval		= 32,			\
+@@ -169,8 +169,9 @@ extern unsigned long node_remap_size[];
+ 	.flags			= SD_LOAD_BALANCE	\
+ 				| SD_BALANCE_EXEC	\
+ 				| SD_BALANCE_FORK	\
+-				| SD_SERIALIZE		\
+-				| SD_WAKE_BALANCE,	\
++				| SD_WAKE_AFFINE	\
++				| SD_WAKE_BALANCE	\
++				| SD_SERIALIZE,		\
+ 	.last_balance		= jiffies,		\
+ 	.balance_interval	= 1,			\
+ }
+
+commit 1965aae3c98397aad957412413c07e97b1bd4e64
+Author: H. Peter Anvin <hpa@zytor.com>
+Date:   Wed Oct 22 22:26:29 2008 -0700
+
+    x86: Fix ASM_X86__ header guards
+    
+    Change header guards named "ASM_X86__*" to "_ASM_X86_*" since:
+    
+    a. the double underscore is ugly and pointless.
+    b. no leading underscore violates namespace constraints.
+    
+    Signed-off-by: H. Peter Anvin <hpa@zytor.com>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+index 7eca9bc022b2..90ac7718469a 100644
+--- a/arch/x86/include/asm/topology.h
++++ b/arch/x86/include/asm/topology.h
+@@ -22,8 +22,8 @@
+  *
+  * Send feedback to <colpatch@us.ibm.com>
+  */
+-#ifndef ASM_X86__TOPOLOGY_H
+-#define ASM_X86__TOPOLOGY_H
++#ifndef _ASM_X86_TOPOLOGY_H
++#define _ASM_X86_TOPOLOGY_H
+ 
+ #ifdef CONFIG_X86_32
+ # ifdef CONFIG_X86_HT
+@@ -255,4 +255,4 @@ static inline void set_mp_bus_to_node(int busnum, int node)
+ }
+ #endif
+ 
+-#endif /* ASM_X86__TOPOLOGY_H */
++#endif /* _ASM_X86_TOPOLOGY_H */
+
+commit bb8985586b7a906e116db835c64773b7a7d51663
+Author: Al Viro <viro@zeniv.linux.org.uk>
+Date:   Sun Aug 17 21:05:42 2008 -0400
+
+    x86, um: ... and asm-x86 move
+    
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+    Signed-off-by: H. Peter Anvin <hpa@zytor.com>
+
+diff --git a/arch/x86/include/asm/topology.h b/arch/x86/include/asm/topology.h
+new file mode 100644
+index 000000000000..7eca9bc022b2
+--- /dev/null
++++ b/arch/x86/include/asm/topology.h
+@@ -0,0 +1,258 @@
++/*
++ * Written by: Matthew Dobson, IBM Corporation
++ *
++ * Copyright (C) 2002, IBM Corp.
++ *
++ * All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE, GOOD TITLE or
++ * NON INFRINGEMENT.  See the GNU General Public License for more
++ * details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
++ *
++ * Send feedback to <colpatch@us.ibm.com>
++ */
++#ifndef ASM_X86__TOPOLOGY_H
++#define ASM_X86__TOPOLOGY_H
++
++#ifdef CONFIG_X86_32
++# ifdef CONFIG_X86_HT
++#  define ENABLE_TOPO_DEFINES
++# endif
++#else
++# ifdef CONFIG_SMP
++#  define ENABLE_TOPO_DEFINES
++# endif
++#endif
++
++/* Node not present */
++#define NUMA_NO_NODE	(-1)
++
++#ifdef CONFIG_NUMA
++#include <linux/cpumask.h>
++#include <asm/mpspec.h>
++
++#ifdef CONFIG_X86_32
++
++/* Mappings between node number and cpus on that node. */
++extern cpumask_t node_to_cpumask_map[];
++
++/* Mappings between logical cpu number and node number */
++extern int cpu_to_node_map[];
++
++/* Returns the number of the node containing CPU 'cpu' */
++static inline int cpu_to_node(int cpu)
++{
++	return cpu_to_node_map[cpu];
++}
++#define early_cpu_to_node(cpu)	cpu_to_node(cpu)
++
++/* Returns a bitmask of CPUs on Node 'node'.
++ *
++ * Side note: this function creates the returned cpumask on the stack
++ * so with a high NR_CPUS count, excessive stack space is used.  The
++ * node_to_cpumask_ptr function should be used whenever possible.
++ */
++static inline cpumask_t node_to_cpumask(int node)
++{
++	return node_to_cpumask_map[node];
++}
++
++#else /* CONFIG_X86_64 */
++
++/* Mappings between node number and cpus on that node. */
++extern cpumask_t *node_to_cpumask_map;
++
++/* Mappings between logical cpu number and node number */
++DECLARE_EARLY_PER_CPU(int, x86_cpu_to_node_map);
++
++/* Returns the number of the current Node. */
++#define numa_node_id()		read_pda(nodenumber)
++
++#ifdef CONFIG_DEBUG_PER_CPU_MAPS
++extern int cpu_to_node(int cpu);
++extern int early_cpu_to_node(int cpu);
++extern const cpumask_t *_node_to_cpumask_ptr(int node);
++extern cpumask_t node_to_cpumask(int node);
++
++#else	/* !CONFIG_DEBUG_PER_CPU_MAPS */
++
++/* Returns the number of the node containing CPU 'cpu' */
++static inline int cpu_to_node(int cpu)
++{
++	return per_cpu(x86_cpu_to_node_map, cpu);
++}
++
++/* Same function but used if called before per_cpu areas are setup */
++static inline int early_cpu_to_node(int cpu)
++{
++	if (early_per_cpu_ptr(x86_cpu_to_node_map))
++		return early_per_cpu_ptr(x86_cpu_to_node_map)[cpu];
++
++	return per_cpu(x86_cpu_to_node_map, cpu);
++}
++
++/* Returns a pointer to the cpumask of CPUs on Node 'node'. */
++static inline const cpumask_t *_node_to_cpumask_ptr(int node)
++{
++	return &node_to_cpumask_map[node];
++}
++
++/* Returns a bitmask of CPUs on Node 'node'. */
++static inline cpumask_t node_to_cpumask(int node)
++{
++	return node_to_cpumask_map[node];
++}
++
++#endif /* !CONFIG_DEBUG_PER_CPU_MAPS */
++
++/* Replace default node_to_cpumask_ptr with optimized version */
++#define node_to_cpumask_ptr(v, node)		\
++		const cpumask_t *v = _node_to_cpumask_ptr(node)
++
++#define node_to_cpumask_ptr_next(v, node)	\
++			   v = _node_to_cpumask_ptr(node)
++
++#endif /* CONFIG_X86_64 */
++
++/*
++ * Returns the number of the node containing Node 'node'. This
++ * architecture is flat, so it is a pretty simple function!
++ */
++#define parent_node(node) (node)
++
++#define pcibus_to_node(bus) __pcibus_to_node(bus)
++#define pcibus_to_cpumask(bus) __pcibus_to_cpumask(bus)
++
++#ifdef CONFIG_X86_32
++extern unsigned long node_start_pfn[];
++extern unsigned long node_end_pfn[];
++extern unsigned long node_remap_size[];
++#define node_has_online_mem(nid) (node_start_pfn[nid] != node_end_pfn[nid])
++
++# define SD_CACHE_NICE_TRIES	1
++# define SD_IDLE_IDX		1
++# define SD_NEWIDLE_IDX		2
++# define SD_FORKEXEC_IDX	0
++
++#else
++
++# define SD_CACHE_NICE_TRIES	2
++# define SD_IDLE_IDX		2
++# define SD_NEWIDLE_IDX		2
++# define SD_FORKEXEC_IDX	1
++
++#endif
++
++/* sched_domains SD_NODE_INIT for NUMAQ machines */
++#define SD_NODE_INIT (struct sched_domain) {		\
++	.min_interval		= 8,			\
++	.max_interval		= 32,			\
++	.busy_factor		= 32,			\
++	.imbalance_pct		= 125,			\
++	.cache_nice_tries	= SD_CACHE_NICE_TRIES,	\
++	.busy_idx		= 3,			\
++	.idle_idx		= SD_IDLE_IDX,		\
++	.newidle_idx		= SD_NEWIDLE_IDX,	\
++	.wake_idx		= 1,			\
++	.forkexec_idx		= SD_FORKEXEC_IDX,	\
++	.flags			= SD_LOAD_BALANCE	\
++				| SD_BALANCE_EXEC	\
++				| SD_BALANCE_FORK	\
++				| SD_SERIALIZE		\
++				| SD_WAKE_BALANCE,	\
++	.last_balance		= jiffies,		\
++	.balance_interval	= 1,			\
++}
++
++#ifdef CONFIG_X86_64_ACPI_NUMA
++extern int __node_distance(int, int);
++#define node_distance(a, b) __node_distance(a, b)
++#endif
++
++#else /* !CONFIG_NUMA */
++
++#define numa_node_id()		0
++#define	cpu_to_node(cpu)	0
++#define	early_cpu_to_node(cpu)	0
++
++static inline const cpumask_t *_node_to_cpumask_ptr(int node)
++{
++	return &cpu_online_map;
++}
++static inline cpumask_t node_to_cpumask(int node)
++{
++	return cpu_online_map;
++}
++static inline int node_to_first_cpu(int node)
++{
++	return first_cpu(cpu_online_map);
++}
++
++/* Replace default node_to_cpumask_ptr with optimized version */
++#define node_to_cpumask_ptr(v, node)		\
++		const cpumask_t *v = _node_to_cpumask_ptr(node)
++
++#define node_to_cpumask_ptr_next(v, node)	\
++			   v = _node_to_cpumask_ptr(node)
++#endif
++
++#include <asm-generic/topology.h>
++
++#ifdef CONFIG_NUMA
++/* Returns the number of the first CPU on Node 'node'. */
++static inline int node_to_first_cpu(int node)
++{
++	node_to_cpumask_ptr(mask, node);
++	return first_cpu(*mask);
++}
++#endif
++
++extern cpumask_t cpu_coregroup_map(int cpu);
++
++#ifdef ENABLE_TOPO_DEFINES
++#define topology_physical_package_id(cpu)	(cpu_data(cpu).phys_proc_id)
++#define topology_core_id(cpu)			(cpu_data(cpu).cpu_core_id)
++#define topology_core_siblings(cpu)		(per_cpu(cpu_core_map, cpu))
++#define topology_thread_siblings(cpu)		(per_cpu(cpu_sibling_map, cpu))
++
++/* indicates that pointers to the topology cpumask_t maps are valid */
++#define arch_provides_topology_pointers		yes
++#endif
++
++static inline void arch_fix_phys_package_id(int num, u32 slot)
++{
++}
++
++struct pci_bus;
++void set_pci_bus_resources_arch_default(struct pci_bus *b);
++
++#ifdef CONFIG_SMP
++#define mc_capable()			(boot_cpu_data.x86_max_cores > 1)
++#define smt_capable()			(smp_num_siblings > 1)
++#endif
++
++#ifdef CONFIG_NUMA
++extern int get_mp_bus_to_node(int busnum);
++extern void set_mp_bus_to_node(int busnum, int node);
++#else
++static inline int get_mp_bus_to_node(int busnum)
++{
++	return 0;
++}
++static inline void set_mp_bus_to_node(int busnum, int node)
++{
++}
++#endif
++
++#endif /* ASM_X86__TOPOLOGY_H */

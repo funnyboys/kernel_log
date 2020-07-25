@@ -1,0 +1,991 @@
+commit b9023b91dd020ad7e093baa5122b6968c48cc9e0
+Author: Balasubramani Vivekanandan <balasubramani_vivekanandan@mentor.com>
+Date:   Thu Sep 26 15:51:01 2019 +0200
+
+    tick: broadcast-hrtimer: Fix a race in bc_set_next
+    
+    When a cpu requests broadcasting, before starting the tick broadcast
+    hrtimer, bc_set_next() checks if the timer callback (bc_handler) is active
+    using hrtimer_try_to_cancel(). But hrtimer_try_to_cancel() does not provide
+    the required synchronization when the callback is active on other core.
+    
+    The callback could have already executed tick_handle_oneshot_broadcast()
+    and could have also returned. But still there is a small time window where
+    the hrtimer_try_to_cancel() returns -1. In that case bc_set_next() returns
+    without doing anything, but the next_event of the tick broadcast clock
+    device is already set to a timeout value.
+    
+    In the race condition diagram below, CPU #1 is running the timer callback
+    and CPU #2 is entering idle state and so calls bc_set_next().
+    
+    In the worst case, the next_event will contain an expiry time, but the
+    hrtimer will not be started which happens when the racing callback returns
+    HRTIMER_NORESTART. The hrtimer might never recover if all further requests
+    from the CPUs to subscribe to tick broadcast have timeout greater than the
+    next_event of tick broadcast clock device. This leads to cascading of
+    failures and finally noticed as rcu stall warnings
+    
+    Here is a depiction of the race condition
+    
+    CPU #1 (Running timer callback)                   CPU #2 (Enter idle
+                                                      and subscribe to
+                                                      tick broadcast)
+    ---------------------                             ---------------------
+    
+    __run_hrtimer()                                   tick_broadcast_enter()
+    
+      bc_handler()                                      __tick_broadcast_oneshot_control()
+    
+        tick_handle_oneshot_broadcast()
+    
+          raw_spin_lock(&tick_broadcast_lock);
+    
+          dev->next_event = KTIME_MAX;                  //wait for tick_broadcast_lock
+          //next_event for tick broadcast clock
+          set to KTIME_MAX since no other cores
+          subscribed to tick broadcasting
+    
+          raw_spin_unlock(&tick_broadcast_lock);
+    
+        if (dev->next_event == KTIME_MAX)
+          return HRTIMER_NORESTART
+        // callback function exits without
+           restarting the hrtimer                      //tick_broadcast_lock acquired
+                                                       raw_spin_lock(&tick_broadcast_lock);
+    
+                                                       tick_broadcast_set_event()
+    
+                                                         clockevents_program_event()
+    
+                                                           dev->next_event = expires;
+    
+                                                           bc_set_next()
+    
+                                                             hrtimer_try_to_cancel()
+                                                             //returns -1 since the timer
+                                                             callback is active. Exits without
+                                                             restarting the timer
+      cpu_base->running = NULL;
+    
+    The comment that hrtimer cannot be armed from within the callback is
+    wrong. It is fine to start the hrtimer from within the callback. Also it is
+    safe to start the hrtimer from the enter/exit idle code while the broadcast
+    handler is active. The enter/exit idle code and the broadcast handler are
+    synchronized using tick_broadcast_lock. So there is no need for the
+    existing try to cancel logic. All this can be removed which will eliminate
+    the race condition as well.
+    
+    Fixes: 5d1638acb9f6 ("tick: Introduce hrtimer based broadcast")
+    Originally-by: Thomas Gleixner <tglx@linutronix.de>
+    Signed-off-by: Balasubramani Vivekanandan <balasubramani_vivekanandan@mentor.com>
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Cc: stable@vger.kernel.org
+    Link: https://lkml.kernel.org/r/20190926135101.12102-2-balasubramani_vivekanandan@mentor.com
+
+diff --git a/kernel/time/tick-broadcast-hrtimer.c b/kernel/time/tick-broadcast-hrtimer.c
+index c1f5bb590b5e..b5a65e212df2 100644
+--- a/kernel/time/tick-broadcast-hrtimer.c
++++ b/kernel/time/tick-broadcast-hrtimer.c
+@@ -42,39 +42,39 @@ static int bc_shutdown(struct clock_event_device *evt)
+  */
+ static int bc_set_next(ktime_t expires, struct clock_event_device *bc)
+ {
+-	int bc_moved;
+ 	/*
+-	 * We try to cancel the timer first. If the callback is on
+-	 * flight on some other cpu then we let it handle it. If we
+-	 * were able to cancel the timer nothing can rearm it as we
+-	 * own broadcast_lock.
++	 * This is called either from enter/exit idle code or from the
++	 * broadcast handler. In all cases tick_broadcast_lock is held.
+ 	 *
+-	 * However we can also be called from the event handler of
+-	 * ce_broadcast_hrtimer itself when it expires. We cannot
+-	 * restart the timer because we are in the callback, but we
+-	 * can set the expiry time and let the callback return
+-	 * HRTIMER_RESTART.
++	 * hrtimer_cancel() cannot be called here neither from the
++	 * broadcast handler nor from the enter/exit idle code. The idle
++	 * code can run into the problem described in bc_shutdown() and the
++	 * broadcast handler cannot wait for itself to complete for obvious
++	 * reasons.
+ 	 *
+-	 * Since we are in the idle loop at this point and because
+-	 * hrtimer_{start/cancel} functions call into tracing,
+-	 * calls to these functions must be bound within RCU_NONIDLE.
++	 * Each caller tries to arm the hrtimer on its own CPU, but if the
++	 * hrtimer callbback function is currently running, then
++	 * hrtimer_start() cannot move it and the timer stays on the CPU on
++	 * which it is assigned at the moment.
++	 *
++	 * As this can be called from idle code, the hrtimer_start()
++	 * invocation has to be wrapped with RCU_NONIDLE() as
++	 * hrtimer_start() can call into tracing.
+ 	 */
+-	RCU_NONIDLE(
+-		{
+-			bc_moved = hrtimer_try_to_cancel(&bctimer) >= 0;
+-			if (bc_moved) {
+-				hrtimer_start(&bctimer, expires,
+-					      HRTIMER_MODE_ABS_PINNED_HARD);
+-			}
+-		}
+-	);
+-
+-	if (bc_moved) {
+-		/* Bind the "device" to the cpu */
+-		bc->bound_on = smp_processor_id();
+-	} else if (bc->bound_on == smp_processor_id()) {
+-		hrtimer_set_expires(&bctimer, expires);
+-	}
++	RCU_NONIDLE( {
++		hrtimer_start(&bctimer, expires, HRTIMER_MODE_ABS_PINNED_HARD);
++		/*
++		 * The core tick broadcast mode expects bc->bound_on to be set
++		 * correctly to prevent a CPU which has the broadcast hrtimer
++		 * armed from going deep idle.
++		 *
++		 * As tick_broadcast_lock is held, nothing can change the cpu
++		 * base which was just established in hrtimer_start() above. So
++		 * the below access is safe even without holding the hrtimer
++		 * base lock.
++		 */
++		bc->bound_on = bctimer.base->cpu_base->cpu;
++	} );
+ 	return 0;
+ }
+ 
+@@ -100,10 +100,6 @@ static enum hrtimer_restart bc_handler(struct hrtimer *t)
+ {
+ 	ce_broadcast_hrtimer.event_handler(&ce_broadcast_hrtimer);
+ 
+-	if (clockevent_state_oneshot(&ce_broadcast_hrtimer))
+-		if (ce_broadcast_hrtimer.next_event != KTIME_MAX)
+-			return HRTIMER_RESTART;
+-
+ 	return HRTIMER_NORESTART;
+ }
+ 
+
+commit 902a9f9c509053161e987778dc5836d2628f53b7
+Author: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Date:   Fri Jul 26 20:30:56 2019 +0200
+
+    tick: Mark tick related hrtimers to expiry in hard interrupt context
+    
+    The tick related hrtimers, which drive the scheduler tick and hrtimer based
+    broadcasting are required to expire in hard interrupt context for obvious
+    reasons.
+    
+    Mark them so PREEMPT_RT kernels wont move them to soft interrupt expiry.
+    
+    Make the horribly formatted RCU_NONIDLE bracket maze readable while at it.
+    
+    No functional change,
+    
+    [ tglx: Split out from larger combo patch. Add changelog ]
+    
+    Signed-off-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+    Link: https://lkml.kernel.org/r/20190726185753.459144407@linutronix.de
+
+diff --git a/kernel/time/tick-broadcast-hrtimer.c b/kernel/time/tick-broadcast-hrtimer.c
+index 5be6154e2fd2..c1f5bb590b5e 100644
+--- a/kernel/time/tick-broadcast-hrtimer.c
++++ b/kernel/time/tick-broadcast-hrtimer.c
+@@ -59,11 +59,16 @@ static int bc_set_next(ktime_t expires, struct clock_event_device *bc)
+ 	 * hrtimer_{start/cancel} functions call into tracing,
+ 	 * calls to these functions must be bound within RCU_NONIDLE.
+ 	 */
+-	RCU_NONIDLE({
++	RCU_NONIDLE(
++		{
+ 			bc_moved = hrtimer_try_to_cancel(&bctimer) >= 0;
+-			if (bc_moved)
++			if (bc_moved) {
+ 				hrtimer_start(&bctimer, expires,
+-					      HRTIMER_MODE_ABS_PINNED);});
++					      HRTIMER_MODE_ABS_PINNED_HARD);
++			}
++		}
++	);
++
+ 	if (bc_moved) {
+ 		/* Bind the "device" to the cpu */
+ 		bc->bound_on = smp_processor_id();
+@@ -104,7 +109,7 @@ static enum hrtimer_restart bc_handler(struct hrtimer *t)
+ 
+ void tick_setup_hrtimer_broadcast(void)
+ {
+-	hrtimer_init(&bctimer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS);
++	hrtimer_init(&bctimer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS_HARD);
+ 	bctimer.function = bc_handler;
+ 	clockevents_register_device(&ce_broadcast_hrtimer);
+ }
+
+commit 58c5fc2b96e4ae65068d815a1c3ca81da92fa1c9
+Author: Thomas Gleixner <tglx@linutronix.de>
+Date:   Wed Oct 31 19:21:08 2018 +0100
+
+    time: Remove useless filenames in top level comments
+    
+    Remove the pointless filenames in the top level comments. They have no
+    value at all and just occupy space. While at it tidy up some of the
+    comments and remove a stale one.
+    
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Acked-by: Nicolas Pitre <nico@linaro.org>
+    Acked-by: Kees Cook <keescook@chromium.org>
+    Acked-by: Ingo Molnar <mingo@kernel.org>
+    Acked-by: John Stultz <john.stultz@linaro.org>
+    Acked-by: Corey Minyard <cminyard@mvista.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Kate Stewart <kstewart@linuxfoundation.org>
+    Cc: Philippe Ombredanne <pombredanne@nexb.com>
+    Cc: Peter Anvin <hpa@zytor.com>
+    Cc: Russell King <rmk+kernel@armlinux.org.uk>
+    Cc: Richard Cochran <richardcochran@gmail.com>
+    Cc: "Paul E. McKenney" <paulmck@linux.vnet.ibm.com>
+    Cc: David Riley <davidriley@chromium.org>
+    Cc: Colin Cross <ccross@android.com>
+    Cc: Mark Brown <broonie@kernel.org>
+    Link: https://lkml.kernel.org/r/20181031182252.794898238@linutronix.de
+
+diff --git a/kernel/time/tick-broadcast-hrtimer.c b/kernel/time/tick-broadcast-hrtimer.c
+index a59641fb88b6..5be6154e2fd2 100644
+--- a/kernel/time/tick-broadcast-hrtimer.c
++++ b/kernel/time/tick-broadcast-hrtimer.c
+@@ -1,8 +1,6 @@
+ // SPDX-License-Identifier: GPL-2.0
+ /*
+- * linux/kernel/time/tick-broadcast-hrtimer.c
+- * This file emulates a local clock event device
+- * via a pseudo clock device.
++ * Emulate a local clock event device via a pseudo clock device.
+  */
+ #include <linux/cpu.h>
+ #include <linux/err.h>
+
+commit 234b3840d73430564a03f53973a311b7a83a95a9
+Author: Sudeep Holla <sudeep.holla@arm.com>
+Date:   Wed Jul 11 12:24:23 2018 +0100
+
+    tick/broadcast-hrtimer: Use cpu_possible_mask for ce_broadcast_hrtimer
+    
+    This is the last instance of cpu_all_mask usage in the core framework.
+    
+    Replace it with cpu_possible_mask like all other instances in the
+    clockevent drivers. This makes it possible to add a warning in the core
+    clockevents_register_device on usage of cpu_all_mask from any clockevent
+    drivers in the future.
+    
+    Signed-off-by: Sudeep Holla <sudeep.holla@arm.com>
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Cc: linux-arm-kernel@lists.infradead.org
+    Link: https://lkml.kernel.org/r/1531308264-24220-2-git-send-email-sudeep.holla@arm.com
+
+diff --git a/kernel/time/tick-broadcast-hrtimer.c b/kernel/time/tick-broadcast-hrtimer.c
+index 58045eb976c3..a59641fb88b6 100644
+--- a/kernel/time/tick-broadcast-hrtimer.c
++++ b/kernel/time/tick-broadcast-hrtimer.c
+@@ -90,7 +90,7 @@ static struct clock_event_device ce_broadcast_hrtimer = {
+ 	.max_delta_ticks	= ULONG_MAX,
+ 	.mult			= 1,
+ 	.shift			= 0,
+-	.cpumask		= cpu_all_mask,
++	.cpumask		= cpu_possible_mask,
+ };
+ 
+ static enum hrtimer_restart bc_handler(struct hrtimer *t)
+
+commit b24413180f5600bcb3bb70fbed5cf186b60864bd
+Author: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Date:   Wed Nov 1 15:07:57 2017 +0100
+
+    License cleanup: add SPDX GPL-2.0 license identifier to files with no license
+    
+    Many source files in the tree are missing licensing information, which
+    makes it harder for compliance tools to determine the correct license.
+    
+    By default all files without license information are under the default
+    license of the kernel, which is GPL version 2.
+    
+    Update the files which contain no license information with the 'GPL-2.0'
+    SPDX license identifier.  The SPDX identifier is a legally binding
+    shorthand, which can be used instead of the full boiler plate text.
+    
+    This patch is based on work done by Thomas Gleixner and Kate Stewart and
+    Philippe Ombredanne.
+    
+    How this work was done:
+    
+    Patches were generated and checked against linux-4.14-rc6 for a subset of
+    the use cases:
+     - file had no licensing information it it.
+     - file was a */uapi/* one with no licensing information in it,
+     - file was a */uapi/* one with existing licensing information,
+    
+    Further patches will be generated in subsequent months to fix up cases
+    where non-standard license headers were used, and references to license
+    had to be inferred by heuristics based on keywords.
+    
+    The analysis to determine which SPDX License Identifier to be applied to
+    a file was done in a spreadsheet of side by side results from of the
+    output of two independent scanners (ScanCode & Windriver) producing SPDX
+    tag:value files created by Philippe Ombredanne.  Philippe prepared the
+    base worksheet, and did an initial spot review of a few 1000 files.
+    
+    The 4.13 kernel was the starting point of the analysis with 60,537 files
+    assessed.  Kate Stewart did a file by file comparison of the scanner
+    results in the spreadsheet to determine which SPDX license identifier(s)
+    to be applied to the file. She confirmed any determination that was not
+    immediately clear with lawyers working with the Linux Foundation.
+    
+    Criteria used to select files for SPDX license identifier tagging was:
+     - Files considered eligible had to be source code files.
+     - Make and config files were included as candidates if they contained >5
+       lines of source
+     - File already had some variant of a license header in it (even if <5
+       lines).
+    
+    All documentation files were explicitly excluded.
+    
+    The following heuristics were used to determine which SPDX license
+    identifiers to apply.
+    
+     - when both scanners couldn't find any license traces, file was
+       considered to have no license information in it, and the top level
+       COPYING file license applied.
+    
+       For non */uapi/* files that summary was:
+    
+       SPDX license identifier                            # files
+       ---------------------------------------------------|-------
+       GPL-2.0                                              11139
+    
+       and resulted in the first patch in this series.
+    
+       If that file was a */uapi/* path one, it was "GPL-2.0 WITH
+       Linux-syscall-note" otherwise it was "GPL-2.0".  Results of that was:
+    
+       SPDX license identifier                            # files
+       ---------------------------------------------------|-------
+       GPL-2.0 WITH Linux-syscall-note                        930
+    
+       and resulted in the second patch in this series.
+    
+     - if a file had some form of licensing information in it, and was one
+       of the */uapi/* ones, it was denoted with the Linux-syscall-note if
+       any GPL family license was found in the file or had no licensing in
+       it (per prior point).  Results summary:
+    
+       SPDX license identifier                            # files
+       ---------------------------------------------------|------
+       GPL-2.0 WITH Linux-syscall-note                       270
+       GPL-2.0+ WITH Linux-syscall-note                      169
+       ((GPL-2.0 WITH Linux-syscall-note) OR BSD-2-Clause)    21
+       ((GPL-2.0 WITH Linux-syscall-note) OR BSD-3-Clause)    17
+       LGPL-2.1+ WITH Linux-syscall-note                      15
+       GPL-1.0+ WITH Linux-syscall-note                       14
+       ((GPL-2.0+ WITH Linux-syscall-note) OR BSD-3-Clause)    5
+       LGPL-2.0+ WITH Linux-syscall-note                       4
+       LGPL-2.1 WITH Linux-syscall-note                        3
+       ((GPL-2.0 WITH Linux-syscall-note) OR MIT)              3
+       ((GPL-2.0 WITH Linux-syscall-note) AND MIT)             1
+    
+       and that resulted in the third patch in this series.
+    
+     - when the two scanners agreed on the detected license(s), that became
+       the concluded license(s).
+    
+     - when there was disagreement between the two scanners (one detected a
+       license but the other didn't, or they both detected different
+       licenses) a manual inspection of the file occurred.
+    
+     - In most cases a manual inspection of the information in the file
+       resulted in a clear resolution of the license that should apply (and
+       which scanner probably needed to revisit its heuristics).
+    
+     - When it was not immediately clear, the license identifier was
+       confirmed with lawyers working with the Linux Foundation.
+    
+     - If there was any question as to the appropriate license identifier,
+       the file was flagged for further research and to be revisited later
+       in time.
+    
+    In total, over 70 hours of logged manual review was done on the
+    spreadsheet to determine the SPDX license identifiers to apply to the
+    source files by Kate, Philippe, Thomas and, in some cases, confirmation
+    by lawyers working with the Linux Foundation.
+    
+    Kate also obtained a third independent scan of the 4.13 code base from
+    FOSSology, and compared selected files where the other two scanners
+    disagreed against that SPDX file, to see if there was new insights.  The
+    Windriver scanner is based on an older version of FOSSology in part, so
+    they are related.
+    
+    Thomas did random spot checks in about 500 files from the spreadsheets
+    for the uapi headers and agreed with SPDX license identifier in the
+    files he inspected. For the non-uapi files Thomas did random spot checks
+    in about 15000 files.
+    
+    In initial set of patches against 4.14-rc6, 3 files were found to have
+    copy/paste license identifier errors, and have been fixed to reflect the
+    correct identifier.
+    
+    Additionally Philippe spent 10 hours this week doing a detailed manual
+    inspection and review of the 12,461 patched files from the initial patch
+    version early this week with:
+     - a full scancode scan run, collecting the matched texts, detected
+       license ids and scores
+     - reviewing anything where there was a license detected (about 500+
+       files) to ensure that the applied SPDX license was correct
+     - reviewing anything where there was no detection but the patch license
+       was not GPL-2.0 WITH Linux-syscall-note to ensure that the applied
+       SPDX license was correct
+    
+    This produced a worksheet with 20 files needing minor correction.  This
+    worksheet was then exported into 3 different .csv files for the
+    different types of files to be modified.
+    
+    These .csv files were then reviewed by Greg.  Thomas wrote a script to
+    parse the csv files and add the proper SPDX tag to the file, in the
+    format that the file expected.  This script was further refined by Greg
+    based on the output to detect more types of files automatically and to
+    distinguish between header and source .c files (which need different
+    comment types.)  Finally Greg ran the script using the .csv files to
+    generate the patches.
+    
+    Reviewed-by: Kate Stewart <kstewart@linuxfoundation.org>
+    Reviewed-by: Philippe Ombredanne <pombredanne@nexb.com>
+    Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/kernel/time/tick-broadcast-hrtimer.c b/kernel/time/tick-broadcast-hrtimer.c
+index a7bb8f33ae07..58045eb976c3 100644
+--- a/kernel/time/tick-broadcast-hrtimer.c
++++ b/kernel/time/tick-broadcast-hrtimer.c
+@@ -1,3 +1,4 @@
++// SPDX-License-Identifier: GPL-2.0
+ /*
+  * linux/kernel/time/tick-broadcast-hrtimer.c
+  * This file emulates a local clock event device
+
+commit 2456e855354415bfaeb7badaa14e11b3e02c8466
+Author: Thomas Gleixner <tglx@linutronix.de>
+Date:   Sun Dec 25 11:38:40 2016 +0100
+
+    ktime: Get rid of the union
+    
+    ktime is a union because the initial implementation stored the time in
+    scalar nanoseconds on 64 bit machine and in a endianess optimized timespec
+    variant for 32bit machines. The Y2038 cleanup removed the timespec variant
+    and switched everything to scalar nanoseconds. The union remained, but
+    become completely pointless.
+    
+    Get rid of the union and just keep ktime_t as simple typedef of type s64.
+    
+    The conversion was done with coccinelle and some manual mopping up.
+    
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+
+diff --git a/kernel/time/tick-broadcast-hrtimer.c b/kernel/time/tick-broadcast-hrtimer.c
+index 690b797f522e..a7bb8f33ae07 100644
+--- a/kernel/time/tick-broadcast-hrtimer.c
++++ b/kernel/time/tick-broadcast-hrtimer.c
+@@ -97,7 +97,7 @@ static enum hrtimer_restart bc_handler(struct hrtimer *t)
+ 	ce_broadcast_hrtimer.event_handler(&ce_broadcast_hrtimer);
+ 
+ 	if (clockevent_state_oneshot(&ce_broadcast_hrtimer))
+-		if (ce_broadcast_hrtimer.next_event.tv64 != KTIME_MAX)
++		if (ce_broadcast_hrtimer.next_event != KTIME_MAX)
+ 			return HRTIMER_RESTART;
+ 
+ 	return HRTIMER_NORESTART;
+
+commit 5130213721d01b6632c255d4295a8102cbb58379
+Author: Jisheng Zhang <jszhang@marvell.com>
+Date:   Tue Jul 5 16:57:51 2016 +0800
+
+    tick/broadcast-hrtimer: Set name of the ce_broadcast_hrtimer
+    
+    This is to avoid the "null" name when we either
+    
+    ~ # cat /sys/devices/system/clockevents/broadcast/current_device
+    (null)
+    
+    or
+    
+    ~ # cat /proc/timer_list
+    ...
+    Tick Device: mode:     1
+    Broadcast device
+    Clock Event Device: (null)
+    ...
+    
+    Signed-off-by: Jisheng Zhang <jszhang@marvell.com>
+    Cc: linux-arm-kernel@lists.infradead.org
+    Link: http://lkml.kernel.org/r/1467709071-3667-1-git-send-email-jszhang@marvell.com
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+
+diff --git a/kernel/time/tick-broadcast-hrtimer.c b/kernel/time/tick-broadcast-hrtimer.c
+index 53d7184da0be..690b797f522e 100644
+--- a/kernel/time/tick-broadcast-hrtimer.c
++++ b/kernel/time/tick-broadcast-hrtimer.c
+@@ -75,6 +75,7 @@ static int bc_set_next(ktime_t expires, struct clock_event_device *bc)
+ }
+ 
+ static struct clock_event_device ce_broadcast_hrtimer = {
++	.name			= "bc_hrtimer",
+ 	.set_state_shutdown	= bc_shutdown,
+ 	.set_next_ktime		= bc_set_next,
+ 	.features		= CLOCK_EVT_FEAT_ONESHOT |
+
+commit ecbebcb868bed598354d3b6d94cfeb10e440e4ca
+Author: Viresh Kumar <viresh.kumar@linaro.org>
+Date:   Thu Jul 16 16:56:35 2015 +0530
+
+    kernel: broadcast-hrtimer: Migrate to new 'set-state' interface
+    
+    Migrate broadcast-hrtimer driver to the new 'set-state' interface
+    provided by clockevents core, the earlier 'set-mode' interface is marked
+    obsolete now.
+    
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Signed-off-by: Viresh Kumar <viresh.kumar@linaro.org>
+    Signed-off-by: Daniel Lezcano <daniel.lezcano@linaro.org>
+
+diff --git a/kernel/time/tick-broadcast-hrtimer.c b/kernel/time/tick-broadcast-hrtimer.c
+index 3e7db49a2381..53d7184da0be 100644
+--- a/kernel/time/tick-broadcast-hrtimer.c
++++ b/kernel/time/tick-broadcast-hrtimer.c
+@@ -18,30 +18,23 @@
+ 
+ static struct hrtimer bctimer;
+ 
+-static void bc_set_mode(enum clock_event_mode mode,
+-			struct clock_event_device *bc)
++static int bc_shutdown(struct clock_event_device *evt)
+ {
+-	switch (mode) {
+-	case CLOCK_EVT_MODE_UNUSED:
+-	case CLOCK_EVT_MODE_SHUTDOWN:
+-		/*
+-		 * Note, we cannot cancel the timer here as we might
+-		 * run into the following live lock scenario:
+-		 *
+-		 * cpu 0		cpu1
+-		 * lock(broadcast_lock);
+-		 *			hrtimer_interrupt()
+-		 *			bc_handler()
+-		 *			   tick_handle_oneshot_broadcast();
+-		 *			    lock(broadcast_lock);
+-		 * hrtimer_cancel()
+-		 *  wait_for_callback()
+-		 */
+-		hrtimer_try_to_cancel(&bctimer);
+-		break;
+-	default:
+-		break;
+-	}
++	/*
++	 * Note, we cannot cancel the timer here as we might
++	 * run into the following live lock scenario:
++	 *
++	 * cpu 0		cpu1
++	 * lock(broadcast_lock);
++	 *			hrtimer_interrupt()
++	 *			bc_handler()
++	 *			   tick_handle_oneshot_broadcast();
++	 *			    lock(broadcast_lock);
++	 * hrtimer_cancel()
++	 *  wait_for_callback()
++	 */
++	hrtimer_try_to_cancel(&bctimer);
++	return 0;
+ }
+ 
+ /*
+@@ -82,7 +75,7 @@ static int bc_set_next(ktime_t expires, struct clock_event_device *bc)
+ }
+ 
+ static struct clock_event_device ce_broadcast_hrtimer = {
+-	.set_mode		= bc_set_mode,
++	.set_state_shutdown	= bc_shutdown,
+ 	.set_next_ktime		= bc_set_next,
+ 	.features		= CLOCK_EVT_FEAT_ONESHOT |
+ 				  CLOCK_EVT_FEAT_KTIME |
+@@ -102,13 +95,11 @@ static enum hrtimer_restart bc_handler(struct hrtimer *t)
+ {
+ 	ce_broadcast_hrtimer.event_handler(&ce_broadcast_hrtimer);
+ 
+-	switch (ce_broadcast_hrtimer.mode) {
+-	case CLOCK_EVT_MODE_ONESHOT:
++	if (clockevent_state_oneshot(&ce_broadcast_hrtimer))
+ 		if (ce_broadcast_hrtimer.next_event.tv64 != KTIME_MAX)
+ 			return HRTIMER_RESTART;
+-	default:
+-		return HRTIMER_NORESTART;
+-	}
++
++	return HRTIMER_NORESTART;
+ }
+ 
+ void tick_setup_hrtimer_broadcast(void)
+
+commit 38d23a6cc16c02f7b0c920266053f340b5601735
+Author: Andreas Sandberg <andreas.sandberg@arm.com>
+Date:   Fri Apr 24 13:06:05 2015 +0000
+
+    tick: hrtimer-broadcast: Prevent endless restarting when broadcast device is unused
+    
+    The hrtimer callback in the hrtimer's tick broadcast code sometimes
+    incorrectly ends up scheduling events at the current tick causing the
+    kernel to hang servicing the same hrtimer forever. This typically
+    happens when a device is swapped out by
+    tick_install_broadcast_device(), which replaces the event handler with
+    clock_events_handle_noop() and sets the device mode to
+    CLOCK_EVT_MODE_UNUSED. If the timer is scheduled when this happens,
+    the next_event field will not be updated and the hrtimer ends up being
+    restarted at the current tick. To prevent this from happening, only
+    try to restart the hrtimer if the broadcast clock event device is in
+    one of the active modes and try to cancel the timer when entering the
+    CLOCK_EVT_MODE_UNUSED mode.
+    
+    Signed-off-by: Andreas Sandberg <andreas.sandberg@arm.com>
+    Tested-by: Catalin Marinas <catalin.marinas@arm.com>
+    Acked-by: Mark Rutland <mark.rutland@arm.com>
+    Reviewed-by: Preeti U Murthy <preeti@linux.vnet.ibm.com>
+    Link: http://lkml.kernel.org/r/1429880765-5558-1-git-send-email-andreas.sandberg@arm.com
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+
+diff --git a/kernel/time/tick-broadcast-hrtimer.c b/kernel/time/tick-broadcast-hrtimer.c
+index 96428d706b16..3e7db49a2381 100644
+--- a/kernel/time/tick-broadcast-hrtimer.c
++++ b/kernel/time/tick-broadcast-hrtimer.c
+@@ -22,6 +22,7 @@ static void bc_set_mode(enum clock_event_mode mode,
+ 			struct clock_event_device *bc)
+ {
+ 	switch (mode) {
++	case CLOCK_EVT_MODE_UNUSED:
+ 	case CLOCK_EVT_MODE_SHUTDOWN:
+ 		/*
+ 		 * Note, we cannot cancel the timer here as we might
+@@ -101,10 +102,13 @@ static enum hrtimer_restart bc_handler(struct hrtimer *t)
+ {
+ 	ce_broadcast_hrtimer.event_handler(&ce_broadcast_hrtimer);
+ 
+-	if (ce_broadcast_hrtimer.next_event.tv64 == KTIME_MAX)
++	switch (ce_broadcast_hrtimer.mode) {
++	case CLOCK_EVT_MODE_ONESHOT:
++		if (ce_broadcast_hrtimer.next_event.tv64 != KTIME_MAX)
++			return HRTIMER_RESTART;
++	default:
+ 		return HRTIMER_NORESTART;
+-
+-	return HRTIMER_RESTART;
++	}
+ }
+ 
+ void tick_setup_hrtimer_broadcast(void)
+
+commit b8a62f1ff0ccb18fdc25c6150d1cd394610f4753
+Author: Thomas Gleixner <tglx@linutronix.de>
+Date:   Tue Apr 14 21:09:22 2015 +0000
+
+    tick: broadcast-hrtimer: Remove overly clever return value abuse
+    
+    The assignment of bc_moved in the conditional construct relies on the
+    fact that in the case of hrtimer_start() invocation the return value
+    is always 0. It took me a while to understand it.
+    
+    We want to get rid of the hrtimer_start() return value. Open code the
+    logic which makes it readable as well.
+    
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Reviewed-by: Preeti U Murthy <preeti@linux.vnet.ibm.com>
+    Acked-by: Peter Zijlstra <peterz@infradead.org>
+    Cc: Viresh Kumar <viresh.kumar@linaro.org>
+    Cc: Marcelo Tosatti <mtosatti@redhat.com>
+    Cc: Frederic Weisbecker <fweisbec@gmail.com>
+    Link: http://lkml.kernel.org/r/20150414203503.404751457@linutronix.de
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+
+diff --git a/kernel/time/tick-broadcast-hrtimer.c b/kernel/time/tick-broadcast-hrtimer.c
+index 6aac4beedbbe..96428d706b16 100644
+--- a/kernel/time/tick-broadcast-hrtimer.c
++++ b/kernel/time/tick-broadcast-hrtimer.c
+@@ -66,9 +66,11 @@ static int bc_set_next(ktime_t expires, struct clock_event_device *bc)
+ 	 * hrtimer_{start/cancel} functions call into tracing,
+ 	 * calls to these functions must be bound within RCU_NONIDLE.
+ 	 */
+-	RCU_NONIDLE(bc_moved = (hrtimer_try_to_cancel(&bctimer) >= 0) ?
+-		!hrtimer_start(&bctimer, expires, HRTIMER_MODE_ABS_PINNED) :
+-			0);
++	RCU_NONIDLE({
++			bc_moved = hrtimer_try_to_cancel(&bctimer) >= 0;
++			if (bc_moved)
++				hrtimer_start(&bctimer, expires,
++					      HRTIMER_MODE_ABS_PINNED);});
+ 	if (bc_moved) {
+ 		/* Bind the "device" to the cpu */
+ 		bc->bound_on = smp_processor_id();
+
+commit a127d2bcf1fbc8c8e0b5cf0dab54f7d3ff50ce47
+Author: Preeti U Murthy <preeti@linux.vnet.ibm.com>
+Date:   Wed Mar 18 16:19:27 2015 +0530
+
+    timers/tick/broadcast-hrtimer: Fix suspicious RCU usage in idle loop
+    
+    The hrtimer mode of broadcast queues hrtimers in the idle entry
+    path so as to wakeup cpus in deep idle states. The associated
+    call graph is :
+    
+            cpuidle_idle_call()
+            |____ clockevents_notify(CLOCK_EVT_NOTIFY_BROADCAST_ENTER, ....))
+                 |_____tick_broadcast_set_event()
+                       |____clockevents_program_event()
+                            |____bc_set_next()
+    
+    The hrtimer_{start/cancel} functions call into tracing which uses RCU.
+    But it is not legal to call into RCU in cpuidle because it is one of the
+    quiescent states. Hence protect this region with RCU_NONIDLE which informs
+    RCU that the cpu is momentarily non-idle.
+    
+    As an aside it is helpful to point out that the clock event device that is
+    programmed here is not a per-cpu clock device; it is a
+    pseudo clock device, used by the broadcast framework alone.
+    The per-cpu clock device programming never goes through bc_set_next().
+    
+    Signed-off-by: Preeti U Murthy <preeti@linux.vnet.ibm.com>
+    Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+    Reviewed-by: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+    Cc: linuxppc-dev@ozlabs.org
+    Cc: mpe@ellerman.id.au
+    Cc: tglx@linutronix.de
+    Link: http://lkml.kernel.org/r/20150318104705.17763.56668.stgit@preeti.in.ibm.com
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/kernel/time/tick-broadcast-hrtimer.c b/kernel/time/tick-broadcast-hrtimer.c
+index eb682d5c697c..6aac4beedbbe 100644
+--- a/kernel/time/tick-broadcast-hrtimer.c
++++ b/kernel/time/tick-broadcast-hrtimer.c
+@@ -49,6 +49,7 @@ static void bc_set_mode(enum clock_event_mode mode,
+  */
+ static int bc_set_next(ktime_t expires, struct clock_event_device *bc)
+ {
++	int bc_moved;
+ 	/*
+ 	 * We try to cancel the timer first. If the callback is on
+ 	 * flight on some other cpu then we let it handle it. If we
+@@ -60,9 +61,15 @@ static int bc_set_next(ktime_t expires, struct clock_event_device *bc)
+ 	 * restart the timer because we are in the callback, but we
+ 	 * can set the expiry time and let the callback return
+ 	 * HRTIMER_RESTART.
++	 *
++	 * Since we are in the idle loop at this point and because
++	 * hrtimer_{start/cancel} functions call into tracing,
++	 * calls to these functions must be bound within RCU_NONIDLE.
+ 	 */
+-	if (hrtimer_try_to_cancel(&bctimer) >= 0) {
+-		hrtimer_start(&bctimer, expires, HRTIMER_MODE_ABS_PINNED);
++	RCU_NONIDLE(bc_moved = (hrtimer_try_to_cancel(&bctimer) >= 0) ?
++		!hrtimer_start(&bctimer, expires, HRTIMER_MODE_ABS_PINNED) :
++			0);
++	if (bc_moved) {
+ 		/* Bind the "device" to the cpu */
+ 		bc->bound_on = smp_processor_id();
+ 	} else if (bc->bound_on == smp_processor_id()) {
+
+commit 849401b66d305f3feb75b6db7459b95ad190552a
+Author: Preeti U Murthy <preeti@linux.vnet.ibm.com>
+Date:   Sun Feb 9 11:32:22 2014 +0530
+
+    tick: Fixup more fallout from hrtimer broadcast mode
+    
+    The hrtimer mode of broadcast is supported only when
+    GENERIC_CLOCKEVENTS_BROADCAST and TICK_ONESHOT config options
+    are enabled. Hence compile in the functions for hrtimer mode
+    of broadcast only when these options are selected.
+    Also fix max_delta_ticks value for the pseudo clock device.
+    
+    Reported-by: Fengguang Wu <fengguang.wu@intel.com>
+    Reported-by: Ingo Molnar <mingo@kernel.org>
+    Signed-off-by: Preeti U Murthy <preeti@linux.vnet.ibm.com>
+    Link: http://lkml.kernel.org/r/52F719EE.9010304@linux.vnet.ibm.com
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+
+diff --git a/kernel/time/tick-broadcast-hrtimer.c b/kernel/time/tick-broadcast-hrtimer.c
+index 92425279312b..eb682d5c697c 100644
+--- a/kernel/time/tick-broadcast-hrtimer.c
++++ b/kernel/time/tick-broadcast-hrtimer.c
+@@ -82,7 +82,7 @@ static struct clock_event_device ce_broadcast_hrtimer = {
+ 	.min_delta_ns		= 1,
+ 	.max_delta_ns		= KTIME_MAX,
+ 	.min_delta_ticks	= 1,
+-	.max_delta_ticks	= KTIME_MAX,
++	.max_delta_ticks	= ULONG_MAX,
+ 	.mult			= 1,
+ 	.shift			= 0,
+ 	.cpumask		= cpu_all_mask,
+
+commit 5d1638acb9f62fa7eb0c07cb85318bbe1f13b227
+Author: Preeti U Murthy <preeti@linux.vnet.ibm.com>
+Date:   Fri Feb 7 13:36:32 2014 +0530
+
+    tick: Introduce hrtimer based broadcast
+    
+    On some architectures, in certain CPU deep idle states the local timers stop.
+    An external clock device is used to wakeup these CPUs. The kernel support for the
+    wakeup of these CPUs is provided by the tick broadcast framework by using the
+    external clock device as the wakeup source.
+    
+    However not all implementations of architectures provide such an external
+    clock device. This patch includes support in the broadcast framework to handle
+    the wakeup of the CPUs in deep idle states on such systems by queuing a hrtimer
+    on one of the CPUs, which is meant to handle the wakeup of CPUs in deep idle states.
+    
+    This patchset introduces a pseudo clock device which can be registered by the
+    archs as tick_broadcast_device in the absence of a real external clock
+    device. Once registered, the broadcast framework will work as is for these
+    architectures as long as the archs take care of the BROADCAST_ENTER
+    notification failing for one of the CPUs. This CPU is made the stand by CPU to
+    handle wakeup of the CPUs in deep idle and it *must not enter deep idle states*.
+    
+    The CPU with the earliest wakeup is chosen to be this CPU. Hence this way the
+    stand by CPU dynamically moves around and so does the hrtimer which is queued
+    to trigger at the next earliest wakeup time. This is consistent with the case where
+    an external clock device is present. The smp affinity of this clock device is
+    set to the CPU with the earliest wakeup. This patchset handles the hotplug of
+    the stand by CPU as well by moving the hrtimer on to the CPU handling the CPU_DEAD
+    notification.
+    
+    Originally-from: Thomas Gleixner <tglx@linutronix.de>
+    Signed-off-by: Preeti U Murthy <preeti@linux.vnet.ibm.com>
+    Cc: deepthi@linux.vnet.ibm.com
+    Cc: paulmck@linux.vnet.ibm.com
+    Cc: fweisbec@gmail.com
+    Cc: paulus@samba.org
+    Cc: srivatsa.bhat@linux.vnet.ibm.com
+    Cc: svaidy@linux.vnet.ibm.com
+    Cc: peterz@infradead.org
+    Cc: benh@kernel.crashing.org
+    Cc: rafael.j.wysocki@intel.com
+    Cc: linuxppc-dev@lists.ozlabs.org
+    Link: http://lkml.kernel.org/r/20140207080632.17187.80532.stgit@preeti.in.ibm.com
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+
+diff --git a/kernel/time/tick-broadcast-hrtimer.c b/kernel/time/tick-broadcast-hrtimer.c
+new file mode 100644
+index 000000000000..92425279312b
+--- /dev/null
++++ b/kernel/time/tick-broadcast-hrtimer.c
+@@ -0,0 +1,106 @@
++/*
++ * linux/kernel/time/tick-broadcast-hrtimer.c
++ * This file emulates a local clock event device
++ * via a pseudo clock device.
++ */
++#include <linux/cpu.h>
++#include <linux/err.h>
++#include <linux/hrtimer.h>
++#include <linux/interrupt.h>
++#include <linux/percpu.h>
++#include <linux/profile.h>
++#include <linux/clockchips.h>
++#include <linux/sched.h>
++#include <linux/smp.h>
++#include <linux/module.h>
++
++#include "tick-internal.h"
++
++static struct hrtimer bctimer;
++
++static void bc_set_mode(enum clock_event_mode mode,
++			struct clock_event_device *bc)
++{
++	switch (mode) {
++	case CLOCK_EVT_MODE_SHUTDOWN:
++		/*
++		 * Note, we cannot cancel the timer here as we might
++		 * run into the following live lock scenario:
++		 *
++		 * cpu 0		cpu1
++		 * lock(broadcast_lock);
++		 *			hrtimer_interrupt()
++		 *			bc_handler()
++		 *			   tick_handle_oneshot_broadcast();
++		 *			    lock(broadcast_lock);
++		 * hrtimer_cancel()
++		 *  wait_for_callback()
++		 */
++		hrtimer_try_to_cancel(&bctimer);
++		break;
++	default:
++		break;
++	}
++}
++
++/*
++ * This is called from the guts of the broadcast code when the cpu
++ * which is about to enter idle has the earliest broadcast timer event.
++ */
++static int bc_set_next(ktime_t expires, struct clock_event_device *bc)
++{
++	/*
++	 * We try to cancel the timer first. If the callback is on
++	 * flight on some other cpu then we let it handle it. If we
++	 * were able to cancel the timer nothing can rearm it as we
++	 * own broadcast_lock.
++	 *
++	 * However we can also be called from the event handler of
++	 * ce_broadcast_hrtimer itself when it expires. We cannot
++	 * restart the timer because we are in the callback, but we
++	 * can set the expiry time and let the callback return
++	 * HRTIMER_RESTART.
++	 */
++	if (hrtimer_try_to_cancel(&bctimer) >= 0) {
++		hrtimer_start(&bctimer, expires, HRTIMER_MODE_ABS_PINNED);
++		/* Bind the "device" to the cpu */
++		bc->bound_on = smp_processor_id();
++	} else if (bc->bound_on == smp_processor_id()) {
++		hrtimer_set_expires(&bctimer, expires);
++	}
++	return 0;
++}
++
++static struct clock_event_device ce_broadcast_hrtimer = {
++	.set_mode		= bc_set_mode,
++	.set_next_ktime		= bc_set_next,
++	.features		= CLOCK_EVT_FEAT_ONESHOT |
++				  CLOCK_EVT_FEAT_KTIME |
++				  CLOCK_EVT_FEAT_HRTIMER,
++	.rating			= 0,
++	.bound_on		= -1,
++	.min_delta_ns		= 1,
++	.max_delta_ns		= KTIME_MAX,
++	.min_delta_ticks	= 1,
++	.max_delta_ticks	= KTIME_MAX,
++	.mult			= 1,
++	.shift			= 0,
++	.cpumask		= cpu_all_mask,
++};
++
++static enum hrtimer_restart bc_handler(struct hrtimer *t)
++{
++	ce_broadcast_hrtimer.event_handler(&ce_broadcast_hrtimer);
++
++	if (ce_broadcast_hrtimer.next_event.tv64 == KTIME_MAX)
++		return HRTIMER_NORESTART;
++
++	return HRTIMER_RESTART;
++}
++
++void tick_setup_hrtimer_broadcast(void)
++{
++	hrtimer_init(&bctimer, CLOCK_MONOTONIC, HRTIMER_MODE_ABS);
++	bctimer.function = bc_handler;
++	clockevents_register_device(&ce_broadcast_hrtimer);
++}

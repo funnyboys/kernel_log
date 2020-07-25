@@ -1,0 +1,1278 @@
+commit 9e55eef4ab1bf1810443bb3989a07a68e1f5d084
+Author: Chuck Lever <chuck.lever@oracle.com>
+Date:   Mon Mar 2 15:19:54 2020 -0500
+
+    SUNRPC: Refactor xs_sendpages()
+    
+    Re-locate xs_sendpages() so that it can be shared with server code.
+    
+    Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+
+diff --git a/net/sunrpc/socklib.c b/net/sunrpc/socklib.c
+index 1a864f1ed119..3fc8af8bb961 100644
+--- a/net/sunrpc/socklib.c
++++ b/net/sunrpc/socklib.c
+@@ -14,9 +14,24 @@
+ #include <linux/types.h>
+ #include <linux/pagemap.h>
+ #include <linux/udp.h>
++#include <linux/sunrpc/msg_prot.h>
+ #include <linux/sunrpc/xdr.h>
+ #include <linux/export.h>
+ 
++#include "socklib.h"
++
++/*
++ * Helper structure for copying from an sk_buff.
++ */
++struct xdr_skb_reader {
++	struct sk_buff	*skb;
++	unsigned int	offset;
++	size_t		count;
++	__wsum		csum;
++};
++
++typedef size_t (*xdr_skb_read_actor)(struct xdr_skb_reader *desc, void *to,
++				     size_t len);
+ 
+ /**
+  * xdr_skb_read_bits - copy some data bits from skb to internal buffer
+@@ -186,3 +201,129 @@ int csum_partial_copy_to_xdr(struct xdr_buf *xdr, struct sk_buff *skb)
+ 	return 0;
+ }
+ EXPORT_SYMBOL_GPL(csum_partial_copy_to_xdr);
++
++static inline int xprt_sendmsg(struct socket *sock, struct msghdr *msg,
++			       size_t seek)
++{
++	if (seek)
++		iov_iter_advance(&msg->msg_iter, seek);
++	return sock_sendmsg(sock, msg);
++}
++
++static int xprt_send_kvec(struct socket *sock, struct msghdr *msg,
++			  struct kvec *vec, size_t seek)
++{
++	iov_iter_kvec(&msg->msg_iter, WRITE, vec, 1, vec->iov_len);
++	return xprt_sendmsg(sock, msg, seek);
++}
++
++static int xprt_send_pagedata(struct socket *sock, struct msghdr *msg,
++			      struct xdr_buf *xdr, size_t base)
++{
++	int err;
++
++	err = xdr_alloc_bvec(xdr, GFP_KERNEL);
++	if (err < 0)
++		return err;
++
++	iov_iter_bvec(&msg->msg_iter, WRITE, xdr->bvec, xdr_buf_pagecount(xdr),
++		      xdr->page_len + xdr->page_base);
++	return xprt_sendmsg(sock, msg, base + xdr->page_base);
++}
++
++/* Common case:
++ *  - stream transport
++ *  - sending from byte 0 of the message
++ *  - the message is wholly contained in @xdr's head iovec
++ */
++static int xprt_send_rm_and_kvec(struct socket *sock, struct msghdr *msg,
++				 rpc_fraghdr marker, struct kvec *vec,
++				 size_t base)
++{
++	struct kvec iov[2] = {
++		[0] = {
++			.iov_base	= &marker,
++			.iov_len	= sizeof(marker)
++		},
++		[1] = *vec,
++	};
++	size_t len = iov[0].iov_len + iov[1].iov_len;
++
++	iov_iter_kvec(&msg->msg_iter, WRITE, iov, 2, len);
++	return xprt_sendmsg(sock, msg, base);
++}
++
++/**
++ * xprt_sock_sendmsg - write an xdr_buf directly to a socket
++ * @sock: open socket to send on
++ * @msg: socket message metadata
++ * @xdr: xdr_buf containing this request
++ * @base: starting position in the buffer
++ * @marker: stream record marker field
++ * @sent_p: return the total number of bytes successfully queued for sending
++ *
++ * Return values:
++ *   On success, returns zero and fills in @sent_p.
++ *   %-ENOTSOCK if  @sock is not a struct socket.
++ */
++int xprt_sock_sendmsg(struct socket *sock, struct msghdr *msg,
++		      struct xdr_buf *xdr, unsigned int base,
++		      rpc_fraghdr marker, unsigned int *sent_p)
++{
++	unsigned int rmsize = marker ? sizeof(marker) : 0;
++	unsigned int remainder = rmsize + xdr->len - base;
++	unsigned int want;
++	int err = 0;
++
++	*sent_p = 0;
++
++	if (unlikely(!sock))
++		return -ENOTSOCK;
++
++	msg->msg_flags |= MSG_MORE;
++	want = xdr->head[0].iov_len + rmsize;
++	if (base < want) {
++		unsigned int len = want - base;
++
++		remainder -= len;
++		if (remainder == 0)
++			msg->msg_flags &= ~MSG_MORE;
++		if (rmsize)
++			err = xprt_send_rm_and_kvec(sock, msg, marker,
++						    &xdr->head[0], base);
++		else
++			err = xprt_send_kvec(sock, msg, &xdr->head[0], base);
++		if (remainder == 0 || err != len)
++			goto out;
++		*sent_p += err;
++		base = 0;
++	} else {
++		base -= want;
++	}
++
++	if (base < xdr->page_len) {
++		unsigned int len = xdr->page_len - base;
++
++		remainder -= len;
++		if (remainder == 0)
++			msg->msg_flags &= ~MSG_MORE;
++		err = xprt_send_pagedata(sock, msg, xdr, base);
++		if (remainder == 0 || err != len)
++			goto out;
++		*sent_p += err;
++		base = 0;
++	} else {
++		base -= xdr->page_len;
++	}
++
++	if (base >= xdr->tail[0].iov_len)
++		return 0;
++	msg->msg_flags &= ~MSG_MORE;
++	err = xprt_send_kvec(sock, msg, &xdr->tail[0], base);
++out:
++	if (err > 0) {
++		*sent_p += err;
++		err = 0;
++	}
++	return err;
++}
+
+commit 457c89965399115e5cd8bf38f9c597293405703d
+Author: Thomas Gleixner <tglx@linutronix.de>
+Date:   Sun May 19 13:08:55 2019 +0100
+
+    treewide: Add SPDX license identifier for missed files
+    
+    Add SPDX license identifiers to all files which:
+    
+     - Have no license information of any form
+    
+     - Have EXPORT_.*_SYMBOL_GPL inside which was used in the
+       initial scan/conversion to ignore the file
+    
+    These files fall under the project license, GPL v2 only. The resulting SPDX
+    license identifier is:
+    
+      GPL-2.0-only
+    
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/net/sunrpc/socklib.c b/net/sunrpc/socklib.c
+index 9faea12624a6..1a864f1ed119 100644
+--- a/net/sunrpc/socklib.c
++++ b/net/sunrpc/socklib.c
+@@ -1,3 +1,4 @@
++// SPDX-License-Identifier: GPL-2.0-only
+ /*
+  * linux/net/sunrpc/socklib.c
+  *
+
+commit 52db6f9a0cd8f6d433a0687aae4f21f209352510
+Author: Chuck Lever <chuck.lever@oracle.com>
+Date:   Wed Apr 24 09:38:55 2019 -0400
+
+    SUNRPC: Avoid digging into the ATOMIC pool
+    
+    Page allocation requests made when the SPARSE_PAGES flag is set are
+    allowed to fail, and are not critical. No need to spend a rare
+    resource.
+    
+    Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+    Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+
+diff --git a/net/sunrpc/socklib.c b/net/sunrpc/socklib.c
+index 7e55cfc69697..9faea12624a6 100644
+--- a/net/sunrpc/socklib.c
++++ b/net/sunrpc/socklib.c
+@@ -106,7 +106,7 @@ xdr_partial_copy_from_skb(struct xdr_buf *xdr, unsigned int base, struct xdr_skb
+ 		/* ACL likes to be lazy in allocating pages - ACLs
+ 		 * are small by default but can get huge. */
+ 		if ((xdr->flags & XDRBUF_SPARSE_PAGES) && *ppage == NULL) {
+-			*ppage = alloc_page(GFP_ATOMIC);
++			*ppage = alloc_page(GFP_NOWAIT | __GFP_NOWARN);
+ 			if (unlikely(*ppage == NULL)) {
+ 				if (copied == 0)
+ 					copied = -ENOMEM;
+
+commit 7fe50ac83f4319c18ed7c634d85cad16bd0bf509
+Author: Cong Wang <xiyou.wangcong@gmail.com>
+Date:   Mon Nov 12 14:47:18 2018 -0800
+
+    net: dump more useful information in netdev_rx_csum_fault()
+    
+    Currently netdev_rx_csum_fault() only shows a device name,
+    we need more information about the skb for debugging csum
+    failures.
+    
+    Sample output:
+    
+     ens3: hw csum failure
+     dev features: 0x0000000000014b89
+     skb len=84 data_len=0 pkt_type=0 gso_size=0 gso_type=0 nr_frags=0 ip_summed=0 csum=0 csum_complete_sw=0 csum_valid=0 csum_level=0
+    
+    Note, I use pr_err() just to be consistent with the existing one.
+    
+    Signed-off-by: Cong Wang <xiyou.wangcong@gmail.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/sunrpc/socklib.c b/net/sunrpc/socklib.c
+index 9062967575c4..7e55cfc69697 100644
+--- a/net/sunrpc/socklib.c
++++ b/net/sunrpc/socklib.c
+@@ -175,7 +175,7 @@ int csum_partial_copy_to_xdr(struct xdr_buf *xdr, struct sk_buff *skb)
+ 		return -1;
+ 	if (unlikely(skb->ip_summed == CHECKSUM_COMPLETE) &&
+ 	    !skb->csum_complete_sw)
+-		netdev_rx_csum_fault(skb->dev);
++		netdev_rx_csum_fault(skb->dev, skb);
+ 	return 0;
+ no_checksum:
+ 	if (xdr_partial_copy_from_skb(xdr, 0, &desc, xdr_skb_read_bits) < 0)
+
+commit ec846469ba7bdb81e42c04e4e15d8fbf19e426e2
+Author: Trond Myklebust <trond.myklebust@hammerspace.com>
+Date:   Fri Sep 14 14:38:05 2018 -0400
+
+    SUNRPC: Unexport xdr_partial_copy_from_skb()
+    
+    It is no longer used outside of net/sunrpc/socklib.c
+    
+    Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+
+diff --git a/net/sunrpc/socklib.c b/net/sunrpc/socklib.c
+index 0e7c0dee7578..9062967575c4 100644
+--- a/net/sunrpc/socklib.c
++++ b/net/sunrpc/socklib.c
+@@ -69,7 +69,8 @@ static size_t xdr_skb_read_and_csum_bits(struct xdr_skb_reader *desc, void *to,
+  * @copy_actor: virtual method for copying data
+  *
+  */
+-ssize_t xdr_partial_copy_from_skb(struct xdr_buf *xdr, unsigned int base, struct xdr_skb_reader *desc, xdr_skb_read_actor copy_actor)
++static ssize_t
++xdr_partial_copy_from_skb(struct xdr_buf *xdr, unsigned int base, struct xdr_skb_reader *desc, xdr_skb_read_actor copy_actor)
+ {
+ 	struct page	**ppage = xdr->pages;
+ 	unsigned int	len, pglen = xdr->page_len;
+@@ -140,7 +141,6 @@ ssize_t xdr_partial_copy_from_skb(struct xdr_buf *xdr, unsigned int base, struct
+ out:
+ 	return copied;
+ }
+-EXPORT_SYMBOL_GPL(xdr_partial_copy_from_skb);
+ 
+ /**
+  * csum_partial_copy_to_xdr - checksum and copy data
+
+commit 550aebfe1c573518c35ae85d6ffbdc2d44c92703
+Author: Trond Myklebust <trond.myklebust@hammerspace.com>
+Date:   Fri Sep 14 14:32:45 2018 -0400
+
+    SUNRPC: Allow AF_LOCAL sockets to use the generic stream receive
+    
+    Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+
+diff --git a/net/sunrpc/socklib.c b/net/sunrpc/socklib.c
+index 08f00a98151f..0e7c0dee7578 100644
+--- a/net/sunrpc/socklib.c
++++ b/net/sunrpc/socklib.c
+@@ -26,7 +26,8 @@
+  * Possibly called several times to iterate over an sk_buff and copy
+  * data out of it.
+  */
+-size_t xdr_skb_read_bits(struct xdr_skb_reader *desc, void *to, size_t len)
++static size_t
++xdr_skb_read_bits(struct xdr_skb_reader *desc, void *to, size_t len)
+ {
+ 	if (len > desc->count)
+ 		len = desc->count;
+@@ -36,7 +37,6 @@ size_t xdr_skb_read_bits(struct xdr_skb_reader *desc, void *to, size_t len)
+ 	desc->offset += len;
+ 	return len;
+ }
+-EXPORT_SYMBOL_GPL(xdr_skb_read_bits);
+ 
+ /**
+  * xdr_skb_read_and_csum_bits - copy and checksum from skb to buffer
+
+commit 431f6eb3570f286036bc8718a908a283f5d99473
+Author: Trond Myklebust <trond.myklebust@hammerspace.com>
+Date:   Sun Sep 16 00:08:20 2018 -0400
+
+    SUNRPC: Add a label for RPC calls that require allocation on receive
+    
+    If the RPC call relies on the receive call allocating pages as buffers,
+    then let's label it so that we
+    a) Don't leak memory by allocating pages for requests that do not expect
+       this behaviour
+    b) Can optimise for the common case where calls do not require allocation.
+    
+    Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+
+diff --git a/net/sunrpc/socklib.c b/net/sunrpc/socklib.c
+index f217c348b341..08f00a98151f 100644
+--- a/net/sunrpc/socklib.c
++++ b/net/sunrpc/socklib.c
+@@ -104,7 +104,7 @@ ssize_t xdr_partial_copy_from_skb(struct xdr_buf *xdr, unsigned int base, struct
+ 
+ 		/* ACL likes to be lazy in allocating pages - ACLs
+ 		 * are small by default but can get huge. */
+-		if (unlikely(*ppage == NULL)) {
++		if ((xdr->flags & XDRBUF_SPARSE_PAGES) && *ppage == NULL) {
+ 			*ppage = alloc_page(GFP_ATOMIC);
+ 			if (unlikely(*ppage == NULL)) {
+ 				if (copied == 0)
+
+commit 1da8c681d5c122afe9fbadc02e92a0f9e3f7af44
+Author: Willem de Bruijn <willemb@google.com>
+Date:   Thu Apr 7 11:44:58 2016 -0400
+
+    sunrpc: do not pull udp headers on receive
+    
+    Commit e6afc8ace6dd modified the udp receive path by pulling the udp
+    header before queuing an skbuff onto the receive queue.
+    
+    Sunrpc also calls skb_recv_datagram to dequeue an skb from a udp
+    socket. Modify this receive path to also no longer expect udp
+    headers.
+    
+    Fixes: e6afc8ace6dd ("udp: remove headers from UDP packets before queueing")
+    
+    Reported-by: Franklin S Cooper Jr. <fcooper@ti.com>
+    Signed-off-by: Willem de Bruijn <willemb@google.com>
+    Tested-by: Thierry Reding <treding@nvidia.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/sunrpc/socklib.c b/net/sunrpc/socklib.c
+index de70c78025d7..f217c348b341 100644
+--- a/net/sunrpc/socklib.c
++++ b/net/sunrpc/socklib.c
+@@ -155,7 +155,7 @@ int csum_partial_copy_to_xdr(struct xdr_buf *xdr, struct sk_buff *skb)
+ 	struct xdr_skb_reader	desc;
+ 
+ 	desc.skb = skb;
+-	desc.offset = sizeof(struct udphdr);
++	desc.offset = 0;
+ 	desc.count = skb->len - desc.offset;
+ 
+ 	if (skb_csum_unnecessary(skb))
+
+commit 09cbfeaf1a5a67bfb3201e0c83c810cecb2efa5a
+Author: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Date:   Fri Apr 1 15:29:47 2016 +0300
+
+    mm, fs: get rid of PAGE_CACHE_* and page_cache_{get,release} macros
+    
+    PAGE_CACHE_{SIZE,SHIFT,MASK,ALIGN} macros were introduced *long* time
+    ago with promise that one day it will be possible to implement page
+    cache with bigger chunks than PAGE_SIZE.
+    
+    This promise never materialized.  And unlikely will.
+    
+    We have many places where PAGE_CACHE_SIZE assumed to be equal to
+    PAGE_SIZE.  And it's constant source of confusion on whether
+    PAGE_CACHE_* or PAGE_* constant should be used in a particular case,
+    especially on the border between fs and mm.
+    
+    Global switching to PAGE_CACHE_SIZE != PAGE_SIZE would cause to much
+    breakage to be doable.
+    
+    Let's stop pretending that pages in page cache are special.  They are
+    not.
+    
+    The changes are pretty straight-forward:
+    
+     - <foo> << (PAGE_CACHE_SHIFT - PAGE_SHIFT) -> <foo>;
+    
+     - <foo> >> (PAGE_CACHE_SHIFT - PAGE_SHIFT) -> <foo>;
+    
+     - PAGE_CACHE_{SIZE,SHIFT,MASK,ALIGN} -> PAGE_{SIZE,SHIFT,MASK,ALIGN};
+    
+     - page_cache_get() -> get_page();
+    
+     - page_cache_release() -> put_page();
+    
+    This patch contains automated changes generated with coccinelle using
+    script below.  For some reason, coccinelle doesn't patch header files.
+    I've called spatch for them manually.
+    
+    The only adjustment after coccinelle is revert of changes to
+    PAGE_CAHCE_ALIGN definition: we are going to drop it later.
+    
+    There are few places in the code where coccinelle didn't reach.  I'll
+    fix them manually in a separate patch.  Comments and documentation also
+    will be addressed with the separate patch.
+    
+    virtual patch
+    
+    @@
+    expression E;
+    @@
+    - E << (PAGE_CACHE_SHIFT - PAGE_SHIFT)
+    + E
+    
+    @@
+    expression E;
+    @@
+    - E >> (PAGE_CACHE_SHIFT - PAGE_SHIFT)
+    + E
+    
+    @@
+    @@
+    - PAGE_CACHE_SHIFT
+    + PAGE_SHIFT
+    
+    @@
+    @@
+    - PAGE_CACHE_SIZE
+    + PAGE_SIZE
+    
+    @@
+    @@
+    - PAGE_CACHE_MASK
+    + PAGE_MASK
+    
+    @@
+    expression E;
+    @@
+    - PAGE_CACHE_ALIGN(E)
+    + PAGE_ALIGN(E)
+    
+    @@
+    expression E;
+    @@
+    - page_cache_get(E)
+    + get_page(E)
+    
+    @@
+    expression E;
+    @@
+    - page_cache_release(E)
+    + put_page(E)
+    
+    Signed-off-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+    Acked-by: Michal Hocko <mhocko@suse.com>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/net/sunrpc/socklib.c b/net/sunrpc/socklib.c
+index 2df87f78e518..de70c78025d7 100644
+--- a/net/sunrpc/socklib.c
++++ b/net/sunrpc/socklib.c
+@@ -96,8 +96,8 @@ ssize_t xdr_partial_copy_from_skb(struct xdr_buf *xdr, unsigned int base, struct
+ 	if (base || xdr->page_base) {
+ 		pglen -= base;
+ 		base += xdr->page_base;
+-		ppage += base >> PAGE_CACHE_SHIFT;
+-		base &= ~PAGE_CACHE_MASK;
++		ppage += base >> PAGE_SHIFT;
++		base &= ~PAGE_MASK;
+ 	}
+ 	do {
+ 		char *kaddr;
+@@ -113,7 +113,7 @@ ssize_t xdr_partial_copy_from_skb(struct xdr_buf *xdr, unsigned int base, struct
+ 			}
+ 		}
+ 
+-		len = PAGE_CACHE_SIZE;
++		len = PAGE_SIZE;
+ 		kaddr = kmap_atomic(*ppage);
+ 		if (base) {
+ 			len -= base;
+
+commit 7e3cead5172927732f51fde77fef6f521e22f209
+Author: Tom Herbert <therbert@google.com>
+Date:   Tue Jun 10 18:54:19 2014 -0700
+
+    net: Save software checksum complete
+    
+    In skb_checksum complete, if we need to compute the checksum for the
+    packet (via skb_checksum) save the result as CHECKSUM_COMPLETE.
+    Subsequent checksum verification can use this.
+    
+    Also, added csum_complete_sw flag to distinguish between software and
+    hardware generated checksum complete, we should always be able to trust
+    the software computation.
+    
+    Signed-off-by: Tom Herbert <therbert@google.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/sunrpc/socklib.c b/net/sunrpc/socklib.c
+index 0a648c502fc3..2df87f78e518 100644
+--- a/net/sunrpc/socklib.c
++++ b/net/sunrpc/socklib.c
+@@ -173,7 +173,8 @@ int csum_partial_copy_to_xdr(struct xdr_buf *xdr, struct sk_buff *skb)
+ 		return -1;
+ 	if (csum_fold(desc.csum))
+ 		return -1;
+-	if (unlikely(skb->ip_summed == CHECKSUM_COMPLETE))
++	if (unlikely(skb->ip_summed == CHECKSUM_COMPLETE) &&
++	    !skb->csum_complete_sw)
+ 		netdev_rx_csum_fault(skb->dev);
+ 	return 0;
+ no_checksum:
+
+commit b85417860172ff693dc115d7999805fc240cec1c
+Author: Cong Wang <amwang@redhat.com>
+Date:   Fri Nov 25 23:14:40 2011 +0800
+
+    sunrpc: remove the second argument of k[un]map_atomic()
+    
+    Signed-off-by: Cong Wang <amwang@redhat.com>
+
+diff --git a/net/sunrpc/socklib.c b/net/sunrpc/socklib.c
+index 145e6784f508..0a648c502fc3 100644
+--- a/net/sunrpc/socklib.c
++++ b/net/sunrpc/socklib.c
+@@ -114,7 +114,7 @@ ssize_t xdr_partial_copy_from_skb(struct xdr_buf *xdr, unsigned int base, struct
+ 		}
+ 
+ 		len = PAGE_CACHE_SIZE;
+-		kaddr = kmap_atomic(*ppage, KM_SKB_SUNRPC_DATA);
++		kaddr = kmap_atomic(*ppage);
+ 		if (base) {
+ 			len -= base;
+ 			if (pglen < len)
+@@ -127,7 +127,7 @@ ssize_t xdr_partial_copy_from_skb(struct xdr_buf *xdr, unsigned int base, struct
+ 			ret = copy_actor(desc, kaddr, len);
+ 		}
+ 		flush_dcache_page(*ppage);
+-		kunmap_atomic(kaddr, KM_SKB_SUNRPC_DATA);
++		kunmap_atomic(kaddr);
+ 		copied += ret;
+ 		if (ret != len || !desc->count)
+ 			goto out;
+
+commit bc3b2d7fb9b014d75ebb79ba371a763dbab5e8cf
+Author: Paul Gortmaker <paul.gortmaker@windriver.com>
+Date:   Fri Jul 15 11:47:34 2011 -0400
+
+    net: Add export.h for EXPORT_SYMBOL/THIS_MODULE to non-modules
+    
+    These files are non modular, but need to export symbols using
+    the macros now living in export.h -- call out the include so
+    that things won't break when we remove the implicit presence
+    of module.h from everywhere.
+    
+    Signed-off-by: Paul Gortmaker <paul.gortmaker@windriver.com>
+
+diff --git a/net/sunrpc/socklib.c b/net/sunrpc/socklib.c
+index 10b4319ebbca..145e6784f508 100644
+--- a/net/sunrpc/socklib.c
++++ b/net/sunrpc/socklib.c
+@@ -14,6 +14,7 @@
+ #include <linux/pagemap.h>
+ #include <linux/udp.h>
+ #include <linux/sunrpc/xdr.h>
++#include <linux/export.h>
+ 
+ 
+ /**
+
+commit 5a0e3ad6af8660be21ca98a971cd00f331318c05
+Author: Tejun Heo <tj@kernel.org>
+Date:   Wed Mar 24 17:04:11 2010 +0900
+
+    include cleanup: Update gfp.h and slab.h includes to prepare for breaking implicit slab.h inclusion from percpu.h
+    
+    percpu.h is included by sched.h and module.h and thus ends up being
+    included when building most .c files.  percpu.h includes slab.h which
+    in turn includes gfp.h making everything defined by the two files
+    universally available and complicating inclusion dependencies.
+    
+    percpu.h -> slab.h dependency is about to be removed.  Prepare for
+    this change by updating users of gfp and slab facilities include those
+    headers directly instead of assuming availability.  As this conversion
+    needs to touch large number of source files, the following script is
+    used as the basis of conversion.
+    
+      http://userweb.kernel.org/~tj/misc/slabh-sweep.py
+    
+    The script does the followings.
+    
+    * Scan files for gfp and slab usages and update includes such that
+      only the necessary includes are there.  ie. if only gfp is used,
+      gfp.h, if slab is used, slab.h.
+    
+    * When the script inserts a new include, it looks at the include
+      blocks and try to put the new include such that its order conforms
+      to its surrounding.  It's put in the include block which contains
+      core kernel includes, in the same order that the rest are ordered -
+      alphabetical, Christmas tree, rev-Xmas-tree or at the end if there
+      doesn't seem to be any matching order.
+    
+    * If the script can't find a place to put a new include (mostly
+      because the file doesn't have fitting include block), it prints out
+      an error message indicating which .h file needs to be added to the
+      file.
+    
+    The conversion was done in the following steps.
+    
+    1. The initial automatic conversion of all .c files updated slightly
+       over 4000 files, deleting around 700 includes and adding ~480 gfp.h
+       and ~3000 slab.h inclusions.  The script emitted errors for ~400
+       files.
+    
+    2. Each error was manually checked.  Some didn't need the inclusion,
+       some needed manual addition while adding it to implementation .h or
+       embedding .c file was more appropriate for others.  This step added
+       inclusions to around 150 files.
+    
+    3. The script was run again and the output was compared to the edits
+       from #2 to make sure no file was left behind.
+    
+    4. Several build tests were done and a couple of problems were fixed.
+       e.g. lib/decompress_*.c used malloc/free() wrappers around slab
+       APIs requiring slab.h to be added manually.
+    
+    5. The script was run on all .h files but without automatically
+       editing them as sprinkling gfp.h and slab.h inclusions around .h
+       files could easily lead to inclusion dependency hell.  Most gfp.h
+       inclusion directives were ignored as stuff from gfp.h was usually
+       wildly available and often used in preprocessor macros.  Each
+       slab.h inclusion directive was examined and added manually as
+       necessary.
+    
+    6. percpu.h was updated not to include slab.h.
+    
+    7. Build test were done on the following configurations and failures
+       were fixed.  CONFIG_GCOV_KERNEL was turned off for all tests (as my
+       distributed build env didn't work with gcov compiles) and a few
+       more options had to be turned off depending on archs to make things
+       build (like ipr on powerpc/64 which failed due to missing writeq).
+    
+       * x86 and x86_64 UP and SMP allmodconfig and a custom test config.
+       * powerpc and powerpc64 SMP allmodconfig
+       * sparc and sparc64 SMP allmodconfig
+       * ia64 SMP allmodconfig
+       * s390 SMP allmodconfig
+       * alpha SMP allmodconfig
+       * um on x86_64 SMP allmodconfig
+    
+    8. percpu.h modifications were reverted so that it could be applied as
+       a separate patch and serve as bisection point.
+    
+    Given the fact that I had only a couple of failures from tests on step
+    6, I'm fairly confident about the coverage of this conversion patch.
+    If there is a breakage, it's likely to be something in one of the arch
+    headers which should be easily discoverable easily on most builds of
+    the specific arch.
+    
+    Signed-off-by: Tejun Heo <tj@kernel.org>
+    Guess-its-ok-by: Christoph Lameter <cl@linux-foundation.org>
+    Cc: Ingo Molnar <mingo@redhat.com>
+    Cc: Lee Schermerhorn <Lee.Schermerhorn@hp.com>
+
+diff --git a/net/sunrpc/socklib.c b/net/sunrpc/socklib.c
+index a661a3acb37e..10b4319ebbca 100644
+--- a/net/sunrpc/socklib.c
++++ b/net/sunrpc/socklib.c
+@@ -8,6 +8,7 @@
+ 
+ #include <linux/compiler.h>
+ #include <linux/netdevice.h>
++#include <linux/gfp.h>
+ #include <linux/skbuff.h>
+ #include <linux/types.h>
+ #include <linux/pagemap.h>
+
+commit 322e2efe6224be5de2852a7fddfac5cf11317af3
+Author: Chuck Lever <chuck.lever@oracle.com>
+Date:   Fri Oct 26 13:30:59 2007 -0400
+
+    SUNRPC: temp var should match return type of xdr_skb_read_actor
+    
+    The return type of xdr_skb_read_actor functions is size_t.  This fixes a
+    nit I unwittingly overlooked in commit dd456471.
+    
+    Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+    Signed-off-by: Trond Myklebust <Trond.Myklebust@netapp.com>
+
+diff --git a/net/sunrpc/socklib.c b/net/sunrpc/socklib.c
+index 97ac45f034d6..a661a3acb37e 100644
+--- a/net/sunrpc/socklib.c
++++ b/net/sunrpc/socklib.c
+@@ -72,7 +72,7 @@ ssize_t xdr_partial_copy_from_skb(struct xdr_buf *xdr, unsigned int base, struct
+ 	struct page	**ppage = xdr->pages;
+ 	unsigned int	len, pglen = xdr->page_len;
+ 	ssize_t		copied = 0;
+-	int		ret;
++	size_t		ret;
+ 
+ 	len = xdr->head[0].iov_len;
+ 	if (base < len) {
+
+commit 1244480976d357447aeddd3f44977586bfa0462b
+Author: \"Talpey, Thomas\ <Thomas.Talpey@netapp.com>
+Date:   Mon Sep 10 13:45:36 2007 -0400
+
+    SUNRPC: add EXPORT_SYMBOL_GPL for generic transport functions
+    
+    SUNRPC: add EXPORT_SYMBOL_GPL for generic transport functions
+    
+    As a preface to allowing arbitrary transport modules to be loaded
+    dynamically, add EXPORT_SYMBOL_GPL for all generic transport functions
+    that a transport implementation might want to use.
+    
+    Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+    Acked-by: Tom Talpey <tmt@netapp.com>
+    
+    Signed-off-by: Trond Myklebust <Trond.Myklebust@netapp.com>
+
+diff --git a/net/sunrpc/socklib.c b/net/sunrpc/socklib.c
+index 1d377d1ab7f4..97ac45f034d6 100644
+--- a/net/sunrpc/socklib.c
++++ b/net/sunrpc/socklib.c
+@@ -34,6 +34,7 @@ size_t xdr_skb_read_bits(struct xdr_skb_reader *desc, void *to, size_t len)
+ 	desc->offset += len;
+ 	return len;
+ }
++EXPORT_SYMBOL_GPL(xdr_skb_read_bits);
+ 
+ /**
+  * xdr_skb_read_and_csum_bits - copy and checksum from skb to buffer
+@@ -137,6 +138,7 @@ ssize_t xdr_partial_copy_from_skb(struct xdr_buf *xdr, unsigned int base, struct
+ out:
+ 	return copied;
+ }
++EXPORT_SYMBOL_GPL(xdr_partial_copy_from_skb);
+ 
+ /**
+  * csum_partial_copy_to_xdr - checksum and copy data
+@@ -179,3 +181,4 @@ int csum_partial_copy_to_xdr(struct xdr_buf *xdr, struct sk_buff *skb)
+ 		return -1;
+ 	return 0;
+ }
++EXPORT_SYMBOL_GPL(csum_partial_copy_to_xdr);
+
+commit 604763722c655c7e3f31ecf6f7b4dafcd26a7a15
+Author: Herbert Xu <herbert@gondor.apana.org.au>
+Date:   Mon Apr 9 11:59:39 2007 -0700
+
+    [NET]: Treat CHECKSUM_PARTIAL as CHECKSUM_UNNECESSARY
+    
+    When a transmitted packet is looped back directly, CHECKSUM_PARTIAL
+    maps to the semantics of CHECKSUM_UNNECESSARY.  Therefore we should
+    treat it as such in the stack.
+    
+    Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/sunrpc/socklib.c b/net/sunrpc/socklib.c
+index 634885b0c04d..1d377d1ab7f4 100644
+--- a/net/sunrpc/socklib.c
++++ b/net/sunrpc/socklib.c
+@@ -154,7 +154,7 @@ int csum_partial_copy_to_xdr(struct xdr_buf *xdr, struct sk_buff *skb)
+ 	desc.offset = sizeof(struct udphdr);
+ 	desc.count = skb->len - desc.offset;
+ 
+-	if (skb->ip_summed == CHECKSUM_UNNECESSARY)
++	if (skb_csum_unnecessary(skb))
+ 		goto no_checksum;
+ 
+ 	desc.csum = csum_partial(skb->data, desc.offset, skb->csum);
+
+commit dd4564715eae2c4136f278da9ae1c3bb5af3e509
+Author: Chuck Lever <chuck.lever@oracle.com>
+Date:   Tue Dec 5 16:35:44 2006 -0500
+
+    SUNRPC: Rename skb_reader_t and friends
+    
+    Clean-up:  hch suggested that the RPC client shouldn't pollute the name
+    space used by the generic skb manipulation routines in net/core/skbuff.c.
+    
+    Rename a couple of types in xdr.h to adhere to this convention.
+    
+    Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+    Signed-off-by: Trond Myklebust <Trond.Myklebust@netapp.com>
+
+diff --git a/net/sunrpc/socklib.c b/net/sunrpc/socklib.c
+index 9c40d67c1ffb..634885b0c04d 100644
+--- a/net/sunrpc/socklib.c
++++ b/net/sunrpc/socklib.c
+@@ -24,7 +24,7 @@
+  * Possibly called several times to iterate over an sk_buff and copy
+  * data out of it.
+  */
+-size_t xdr_skb_read_bits(skb_reader_t *desc, void *to, size_t len)
++size_t xdr_skb_read_bits(struct xdr_skb_reader *desc, void *to, size_t len)
+ {
+ 	if (len > desc->count)
+ 		len = desc->count;
+@@ -43,7 +43,7 @@ size_t xdr_skb_read_bits(skb_reader_t *desc, void *to, size_t len)
+  *
+  * Same as skb_read_bits, but calculate a checksum at the same time.
+  */
+-static size_t xdr_skb_read_and_csum_bits(skb_reader_t *desc, void *to, size_t len)
++static size_t xdr_skb_read_and_csum_bits(struct xdr_skb_reader *desc, void *to, size_t len)
+ {
+ 	unsigned int pos;
+ 	__wsum csum2;
+@@ -66,7 +66,7 @@ static size_t xdr_skb_read_and_csum_bits(skb_reader_t *desc, void *to, size_t le
+  * @copy_actor: virtual method for copying data
+  *
+  */
+-ssize_t xdr_partial_copy_from_skb(struct xdr_buf *xdr, unsigned int base, skb_reader_t *desc, skb_read_actor_t copy_actor)
++ssize_t xdr_partial_copy_from_skb(struct xdr_buf *xdr, unsigned int base, struct xdr_skb_reader *desc, xdr_skb_read_actor copy_actor)
+ {
+ 	struct page	**ppage = xdr->pages;
+ 	unsigned int	len, pglen = xdr->page_len;
+@@ -148,7 +148,7 @@ ssize_t xdr_partial_copy_from_skb(struct xdr_buf *xdr, unsigned int base, skb_re
+  */
+ int csum_partial_copy_to_xdr(struct xdr_buf *xdr, struct sk_buff *skb)
+ {
+-	skb_reader_t	desc;
++	struct xdr_skb_reader	desc;
+ 
+ 	desc.skb = skb;
+ 	desc.offset = sizeof(struct udphdr);
+
+commit 9d29231690925915015c21c1fff73c7118099843
+Author: Chuck Lever <chuck.lever@oracle.com>
+Date:   Tue Dec 5 16:35:41 2006 -0500
+
+    SUNRPC: skb_read_bits is the same as xs_tcp_copy_data
+    
+    Clean-up: eliminate xs_tcp_copy_data -- it's exactly the same logic as the
+    common routine skb_read_bits.  The UDP and TCP socket read code now share
+    the same routine for copying data into an xdr_buf.
+    
+    Now that skb_read_bits() is exported, rename it to avoid confusing it with
+    a generic skb_* function.  As these functions are XDR-specific, they should
+    not have names that suggest they are of generic use.  Also rename
+    skb_read_and_csum_bits() to be consistent.
+    
+    Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+    Signed-off-by: Trond Myklebust <Trond.Myklebust@netapp.com>
+
+diff --git a/net/sunrpc/socklib.c b/net/sunrpc/socklib.c
+index 2635c543ba06..9c40d67c1ffb 100644
+--- a/net/sunrpc/socklib.c
++++ b/net/sunrpc/socklib.c
+@@ -16,7 +16,7 @@
+ 
+ 
+ /**
+- * skb_read_bits - copy some data bits from skb to internal buffer
++ * xdr_skb_read_bits - copy some data bits from skb to internal buffer
+  * @desc: sk_buff copy helper
+  * @to: copy destination
+  * @len: number of bytes to copy
+@@ -24,11 +24,11 @@
+  * Possibly called several times to iterate over an sk_buff and copy
+  * data out of it.
+  */
+-static size_t skb_read_bits(skb_reader_t *desc, void *to, size_t len)
++size_t xdr_skb_read_bits(skb_reader_t *desc, void *to, size_t len)
+ {
+ 	if (len > desc->count)
+ 		len = desc->count;
+-	if (skb_copy_bits(desc->skb, desc->offset, to, len))
++	if (unlikely(skb_copy_bits(desc->skb, desc->offset, to, len)))
+ 		return 0;
+ 	desc->count -= len;
+ 	desc->offset += len;
+@@ -36,14 +36,14 @@ static size_t skb_read_bits(skb_reader_t *desc, void *to, size_t len)
+ }
+ 
+ /**
+- * skb_read_and_csum_bits - copy and checksum from skb to buffer
++ * xdr_skb_read_and_csum_bits - copy and checksum from skb to buffer
+  * @desc: sk_buff copy helper
+  * @to: copy destination
+  * @len: number of bytes to copy
+  *
+  * Same as skb_read_bits, but calculate a checksum at the same time.
+  */
+-static size_t skb_read_and_csum_bits(skb_reader_t *desc, void *to, size_t len)
++static size_t xdr_skb_read_and_csum_bits(skb_reader_t *desc, void *to, size_t len)
+ {
+ 	unsigned int pos;
+ 	__wsum csum2;
+@@ -158,7 +158,7 @@ int csum_partial_copy_to_xdr(struct xdr_buf *xdr, struct sk_buff *skb)
+ 		goto no_checksum;
+ 
+ 	desc.csum = csum_partial(skb->data, desc.offset, skb->csum);
+-	if (xdr_partial_copy_from_skb(xdr, 0, &desc, skb_read_and_csum_bits) < 0)
++	if (xdr_partial_copy_from_skb(xdr, 0, &desc, xdr_skb_read_and_csum_bits) < 0)
+ 		return -1;
+ 	if (desc.offset != skb->len) {
+ 		__wsum csum2;
+@@ -173,7 +173,7 @@ int csum_partial_copy_to_xdr(struct xdr_buf *xdr, struct sk_buff *skb)
+ 		netdev_rx_csum_fault(skb->dev);
+ 	return 0;
+ no_checksum:
+-	if (xdr_partial_copy_from_skb(xdr, 0, &desc, skb_read_bits) < 0)
++	if (xdr_partial_copy_from_skb(xdr, 0, &desc, xdr_skb_read_bits) < 0)
+ 		return -1;
+ 	if (desc.count)
+ 		return -1;
+
+commit 5f92a7388a29594d6c365b23a48d4bb8299a3ea7
+Author: Al Viro <viro@zeniv.linux.org.uk>
+Date:   Tue Nov 14 21:36:54 2006 -0800
+
+    [NET]: Annotate callers of the reset of checksum.h stuff.
+    
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/sunrpc/socklib.c b/net/sunrpc/socklib.c
+index 61a038fc30cf..2635c543ba06 100644
+--- a/net/sunrpc/socklib.c
++++ b/net/sunrpc/socklib.c
+@@ -45,7 +45,8 @@ static size_t skb_read_bits(skb_reader_t *desc, void *to, size_t len)
+  */
+ static size_t skb_read_and_csum_bits(skb_reader_t *desc, void *to, size_t len)
+ {
+-	unsigned int	csum2, pos;
++	unsigned int pos;
++	__wsum csum2;
+ 
+ 	if (len > desc->count)
+ 		len = desc->count;
+@@ -160,7 +161,7 @@ int csum_partial_copy_to_xdr(struct xdr_buf *xdr, struct sk_buff *skb)
+ 	if (xdr_partial_copy_from_skb(xdr, 0, &desc, skb_read_and_csum_bits) < 0)
+ 		return -1;
+ 	if (desc.offset != skb->len) {
+-		unsigned int csum2;
++		__wsum csum2;
+ 		csum2 = skb_checksum(skb, desc.offset, skb->len - desc.offset, 0);
+ 		desc.csum = csum_block_add(desc.csum, csum2, desc.offset);
+ 	}
+
+commit d3bc23e7ee9db8023dff5a86bb3b0069ed018789
+Author: Al Viro <viro@zeniv.linux.org.uk>
+Date:   Tue Nov 14 21:24:49 2006 -0800
+
+    [NET]: Annotate callers of csum_fold() in net/*
+    
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/sunrpc/socklib.c b/net/sunrpc/socklib.c
+index 6f17527b9e69..61a038fc30cf 100644
+--- a/net/sunrpc/socklib.c
++++ b/net/sunrpc/socklib.c
+@@ -166,7 +166,7 @@ int csum_partial_copy_to_xdr(struct xdr_buf *xdr, struct sk_buff *skb)
+ 	}
+ 	if (desc.count)
+ 		return -1;
+-	if ((unsigned short)csum_fold(desc.csum))
++	if (csum_fold(desc.csum))
+ 		return -1;
+ 	if (unlikely(skb->ip_summed == CHECKSUM_COMPLETE))
+ 		netdev_rx_csum_fault(skb->dev);
+
+commit 84fa7933a33f806bbbaae6775e87459b1ec584c0
+Author: Patrick McHardy <kaber@trash.net>
+Date:   Tue Aug 29 16:44:56 2006 -0700
+
+    [NET]: Replace CHECKSUM_HW by CHECKSUM_PARTIAL/CHECKSUM_COMPLETE
+    
+    Replace CHECKSUM_HW by CHECKSUM_PARTIAL (for outgoing packets, whose
+    checksum still needs to be completed) and CHECKSUM_COMPLETE (for
+    incoming packets, device supplied full checksum).
+    
+    Patch originally from Herbert Xu, updated by myself for 2.6.18-rc3.
+    
+    Signed-off-by: Patrick McHardy <kaber@trash.net>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/sunrpc/socklib.c b/net/sunrpc/socklib.c
+index eb330d4f66d6..6f17527b9e69 100644
+--- a/net/sunrpc/socklib.c
++++ b/net/sunrpc/socklib.c
+@@ -168,7 +168,7 @@ int csum_partial_copy_to_xdr(struct xdr_buf *xdr, struct sk_buff *skb)
+ 		return -1;
+ 	if ((unsigned short)csum_fold(desc.csum))
+ 		return -1;
+-	if (unlikely(skb->ip_summed == CHECKSUM_HW))
++	if (unlikely(skb->ip_summed == CHECKSUM_COMPLETE))
+ 		netdev_rx_csum_fault(skb->dev);
+ 	return 0;
+ no_checksum:
+
+commit fb286bb2990a107009dbf25f6ffebeb7df77f9be
+Author: Herbert Xu <herbert@gondor.apana.org.au>
+Date:   Thu Nov 10 13:01:24 2005 -0800
+
+    [NET]: Detect hardware rx checksum faults correctly
+    
+    Here is the patch that introduces the generic skb_checksum_complete
+    which also checks for hardware RX checksum faults.  If that happens,
+    it'll call netdev_rx_csum_fault which currently prints out a stack
+    trace with the device name.  In future it can turn off RX checksum.
+    
+    I've converted every spot under net/ that does RX checksum checks to
+    use skb_checksum_complete or __skb_checksum_complete with the
+    exceptions of:
+    
+    * Those places where checksums are done bit by bit.  These will call
+    netdev_rx_csum_fault directly.
+    
+    * The following have not been completely checked/converted:
+    
+    ipmr
+    ip_vs
+    netfilter
+    dccp
+    
+    This patch is based on patches and suggestions from Stephen Hemminger
+    and David S. Miller.
+    
+    Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/sunrpc/socklib.c b/net/sunrpc/socklib.c
+index 8f97e90f36c8..eb330d4f66d6 100644
+--- a/net/sunrpc/socklib.c
++++ b/net/sunrpc/socklib.c
+@@ -6,6 +6,9 @@
+  * Copyright (C) 1995, 1996 Olaf Kirch <okir@monad.swb.de>
+  */
+ 
++#include <linux/compiler.h>
++#include <linux/netdevice.h>
++#include <linux/skbuff.h>
+ #include <linux/types.h>
+ #include <linux/pagemap.h>
+ #include <linux/udp.h>
+@@ -165,6 +168,8 @@ int csum_partial_copy_to_xdr(struct xdr_buf *xdr, struct sk_buff *skb)
+ 		return -1;
+ 	if ((unsigned short)csum_fold(desc.csum))
+ 		return -1;
++	if (unlikely(skb->ip_summed == CHECKSUM_HW))
++		netdev_rx_csum_fault(skb->dev);
+ 	return 0;
+ no_checksum:
+ 	if (xdr_partial_copy_from_skb(xdr, 0, &desc, skb_read_bits) < 0)
+
+commit 094bb20b9fcab3a1652a77741caba6b78097d622
+Author: Chuck Lever <cel@citi.umich.edu>
+Date:   Thu Aug 11 16:25:20 2005 -0400
+
+    [PATCH] RPC: extract socket logic common to both client and server
+    
+     Clean-up: Move some code that is common to both RPC client- and server-side
+     socket transports into its own source file, net/sunrpc/socklib.c.
+    
+     Test-plan:
+     Compile kernel with CONFIG_NFS enabled.  Millions of fsx operations over
+     UDP, client and server.  Connectathon over UDP.
+    
+     Version: Thu, 11 Aug 2005 16:03:09 -0400
+    
+     Signed-off-by: Chuck Lever <cel@netapp.com>
+     Signed-off-by: Trond Myklebust <Trond.Myklebust@netapp.com>
+
+diff --git a/net/sunrpc/socklib.c b/net/sunrpc/socklib.c
+new file mode 100644
+index 000000000000..8f97e90f36c8
+--- /dev/null
++++ b/net/sunrpc/socklib.c
+@@ -0,0 +1,175 @@
++/*
++ * linux/net/sunrpc/socklib.c
++ *
++ * Common socket helper routines for RPC client and server
++ *
++ * Copyright (C) 1995, 1996 Olaf Kirch <okir@monad.swb.de>
++ */
++
++#include <linux/types.h>
++#include <linux/pagemap.h>
++#include <linux/udp.h>
++#include <linux/sunrpc/xdr.h>
++
++
++/**
++ * skb_read_bits - copy some data bits from skb to internal buffer
++ * @desc: sk_buff copy helper
++ * @to: copy destination
++ * @len: number of bytes to copy
++ *
++ * Possibly called several times to iterate over an sk_buff and copy
++ * data out of it.
++ */
++static size_t skb_read_bits(skb_reader_t *desc, void *to, size_t len)
++{
++	if (len > desc->count)
++		len = desc->count;
++	if (skb_copy_bits(desc->skb, desc->offset, to, len))
++		return 0;
++	desc->count -= len;
++	desc->offset += len;
++	return len;
++}
++
++/**
++ * skb_read_and_csum_bits - copy and checksum from skb to buffer
++ * @desc: sk_buff copy helper
++ * @to: copy destination
++ * @len: number of bytes to copy
++ *
++ * Same as skb_read_bits, but calculate a checksum at the same time.
++ */
++static size_t skb_read_and_csum_bits(skb_reader_t *desc, void *to, size_t len)
++{
++	unsigned int	csum2, pos;
++
++	if (len > desc->count)
++		len = desc->count;
++	pos = desc->offset;
++	csum2 = skb_copy_and_csum_bits(desc->skb, pos, to, len, 0);
++	desc->csum = csum_block_add(desc->csum, csum2, pos);
++	desc->count -= len;
++	desc->offset += len;
++	return len;
++}
++
++/**
++ * xdr_partial_copy_from_skb - copy data out of an skb
++ * @xdr: target XDR buffer
++ * @base: starting offset
++ * @desc: sk_buff copy helper
++ * @copy_actor: virtual method for copying data
++ *
++ */
++ssize_t xdr_partial_copy_from_skb(struct xdr_buf *xdr, unsigned int base, skb_reader_t *desc, skb_read_actor_t copy_actor)
++{
++	struct page	**ppage = xdr->pages;
++	unsigned int	len, pglen = xdr->page_len;
++	ssize_t		copied = 0;
++	int		ret;
++
++	len = xdr->head[0].iov_len;
++	if (base < len) {
++		len -= base;
++		ret = copy_actor(desc, (char *)xdr->head[0].iov_base + base, len);
++		copied += ret;
++		if (ret != len || !desc->count)
++			goto out;
++		base = 0;
++	} else
++		base -= len;
++
++	if (unlikely(pglen == 0))
++		goto copy_tail;
++	if (unlikely(base >= pglen)) {
++		base -= pglen;
++		goto copy_tail;
++	}
++	if (base || xdr->page_base) {
++		pglen -= base;
++		base += xdr->page_base;
++		ppage += base >> PAGE_CACHE_SHIFT;
++		base &= ~PAGE_CACHE_MASK;
++	}
++	do {
++		char *kaddr;
++
++		/* ACL likes to be lazy in allocating pages - ACLs
++		 * are small by default but can get huge. */
++		if (unlikely(*ppage == NULL)) {
++			*ppage = alloc_page(GFP_ATOMIC);
++			if (unlikely(*ppage == NULL)) {
++				if (copied == 0)
++					copied = -ENOMEM;
++				goto out;
++			}
++		}
++
++		len = PAGE_CACHE_SIZE;
++		kaddr = kmap_atomic(*ppage, KM_SKB_SUNRPC_DATA);
++		if (base) {
++			len -= base;
++			if (pglen < len)
++				len = pglen;
++			ret = copy_actor(desc, kaddr + base, len);
++			base = 0;
++		} else {
++			if (pglen < len)
++				len = pglen;
++			ret = copy_actor(desc, kaddr, len);
++		}
++		flush_dcache_page(*ppage);
++		kunmap_atomic(kaddr, KM_SKB_SUNRPC_DATA);
++		copied += ret;
++		if (ret != len || !desc->count)
++			goto out;
++		ppage++;
++	} while ((pglen -= len) != 0);
++copy_tail:
++	len = xdr->tail[0].iov_len;
++	if (base < len)
++		copied += copy_actor(desc, (char *)xdr->tail[0].iov_base + base, len - base);
++out:
++	return copied;
++}
++
++/**
++ * csum_partial_copy_to_xdr - checksum and copy data
++ * @xdr: target XDR buffer
++ * @skb: source skb
++ *
++ * We have set things up such that we perform the checksum of the UDP
++ * packet in parallel with the copies into the RPC client iovec.  -DaveM
++ */
++int csum_partial_copy_to_xdr(struct xdr_buf *xdr, struct sk_buff *skb)
++{
++	skb_reader_t	desc;
++
++	desc.skb = skb;
++	desc.offset = sizeof(struct udphdr);
++	desc.count = skb->len - desc.offset;
++
++	if (skb->ip_summed == CHECKSUM_UNNECESSARY)
++		goto no_checksum;
++
++	desc.csum = csum_partial(skb->data, desc.offset, skb->csum);
++	if (xdr_partial_copy_from_skb(xdr, 0, &desc, skb_read_and_csum_bits) < 0)
++		return -1;
++	if (desc.offset != skb->len) {
++		unsigned int csum2;
++		csum2 = skb_checksum(skb, desc.offset, skb->len - desc.offset, 0);
++		desc.csum = csum_block_add(desc.csum, csum2, desc.offset);
++	}
++	if (desc.count)
++		return -1;
++	if ((unsigned short)csum_fold(desc.csum))
++		return -1;
++	return 0;
++no_checksum:
++	if (xdr_partial_copy_from_skb(xdr, 0, &desc, skb_read_bits) < 0)
++		return -1;
++	if (desc.count)
++		return -1;
++	return 0;
++}

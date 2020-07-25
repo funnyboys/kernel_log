@@ -1,0 +1,1378 @@
+commit 457f44363a8894135c85b7a9afd2bd8196db24ab
+Author: Andrii Nakryiko <andriin@fb.com>
+Date:   Fri May 29 00:54:20 2020 -0700
+
+    bpf: Implement BPF ring buffer and verifier support for it
+    
+    This commit adds a new MPSC ring buffer implementation into BPF ecosystem,
+    which allows multiple CPUs to submit data to a single shared ring buffer. On
+    the consumption side, only single consumer is assumed.
+    
+    Motivation
+    ----------
+    There are two distinctive motivators for this work, which are not satisfied by
+    existing perf buffer, which prompted creation of a new ring buffer
+    implementation.
+      - more efficient memory utilization by sharing ring buffer across CPUs;
+      - preserving ordering of events that happen sequentially in time, even
+      across multiple CPUs (e.g., fork/exec/exit events for a task).
+    
+    These two problems are independent, but perf buffer fails to satisfy both.
+    Both are a result of a choice to have per-CPU perf ring buffer.  Both can be
+    also solved by having an MPSC implementation of ring buffer. The ordering
+    problem could technically be solved for perf buffer with some in-kernel
+    counting, but given the first one requires an MPSC buffer, the same solution
+    would solve the second problem automatically.
+    
+    Semantics and APIs
+    ------------------
+    Single ring buffer is presented to BPF programs as an instance of BPF map of
+    type BPF_MAP_TYPE_RINGBUF. Two other alternatives considered, but ultimately
+    rejected.
+    
+    One way would be to, similar to BPF_MAP_TYPE_PERF_EVENT_ARRAY, make
+    BPF_MAP_TYPE_RINGBUF could represent an array of ring buffers, but not enforce
+    "same CPU only" rule. This would be more familiar interface compatible with
+    existing perf buffer use in BPF, but would fail if application needed more
+    advanced logic to lookup ring buffer by arbitrary key. HASH_OF_MAPS addresses
+    this with current approach. Additionally, given the performance of BPF
+    ringbuf, many use cases would just opt into a simple single ring buffer shared
+    among all CPUs, for which current approach would be an overkill.
+    
+    Another approach could introduce a new concept, alongside BPF map, to
+    represent generic "container" object, which doesn't necessarily have key/value
+    interface with lookup/update/delete operations. This approach would add a lot
+    of extra infrastructure that has to be built for observability and verifier
+    support. It would also add another concept that BPF developers would have to
+    familiarize themselves with, new syntax in libbpf, etc. But then would really
+    provide no additional benefits over the approach of using a map.
+    BPF_MAP_TYPE_RINGBUF doesn't support lookup/update/delete operations, but so
+    doesn't few other map types (e.g., queue and stack; array doesn't support
+    delete, etc).
+    
+    The approach chosen has an advantage of re-using existing BPF map
+    infrastructure (introspection APIs in kernel, libbpf support, etc), being
+    familiar concept (no need to teach users a new type of object in BPF program),
+    and utilizing existing tooling (bpftool). For common scenario of using
+    a single ring buffer for all CPUs, it's as simple and straightforward, as
+    would be with a dedicated "container" object. On the other hand, by being
+    a map, it can be combined with ARRAY_OF_MAPS and HASH_OF_MAPS map-in-maps to
+    implement a wide variety of topologies, from one ring buffer for each CPU
+    (e.g., as a replacement for perf buffer use cases), to a complicated
+    application hashing/sharding of ring buffers (e.g., having a small pool of
+    ring buffers with hashed task's tgid being a look up key to preserve order,
+    but reduce contention).
+    
+    Key and value sizes are enforced to be zero. max_entries is used to specify
+    the size of ring buffer and has to be a power of 2 value.
+    
+    There are a bunch of similarities between perf buffer
+    (BPF_MAP_TYPE_PERF_EVENT_ARRAY) and new BPF ring buffer semantics:
+      - variable-length records;
+      - if there is no more space left in ring buffer, reservation fails, no
+        blocking;
+      - memory-mappable data area for user-space applications for ease of
+        consumption and high performance;
+      - epoll notifications for new incoming data;
+      - but still the ability to do busy polling for new data to achieve the
+        lowest latency, if necessary.
+    
+    BPF ringbuf provides two sets of APIs to BPF programs:
+      - bpf_ringbuf_output() allows to *copy* data from one place to a ring
+        buffer, similarly to bpf_perf_event_output();
+      - bpf_ringbuf_reserve()/bpf_ringbuf_commit()/bpf_ringbuf_discard() APIs
+        split the whole process into two steps. First, a fixed amount of space is
+        reserved. If successful, a pointer to a data inside ring buffer data area
+        is returned, which BPF programs can use similarly to a data inside
+        array/hash maps. Once ready, this piece of memory is either committed or
+        discarded. Discard is similar to commit, but makes consumer ignore the
+        record.
+    
+    bpf_ringbuf_output() has disadvantage of incurring extra memory copy, because
+    record has to be prepared in some other place first. But it allows to submit
+    records of the length that's not known to verifier beforehand. It also closely
+    matches bpf_perf_event_output(), so will simplify migration significantly.
+    
+    bpf_ringbuf_reserve() avoids the extra copy of memory by providing a memory
+    pointer directly to ring buffer memory. In a lot of cases records are larger
+    than BPF stack space allows, so many programs have use extra per-CPU array as
+    a temporary heap for preparing sample. bpf_ringbuf_reserve() avoid this needs
+    completely. But in exchange, it only allows a known constant size of memory to
+    be reserved, such that verifier can verify that BPF program can't access
+    memory outside its reserved record space. bpf_ringbuf_output(), while slightly
+    slower due to extra memory copy, covers some use cases that are not suitable
+    for bpf_ringbuf_reserve().
+    
+    The difference between commit and discard is very small. Discard just marks
+    a record as discarded, and such records are supposed to be ignored by consumer
+    code. Discard is useful for some advanced use-cases, such as ensuring
+    all-or-nothing multi-record submission, or emulating temporary malloc()/free()
+    within single BPF program invocation.
+    
+    Each reserved record is tracked by verifier through existing
+    reference-tracking logic, similar to socket ref-tracking. It is thus
+    impossible to reserve a record, but forget to submit (or discard) it.
+    
+    bpf_ringbuf_query() helper allows to query various properties of ring buffer.
+    Currently 4 are supported:
+      - BPF_RB_AVAIL_DATA returns amount of unconsumed data in ring buffer;
+      - BPF_RB_RING_SIZE returns the size of ring buffer;
+      - BPF_RB_CONS_POS/BPF_RB_PROD_POS returns current logical possition of
+        consumer/producer, respectively.
+    Returned values are momentarily snapshots of ring buffer state and could be
+    off by the time helper returns, so this should be used only for
+    debugging/reporting reasons or for implementing various heuristics, that take
+    into account highly-changeable nature of some of those characteristics.
+    
+    One such heuristic might involve more fine-grained control over poll/epoll
+    notifications about new data availability in ring buffer. Together with
+    BPF_RB_NO_WAKEUP/BPF_RB_FORCE_WAKEUP flags for output/commit/discard helpers,
+    it allows BPF program a high degree of control and, e.g., more efficient
+    batched notifications. Default self-balancing strategy, though, should be
+    adequate for most applications and will work reliable and efficiently already.
+    
+    Design and implementation
+    -------------------------
+    This reserve/commit schema allows a natural way for multiple producers, either
+    on different CPUs or even on the same CPU/in the same BPF program, to reserve
+    independent records and work with them without blocking other producers. This
+    means that if BPF program was interruped by another BPF program sharing the
+    same ring buffer, they will both get a record reserved (provided there is
+    enough space left) and can work with it and submit it independently. This
+    applies to NMI context as well, except that due to using a spinlock during
+    reservation, in NMI context, bpf_ringbuf_reserve() might fail to get a lock,
+    in which case reservation will fail even if ring buffer is not full.
+    
+    The ring buffer itself internally is implemented as a power-of-2 sized
+    circular buffer, with two logical and ever-increasing counters (which might
+    wrap around on 32-bit architectures, that's not a problem):
+      - consumer counter shows up to which logical position consumer consumed the
+        data;
+      - producer counter denotes amount of data reserved by all producers.
+    
+    Each time a record is reserved, producer that "owns" the record will
+    successfully advance producer counter. At that point, data is still not yet
+    ready to be consumed, though. Each record has 8 byte header, which contains
+    the length of reserved record, as well as two extra bits: busy bit to denote
+    that record is still being worked on, and discard bit, which might be set at
+    commit time if record is discarded. In the latter case, consumer is supposed
+    to skip the record and move on to the next one. Record header also encodes
+    record's relative offset from the beginning of ring buffer data area (in
+    pages). This allows bpf_ringbuf_commit()/bpf_ringbuf_discard() to accept only
+    the pointer to the record itself, without requiring also the pointer to ring
+    buffer itself. Ring buffer memory location will be restored from record
+    metadata header. This significantly simplifies verifier, as well as improving
+    API usability.
+    
+    Producer counter increments are serialized under spinlock, so there is
+    a strict ordering between reservations. Commits, on the other hand, are
+    completely lockless and independent. All records become available to consumer
+    in the order of reservations, but only after all previous records where
+    already committed. It is thus possible for slow producers to temporarily hold
+    off submitted records, that were reserved later.
+    
+    Reservation/commit/consumer protocol is verified by litmus tests in
+    Documentation/litmus-test/bpf-rb.
+    
+    One interesting implementation bit, that significantly simplifies (and thus
+    speeds up as well) implementation of both producers and consumers is how data
+    area is mapped twice contiguously back-to-back in the virtual memory. This
+    allows to not take any special measures for samples that have to wrap around
+    at the end of the circular buffer data area, because the next page after the
+    last data page would be first data page again, and thus the sample will still
+    appear completely contiguous in virtual memory. See comment and a simple ASCII
+    diagram showing this visually in bpf_ringbuf_area_alloc().
+    
+    Another feature that distinguishes BPF ringbuf from perf ring buffer is
+    a self-pacing notifications of new data being availability.
+    bpf_ringbuf_commit() implementation will send a notification of new record
+    being available after commit only if consumer has already caught up right up
+    to the record being committed. If not, consumer still has to catch up and thus
+    will see new data anyways without needing an extra poll notification.
+    Benchmarks (see tools/testing/selftests/bpf/benchs/bench_ringbuf.c) show that
+    this allows to achieve a very high throughput without having to resort to
+    tricks like "notify only every Nth sample", which are necessary with perf
+    buffer. For extreme cases, when BPF program wants more manual control of
+    notifications, commit/discard/output helpers accept BPF_RB_NO_WAKEUP and
+    BPF_RB_FORCE_WAKEUP flags, which give full control over notifications of data
+    availability, but require extra caution and diligence in using this API.
+    
+    Comparison to alternatives
+    --------------------------
+    Before considering implementing BPF ring buffer from scratch existing
+    alternatives in kernel were evaluated, but didn't seem to meet the needs. They
+    largely fell into few categores:
+      - per-CPU buffers (perf, ftrace, etc), which don't satisfy two motivations
+        outlined above (ordering and memory consumption);
+      - linked list-based implementations; while some were multi-producer designs,
+        consuming these from user-space would be very complicated and most
+        probably not performant; memory-mapping contiguous piece of memory is
+        simpler and more performant for user-space consumers;
+      - io_uring is SPSC, but also requires fixed-sized elements. Naively turning
+        SPSC queue into MPSC w/ lock would have subpar performance compared to
+        locked reserve + lockless commit, as with BPF ring buffer. Fixed sized
+        elements would be too limiting for BPF programs, given existing BPF
+        programs heavily rely on variable-sized perf buffer already;
+      - specialized implementations (like a new printk ring buffer, [0]) with lots
+        of printk-specific limitations and implications, that didn't seem to fit
+        well for intended use with BPF programs.
+    
+      [0] https://lwn.net/Articles/779550/
+    
+    Signed-off-by: Andrii Nakryiko <andriin@fb.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+    Link: https://lore.kernel.org/bpf/20200529075424.3139988-2-andriin@fb.com
+    Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+
+diff --git a/tools/testing/selftests/bpf/verifier/bounds.c b/tools/testing/selftests/bpf/verifier/bounds.c
+index 58f4aa593b1b..4d6645f2874c 100644
+--- a/tools/testing/selftests/bpf/verifier/bounds.c
++++ b/tools/testing/selftests/bpf/verifier/bounds.c
+@@ -20,7 +20,7 @@
+ 	BPF_EXIT_INSN(),
+ 	},
+ 	.fixup_map_hash_8b = { 3 },
+-	.errstr = "R0 max value is outside of the array range",
++	.errstr = "R0 max value is outside of the allowed memory range",
+ 	.result = REJECT,
+ },
+ {
+@@ -146,7 +146,7 @@
+ 	BPF_EXIT_INSN(),
+ 	},
+ 	.fixup_map_hash_8b = { 3 },
+-	.errstr = "R0 min value is outside of the array range",
++	.errstr = "R0 min value is outside of the allowed memory range",
+ 	.result = REJECT
+ },
+ {
+@@ -354,7 +354,7 @@
+ 	BPF_EXIT_INSN(),
+ 	},
+ 	.fixup_map_hash_8b = { 3 },
+-	.errstr = "R0 max value is outside of the array range",
++	.errstr = "R0 max value is outside of the allowed memory range",
+ 	.result = REJECT
+ },
+ {
+
+commit cf66c29bd7534813d2e1971fab71e25fe87c7e0a
+Author: John Fastabend <john.fastabend@gmail.com>
+Date:   Fri May 29 10:29:18 2020 -0700
+
+    bpf, selftests: Add a verifier test for assigning 32bit reg states to 64bit ones
+    
+    Added a verifier test for assigning 32bit reg states to
+    64bit where 32bit reg holds a constant value of 0.
+    
+    Without previous kernel verifier.c fix, the test in
+    this patch will fail.
+    
+    Signed-off-by: Yonghong Song <yhs@fb.com>
+    Signed-off-by: John Fastabend <john.fastabend@gmail.com>
+    Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+    Link: https://lore.kernel.org/bpf/159077335867.6014.2075350327073125374.stgit@john-Precision-5820-Tower
+
+diff --git a/tools/testing/selftests/bpf/verifier/bounds.c b/tools/testing/selftests/bpf/verifier/bounds.c
+index fafa5409bdac..58f4aa593b1b 100644
+--- a/tools/testing/selftests/bpf/verifier/bounds.c
++++ b/tools/testing/selftests/bpf/verifier/bounds.c
+@@ -535,3 +535,25 @@
+ 	},
+ 	.result = ACCEPT
+ },
++{
++	"assigning 32bit bounds to 64bit for wA = 0, wB = wA",
++	.insns = {
++	BPF_LDX_MEM(BPF_W, BPF_REG_8, BPF_REG_1,
++		    offsetof(struct __sk_buff, data_end)),
++	BPF_LDX_MEM(BPF_W, BPF_REG_7, BPF_REG_1,
++		    offsetof(struct __sk_buff, data)),
++	BPF_MOV32_IMM(BPF_REG_9, 0),
++	BPF_MOV32_REG(BPF_REG_2, BPF_REG_9),
++	BPF_MOV64_REG(BPF_REG_6, BPF_REG_7),
++	BPF_ALU64_REG(BPF_ADD, BPF_REG_6, BPF_REG_2),
++	BPF_MOV64_REG(BPF_REG_3, BPF_REG_6),
++	BPF_ALU64_IMM(BPF_ADD, BPF_REG_3, 8),
++	BPF_JMP_REG(BPF_JGT, BPF_REG_3, BPF_REG_8, 1),
++	BPF_LDX_MEM(BPF_W, BPF_REG_5, BPF_REG_6, 0),
++	BPF_MOV64_IMM(BPF_REG_0, 0),
++	BPF_EXIT_INSN(),
++	},
++	.prog_type = BPF_PROG_TYPE_SCHED_CLS,
++	.result = ACCEPT,
++	.flags = F_NEEDS_EFFICIENT_UNALIGNED_ACCESS,
++},
+
+commit e3effcdfe02eb20f23d4f1833c75658ddc49e65a
+Author: John Fastabend <john.fastabend@gmail.com>
+Date:   Fri May 29 10:28:59 2020 -0700
+
+    bpf, selftests: Verifier bounds tests need to be updated
+    
+    After previous fix for zero extension test_verifier tests #65 and #66 now
+    fail. Before the fix we can see the alu32 mov op at insn 10
+    
+    10: R0_w=map_value(id=0,off=0,ks=8,vs=8,imm=0)
+        R1_w=invP(id=0,
+                  smin_value=4294967168,smax_value=4294967423,
+                  umin_value=4294967168,umax_value=4294967423,
+                  var_off=(0x0; 0x1ffffffff),
+                  s32_min_value=-2147483648,s32_max_value=2147483647,
+                  u32_min_value=0,u32_max_value=-1)
+        R10=fp0 fp-8_w=mmmmmmmm
+    10: (bc) w1 = w1
+    11: R0_w=map_value(id=0,off=0,ks=8,vs=8,imm=0)
+        R1_w=invP(id=0,
+                  smin_value=0,smax_value=2147483647,
+                  umin_value=0,umax_value=4294967295,
+                  var_off=(0x0; 0xffffffff),
+                  s32_min_value=-2147483648,s32_max_value=2147483647,
+                  u32_min_value=0,u32_max_value=-1)
+        R10=fp0 fp-8_w=mmmmmmmm
+    
+    After the fix at insn 10 because we have 's32_min_value < 0' the following
+    step 11 now has 'smax_value=U32_MAX' where before we pulled the s32_max_value
+    bound into the smax_value as seen above in 11 with smax_value=2147483647.
+    
+    10: R0_w=map_value(id=0,off=0,ks=8,vs=8,imm=0)
+        R1_w=inv(id=0,
+                 smin_value=4294967168,smax_value=4294967423,
+                 umin_value=4294967168,umax_value=4294967423,
+                 var_off=(0x0; 0x1ffffffff),
+                 s32_min_value=-2147483648, s32_max_value=2147483647,
+                 u32_min_value=0,u32_max_value=-1)
+        R10=fp0 fp-8_w=mmmmmmmm
+    10: (bc) w1 = w1
+    11: R0_w=map_value(id=0,off=0,ks=8,vs=8,imm=0)
+        R1_w=inv(id=0,
+                 smin_value=0,smax_value=4294967295,
+                 umin_value=0,umax_value=4294967295,
+                 var_off=(0x0; 0xffffffff),
+                 s32_min_value=-2147483648, s32_max_value=2147483647,
+                 u32_min_value=0, u32_max_value=-1)
+        R10=fp0 fp-8_w=mmmmmmmm
+    
+    The fall out of this is by the time we get to the failing instruction at
+    step 14 where previously we had the following:
+    
+    14: R0_w=map_value(id=0,off=0,ks=8,vs=8,imm=0)
+        R1_w=inv(id=0,
+                 smin_value=72057594021150720,smax_value=72057594029539328,
+                 umin_value=72057594021150720,umax_value=72057594029539328,
+                 var_off=(0xffffffff000000; 0xffffff),
+                 s32_min_value=-16777216,s32_max_value=-1,
+                 u32_min_value=-16777216,u32_max_value=-1)
+        R10=fp0 fp-8_w=mmmmmmmm
+    14: (0f) r0 += r1
+    
+    We now have,
+    
+    14: R0_w=map_value(id=0,off=0,ks=8,vs=8,imm=0)
+        R1_w=inv(id=0,
+                 smin_value=0,smax_value=72057594037927935,
+                 umin_value=0,umax_value=72057594037927935,
+                 var_off=(0x0; 0xffffffffffffff),
+                 s32_min_value=-2147483648,s32_max_value=2147483647,
+                 u32_min_value=0,u32_max_value=-1)
+        R10=fp0 fp-8_w=mmmmmmmm
+    14: (0f) r0 += r1
+    
+    In the original step 14 'smin_value=72057594021150720' this trips the logic
+    in the verifier function check_reg_sane_offset(),
+    
+     if (smin >= BPF_MAX_VAR_OFF || smin <= -BPF_MAX_VAR_OFF) {
+            verbose(env, "value %lld makes %s pointer be out of bounds\n",
+                    smin, reg_type_str[type]);
+            return false;
+     }
+    
+    Specifically, the 'smin <= -BPF_MAX_VAR_OFF' check. But with the fix
+    at step 14 we have bounds 'smin_value=0' so the above check is not tripped
+    because BPF_MAX_VAR_OFF=1<<29.
+    
+    We have a smin_value=0 here because at step 10 the smaller smin_value=0 means
+    the subtractions at steps 11 and 12 bring the smin_value negative.
+    
+    11: (17) r1 -= 2147483584
+    12: (17) r1 -= 2147483584
+    13: (77) r1 >>= 8
+    
+    Then the shift clears the top bit and smin_value is set to 0. Note we still
+    have the smax_value in the fixed code so any reads will fail. An alternative
+    would be to have reg_sane_check() do both smin and smax value tests.
+    
+    To fix the test we can omit the 'r1 >>=8' at line 13. This will change the
+    err string, but keeps the intention of the test as suggseted by the title,
+    "check after truncation of boundary-crossing range". If the verifier logic
+    changes a different value is likely to be thrown in the error or the error
+    will no longer be thrown forcing this test to be examined. With this change
+    we see the new state at step 13.
+    
+    13: R0_w=map_value(id=0,off=0,ks=8,vs=8,imm=0)
+        R1_w=invP(id=0,
+                  smin_value=-4294967168,smax_value=127,
+                  umin_value=0,umax_value=18446744073709551615,
+                  s32_min_value=-2147483648,s32_max_value=2147483647,
+                  u32_min_value=0,u32_max_value=-1)
+        R10=fp0 fp-8_w=mmmmmmmm
+    
+    Giving the expected out of bounds error, "value -4294967168 makes map_value
+    pointer be out of bounds" However, for unpriv case we see a different error
+    now because of the mixed signed bounds pointer arithmatic. This seems OK so
+    I've only added the unpriv_errstr for this. Another optino may have been to
+    do addition on r1 instead of subtraction but I favor the approach above
+    slightly.
+    
+    Signed-off-by: John Fastabend <john.fastabend@gmail.com>
+    Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+    Acked-by: Yonghong Song <yhs@fb.com>
+    Link: https://lore.kernel.org/bpf/159077333942.6014.14004320043595756079.stgit@john-Precision-5820-Tower
+
+diff --git a/tools/testing/selftests/bpf/verifier/bounds.c b/tools/testing/selftests/bpf/verifier/bounds.c
+index a253a064e6e0..fafa5409bdac 100644
+--- a/tools/testing/selftests/bpf/verifier/bounds.c
++++ b/tools/testing/selftests/bpf/verifier/bounds.c
+@@ -238,7 +238,7 @@
+ 	BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, -8),
+ 	BPF_LD_MAP_FD(BPF_REG_1, 0),
+ 	BPF_RAW_INSN(BPF_JMP | BPF_CALL, 0, 0, 0, BPF_FUNC_map_lookup_elem),
+-	BPF_JMP_IMM(BPF_JEQ, BPF_REG_0, 0, 9),
++	BPF_JMP_IMM(BPF_JEQ, BPF_REG_0, 0, 8),
+ 	/* r1 = [0x00, 0xff] */
+ 	BPF_LDX_MEM(BPF_B, BPF_REG_1, BPF_REG_0, 0),
+ 	BPF_ALU64_IMM(BPF_ADD, BPF_REG_1, 0xffffff80 >> 1),
+@@ -253,10 +253,6 @@
+ 	 *      [0xffff'ffff'0000'0080, 0xffff'ffff'ffff'ffff]
+ 	 */
+ 	BPF_ALU64_IMM(BPF_SUB, BPF_REG_1, 0xffffff80 >> 1),
+-	/* r1 = 0 or
+-	 *      [0x00ff'ffff'ff00'0000, 0x00ff'ffff'ffff'ffff]
+-	 */
+-	BPF_ALU64_IMM(BPF_RSH, BPF_REG_1, 8),
+ 	/* error on OOB pointer computation */
+ 	BPF_ALU64_REG(BPF_ADD, BPF_REG_0, BPF_REG_1),
+ 	/* exit */
+@@ -265,8 +261,10 @@
+ 	},
+ 	.fixup_map_hash_8b = { 3 },
+ 	/* not actually fully unbounded, but the bound is very high */
+-	.errstr = "value 72057594021150720 makes map_value pointer be out of bounds",
+-	.result = REJECT
++	.errstr_unpriv = "R1 has unknown scalar with mixed signed bounds, pointer arithmetic with it prohibited for !root",
++	.result_unpriv = REJECT,
++	.errstr = "value -4294967168 makes map_value pointer be out of bounds",
++	.result = REJECT,
+ },
+ {
+ 	"bounds check after truncation of boundary-crossing range (2)",
+@@ -276,7 +274,7 @@
+ 	BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, -8),
+ 	BPF_LD_MAP_FD(BPF_REG_1, 0),
+ 	BPF_RAW_INSN(BPF_JMP | BPF_CALL, 0, 0, 0, BPF_FUNC_map_lookup_elem),
+-	BPF_JMP_IMM(BPF_JEQ, BPF_REG_0, 0, 9),
++	BPF_JMP_IMM(BPF_JEQ, BPF_REG_0, 0, 8),
+ 	/* r1 = [0x00, 0xff] */
+ 	BPF_LDX_MEM(BPF_B, BPF_REG_1, BPF_REG_0, 0),
+ 	BPF_ALU64_IMM(BPF_ADD, BPF_REG_1, 0xffffff80 >> 1),
+@@ -293,10 +291,6 @@
+ 	 *      [0xffff'ffff'0000'0080, 0xffff'ffff'ffff'ffff]
+ 	 */
+ 	BPF_ALU64_IMM(BPF_SUB, BPF_REG_1, 0xffffff80 >> 1),
+-	/* r1 = 0 or
+-	 *      [0x00ff'ffff'ff00'0000, 0x00ff'ffff'ffff'ffff]
+-	 */
+-	BPF_ALU64_IMM(BPF_RSH, BPF_REG_1, 8),
+ 	/* error on OOB pointer computation */
+ 	BPF_ALU64_REG(BPF_ADD, BPF_REG_0, BPF_REG_1),
+ 	/* exit */
+@@ -305,8 +299,10 @@
+ 	},
+ 	.fixup_map_hash_8b = { 3 },
+ 	/* not actually fully unbounded, but the bound is very high */
+-	.errstr = "value 72057594021150720 makes map_value pointer be out of bounds",
+-	.result = REJECT
++	.errstr_unpriv = "R1 has unknown scalar with mixed signed bounds, pointer arithmetic with it prohibited for !root",
++	.result_unpriv = REJECT,
++	.errstr = "value -4294967168 makes map_value pointer be out of bounds",
++	.result = REJECT,
+ },
+ {
+ 	"bounds check after wrapping 32-bit addition",
+
+commit 250e778fe1635b237d9f52c5d9df202cf23413d6
+Author: Colin Ian King <colin.king@canonical.com>
+Date:   Tue Mar 31 11:00:30 2020 +0100
+
+    bpf: Fix spelling mistake "arithmatic" -> "arithmetic" in test_verifier
+    
+    There are a couple of spelling mistakes in two literal strings, fix them.
+    
+    Signed-off-by: Colin Ian King <colin.king@canonical.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+    Link: https://lore.kernel.org/bpf/20200331100030.41372-1-colin.king@canonical.com
+
+diff --git a/tools/testing/selftests/bpf/verifier/bounds.c b/tools/testing/selftests/bpf/verifier/bounds.c
+index 4d0d09574bf4..a253a064e6e0 100644
+--- a/tools/testing/selftests/bpf/verifier/bounds.c
++++ b/tools/testing/selftests/bpf/verifier/bounds.c
+@@ -501,7 +501,7 @@
+ 	.result = REJECT
+ },
+ {
+-	"bounds check mixed 32bit and 64bit arithmatic. test1",
++	"bounds check mixed 32bit and 64bit arithmetic. test1",
+ 	.insns = {
+ 	BPF_MOV64_IMM(BPF_REG_0, 0),
+ 	BPF_MOV64_IMM(BPF_REG_1, -1),
+@@ -520,7 +520,7 @@
+ 	.result = ACCEPT
+ },
+ {
+-	"bounds check mixed 32bit and 64bit arithmatic. test2",
++	"bounds check mixed 32bit and 64bit arithmetic. test2",
+ 	.insns = {
+ 	BPF_MOV64_IMM(BPF_REG_0, 0),
+ 	BPF_MOV64_IMM(BPF_REG_1, -1),
+
+commit 41f70fe0649dddf02046315dc566e06da5a2dc91
+Author: John Fastabend <john.fastabend@gmail.com>
+Date:   Mon Mar 30 14:38:21 2020 -0700
+
+    bpf: Test_verifier, add alu32 bounds tracking tests
+    
+    Its possible to have divergent ALU32 and ALU64 bounds when using JMP32
+    instructins and ALU64 arithmatic operations. Sometimes the clang will
+    even generate this code. Because the case is a bit tricky lets add
+    a specific test for it.
+    
+    Here is  pseudocode asm version to illustrate the idea,
+    
+     1 r0 = 0xffffffff00000001;
+     2 if w0 > 1 goto %l[fail];
+     3 r0 += 1
+     5 if w0 > 2 goto %l[fail]
+     6 exit
+    
+    The intent here is the verifier will fail the load if the 32bit bounds
+    are not tracked correctly through ALU64 op. Similarly we can check the
+    64bit bounds are correctly zero extended after ALU32 ops.
+    
+     1 r0 = 0xffffffff00000001;
+     2 w0 += 1
+     2 if r0 > 3 goto %l[fail];
+     6 exit
+    
+    The above will fail if we do not correctly zero extend 64bit bounds
+    after 32bit op.
+    
+    Signed-off-by: John Fastabend <john.fastabend@gmail.com>
+    Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+    Link: https://lore.kernel.org/bpf/158560430155.10843.514209255758200922.stgit@john-Precision-5820-Tower
+
+diff --git a/tools/testing/selftests/bpf/verifier/bounds.c b/tools/testing/selftests/bpf/verifier/bounds.c
+index cf72fcc5ced0..4d0d09574bf4 100644
+--- a/tools/testing/selftests/bpf/verifier/bounds.c
++++ b/tools/testing/selftests/bpf/verifier/bounds.c
+@@ -500,3 +500,42 @@
+ 	.errstr = "map_value pointer and 1000000000000",
+ 	.result = REJECT
+ },
++{
++	"bounds check mixed 32bit and 64bit arithmatic. test1",
++	.insns = {
++	BPF_MOV64_IMM(BPF_REG_0, 0),
++	BPF_MOV64_IMM(BPF_REG_1, -1),
++	BPF_ALU64_IMM(BPF_LSH, BPF_REG_1, 32),
++	BPF_ALU64_IMM(BPF_ADD, BPF_REG_1, 1),
++	/* r1 = 0xffffFFFF00000001 */
++	BPF_JMP32_IMM(BPF_JGT, BPF_REG_1, 1, 3),
++	/* check ALU64 op keeps 32bit bounds */
++	BPF_ALU64_IMM(BPF_ADD, BPF_REG_1, 1),
++	BPF_JMP32_IMM(BPF_JGT, BPF_REG_1, 2, 1),
++	BPF_JMP_A(1),
++	/* invalid ldx if bounds are lost above */
++	BPF_LDX_MEM(BPF_DW, BPF_REG_0, BPF_REG_0, -1),
++	BPF_EXIT_INSN(),
++	},
++	.result = ACCEPT
++},
++{
++	"bounds check mixed 32bit and 64bit arithmatic. test2",
++	.insns = {
++	BPF_MOV64_IMM(BPF_REG_0, 0),
++	BPF_MOV64_IMM(BPF_REG_1, -1),
++	BPF_ALU64_IMM(BPF_LSH, BPF_REG_1, 32),
++	BPF_ALU64_IMM(BPF_ADD, BPF_REG_1, 1),
++	/* r1 = 0xffffFFFF00000001 */
++	BPF_MOV64_IMM(BPF_REG_2, 3),
++	/* r1 = 0x2 */
++	BPF_ALU32_IMM(BPF_ADD, BPF_REG_1, 1),
++	/* check ALU32 op zero extends 64bit bounds */
++	BPF_JMP_REG(BPF_JGT, BPF_REG_1, BPF_REG_2, 1),
++	BPF_JMP_A(1),
++	/* invalid ldx if bounds are lost above */
++	BPF_LDX_MEM(BPF_DW, BPF_REG_0, BPF_REG_0, -1),
++	BPF_EXIT_INSN(),
++	},
++	.result = ACCEPT
++},
+
+commit 32f13a5add87caf11e9dd262372b4a2b79c57aa5
+Author: John Fastabend <john.fastabend@gmail.com>
+Date:   Mon Mar 30 14:38:01 2020 -0700
+
+    bpf: Test_verifier, #65 error message updates for trunc of boundary-cross
+    
+    After changes to add update_reg_bounds after ALU ops and 32-bit bounds
+    tracking truncation of boundary crossing range will fail earlier and with
+    a different error message. Now the test error trace is the following
+    
+    11: (17) r1 -= 2147483584
+    12: R0_w=map_value(id=0,off=0,ks=8,vs=8,imm=0)
+        R1_w=invP(id=0,smin_value=-2147483584,smax_value=63)
+        R10=fp0 fp-8_w=mmmmmmmm
+    12: (17) r1 -= 2147483584
+    13: R0_w=map_value(id=0,off=0,ks=8,vs=8,imm=0)
+        R1_w=invP(id=0,
+                  umin_value=18446744069414584448,umax_value=18446744071562068095,
+                  var_off=(0xffffffff00000000; 0xffffffff))
+        R10=fp0 fp-8_w=mmmmmmmm
+    13: (77) r1 >>= 8
+    14: R0_w=map_value(id=0,off=0,ks=8,vs=8,imm=0)
+        R1_w=invP(id=0,
+                  umin_value=72057594021150720,umax_value=72057594029539328,
+                  var_off=(0xffffffff000000; 0xffffff),
+                  s32_min_value=-16777216,s32_max_value=-1,
+                  u32_min_value=-16777216)
+        R10=fp0 fp-8_w=mmmmmmmm
+    14: (0f) r0 += r1
+    value 72057594021150720 makes map_value pointer be out of bounds
+    
+    Because we have 'umin_value == umax_value' instead of previously
+    where 'umin_value != umax_value' we can now fail earlier noting
+    that pointer addition is out of bounds.
+    
+    Signed-off-by: John Fastabend <john.fastabend@gmail.com>
+    Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+    Link: https://lore.kernel.org/bpf/158560428103.10843.6316594510312781186.stgit@john-Precision-5820-Tower
+
+diff --git a/tools/testing/selftests/bpf/verifier/bounds.c b/tools/testing/selftests/bpf/verifier/bounds.c
+index 7c9b659095e9..cf72fcc5ced0 100644
+--- a/tools/testing/selftests/bpf/verifier/bounds.c
++++ b/tools/testing/selftests/bpf/verifier/bounds.c
+@@ -257,17 +257,15 @@
+ 	 *      [0x00ff'ffff'ff00'0000, 0x00ff'ffff'ffff'ffff]
+ 	 */
+ 	BPF_ALU64_IMM(BPF_RSH, BPF_REG_1, 8),
+-	/* no-op or OOB pointer computation */
++	/* error on OOB pointer computation */
+ 	BPF_ALU64_REG(BPF_ADD, BPF_REG_0, BPF_REG_1),
+-	/* potentially OOB access */
+-	BPF_LDX_MEM(BPF_B, BPF_REG_0, BPF_REG_0, 0),
+ 	/* exit */
+ 	BPF_MOV64_IMM(BPF_REG_0, 0),
+ 	BPF_EXIT_INSN(),
+ 	},
+ 	.fixup_map_hash_8b = { 3 },
+ 	/* not actually fully unbounded, but the bound is very high */
+-	.errstr = "R0 unbounded memory access",
++	.errstr = "value 72057594021150720 makes map_value pointer be out of bounds",
+ 	.result = REJECT
+ },
+ {
+@@ -299,17 +297,15 @@
+ 	 *      [0x00ff'ffff'ff00'0000, 0x00ff'ffff'ffff'ffff]
+ 	 */
+ 	BPF_ALU64_IMM(BPF_RSH, BPF_REG_1, 8),
+-	/* no-op or OOB pointer computation */
++	/* error on OOB pointer computation */
+ 	BPF_ALU64_REG(BPF_ADD, BPF_REG_0, BPF_REG_1),
+-	/* potentially OOB access */
+-	BPF_LDX_MEM(BPF_B, BPF_REG_0, BPF_REG_0, 0),
+ 	/* exit */
+ 	BPF_MOV64_IMM(BPF_REG_0, 0),
+ 	BPF_EXIT_INSN(),
+ 	},
+ 	.fixup_map_hash_8b = { 3 },
+ 	/* not actually fully unbounded, but the bound is very high */
+-	.errstr = "R0 unbounded memory access",
++	.errstr = "value 72057594021150720 makes map_value pointer be out of bounds",
+ 	.result = REJECT
+ },
+ {
+
+commit aa131ed44ae1d76637f0dbec33cfcf9115af9bc3
+Author: John Fastabend <john.fastabend@gmail.com>
+Date:   Tue Mar 24 10:40:14 2020 -0700
+
+    bpf: Test_verifier, #70 error message updates for 32-bit right shift
+    
+    After changes to add update_reg_bounds after ALU ops and adding ALU32
+    bounds tracking the error message is changed in the 32-bit right shift
+    tests.
+    
+    Test "#70/u bounds check after 32-bit right shift with 64-bit input FAIL"
+    now fails with,
+    
+    Unexpected error message!
+            EXP: R0 invalid mem access
+            RES: func#0 @0
+    
+    7: (b7) r1 = 2
+    8: R0_w=map_value(id=0,off=0,ks=8,vs=8,imm=0) R1_w=invP2 R10=fp0 fp-8_w=mmmmmmmm
+    8: (67) r1 <<= 31
+    9: R0_w=map_value(id=0,off=0,ks=8,vs=8,imm=0) R1_w=invP4294967296 R10=fp0 fp-8_w=mmmmmmmm
+    9: (74) w1 >>= 31
+    10: R0_w=map_value(id=0,off=0,ks=8,vs=8,imm=0) R1_w=invP0 R10=fp0 fp-8_w=mmmmmmmm
+    10: (14) w1 -= 2
+    11: R0_w=map_value(id=0,off=0,ks=8,vs=8,imm=0) R1_w=invP4294967294 R10=fp0 fp-8_w=mmmmmmmm
+    11: (0f) r0 += r1
+    math between map_value pointer and 4294967294 is not allowed
+    
+    And test "#70/p bounds check after 32-bit right shift with 64-bit input
+    FAIL" now fails with,
+    
+    Unexpected error message!
+            EXP: R0 invalid mem access
+            RES: func#0 @0
+    
+    7: (b7) r1 = 2
+    8: R0_w=map_value(id=0,off=0,ks=8,vs=8,imm=0) R1_w=inv2 R10=fp0 fp-8_w=mmmmmmmm
+    8: (67) r1 <<= 31
+    9: R0_w=map_value(id=0,off=0,ks=8,vs=8,imm=0) R1_w=inv4294967296 R10=fp0 fp-8_w=mmmmmmmm
+    9: (74) w1 >>= 31
+    10: R0_w=map_value(id=0,off=0,ks=8,vs=8,imm=0) R1_w=inv0 R10=fp0 fp-8_w=mmmmmmmm
+    10: (14) w1 -= 2
+    11: R0_w=map_value(id=0,off=0,ks=8,vs=8,imm=0) R1_w=inv4294967294 R10=fp0 fp-8_w=mmmmmmmm
+    11: (0f) r0 += r1
+    last_idx 11 first_idx 0
+    regs=2 stack=0 before 10: (14) w1 -= 2
+    regs=2 stack=0 before 9: (74) w1 >>= 31
+    regs=2 stack=0 before 8: (67) r1 <<= 31
+    regs=2 stack=0 before 7: (b7) r1 = 2
+    math between map_value pointer and 4294967294 is not allowed
+    
+    Before this series we did not trip the "math between map_value pointer..."
+    error because check_reg_sane_offset is never called in
+    adjust_ptr_min_max_vals(). Instead we have a register state that looks
+    like this at line 11*,
+    
+    11: R0_w=map_value(id=0,off=0,ks=8,vs=8,
+                       smin_value=0,smax_value=0,
+                       umin_value=0,umax_value=0,
+                       var_off=(0x0; 0x0))
+        R1_w=invP(id=0,
+                  smin_value=0,smax_value=4294967295,
+                  umin_value=0,umax_value=4294967295,
+                  var_off=(0xfffffffe; 0x0))
+        R10=fp(id=0,off=0,
+               smin_value=0,smax_value=0,
+               umin_value=0,umax_value=0,
+               var_off=(0x0; 0x0)) fp-8_w=mmmmmmmm
+    11: (0f) r0 += r1
+    
+    In R1 'smin_val != smax_val' yet we have a tnum_const as seen
+    by 'var_off(0xfffffffe; 0x0))' with a 0x0 mask. So we hit this check
+    in adjust_ptr_min_max_vals()
+    
+     if ((known && (smin_val != smax_val || umin_val != umax_val)) ||
+          smin_val > smax_val || umin_val > umax_val) {
+           /* Taint dst register if offset had invalid bounds derived from
+            * e.g. dead branches.
+            */
+           __mark_reg_unknown(env, dst_reg);
+           return 0;
+     }
+    
+    So we don't throw an error here and instead only throw an error
+    later in the verification when the memory access is made.
+    
+    The root cause in verifier without alu32 bounds tracking is having
+    'umin_value = 0' and 'umax_value = U64_MAX' from BPF_SUB which we set
+    when 'umin_value < umax_val' here,
+    
+     if (dst_reg->umin_value < umax_val) {
+        /* Overflow possible, we know nothing */
+        dst_reg->umin_value = 0;
+        dst_reg->umax_value = U64_MAX;
+     } else { ...}
+    
+    Later in adjust_calar_min_max_vals we previously did a
+    coerce_reg_to_size() which will clamp the U64_MAX to U32_MAX by
+    truncating to 32bits. But either way without a call to update_reg_bounds
+    the less precise bounds tracking will fall out of the alu op
+    verification.
+    
+    After latest changes we now exit adjust_scalar_min_max_vals with the
+    more precise umin value, due to zero extension propogating bounds from
+    alu32 bounds into alu64 bounds and then calling update_reg_bounds.
+    This then causes the verifier to trigger an earlier error and we get
+    the error in the output above.
+    
+    This patch updates tests to reflect new error message.
+    
+    * I have a local patch to print entire verifier state regardless if we
+     believe it is a constant so we can get a full picture of the state.
+     Usually if tnum_is_const() then bounds are also smin=smax, etc. but
+     this is not always true and is a bit subtle. Being able to see these
+     states helps understand dataflow imo. Let me know if we want something
+     similar upstream.
+    
+    Signed-off-by: John Fastabend <john.fastabend@gmail.com>
+    Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+    Link: https://lore.kernel.org/bpf/158507161475.15666.3061518385241144063.stgit@john-Precision-5820-Tower
+
+diff --git a/tools/testing/selftests/bpf/verifier/bounds.c b/tools/testing/selftests/bpf/verifier/bounds.c
+index d55f476f2237..7c9b659095e9 100644
+--- a/tools/testing/selftests/bpf/verifier/bounds.c
++++ b/tools/testing/selftests/bpf/verifier/bounds.c
+@@ -411,16 +411,14 @@
+ 	BPF_ALU32_IMM(BPF_RSH, BPF_REG_1, 31),
+ 	/* r1 = 0xffff'fffe (NOT 0!) */
+ 	BPF_ALU32_IMM(BPF_SUB, BPF_REG_1, 2),
+-	/* computes OOB pointer */
++	/* error on computing OOB pointer */
+ 	BPF_ALU64_REG(BPF_ADD, BPF_REG_0, BPF_REG_1),
+-	/* OOB access */
+-	BPF_LDX_MEM(BPF_B, BPF_REG_0, BPF_REG_0, 0),
+ 	/* exit */
+ 	BPF_MOV64_IMM(BPF_REG_0, 0),
+ 	BPF_EXIT_INSN(),
+ 	},
+ 	.fixup_map_hash_8b = { 3 },
+-	.errstr = "R0 invalid mem access",
++	.errstr = "math between map_value pointer and 4294967294 is not allowed",
+ 	.result = REJECT,
+ },
+ {
+
+commit 40f2fbd5a5e9c6d0799632fcba174a7b45c471da
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Fri Jan 25 15:24:43 2019 -0800
+
+    selftests: bpf: break up test_verifier
+    
+    Break up the first 10 kLoC of test verifier test cases
+    out into smaller files.  Looks like git line counting
+    gets a little flismy above 16 bit integers, so we need
+    two commits to break up test_verifier.
+    
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Acked-by: Jiong Wang <jiong.wang@netronome.com>
+    Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+
+diff --git a/tools/testing/selftests/bpf/verifier/bounds.c b/tools/testing/selftests/bpf/verifier/bounds.c
+new file mode 100644
+index 000000000000..d55f476f2237
+--- /dev/null
++++ b/tools/testing/selftests/bpf/verifier/bounds.c
+@@ -0,0 +1,508 @@
++{
++	"subtraction bounds (map value) variant 1",
++	.insns = {
++	BPF_ST_MEM(BPF_DW, BPF_REG_10, -8, 0),
++	BPF_MOV64_REG(BPF_REG_2, BPF_REG_10),
++	BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, -8),
++	BPF_LD_MAP_FD(BPF_REG_1, 0),
++	BPF_RAW_INSN(BPF_JMP | BPF_CALL, 0, 0, 0, BPF_FUNC_map_lookup_elem),
++	BPF_JMP_IMM(BPF_JEQ, BPF_REG_0, 0, 9),
++	BPF_LDX_MEM(BPF_B, BPF_REG_1, BPF_REG_0, 0),
++	BPF_JMP_IMM(BPF_JGT, BPF_REG_1, 0xff, 7),
++	BPF_LDX_MEM(BPF_B, BPF_REG_3, BPF_REG_0, 1),
++	BPF_JMP_IMM(BPF_JGT, BPF_REG_3, 0xff, 5),
++	BPF_ALU64_REG(BPF_SUB, BPF_REG_1, BPF_REG_3),
++	BPF_ALU64_IMM(BPF_RSH, BPF_REG_1, 56),
++	BPF_ALU64_REG(BPF_ADD, BPF_REG_0, BPF_REG_1),
++	BPF_LDX_MEM(BPF_B, BPF_REG_0, BPF_REG_0, 0),
++	BPF_EXIT_INSN(),
++	BPF_MOV64_IMM(BPF_REG_0, 0),
++	BPF_EXIT_INSN(),
++	},
++	.fixup_map_hash_8b = { 3 },
++	.errstr = "R0 max value is outside of the array range",
++	.result = REJECT,
++},
++{
++	"subtraction bounds (map value) variant 2",
++	.insns = {
++	BPF_ST_MEM(BPF_DW, BPF_REG_10, -8, 0),
++	BPF_MOV64_REG(BPF_REG_2, BPF_REG_10),
++	BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, -8),
++	BPF_LD_MAP_FD(BPF_REG_1, 0),
++	BPF_RAW_INSN(BPF_JMP | BPF_CALL, 0, 0, 0, BPF_FUNC_map_lookup_elem),
++	BPF_JMP_IMM(BPF_JEQ, BPF_REG_0, 0, 8),
++	BPF_LDX_MEM(BPF_B, BPF_REG_1, BPF_REG_0, 0),
++	BPF_JMP_IMM(BPF_JGT, BPF_REG_1, 0xff, 6),
++	BPF_LDX_MEM(BPF_B, BPF_REG_3, BPF_REG_0, 1),
++	BPF_JMP_IMM(BPF_JGT, BPF_REG_3, 0xff, 4),
++	BPF_ALU64_REG(BPF_SUB, BPF_REG_1, BPF_REG_3),
++	BPF_ALU64_REG(BPF_ADD, BPF_REG_0, BPF_REG_1),
++	BPF_LDX_MEM(BPF_B, BPF_REG_0, BPF_REG_0, 0),
++	BPF_EXIT_INSN(),
++	BPF_MOV64_IMM(BPF_REG_0, 0),
++	BPF_EXIT_INSN(),
++	},
++	.fixup_map_hash_8b = { 3 },
++	.errstr = "R0 min value is negative, either use unsigned index or do a if (index >=0) check.",
++	.errstr_unpriv = "R1 has unknown scalar with mixed signed bounds",
++	.result = REJECT,
++},
++{
++	"check subtraction on pointers for unpriv",
++	.insns = {
++	BPF_MOV64_IMM(BPF_REG_0, 0),
++	BPF_LD_MAP_FD(BPF_REG_ARG1, 0),
++	BPF_MOV64_REG(BPF_REG_ARG2, BPF_REG_FP),
++	BPF_ALU64_IMM(BPF_ADD, BPF_REG_ARG2, -8),
++	BPF_ST_MEM(BPF_DW, BPF_REG_ARG2, 0, 9),
++	BPF_RAW_INSN(BPF_JMP | BPF_CALL, 0, 0, 0, BPF_FUNC_map_lookup_elem),
++	BPF_MOV64_REG(BPF_REG_9, BPF_REG_FP),
++	BPF_ALU64_REG(BPF_SUB, BPF_REG_9, BPF_REG_0),
++	BPF_LD_MAP_FD(BPF_REG_ARG1, 0),
++	BPF_MOV64_REG(BPF_REG_ARG2, BPF_REG_FP),
++	BPF_ALU64_IMM(BPF_ADD, BPF_REG_ARG2, -8),
++	BPF_ST_MEM(BPF_DW, BPF_REG_ARG2, 0, 0),
++	BPF_RAW_INSN(BPF_JMP | BPF_CALL, 0, 0, 0, BPF_FUNC_map_lookup_elem),
++	BPF_JMP_IMM(BPF_JNE, BPF_REG_0, 0, 1),
++	BPF_EXIT_INSN(),
++	BPF_STX_MEM(BPF_DW, BPF_REG_0, BPF_REG_9, 0),
++	BPF_MOV64_IMM(BPF_REG_0, 0),
++	BPF_EXIT_INSN(),
++	},
++	.fixup_map_hash_8b = { 1, 9 },
++	.result = ACCEPT,
++	.result_unpriv = REJECT,
++	.errstr_unpriv = "R9 pointer -= pointer prohibited",
++},
++{
++	"bounds check based on zero-extended MOV",
++	.insns = {
++	BPF_ST_MEM(BPF_DW, BPF_REG_10, -8, 0),
++	BPF_MOV64_REG(BPF_REG_2, BPF_REG_10),
++	BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, -8),
++	BPF_LD_MAP_FD(BPF_REG_1, 0),
++	BPF_RAW_INSN(BPF_JMP | BPF_CALL, 0, 0, 0, BPF_FUNC_map_lookup_elem),
++	BPF_JMP_IMM(BPF_JEQ, BPF_REG_0, 0, 4),
++	/* r2 = 0x0000'0000'ffff'ffff */
++	BPF_MOV32_IMM(BPF_REG_2, 0xffffffff),
++	/* r2 = 0 */
++	BPF_ALU64_IMM(BPF_RSH, BPF_REG_2, 32),
++	/* no-op */
++	BPF_ALU64_REG(BPF_ADD, BPF_REG_0, BPF_REG_2),
++	/* access at offset 0 */
++	BPF_LDX_MEM(BPF_B, BPF_REG_0, BPF_REG_0, 0),
++	/* exit */
++	BPF_MOV64_IMM(BPF_REG_0, 0),
++	BPF_EXIT_INSN(),
++	},
++	.fixup_map_hash_8b = { 3 },
++	.result = ACCEPT
++},
++{
++	"bounds check based on sign-extended MOV. test1",
++	.insns = {
++	BPF_ST_MEM(BPF_DW, BPF_REG_10, -8, 0),
++	BPF_MOV64_REG(BPF_REG_2, BPF_REG_10),
++	BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, -8),
++	BPF_LD_MAP_FD(BPF_REG_1, 0),
++	BPF_RAW_INSN(BPF_JMP | BPF_CALL, 0, 0, 0, BPF_FUNC_map_lookup_elem),
++	BPF_JMP_IMM(BPF_JEQ, BPF_REG_0, 0, 4),
++	/* r2 = 0xffff'ffff'ffff'ffff */
++	BPF_MOV64_IMM(BPF_REG_2, 0xffffffff),
++	/* r2 = 0xffff'ffff */
++	BPF_ALU64_IMM(BPF_RSH, BPF_REG_2, 32),
++	/* r0 = <oob pointer> */
++	BPF_ALU64_REG(BPF_ADD, BPF_REG_0, BPF_REG_2),
++	/* access to OOB pointer */
++	BPF_LDX_MEM(BPF_B, BPF_REG_0, BPF_REG_0, 0),
++	/* exit */
++	BPF_MOV64_IMM(BPF_REG_0, 0),
++	BPF_EXIT_INSN(),
++	},
++	.fixup_map_hash_8b = { 3 },
++	.errstr = "map_value pointer and 4294967295",
++	.result = REJECT
++},
++{
++	"bounds check based on sign-extended MOV. test2",
++	.insns = {
++	BPF_ST_MEM(BPF_DW, BPF_REG_10, -8, 0),
++	BPF_MOV64_REG(BPF_REG_2, BPF_REG_10),
++	BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, -8),
++	BPF_LD_MAP_FD(BPF_REG_1, 0),
++	BPF_RAW_INSN(BPF_JMP | BPF_CALL, 0, 0, 0, BPF_FUNC_map_lookup_elem),
++	BPF_JMP_IMM(BPF_JEQ, BPF_REG_0, 0, 4),
++	/* r2 = 0xffff'ffff'ffff'ffff */
++	BPF_MOV64_IMM(BPF_REG_2, 0xffffffff),
++	/* r2 = 0xfff'ffff */
++	BPF_ALU64_IMM(BPF_RSH, BPF_REG_2, 36),
++	/* r0 = <oob pointer> */
++	BPF_ALU64_REG(BPF_ADD, BPF_REG_0, BPF_REG_2),
++	/* access to OOB pointer */
++	BPF_LDX_MEM(BPF_B, BPF_REG_0, BPF_REG_0, 0),
++	/* exit */
++	BPF_MOV64_IMM(BPF_REG_0, 0),
++	BPF_EXIT_INSN(),
++	},
++	.fixup_map_hash_8b = { 3 },
++	.errstr = "R0 min value is outside of the array range",
++	.result = REJECT
++},
++{
++	"bounds check based on reg_off + var_off + insn_off. test1",
++	.insns = {
++	BPF_LDX_MEM(BPF_W, BPF_REG_6, BPF_REG_1,
++		    offsetof(struct __sk_buff, mark)),
++	BPF_ST_MEM(BPF_DW, BPF_REG_10, -8, 0),
++	BPF_MOV64_REG(BPF_REG_2, BPF_REG_10),
++	BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, -8),
++	BPF_LD_MAP_FD(BPF_REG_1, 0),
++	BPF_RAW_INSN(BPF_JMP | BPF_CALL, 0, 0, 0, BPF_FUNC_map_lookup_elem),
++	BPF_JMP_IMM(BPF_JEQ, BPF_REG_0, 0, 4),
++	BPF_ALU64_IMM(BPF_AND, BPF_REG_6, 1),
++	BPF_ALU64_IMM(BPF_ADD, BPF_REG_6, (1 << 29) - 1),
++	BPF_ALU64_REG(BPF_ADD, BPF_REG_0, BPF_REG_6),
++	BPF_ALU64_IMM(BPF_ADD, BPF_REG_0, (1 << 29) - 1),
++	BPF_LDX_MEM(BPF_B, BPF_REG_0, BPF_REG_0, 3),
++	BPF_MOV64_IMM(BPF_REG_0, 0),
++	BPF_EXIT_INSN(),
++	},
++	.fixup_map_hash_8b = { 4 },
++	.errstr = "value_size=8 off=1073741825",
++	.result = REJECT,
++	.prog_type = BPF_PROG_TYPE_SCHED_CLS,
++},
++{
++	"bounds check based on reg_off + var_off + insn_off. test2",
++	.insns = {
++	BPF_LDX_MEM(BPF_W, BPF_REG_6, BPF_REG_1,
++		    offsetof(struct __sk_buff, mark)),
++	BPF_ST_MEM(BPF_DW, BPF_REG_10, -8, 0),
++	BPF_MOV64_REG(BPF_REG_2, BPF_REG_10),
++	BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, -8),
++	BPF_LD_MAP_FD(BPF_REG_1, 0),
++	BPF_RAW_INSN(BPF_JMP | BPF_CALL, 0, 0, 0, BPF_FUNC_map_lookup_elem),
++	BPF_JMP_IMM(BPF_JEQ, BPF_REG_0, 0, 4),
++	BPF_ALU64_IMM(BPF_AND, BPF_REG_6, 1),
++	BPF_ALU64_IMM(BPF_ADD, BPF_REG_6, (1 << 30) - 1),
++	BPF_ALU64_REG(BPF_ADD, BPF_REG_0, BPF_REG_6),
++	BPF_ALU64_IMM(BPF_ADD, BPF_REG_0, (1 << 29) - 1),
++	BPF_LDX_MEM(BPF_B, BPF_REG_0, BPF_REG_0, 3),
++	BPF_MOV64_IMM(BPF_REG_0, 0),
++	BPF_EXIT_INSN(),
++	},
++	.fixup_map_hash_8b = { 4 },
++	.errstr = "value 1073741823",
++	.result = REJECT,
++	.prog_type = BPF_PROG_TYPE_SCHED_CLS,
++},
++{
++	"bounds check after truncation of non-boundary-crossing range",
++	.insns = {
++	BPF_ST_MEM(BPF_DW, BPF_REG_10, -8, 0),
++	BPF_MOV64_REG(BPF_REG_2, BPF_REG_10),
++	BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, -8),
++	BPF_LD_MAP_FD(BPF_REG_1, 0),
++	BPF_RAW_INSN(BPF_JMP | BPF_CALL, 0, 0, 0, BPF_FUNC_map_lookup_elem),
++	BPF_JMP_IMM(BPF_JEQ, BPF_REG_0, 0, 9),
++	/* r1 = [0x00, 0xff] */
++	BPF_LDX_MEM(BPF_B, BPF_REG_1, BPF_REG_0, 0),
++	BPF_MOV64_IMM(BPF_REG_2, 1),
++	/* r2 = 0x10'0000'0000 */
++	BPF_ALU64_IMM(BPF_LSH, BPF_REG_2, 36),
++	/* r1 = [0x10'0000'0000, 0x10'0000'00ff] */
++	BPF_ALU64_REG(BPF_ADD, BPF_REG_1, BPF_REG_2),
++	/* r1 = [0x10'7fff'ffff, 0x10'8000'00fe] */
++	BPF_ALU64_IMM(BPF_ADD, BPF_REG_1, 0x7fffffff),
++	/* r1 = [0x00, 0xff] */
++	BPF_ALU32_IMM(BPF_SUB, BPF_REG_1, 0x7fffffff),
++	/* r1 = 0 */
++	BPF_ALU64_IMM(BPF_RSH, BPF_REG_1, 8),
++	/* no-op */
++	BPF_ALU64_REG(BPF_ADD, BPF_REG_0, BPF_REG_1),
++	/* access at offset 0 */
++	BPF_LDX_MEM(BPF_B, BPF_REG_0, BPF_REG_0, 0),
++	/* exit */
++	BPF_MOV64_IMM(BPF_REG_0, 0),
++	BPF_EXIT_INSN(),
++	},
++	.fixup_map_hash_8b = { 3 },
++	.result = ACCEPT
++},
++{
++	"bounds check after truncation of boundary-crossing range (1)",
++	.insns = {
++	BPF_ST_MEM(BPF_DW, BPF_REG_10, -8, 0),
++	BPF_MOV64_REG(BPF_REG_2, BPF_REG_10),
++	BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, -8),
++	BPF_LD_MAP_FD(BPF_REG_1, 0),
++	BPF_RAW_INSN(BPF_JMP | BPF_CALL, 0, 0, 0, BPF_FUNC_map_lookup_elem),
++	BPF_JMP_IMM(BPF_JEQ, BPF_REG_0, 0, 9),
++	/* r1 = [0x00, 0xff] */
++	BPF_LDX_MEM(BPF_B, BPF_REG_1, BPF_REG_0, 0),
++	BPF_ALU64_IMM(BPF_ADD, BPF_REG_1, 0xffffff80 >> 1),
++	/* r1 = [0xffff'ff80, 0x1'0000'007f] */
++	BPF_ALU64_IMM(BPF_ADD, BPF_REG_1, 0xffffff80 >> 1),
++	/* r1 = [0xffff'ff80, 0xffff'ffff] or
++	 *      [0x0000'0000, 0x0000'007f]
++	 */
++	BPF_ALU32_IMM(BPF_ADD, BPF_REG_1, 0),
++	BPF_ALU64_IMM(BPF_SUB, BPF_REG_1, 0xffffff80 >> 1),
++	/* r1 = [0x00, 0xff] or
++	 *      [0xffff'ffff'0000'0080, 0xffff'ffff'ffff'ffff]
++	 */
++	BPF_ALU64_IMM(BPF_SUB, BPF_REG_1, 0xffffff80 >> 1),
++	/* r1 = 0 or
++	 *      [0x00ff'ffff'ff00'0000, 0x00ff'ffff'ffff'ffff]
++	 */
++	BPF_ALU64_IMM(BPF_RSH, BPF_REG_1, 8),
++	/* no-op or OOB pointer computation */
++	BPF_ALU64_REG(BPF_ADD, BPF_REG_0, BPF_REG_1),
++	/* potentially OOB access */
++	BPF_LDX_MEM(BPF_B, BPF_REG_0, BPF_REG_0, 0),
++	/* exit */
++	BPF_MOV64_IMM(BPF_REG_0, 0),
++	BPF_EXIT_INSN(),
++	},
++	.fixup_map_hash_8b = { 3 },
++	/* not actually fully unbounded, but the bound is very high */
++	.errstr = "R0 unbounded memory access",
++	.result = REJECT
++},
++{
++	"bounds check after truncation of boundary-crossing range (2)",
++	.insns = {
++	BPF_ST_MEM(BPF_DW, BPF_REG_10, -8, 0),
++	BPF_MOV64_REG(BPF_REG_2, BPF_REG_10),
++	BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, -8),
++	BPF_LD_MAP_FD(BPF_REG_1, 0),
++	BPF_RAW_INSN(BPF_JMP | BPF_CALL, 0, 0, 0, BPF_FUNC_map_lookup_elem),
++	BPF_JMP_IMM(BPF_JEQ, BPF_REG_0, 0, 9),
++	/* r1 = [0x00, 0xff] */
++	BPF_LDX_MEM(BPF_B, BPF_REG_1, BPF_REG_0, 0),
++	BPF_ALU64_IMM(BPF_ADD, BPF_REG_1, 0xffffff80 >> 1),
++	/* r1 = [0xffff'ff80, 0x1'0000'007f] */
++	BPF_ALU64_IMM(BPF_ADD, BPF_REG_1, 0xffffff80 >> 1),
++	/* r1 = [0xffff'ff80, 0xffff'ffff] or
++	 *      [0x0000'0000, 0x0000'007f]
++	 * difference to previous test: truncation via MOV32
++	 * instead of ALU32.
++	 */
++	BPF_MOV32_REG(BPF_REG_1, BPF_REG_1),
++	BPF_ALU64_IMM(BPF_SUB, BPF_REG_1, 0xffffff80 >> 1),
++	/* r1 = [0x00, 0xff] or
++	 *      [0xffff'ffff'0000'0080, 0xffff'ffff'ffff'ffff]
++	 */
++	BPF_ALU64_IMM(BPF_SUB, BPF_REG_1, 0xffffff80 >> 1),
++	/* r1 = 0 or
++	 *      [0x00ff'ffff'ff00'0000, 0x00ff'ffff'ffff'ffff]
++	 */
++	BPF_ALU64_IMM(BPF_RSH, BPF_REG_1, 8),
++	/* no-op or OOB pointer computation */
++	BPF_ALU64_REG(BPF_ADD, BPF_REG_0, BPF_REG_1),
++	/* potentially OOB access */
++	BPF_LDX_MEM(BPF_B, BPF_REG_0, BPF_REG_0, 0),
++	/* exit */
++	BPF_MOV64_IMM(BPF_REG_0, 0),
++	BPF_EXIT_INSN(),
++	},
++	.fixup_map_hash_8b = { 3 },
++	/* not actually fully unbounded, but the bound is very high */
++	.errstr = "R0 unbounded memory access",
++	.result = REJECT
++},
++{
++	"bounds check after wrapping 32-bit addition",
++	.insns = {
++	BPF_ST_MEM(BPF_DW, BPF_REG_10, -8, 0),
++	BPF_MOV64_REG(BPF_REG_2, BPF_REG_10),
++	BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, -8),
++	BPF_LD_MAP_FD(BPF_REG_1, 0),
++	BPF_RAW_INSN(BPF_JMP | BPF_CALL, 0, 0, 0, BPF_FUNC_map_lookup_elem),
++	BPF_JMP_IMM(BPF_JEQ, BPF_REG_0, 0, 5),
++	/* r1 = 0x7fff'ffff */
++	BPF_MOV64_IMM(BPF_REG_1, 0x7fffffff),
++	/* r1 = 0xffff'fffe */
++	BPF_ALU64_IMM(BPF_ADD, BPF_REG_1, 0x7fffffff),
++	/* r1 = 0 */
++	BPF_ALU32_IMM(BPF_ADD, BPF_REG_1, 2),
++	/* no-op */
++	BPF_ALU64_REG(BPF_ADD, BPF_REG_0, BPF_REG_1),
++	/* access at offset 0 */
++	BPF_LDX_MEM(BPF_B, BPF_REG_0, BPF_REG_0, 0),
++	/* exit */
++	BPF_MOV64_IMM(BPF_REG_0, 0),
++	BPF_EXIT_INSN(),
++	},
++	.fixup_map_hash_8b = { 3 },
++	.result = ACCEPT
++},
++{
++	"bounds check after shift with oversized count operand",
++	.insns = {
++	BPF_ST_MEM(BPF_DW, BPF_REG_10, -8, 0),
++	BPF_MOV64_REG(BPF_REG_2, BPF_REG_10),
++	BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, -8),
++	BPF_LD_MAP_FD(BPF_REG_1, 0),
++	BPF_RAW_INSN(BPF_JMP | BPF_CALL, 0, 0, 0, BPF_FUNC_map_lookup_elem),
++	BPF_JMP_IMM(BPF_JEQ, BPF_REG_0, 0, 6),
++	BPF_MOV64_IMM(BPF_REG_2, 32),
++	BPF_MOV64_IMM(BPF_REG_1, 1),
++	/* r1 = (u32)1 << (u32)32 = ? */
++	BPF_ALU32_REG(BPF_LSH, BPF_REG_1, BPF_REG_2),
++	/* r1 = [0x0000, 0xffff] */
++	BPF_ALU64_IMM(BPF_AND, BPF_REG_1, 0xffff),
++	/* computes unknown pointer, potentially OOB */
++	BPF_ALU64_REG(BPF_ADD, BPF_REG_0, BPF_REG_1),
++	/* potentially OOB access */
++	BPF_LDX_MEM(BPF_B, BPF_REG_0, BPF_REG_0, 0),
++	/* exit */
++	BPF_MOV64_IMM(BPF_REG_0, 0),
++	BPF_EXIT_INSN(),
++	},
++	.fixup_map_hash_8b = { 3 },
++	.errstr = "R0 max value is outside of the array range",
++	.result = REJECT
++},
++{
++	"bounds check after right shift of maybe-negative number",
++	.insns = {
++	BPF_ST_MEM(BPF_DW, BPF_REG_10, -8, 0),
++	BPF_MOV64_REG(BPF_REG_2, BPF_REG_10),
++	BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, -8),
++	BPF_LD_MAP_FD(BPF_REG_1, 0),
++	BPF_RAW_INSN(BPF_JMP | BPF_CALL, 0, 0, 0, BPF_FUNC_map_lookup_elem),
++	BPF_JMP_IMM(BPF_JEQ, BPF_REG_0, 0, 6),
++	/* r1 = [0x00, 0xff] */
++	BPF_LDX_MEM(BPF_B, BPF_REG_1, BPF_REG_0, 0),
++	/* r1 = [-0x01, 0xfe] */
++	BPF_ALU64_IMM(BPF_SUB, BPF_REG_1, 1),
++	/* r1 = 0 or 0xff'ffff'ffff'ffff */
++	BPF_ALU64_IMM(BPF_RSH, BPF_REG_1, 8),
++	/* r1 = 0 or 0xffff'ffff'ffff */
++	BPF_ALU64_IMM(BPF_RSH, BPF_REG_1, 8),
++	/* computes unknown pointer, potentially OOB */
++	BPF_ALU64_REG(BPF_ADD, BPF_REG_0, BPF_REG_1),
++	/* potentially OOB access */
++	BPF_LDX_MEM(BPF_B, BPF_REG_0, BPF_REG_0, 0),
++	/* exit */
++	BPF_MOV64_IMM(BPF_REG_0, 0),
++	BPF_EXIT_INSN(),
++	},
++	.fixup_map_hash_8b = { 3 },
++	.errstr = "R0 unbounded memory access",
++	.result = REJECT
++},
++{
++	"bounds check after 32-bit right shift with 64-bit input",
++	.insns = {
++	BPF_ST_MEM(BPF_DW, BPF_REG_10, -8, 0),
++	BPF_MOV64_REG(BPF_REG_2, BPF_REG_10),
++	BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, -8),
++	BPF_LD_MAP_FD(BPF_REG_1, 0),
++	BPF_RAW_INSN(BPF_JMP | BPF_CALL, 0, 0, 0, BPF_FUNC_map_lookup_elem),
++	BPF_JMP_IMM(BPF_JEQ, BPF_REG_0, 0, 6),
++	/* r1 = 2 */
++	BPF_MOV64_IMM(BPF_REG_1, 2),
++	/* r1 = 1<<32 */
++	BPF_ALU64_IMM(BPF_LSH, BPF_REG_1, 31),
++	/* r1 = 0 (NOT 2!) */
++	BPF_ALU32_IMM(BPF_RSH, BPF_REG_1, 31),
++	/* r1 = 0xffff'fffe (NOT 0!) */
++	BPF_ALU32_IMM(BPF_SUB, BPF_REG_1, 2),
++	/* computes OOB pointer */
++	BPF_ALU64_REG(BPF_ADD, BPF_REG_0, BPF_REG_1),
++	/* OOB access */
++	BPF_LDX_MEM(BPF_B, BPF_REG_0, BPF_REG_0, 0),
++	/* exit */
++	BPF_MOV64_IMM(BPF_REG_0, 0),
++	BPF_EXIT_INSN(),
++	},
++	.fixup_map_hash_8b = { 3 },
++	.errstr = "R0 invalid mem access",
++	.result = REJECT,
++},
++{
++	"bounds check map access with off+size signed 32bit overflow. test1",
++	.insns = {
++	BPF_ST_MEM(BPF_DW, BPF_REG_10, -8, 0),
++	BPF_MOV64_REG(BPF_REG_2, BPF_REG_10),
++	BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, -8),
++	BPF_LD_MAP_FD(BPF_REG_1, 0),
++	BPF_RAW_INSN(BPF_JMP | BPF_CALL, 0, 0, 0, BPF_FUNC_map_lookup_elem),
++	BPF_JMP_IMM(BPF_JNE, BPF_REG_0, 0, 1),
++	BPF_EXIT_INSN(),
++	BPF_ALU64_IMM(BPF_ADD, BPF_REG_0, 0x7ffffffe),
++	BPF_LDX_MEM(BPF_DW, BPF_REG_0, BPF_REG_0, 0),
++	BPF_JMP_A(0),
++	BPF_EXIT_INSN(),
++	},
++	.fixup_map_hash_8b = { 3 },
++	.errstr = "map_value pointer and 2147483646",
++	.result = REJECT
++},
++{
++	"bounds check map access with off+size signed 32bit overflow. test2",
++	.insns = {
++	BPF_ST_MEM(BPF_DW, BPF_REG_10, -8, 0),
++	BPF_MOV64_REG(BPF_REG_2, BPF_REG_10),
++	BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, -8),
++	BPF_LD_MAP_FD(BPF_REG_1, 0),
++	BPF_RAW_INSN(BPF_JMP | BPF_CALL, 0, 0, 0, BPF_FUNC_map_lookup_elem),
++	BPF_JMP_IMM(BPF_JNE, BPF_REG_0, 0, 1),
++	BPF_EXIT_INSN(),
++	BPF_ALU64_IMM(BPF_ADD, BPF_REG_0, 0x1fffffff),
++	BPF_ALU64_IMM(BPF_ADD, BPF_REG_0, 0x1fffffff),
++	BPF_ALU64_IMM(BPF_ADD, BPF_REG_0, 0x1fffffff),
++	BPF_LDX_MEM(BPF_DW, BPF_REG_0, BPF_REG_0, 0),
++	BPF_JMP_A(0),
++	BPF_EXIT_INSN(),
++	},
++	.fixup_map_hash_8b = { 3 },
++	.errstr = "pointer offset 1073741822",
++	.errstr_unpriv = "R0 pointer arithmetic of map value goes out of range",
++	.result = REJECT
++},
++{
++	"bounds check map access with off+size signed 32bit overflow. test3",
++	.insns = {
++	BPF_ST_MEM(BPF_DW, BPF_REG_10, -8, 0),
++	BPF_MOV64_REG(BPF_REG_2, BPF_REG_10),
++	BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, -8),
++	BPF_LD_MAP_FD(BPF_REG_1, 0),
++	BPF_RAW_INSN(BPF_JMP | BPF_CALL, 0, 0, 0, BPF_FUNC_map_lookup_elem),
++	BPF_JMP_IMM(BPF_JNE, BPF_REG_0, 0, 1),
++	BPF_EXIT_INSN(),
++	BPF_ALU64_IMM(BPF_SUB, BPF_REG_0, 0x1fffffff),
++	BPF_ALU64_IMM(BPF_SUB, BPF_REG_0, 0x1fffffff),
++	BPF_LDX_MEM(BPF_DW, BPF_REG_0, BPF_REG_0, 2),
++	BPF_JMP_A(0),
++	BPF_EXIT_INSN(),
++	},
++	.fixup_map_hash_8b = { 3 },
++	.errstr = "pointer offset -1073741822",
++	.errstr_unpriv = "R0 pointer arithmetic of map value goes out of range",
++	.result = REJECT
++},
++{
++	"bounds check map access with off+size signed 32bit overflow. test4",
++	.insns = {
++	BPF_ST_MEM(BPF_DW, BPF_REG_10, -8, 0),
++	BPF_MOV64_REG(BPF_REG_2, BPF_REG_10),
++	BPF_ALU64_IMM(BPF_ADD, BPF_REG_2, -8),
++	BPF_LD_MAP_FD(BPF_REG_1, 0),
++	BPF_RAW_INSN(BPF_JMP | BPF_CALL, 0, 0, 0, BPF_FUNC_map_lookup_elem),
++	BPF_JMP_IMM(BPF_JNE, BPF_REG_0, 0, 1),
++	BPF_EXIT_INSN(),
++	BPF_MOV64_IMM(BPF_REG_1, 1000000),
++	BPF_ALU64_IMM(BPF_MUL, BPF_REG_1, 1000000),
++	BPF_ALU64_REG(BPF_ADD, BPF_REG_0, BPF_REG_1),
++	BPF_LDX_MEM(BPF_DW, BPF_REG_0, BPF_REG_0, 2),
++	BPF_JMP_A(0),
++	BPF_EXIT_INSN(),
++	},
++	.fixup_map_hash_8b = { 3 },
++	.errstr = "map_value pointer and 1000000000000",
++	.result = REJECT
++},

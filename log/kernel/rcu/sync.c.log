@@ -1,0 +1,1240 @@
+commit 89da3b94bb97417ca2c5b0ce3a28643819030247
+Author: Oleg Nesterov <oleg@redhat.com>
+Date:   Thu Apr 25 18:50:55 2019 +0200
+
+    rcu/sync: Simplify the state machine
+    
+    With this patch rcu_sync has a single state variable and the transition rules
+    become really simple:
+    
+            GP_IDLE   - owned by the first rcu_sync_enter() which moves it to
+    
+            GP_ENTER  - owned by rcu-callback which moves it to
+    
+            GP_PASSED - owned by the last rcu_sync_exit() which moves it to
+    
+            GP_EXIT   - and this is the only "nontrivial" state.
+    
+                    rcu-callback moves it back to GP_IDLE unless another enter()
+                    comes before a GP pass.
+    
+                    If rcu-callback is invoked before the next rcu_sync_exit() it
+                    must see gp_count incremented by that enter() and set GP_PASSED.
+    
+                    Otherwise, if the next rcu_sync_exit() wins the race, it will
+                    move it to
+    
+            GP_REPLAY - owned by rcu-callback which moves it to GP_EXIT
+    
+    Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+    [ paulmck: While here, apply READ_ONCE() and WRITE_ONCE() to ->gp_state. ]
+    [ paulmck: Tweaks to make htmldocs happy. (Reported by kbuild test robot.) ]
+    Signed-off-by: Paul E. McKenney <paulmck@linux.ibm.com>
+
+diff --git a/kernel/rcu/sync.c b/kernel/rcu/sync.c
+index ee427e138dad..d4558ab7a07d 100644
+--- a/kernel/rcu/sync.c
++++ b/kernel/rcu/sync.c
+@@ -10,15 +10,13 @@
+ #include <linux/rcu_sync.h>
+ #include <linux/sched.h>
+ 
+-enum { GP_IDLE = 0, GP_PENDING, GP_PASSED };
+-enum { CB_IDLE = 0, CB_PENDING, CB_REPLAY };
++enum { GP_IDLE = 0, GP_ENTER, GP_PASSED, GP_EXIT, GP_REPLAY };
+ 
+ #define	rss_lock	gp_wait.lock
+ 
+ /**
+  * rcu_sync_init() - Initialize an rcu_sync structure
+  * @rsp: Pointer to rcu_sync structure to be initialized
+- * @type: Flavor of RCU with which to synchronize rcu_sync structure
+  */
+ void rcu_sync_init(struct rcu_sync *rsp)
+ {
+@@ -41,56 +39,26 @@ void rcu_sync_enter_start(struct rcu_sync *rsp)
+ 	rsp->gp_state = GP_PASSED;
+ }
+ 
+-/**
+- * rcu_sync_enter() - Force readers onto slowpath
+- * @rsp: Pointer to rcu_sync structure to use for synchronization
+- *
+- * This function is used by updaters who need readers to make use of
+- * a slowpath during the update.  After this function returns, all
+- * subsequent calls to rcu_sync_is_idle() will return false, which
+- * tells readers to stay off their fastpaths.  A later call to
+- * rcu_sync_exit() re-enables reader slowpaths.
+- *
+- * When called in isolation, rcu_sync_enter() must wait for a grace
+- * period, however, closely spaced calls to rcu_sync_enter() can
+- * optimize away the grace-period wait via a state machine implemented
+- * by rcu_sync_enter(), rcu_sync_exit(), and rcu_sync_func().
+- */
+-void rcu_sync_enter(struct rcu_sync *rsp)
+-{
+-	bool need_wait, need_sync;
+ 
+-	spin_lock_irq(&rsp->rss_lock);
+-	need_wait = rsp->gp_count++;
+-	need_sync = rsp->gp_state == GP_IDLE;
+-	if (need_sync)
+-		rsp->gp_state = GP_PENDING;
+-	spin_unlock_irq(&rsp->rss_lock);
++static void rcu_sync_func(struct rcu_head *rhp);
+ 
+-	WARN_ON_ONCE(need_wait && need_sync);
+-	if (need_sync) {
+-		synchronize_rcu();
+-		rsp->gp_state = GP_PASSED;
+-		wake_up_all(&rsp->gp_wait);
+-	} else if (need_wait) {
+-		wait_event(rsp->gp_wait, rsp->gp_state == GP_PASSED);
+-	} else {
+-		/*
+-		 * Possible when there's a pending CB from a rcu_sync_exit().
+-		 * Nobody has yet been allowed the 'fast' path and thus we can
+-		 * avoid doing any sync(). The callback will get 'dropped'.
+-		 */
+-		WARN_ON_ONCE(rsp->gp_state != GP_PASSED);
+-	}
++static void rcu_sync_call(struct rcu_sync *rsp)
++{
++	call_rcu(&rsp->cb_head, rcu_sync_func);
+ }
+ 
+ /**
+  * rcu_sync_func() - Callback function managing reader access to fastpath
+  * @rhp: Pointer to rcu_head in rcu_sync structure to use for synchronization
+  *
+- * This function is passed to one of the call_rcu() functions by
++ * This function is passed to call_rcu() function by rcu_sync_enter() and
+  * rcu_sync_exit(), so that it is invoked after a grace period following the
+- * that invocation of rcu_sync_exit().  It takes action based on events that
++ * that invocation of enter/exit.
++ *
++ * If it is called by rcu_sync_enter() it signals that all the readers were
++ * switched onto slow path.
++ *
++ * If it is called by rcu_sync_exit() it takes action based on events that
+  * have taken place in the meantime, so that closely spaced rcu_sync_enter()
+  * and rcu_sync_exit() pairs need not wait for a grace period.
+  *
+@@ -107,35 +75,88 @@ static void rcu_sync_func(struct rcu_head *rhp)
+ 	struct rcu_sync *rsp = container_of(rhp, struct rcu_sync, cb_head);
+ 	unsigned long flags;
+ 
+-	WARN_ON_ONCE(rsp->gp_state != GP_PASSED);
+-	WARN_ON_ONCE(rsp->cb_state == CB_IDLE);
++	WARN_ON_ONCE(READ_ONCE(rsp->gp_state) == GP_IDLE);
++	WARN_ON_ONCE(READ_ONCE(rsp->gp_state) == GP_PASSED);
+ 
+ 	spin_lock_irqsave(&rsp->rss_lock, flags);
+ 	if (rsp->gp_count) {
+ 		/*
+-		 * A new rcu_sync_begin() has happened; drop the callback.
++		 * We're at least a GP after the GP_IDLE->GP_ENTER transition.
+ 		 */
+-		rsp->cb_state = CB_IDLE;
+-	} else if (rsp->cb_state == CB_REPLAY) {
++		WRITE_ONCE(rsp->gp_state, GP_PASSED);
++		wake_up_locked(&rsp->gp_wait);
++	} else if (rsp->gp_state == GP_REPLAY) {
+ 		/*
+-		 * A new rcu_sync_exit() has happened; requeue the callback
+-		 * to catch a later GP.
++		 * A new rcu_sync_exit() has happened; requeue the callback to
++		 * catch a later GP.
+ 		 */
+-		rsp->cb_state = CB_PENDING;
+-		call_rcu(&rsp->cb_head, rcu_sync_func);
++		WRITE_ONCE(rsp->gp_state, GP_EXIT);
++		rcu_sync_call(rsp);
+ 	} else {
+ 		/*
+-		 * We're at least a GP after rcu_sync_exit(); eveybody will now
+-		 * have observed the write side critical section. Let 'em rip!.
++		 * We're at least a GP after the last rcu_sync_exit(); eveybody
++		 * will now have observed the write side critical section.
++		 * Let 'em rip!.
+ 		 */
+-		rsp->cb_state = CB_IDLE;
+-		rsp->gp_state = GP_IDLE;
++		WRITE_ONCE(rsp->gp_state, GP_IDLE);
+ 	}
+ 	spin_unlock_irqrestore(&rsp->rss_lock, flags);
+ }
+ 
+ /**
+- * rcu_sync_exit() - Allow readers back onto fast patch after grace period
++ * rcu_sync_enter() - Force readers onto slowpath
++ * @rsp: Pointer to rcu_sync structure to use for synchronization
++ *
++ * This function is used by updaters who need readers to make use of
++ * a slowpath during the update.  After this function returns, all
++ * subsequent calls to rcu_sync_is_idle() will return false, which
++ * tells readers to stay off their fastpaths.  A later call to
++ * rcu_sync_exit() re-enables reader slowpaths.
++ *
++ * When called in isolation, rcu_sync_enter() must wait for a grace
++ * period, however, closely spaced calls to rcu_sync_enter() can
++ * optimize away the grace-period wait via a state machine implemented
++ * by rcu_sync_enter(), rcu_sync_exit(), and rcu_sync_func().
++ */
++void rcu_sync_enter(struct rcu_sync *rsp)
++{
++	int gp_state;
++
++	spin_lock_irq(&rsp->rss_lock);
++	gp_state = rsp->gp_state;
++	if (gp_state == GP_IDLE) {
++		WRITE_ONCE(rsp->gp_state, GP_ENTER);
++		WARN_ON_ONCE(rsp->gp_count);
++		/*
++		 * Note that we could simply do rcu_sync_call(rsp) here and
++		 * avoid the "if (gp_state == GP_IDLE)" block below.
++		 *
++		 * However, synchronize_rcu() can be faster if rcu_expedited
++		 * or rcu_blocking_is_gp() is true.
++		 *
++		 * Another reason is that we can't wait for rcu callback if
++		 * we are called at early boot time but this shouldn't happen.
++		 */
++	}
++	rsp->gp_count++;
++	spin_unlock_irq(&rsp->rss_lock);
++
++	if (gp_state == GP_IDLE) {
++		/*
++		 * See the comment above, this simply does the "synchronous"
++		 * call_rcu(rcu_sync_func) which does GP_ENTER -> GP_PASSED.
++		 */
++		synchronize_rcu();
++		rcu_sync_func(&rsp->cb_head);
++		/* Not really needed, wait_event() would see GP_PASSED. */
++		return;
++	}
++
++	wait_event(rsp->gp_wait, READ_ONCE(rsp->gp_state) >= GP_PASSED);
++}
++
++/**
++ * rcu_sync_exit() - Allow readers back onto fast path after grace period
+  * @rsp: Pointer to rcu_sync structure to use for synchronization
+  *
+  * This function is used by updaters who have completed, and can therefore
+@@ -146,13 +167,16 @@ static void rcu_sync_func(struct rcu_head *rhp)
+  */
+ void rcu_sync_exit(struct rcu_sync *rsp)
+ {
++	WARN_ON_ONCE(READ_ONCE(rsp->gp_state) == GP_IDLE);
++	WARN_ON_ONCE(READ_ONCE(rsp->gp_count) == 0);
++
+ 	spin_lock_irq(&rsp->rss_lock);
+ 	if (!--rsp->gp_count) {
+-		if (rsp->cb_state == CB_IDLE) {
+-			rsp->cb_state = CB_PENDING;
+-			call_rcu(&rsp->cb_head, rcu_sync_func);
+-		} else if (rsp->cb_state == CB_PENDING) {
+-			rsp->cb_state = CB_REPLAY;
++		if (rsp->gp_state == GP_PASSED) {
++			WRITE_ONCE(rsp->gp_state, GP_EXIT);
++			rcu_sync_call(rsp);
++		} else if (rsp->gp_state == GP_EXIT) {
++			WRITE_ONCE(rsp->gp_state, GP_REPLAY);
+ 		}
+ 	}
+ 	spin_unlock_irq(&rsp->rss_lock);
+@@ -164,18 +188,19 @@ void rcu_sync_exit(struct rcu_sync *rsp)
+  */
+ void rcu_sync_dtor(struct rcu_sync *rsp)
+ {
+-	int cb_state;
++	int gp_state;
+ 
+-	WARN_ON_ONCE(rsp->gp_count);
++	WARN_ON_ONCE(READ_ONCE(rsp->gp_count));
++	WARN_ON_ONCE(READ_ONCE(rsp->gp_state) == GP_PASSED);
+ 
+ 	spin_lock_irq(&rsp->rss_lock);
+-	if (rsp->cb_state == CB_REPLAY)
+-		rsp->cb_state = CB_PENDING;
+-	cb_state = rsp->cb_state;
++	if (rsp->gp_state == GP_REPLAY)
++		WRITE_ONCE(rsp->gp_state, GP_EXIT);
++	gp_state = rsp->gp_state;
+ 	spin_unlock_irq(&rsp->rss_lock);
+ 
+-	if (cb_state != CB_IDLE) {
++	if (gp_state != GP_IDLE) {
+ 		rcu_barrier();
+-		WARN_ON_ONCE(rsp->cb_state != CB_IDLE);
++		WARN_ON_ONCE(rsp->gp_state != GP_IDLE);
+ 	}
+ }
+
+commit 95bf33b55ff4465399bad843f1d8d618c8baf1f3
+Author: Oleg Nesterov <oleg@redhat.com>
+Date:   Tue Apr 23 14:07:24 2019 +0200
+
+    rcu/sync: Kill rcu_sync_type/gp_type
+    
+    Now that the RCU flavors have been consolidated, rcu_sync_type makes no
+    sense because none of internal update functions aside from .held() depend
+    on gp_type.  This commit therefore removes this field and consolidates
+    the relevant code.
+    
+    Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+    [ paulmck: Added RCU and RCU-bh checks to rcu_sync_is_idle(). ]
+    [ paulmck: And applied subsequent feedback from Oleg Nesterov. ]
+    Signed-off-by: Paul E. McKenney <paulmck@linux.ibm.com>
+
+diff --git a/kernel/rcu/sync.c b/kernel/rcu/sync.c
+index a8304d90573f..ee427e138dad 100644
+--- a/kernel/rcu/sync.c
++++ b/kernel/rcu/sync.c
+@@ -10,65 +10,20 @@
+ #include <linux/rcu_sync.h>
+ #include <linux/sched.h>
+ 
+-#ifdef CONFIG_PROVE_RCU
+-#define __INIT_HELD(func)	.held = func,
+-#else
+-#define __INIT_HELD(func)
+-#endif
+-
+-static const struct {
+-	void (*sync)(void);
+-	void (*call)(struct rcu_head *, void (*)(struct rcu_head *));
+-	void (*wait)(void);
+-#ifdef CONFIG_PROVE_RCU
+-	int  (*held)(void);
+-#endif
+-} gp_ops[] = {
+-	[RCU_SYNC] = {
+-		.sync = synchronize_rcu,
+-		.call = call_rcu,
+-		.wait = rcu_barrier,
+-		__INIT_HELD(rcu_read_lock_held)
+-	},
+-	[RCU_SCHED_SYNC] = {
+-		.sync = synchronize_rcu,
+-		.call = call_rcu,
+-		.wait = rcu_barrier,
+-		__INIT_HELD(rcu_read_lock_sched_held)
+-	},
+-	[RCU_BH_SYNC] = {
+-		.sync = synchronize_rcu,
+-		.call = call_rcu,
+-		.wait = rcu_barrier,
+-		__INIT_HELD(rcu_read_lock_bh_held)
+-	},
+-};
+-
+ enum { GP_IDLE = 0, GP_PENDING, GP_PASSED };
+ enum { CB_IDLE = 0, CB_PENDING, CB_REPLAY };
+ 
+ #define	rss_lock	gp_wait.lock
+ 
+-#ifdef CONFIG_PROVE_RCU
+-void rcu_sync_lockdep_assert(struct rcu_sync *rsp)
+-{
+-	RCU_LOCKDEP_WARN(!gp_ops[rsp->gp_type].held(),
+-			 "suspicious rcu_sync_is_idle() usage");
+-}
+-
+-EXPORT_SYMBOL_GPL(rcu_sync_lockdep_assert);
+-#endif
+-
+ /**
+  * rcu_sync_init() - Initialize an rcu_sync structure
+  * @rsp: Pointer to rcu_sync structure to be initialized
+  * @type: Flavor of RCU with which to synchronize rcu_sync structure
+  */
+-void rcu_sync_init(struct rcu_sync *rsp, enum rcu_sync_type type)
++void rcu_sync_init(struct rcu_sync *rsp)
+ {
+ 	memset(rsp, 0, sizeof(*rsp));
+ 	init_waitqueue_head(&rsp->gp_wait);
+-	rsp->gp_type = type;
+ }
+ 
+ /**
+@@ -114,7 +69,7 @@ void rcu_sync_enter(struct rcu_sync *rsp)
+ 
+ 	WARN_ON_ONCE(need_wait && need_sync);
+ 	if (need_sync) {
+-		gp_ops[rsp->gp_type].sync();
++		synchronize_rcu();
+ 		rsp->gp_state = GP_PASSED;
+ 		wake_up_all(&rsp->gp_wait);
+ 	} else if (need_wait) {
+@@ -167,7 +122,7 @@ static void rcu_sync_func(struct rcu_head *rhp)
+ 		 * to catch a later GP.
+ 		 */
+ 		rsp->cb_state = CB_PENDING;
+-		gp_ops[rsp->gp_type].call(&rsp->cb_head, rcu_sync_func);
++		call_rcu(&rsp->cb_head, rcu_sync_func);
+ 	} else {
+ 		/*
+ 		 * We're at least a GP after rcu_sync_exit(); eveybody will now
+@@ -195,7 +150,7 @@ void rcu_sync_exit(struct rcu_sync *rsp)
+ 	if (!--rsp->gp_count) {
+ 		if (rsp->cb_state == CB_IDLE) {
+ 			rsp->cb_state = CB_PENDING;
+-			gp_ops[rsp->gp_type].call(&rsp->cb_head, rcu_sync_func);
++			call_rcu(&rsp->cb_head, rcu_sync_func);
+ 		} else if (rsp->cb_state == CB_PENDING) {
+ 			rsp->cb_state = CB_REPLAY;
+ 		}
+@@ -220,7 +175,7 @@ void rcu_sync_dtor(struct rcu_sync *rsp)
+ 	spin_unlock_irq(&rsp->rss_lock);
+ 
+ 	if (cb_state != CB_IDLE) {
+-		gp_ops[rsp->gp_type].wait();
++		rcu_barrier();
+ 		WARN_ON_ONCE(rsp->cb_state != CB_IDLE);
+ 	}
+ }
+
+commit 96b903f5da491199b51a7a9e70699f606a8a09b4
+Author: Paul E. McKenney <paulmck@linux.ibm.com>
+Date:   Thu Jan 17 10:19:01 2019 -0800
+
+    rcu/sync: Convert to SPDX license identifier
+    
+    Replace the license boiler plate with a SPDX license identifier.
+    
+    Signed-off-by: Paul E. McKenney <paulmck@linux.ibm.com>
+    Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+
+diff --git a/kernel/rcu/sync.c b/kernel/rcu/sync.c
+index be10036fa621..a8304d90573f 100644
+--- a/kernel/rcu/sync.c
++++ b/kernel/rcu/sync.c
+@@ -1,20 +1,7 @@
++// SPDX-License-Identifier: GPL-2.0+
+ /*
+  * RCU-based infrastructure for lightweight reader-writer locking
+  *
+- * This program is free software; you can redistribute it and/or modify
+- * it under the terms of the GNU General Public License as published by
+- * the Free Software Foundation; either version 2 of the License, or
+- * (at your option) any later version.
+- *
+- * This program is distributed in the hope that it will be useful,
+- * but WITHOUT ANY WARRANTY; without even the implied warranty of
+- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+- * GNU General Public License for more details.
+- *
+- * You should have received a copy of the GNU General Public License
+- * along with this program; if not, you can access it online at
+- * http://www.gnu.org/licenses/gpl-2.0.html.
+- *
+  * Copyright (c) 2015, Red Hat, Inc.
+  *
+  * Author: Oleg Nesterov <oleg@redhat.com>
+
+commit eaaf055f27a0eaaed0cdb0d3aa8d7fb892829ccb
+Merge: f0ad56e876cd df56e0f96062 97b59370fa59 3d709ab5a176 b94ec36896da d4d592a6eeda aacb5d91ab1b
+Author: Paul E. McKenney <paulmck@linux.ibm.com>
+Date:   Sat Dec 1 12:43:16 2018 -0800
+
+    Merge branches 'bug.2018.11.12a', 'consolidate.2018.12.01a', 'doc.2018.11.12a', 'fixes.2018.11.12a', 'initrd.2018.11.08b', 'sil.2018.11.12a' and 'srcu.2018.11.27a' into HEAD
+    
+    bug.2018.11.12a:  Get rid of BUG_ON() and friends
+    consolidate.2018.12.01a:  Continued RCU flavor-consolidation cleanup
+    doc.2018.11.12a:  Documentation updates
+    fixes.2018.11.12a:  Miscellaneous fixes
+    initrd.2018.11.08b:  Automate creation of rcutorture initrd
+    sil.2018.11.12a:  Remove more spin_unlock_wait() calls
+
+commit d3ff3891b2edba63a7dee9023306bb66878fc3d8
+Author: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+Date:   Wed Jul 11 14:42:53 2018 -0700
+
+    rcu: Consolidate the RCU update functions invoked by sync.c
+    
+    This commit retains all the various gp_ops[] entries, but makes their
+    update functions all be synchronize_rcu(), call_rcu() and rcu_barrier().
+    The read-side checks remain consistent with the various RCU flavors,
+    which still exist on the read side.
+    
+    Signed-off-by: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+    Cc: Oleg Nesterov <oleg@redhat.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+
+diff --git a/kernel/rcu/sync.c b/kernel/rcu/sync.c
+index 3f943efcf61c..9d570b1892b0 100644
+--- a/kernel/rcu/sync.c
++++ b/kernel/rcu/sync.c
+@@ -44,15 +44,15 @@ static const struct {
+ 		__INIT_HELD(rcu_read_lock_held)
+ 	},
+ 	[RCU_SCHED_SYNC] = {
+-		.sync = synchronize_sched,
+-		.call = call_rcu_sched,
+-		.wait = rcu_barrier_sched,
++		.sync = synchronize_rcu,
++		.call = call_rcu,
++		.wait = rcu_barrier,
+ 		__INIT_HELD(rcu_read_lock_sched_held)
+ 	},
+ 	[RCU_BH_SYNC] = {
+-		.sync = synchronize_rcu_bh,
+-		.call = call_rcu_bh,
+-		.wait = rcu_barrier_bh,
++		.sync = synchronize_rcu,
++		.call = call_rcu,
++		.wait = rcu_barrier,
+ 		__INIT_HELD(rcu_read_lock_bh_held)
+ 	},
+ };
+
+commit 042d4c70a203998697b34eaad1a99f6f09d09e4d
+Author: Paul E. McKenney <paulmck@linux.ibm.com>
+Date:   Mon Oct 22 07:43:22 2018 -0700
+
+    rcu: Eliminate BUG_ON() for sync.c
+    
+    The sync.c file has a number of calls to BUG_ON(), which panics the
+    kernel, which is not a good strategy for devices (like embedded) that
+    don't have a way to capture console output.  This commit therefore
+    changes these BUG_ON() calls to WARN_ON_ONCE(), but does so quite naively.
+    
+    Reported-by: Linus Torvalds <torvalds@linux-foundation.org>
+    Signed-off-by: Paul E. McKenney <paulmck@linux.ibm.com>
+    Acked-by: Oleg Nesterov <oleg@redhat.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+
+diff --git a/kernel/rcu/sync.c b/kernel/rcu/sync.c
+index 3f943efcf61c..a6ba446a9693 100644
+--- a/kernel/rcu/sync.c
++++ b/kernel/rcu/sync.c
+@@ -125,8 +125,7 @@ void rcu_sync_enter(struct rcu_sync *rsp)
+ 		rsp->gp_state = GP_PENDING;
+ 	spin_unlock_irq(&rsp->rss_lock);
+ 
+-	BUG_ON(need_wait && need_sync);
+-
++	WARN_ON_ONCE(need_wait && need_sync);
+ 	if (need_sync) {
+ 		gp_ops[rsp->gp_type].sync();
+ 		rsp->gp_state = GP_PASSED;
+@@ -139,7 +138,7 @@ void rcu_sync_enter(struct rcu_sync *rsp)
+ 		 * Nobody has yet been allowed the 'fast' path and thus we can
+ 		 * avoid doing any sync(). The callback will get 'dropped'.
+ 		 */
+-		BUG_ON(rsp->gp_state != GP_PASSED);
++		WARN_ON_ONCE(rsp->gp_state != GP_PASSED);
+ 	}
+ }
+ 
+@@ -166,8 +165,8 @@ static void rcu_sync_func(struct rcu_head *rhp)
+ 	struct rcu_sync *rsp = container_of(rhp, struct rcu_sync, cb_head);
+ 	unsigned long flags;
+ 
+-	BUG_ON(rsp->gp_state != GP_PASSED);
+-	BUG_ON(rsp->cb_state == CB_IDLE);
++	WARN_ON_ONCE(rsp->gp_state != GP_PASSED);
++	WARN_ON_ONCE(rsp->cb_state == CB_IDLE);
+ 
+ 	spin_lock_irqsave(&rsp->rss_lock, flags);
+ 	if (rsp->gp_count) {
+@@ -225,7 +224,7 @@ void rcu_sync_dtor(struct rcu_sync *rsp)
+ {
+ 	int cb_state;
+ 
+-	BUG_ON(rsp->gp_count);
++	WARN_ON_ONCE(rsp->gp_count);
+ 
+ 	spin_lock_irq(&rsp->rss_lock);
+ 	if (rsp->cb_state == CB_REPLAY)
+@@ -235,6 +234,6 @@ void rcu_sync_dtor(struct rcu_sync *rsp)
+ 
+ 	if (cb_state != CB_IDLE) {
+ 		gp_ops[rsp->gp_type].wait();
+-		BUG_ON(rsp->cb_state != CB_IDLE);
++		WARN_ON_ONCE(rsp->cb_state != CB_IDLE);
+ 	}
+ }
+
+commit 27fdb35fe99011d86bcc54f62fe84712c53f4d05
+Author: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+Date:   Thu Oct 19 14:26:21 2017 -0700
+
+    doc: Fix various RCU docbook comment-header problems
+    
+    Because many of RCU's files have not been included into docbook, a
+    number of errors have accumulated.  This commit fixes them.
+    
+    Signed-off-by: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/kernel/rcu/sync.c b/kernel/rcu/sync.c
+index 50d1861f7759..3f943efcf61c 100644
+--- a/kernel/rcu/sync.c
++++ b/kernel/rcu/sync.c
+@@ -85,6 +85,9 @@ void rcu_sync_init(struct rcu_sync *rsp, enum rcu_sync_type type)
+ }
+ 
+ /**
++ * rcu_sync_enter_start - Force readers onto slow path for multiple updates
++ * @rsp: Pointer to rcu_sync structure to use for synchronization
++ *
+  * Must be called after rcu_sync_init() and before first use.
+  *
+  * Ensures rcu_sync_is_idle() returns false and rcu_sync_{enter,exit}()
+@@ -142,7 +145,7 @@ void rcu_sync_enter(struct rcu_sync *rsp)
+ 
+ /**
+  * rcu_sync_func() - Callback function managing reader access to fastpath
+- * @rsp: Pointer to rcu_sync structure to use for synchronization
++ * @rhp: Pointer to rcu_head in rcu_sync structure to use for synchronization
+  *
+  * This function is passed to one of the call_rcu() functions by
+  * rcu_sync_exit(), so that it is invoked after a grace period following the
+@@ -158,9 +161,9 @@ void rcu_sync_enter(struct rcu_sync *rsp)
+  * rcu_sync_exit().  Otherwise, set all state back to idle so that readers
+  * can again use their fastpaths.
+  */
+-static void rcu_sync_func(struct rcu_head *rcu)
++static void rcu_sync_func(struct rcu_head *rhp)
+ {
+-	struct rcu_sync *rsp = container_of(rcu, struct rcu_sync, cb_head);
++	struct rcu_sync *rsp = container_of(rhp, struct rcu_sync, cb_head);
+ 	unsigned long flags;
+ 
+ 	BUG_ON(rsp->gp_state != GP_PASSED);
+
+commit 3942a9bd7b5842a924e99ee6ec1350b8006c94ec
+Author: Peter Zijlstra <peterz@infradead.org>
+Date:   Thu Aug 11 18:54:13 2016 +0200
+
+    locking, rcu, cgroup: Avoid synchronize_sched() in __cgroup_procs_write()
+    
+    The current percpu-rwsem read side is entirely free of serializing insns
+    at the cost of having a synchronize_sched() in the write path.
+    
+    The latency of the synchronize_sched() is too high for cgroups. The
+    commit 1ed1328792ff talks about the write path being a fairly cold path
+    but this is not the case for Android which moves task to the foreground
+    cgroup and back around binder IPC calls from foreground processes to
+    background processes, so it is significantly hotter than human initiated
+    operations.
+    
+    Switch cgroup_threadgroup_rwsem into the slow mode for now to avoid the
+    problem, hopefully it should not be that slow after another commit:
+    
+      80127a39681b ("locking/percpu-rwsem: Optimize readers and reduce global impact").
+    
+    We could just add rcu_sync_enter() into cgroup_init() but we do not want
+    another synchronize_sched() at boot time, so this patch adds the new helper
+    which doesn't block but currently can only be called before the first use.
+    
+    Reported-by: John Stultz <john.stultz@linaro.org>
+    Reported-by: Dmitry Shmidt <dimitrysh@google.com>
+    Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+    Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+    Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+    Cc: Andrew Morton <akpm@linux-foundation.org>
+    Cc: Colin Cross <ccross@google.com>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Rom Lemarchand <romlem@google.com>
+    Cc: Tejun Heo <tj@kernel.org>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Todd Kjos <tkjos@google.com>
+    Link: http://lkml.kernel.org/r/20160811165413.GA22807@redhat.com
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/kernel/rcu/sync.c b/kernel/rcu/sync.c
+index 198473d90f81..50d1861f7759 100644
+--- a/kernel/rcu/sync.c
++++ b/kernel/rcu/sync.c
+@@ -84,6 +84,18 @@ void rcu_sync_init(struct rcu_sync *rsp, enum rcu_sync_type type)
+ 	rsp->gp_type = type;
+ }
+ 
++/**
++ * Must be called after rcu_sync_init() and before first use.
++ *
++ * Ensures rcu_sync_is_idle() returns false and rcu_sync_{enter,exit}()
++ * pairs turn into NO-OPs.
++ */
++void rcu_sync_enter_start(struct rcu_sync *rsp)
++{
++	rsp->gp_count++;
++	rsp->gp_state = GP_PASSED;
++}
++
+ /**
+  * rcu_sync_enter() - Force readers onto slowpath
+  * @rsp: Pointer to rcu_sync structure to use for synchronization
+
+commit 80127a39681bd68c959f0953f84a830cbd7c3b1c
+Author: Peter Zijlstra <peterz@infradead.org>
+Date:   Thu Jul 14 20:08:46 2016 +0200
+
+    locking/percpu-rwsem: Optimize readers and reduce global impact
+    
+    Currently the percpu-rwsem switches to (global) atomic ops while a
+    writer is waiting; which could be quite a while and slows down
+    releasing the readers.
+    
+    This patch cures this problem by ordering the reader-state vs
+    reader-count (see the comments in __percpu_down_read() and
+    percpu_down_write()). This changes a global atomic op into a full
+    memory barrier, which doesn't have the global cacheline contention.
+    
+    This also enables using the percpu-rwsem with rcu_sync disabled in order
+    to bias the implementation differently, reducing the writer latency by
+    adding some cost to readers.
+    
+    Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+    Reviewed-by: Oleg Nesterov <oleg@redhat.com>
+    Cc: Andrew Morton <akpm@linux-foundation.org>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+    Cc: Paul McKenney <paulmck@linux.vnet.ibm.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: linux-kernel@vger.kernel.org
+    [ Fixed modular build. ]
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/kernel/rcu/sync.c b/kernel/rcu/sync.c
+index be922c9f3d37..198473d90f81 100644
+--- a/kernel/rcu/sync.c
++++ b/kernel/rcu/sync.c
+@@ -68,6 +68,8 @@ void rcu_sync_lockdep_assert(struct rcu_sync *rsp)
+ 	RCU_LOCKDEP_WARN(!gp_ops[rsp->gp_type].held(),
+ 			 "suspicious rcu_sync_is_idle() usage");
+ }
++
++EXPORT_SYMBOL_GPL(rcu_sync_lockdep_assert);
+ #endif
+ 
+ /**
+
+commit 4bace7344d6dbd7a1b0b801abf24ea9878064317
+Author: Oleg Nesterov <oleg@redhat.com>
+Date:   Fri Sep 11 17:59:18 2015 +0200
+
+    rcu_sync: Cleanup the CONFIG_PROVE_RCU checks
+    
+    1. Rename __rcu_sync_is_idle() to rcu_sync_lockdep_assert() and
+       change it to use rcu_lockdep_assert().
+    
+    2. Change rcu_sync_is_idle() to return rsp->gp_state == GP_IDLE
+       unconditonally, this way we can remove the same check from
+       rcu_sync_lockdep_assert() and clearly isolate the debugging
+       code.
+    
+    Note: rcu_sync_enter()->wait_event(gp_state == GP_PASSED) needs
+    another CONFIG_PROVE_RCU check, the same as is done in ->sync(); but
+    this needs some simple preparations in the core RCU code to avoid the
+    code duplication.
+    
+    Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+    Signed-off-by: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+    Reviewed-by: Josh Triplett <josh@joshtriplett.org>
+
+diff --git a/kernel/rcu/sync.c b/kernel/rcu/sync.c
+index 1e353f0a2b66..be922c9f3d37 100644
+--- a/kernel/rcu/sync.c
++++ b/kernel/rcu/sync.c
+@@ -63,10 +63,10 @@ enum { CB_IDLE = 0, CB_PENDING, CB_REPLAY };
+ #define	rss_lock	gp_wait.lock
+ 
+ #ifdef CONFIG_PROVE_RCU
+-bool __rcu_sync_is_idle(struct rcu_sync *rsp)
++void rcu_sync_lockdep_assert(struct rcu_sync *rsp)
+ {
+-	WARN_ON(!gp_ops[rsp->gp_type].held());
+-	return rsp->gp_state == GP_IDLE;
++	RCU_LOCKDEP_WARN(!gp_ops[rsp->gp_type].held(),
++			 "suspicious rcu_sync_is_idle() usage");
+ }
+ #endif
+ 
+
+commit 07899a6e5f56136028c44a57ad0451e797365ac3
+Author: Oleg Nesterov <oleg@redhat.com>
+Date:   Fri Aug 21 19:42:52 2015 +0200
+
+    rcu_sync: Introduce rcu_sync_dtor()
+    
+    This commit allows rcu_sync structures to be safely deallocated,
+    The trick is to add a new ->wait field to the gp_ops array.
+    This field is a pointer to the rcu_barrier() function corresponding
+    to the flavor of RCU in question.  This allows a new rcu_sync_dtor()
+    to wait for any outstanding callbacks before freeing the rcu_sync
+    structure.
+    
+    Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+    Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+    Signed-off-by: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+    Reviewed-by: Josh Triplett <josh@joshtriplett.org>
+
+diff --git a/kernel/rcu/sync.c b/kernel/rcu/sync.c
+index 01c9807a7f73..1e353f0a2b66 100644
+--- a/kernel/rcu/sync.c
++++ b/kernel/rcu/sync.c
+@@ -32,6 +32,7 @@
+ static const struct {
+ 	void (*sync)(void);
+ 	void (*call)(struct rcu_head *, void (*)(struct rcu_head *));
++	void (*wait)(void);
+ #ifdef CONFIG_PROVE_RCU
+ 	int  (*held)(void);
+ #endif
+@@ -39,16 +40,19 @@ static const struct {
+ 	[RCU_SYNC] = {
+ 		.sync = synchronize_rcu,
+ 		.call = call_rcu,
++		.wait = rcu_barrier,
+ 		__INIT_HELD(rcu_read_lock_held)
+ 	},
+ 	[RCU_SCHED_SYNC] = {
+ 		.sync = synchronize_sched,
+ 		.call = call_rcu_sched,
++		.wait = rcu_barrier_sched,
+ 		__INIT_HELD(rcu_read_lock_sched_held)
+ 	},
+ 	[RCU_BH_SYNC] = {
+ 		.sync = synchronize_rcu_bh,
+ 		.call = call_rcu_bh,
++		.wait = rcu_barrier_bh,
+ 		__INIT_HELD(rcu_read_lock_bh_held)
+ 	},
+ };
+@@ -195,3 +199,25 @@ void rcu_sync_exit(struct rcu_sync *rsp)
+ 	}
+ 	spin_unlock_irq(&rsp->rss_lock);
+ }
++
++/**
++ * rcu_sync_dtor() - Clean up an rcu_sync structure
++ * @rsp: Pointer to rcu_sync structure to be cleaned up
++ */
++void rcu_sync_dtor(struct rcu_sync *rsp)
++{
++	int cb_state;
++
++	BUG_ON(rsp->gp_count);
++
++	spin_lock_irq(&rsp->rss_lock);
++	if (rsp->cb_state == CB_REPLAY)
++		rsp->cb_state = CB_PENDING;
++	cb_state = rsp->cb_state;
++	spin_unlock_irq(&rsp->rss_lock);
++
++	if (cb_state != CB_IDLE) {
++		gp_ops[rsp->gp_type].wait();
++		BUG_ON(rsp->cb_state != CB_IDLE);
++	}
++}
+
+commit 3a518b76af7bb411efe6dd090fbf098e29accb2e
+Author: Oleg Nesterov <oleg@redhat.com>
+Date:   Fri Aug 21 19:42:50 2015 +0200
+
+    rcu_sync: Add CONFIG_PROVE_RCU checks
+    
+    This commit validates that the caller of rcu_sync_is_idle() holds the
+    corresponding type of RCU read-side lock, but only in kernels built
+    with CONFIG_PROVE_RCU=y.  This validation is carried out via a new
+    rcu_sync_ops->held() method that is checked within rcu_sync_is_idle().
+    
+    Note that although this does add code to the fast path, it only does so
+    in kernels built with CONFIG_PROVE_RCU=y.
+    
+    Suggested-by: "Paul E. McKenney" <paulmck@linux.vnet.ibm.com>
+    Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+    Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+    Signed-off-by: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+    Reviewed-by: Josh Triplett <josh@joshtriplett.org>
+
+diff --git a/kernel/rcu/sync.c b/kernel/rcu/sync.c
+index 5a9aa4c394f1..01c9807a7f73 100644
+--- a/kernel/rcu/sync.c
++++ b/kernel/rcu/sync.c
+@@ -23,21 +23,33 @@
+ #include <linux/rcu_sync.h>
+ #include <linux/sched.h>
+ 
++#ifdef CONFIG_PROVE_RCU
++#define __INIT_HELD(func)	.held = func,
++#else
++#define __INIT_HELD(func)
++#endif
++
+ static const struct {
+ 	void (*sync)(void);
+ 	void (*call)(struct rcu_head *, void (*)(struct rcu_head *));
++#ifdef CONFIG_PROVE_RCU
++	int  (*held)(void);
++#endif
+ } gp_ops[] = {
+ 	[RCU_SYNC] = {
+ 		.sync = synchronize_rcu,
+ 		.call = call_rcu,
++		__INIT_HELD(rcu_read_lock_held)
+ 	},
+ 	[RCU_SCHED_SYNC] = {
+ 		.sync = synchronize_sched,
+ 		.call = call_rcu_sched,
++		__INIT_HELD(rcu_read_lock_sched_held)
+ 	},
+ 	[RCU_BH_SYNC] = {
+ 		.sync = synchronize_rcu_bh,
+ 		.call = call_rcu_bh,
++		__INIT_HELD(rcu_read_lock_bh_held)
+ 	},
+ };
+ 
+@@ -46,6 +58,14 @@ enum { CB_IDLE = 0, CB_PENDING, CB_REPLAY };
+ 
+ #define	rss_lock	gp_wait.lock
+ 
++#ifdef CONFIG_PROVE_RCU
++bool __rcu_sync_is_idle(struct rcu_sync *rsp)
++{
++	WARN_ON(!gp_ops[rsp->gp_type].held());
++	return rsp->gp_state == GP_IDLE;
++}
++#endif
++
+ /**
+  * rcu_sync_init() - Initialize an rcu_sync structure
+  * @rsp: Pointer to rcu_sync structure to be initialized
+
+commit 82e8c565be8a72957570d7da8dd9b441db7bb648
+Author: Oleg Nesterov <oleg@redhat.com>
+Date:   Fri Aug 21 19:42:47 2015 +0200
+
+    rcu_sync: Simplify rcu_sync using new rcu_sync_ops structure
+    
+    This commit adds the new struct rcu_sync_ops which holds sync/call
+    methods, and turns the function pointers in rcu_sync_struct into an array
+    of struct rcu_sync_ops.  This simplifies the "init" helpers by collapsing
+    a switch statement and explicit multiple definitions into a simple
+    assignment and a helper macro, respectively.
+    
+    Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+    Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+    Signed-off-by: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+    Reviewed-by: Josh Triplett <josh@joshtriplett.org>
+
+diff --git a/kernel/rcu/sync.c b/kernel/rcu/sync.c
+index 0a11df43be23..5a9aa4c394f1 100644
+--- a/kernel/rcu/sync.c
++++ b/kernel/rcu/sync.c
+@@ -23,6 +23,24 @@
+ #include <linux/rcu_sync.h>
+ #include <linux/sched.h>
+ 
++static const struct {
++	void (*sync)(void);
++	void (*call)(struct rcu_head *, void (*)(struct rcu_head *));
++} gp_ops[] = {
++	[RCU_SYNC] = {
++		.sync = synchronize_rcu,
++		.call = call_rcu,
++	},
++	[RCU_SCHED_SYNC] = {
++		.sync = synchronize_sched,
++		.call = call_rcu_sched,
++	},
++	[RCU_BH_SYNC] = {
++		.sync = synchronize_rcu_bh,
++		.call = call_rcu_bh,
++	},
++};
++
+ enum { GP_IDLE = 0, GP_PENDING, GP_PASSED };
+ enum { CB_IDLE = 0, CB_PENDING, CB_REPLAY };
+ 
+@@ -37,23 +55,7 @@ void rcu_sync_init(struct rcu_sync *rsp, enum rcu_sync_type type)
+ {
+ 	memset(rsp, 0, sizeof(*rsp));
+ 	init_waitqueue_head(&rsp->gp_wait);
+-
+-	switch (type) {
+-	case RCU_SYNC:
+-		rsp->sync = synchronize_rcu;
+-		rsp->call = call_rcu;
+-		break;
+-
+-	case RCU_SCHED_SYNC:
+-		rsp->sync = synchronize_sched;
+-		rsp->call = call_rcu_sched;
+-		break;
+-
+-	case RCU_BH_SYNC:
+-		rsp->sync = synchronize_rcu_bh;
+-		rsp->call = call_rcu_bh;
+-		break;
+-	}
++	rsp->gp_type = type;
+ }
+ 
+ /**
+@@ -85,7 +87,7 @@ void rcu_sync_enter(struct rcu_sync *rsp)
+ 	BUG_ON(need_wait && need_sync);
+ 
+ 	if (need_sync) {
+-		rsp->sync();
++		gp_ops[rsp->gp_type].sync();
+ 		rsp->gp_state = GP_PASSED;
+ 		wake_up_all(&rsp->gp_wait);
+ 	} else if (need_wait) {
+@@ -138,7 +140,7 @@ static void rcu_sync_func(struct rcu_head *rcu)
+ 		 * to catch a later GP.
+ 		 */
+ 		rsp->cb_state = CB_PENDING;
+-		rsp->call(&rsp->cb_head, rcu_sync_func);
++		gp_ops[rsp->gp_type].call(&rsp->cb_head, rcu_sync_func);
+ 	} else {
+ 		/*
+ 		 * We're at least a GP after rcu_sync_exit(); eveybody will now
+@@ -166,7 +168,7 @@ void rcu_sync_exit(struct rcu_sync *rsp)
+ 	if (!--rsp->gp_count) {
+ 		if (rsp->cb_state == CB_IDLE) {
+ 			rsp->cb_state = CB_PENDING;
+-			rsp->call(&rsp->cb_head, rcu_sync_func);
++			gp_ops[rsp->gp_type].call(&rsp->cb_head, rcu_sync_func);
+ 		} else if (rsp->cb_state == CB_PENDING) {
+ 			rsp->cb_state = CB_REPLAY;
+ 		}
+
+commit cc44ca848f5e517aeca9f5eabbe13609a3f71450
+Author: Oleg Nesterov <oleg@redhat.com>
+Date:   Fri Aug 21 19:42:44 2015 +0200
+
+    rcu: Create rcu_sync infrastructure
+    
+    The rcu_sync infrastructure can be thought of as infrastructure to be
+    used to implement reader-writer primitives having extremely lightweight
+    readers during times when there are no writers.  The first use is in
+    the percpu_rwsem used by the VFS subsystem.
+    
+    This infrastructure is functionally equivalent to
+    
+            struct rcu_sync_struct {
+                    atomic_t counter;
+            };
+    
+            /* Check possibility of fast-path read-side operations. */
+            static inline bool rcu_sync_is_idle(struct rcu_sync_struct *rss)
+            {
+                    return atomic_read(&rss->counter) == 0;
+            }
+    
+            /* Tell readers to use slowpaths. */
+            static inline void rcu_sync_enter(struct rcu_sync_struct *rss)
+            {
+                    atomic_inc(&rss->counter);
+                    synchronize_sched();
+            }
+    
+            /* Allow readers to once again use fastpaths. */
+            static inline void rcu_sync_exit(struct rcu_sync_struct *rss)
+            {
+                    synchronize_sched();
+                    atomic_dec(&rss->counter);
+            }
+    
+    The main difference is that it records the state and only calls
+    synchronize_sched() if required.  At least some of the calls to
+    synchronize_sched() will be optimized away when rcu_sync_enter() and
+    rcu_sync_exit() are invoked repeatedly in quick succession.
+    
+    Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+    Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+    Signed-off-by: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+    Reviewed-by: Josh Triplett <josh@joshtriplett.org>
+
+diff --git a/kernel/rcu/sync.c b/kernel/rcu/sync.c
+new file mode 100644
+index 000000000000..0a11df43be23
+--- /dev/null
++++ b/kernel/rcu/sync.c
+@@ -0,0 +1,175 @@
++/*
++ * RCU-based infrastructure for lightweight reader-writer locking
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, you can access it online at
++ * http://www.gnu.org/licenses/gpl-2.0.html.
++ *
++ * Copyright (c) 2015, Red Hat, Inc.
++ *
++ * Author: Oleg Nesterov <oleg@redhat.com>
++ */
++
++#include <linux/rcu_sync.h>
++#include <linux/sched.h>
++
++enum { GP_IDLE = 0, GP_PENDING, GP_PASSED };
++enum { CB_IDLE = 0, CB_PENDING, CB_REPLAY };
++
++#define	rss_lock	gp_wait.lock
++
++/**
++ * rcu_sync_init() - Initialize an rcu_sync structure
++ * @rsp: Pointer to rcu_sync structure to be initialized
++ * @type: Flavor of RCU with which to synchronize rcu_sync structure
++ */
++void rcu_sync_init(struct rcu_sync *rsp, enum rcu_sync_type type)
++{
++	memset(rsp, 0, sizeof(*rsp));
++	init_waitqueue_head(&rsp->gp_wait);
++
++	switch (type) {
++	case RCU_SYNC:
++		rsp->sync = synchronize_rcu;
++		rsp->call = call_rcu;
++		break;
++
++	case RCU_SCHED_SYNC:
++		rsp->sync = synchronize_sched;
++		rsp->call = call_rcu_sched;
++		break;
++
++	case RCU_BH_SYNC:
++		rsp->sync = synchronize_rcu_bh;
++		rsp->call = call_rcu_bh;
++		break;
++	}
++}
++
++/**
++ * rcu_sync_enter() - Force readers onto slowpath
++ * @rsp: Pointer to rcu_sync structure to use for synchronization
++ *
++ * This function is used by updaters who need readers to make use of
++ * a slowpath during the update.  After this function returns, all
++ * subsequent calls to rcu_sync_is_idle() will return false, which
++ * tells readers to stay off their fastpaths.  A later call to
++ * rcu_sync_exit() re-enables reader slowpaths.
++ *
++ * When called in isolation, rcu_sync_enter() must wait for a grace
++ * period, however, closely spaced calls to rcu_sync_enter() can
++ * optimize away the grace-period wait via a state machine implemented
++ * by rcu_sync_enter(), rcu_sync_exit(), and rcu_sync_func().
++ */
++void rcu_sync_enter(struct rcu_sync *rsp)
++{
++	bool need_wait, need_sync;
++
++	spin_lock_irq(&rsp->rss_lock);
++	need_wait = rsp->gp_count++;
++	need_sync = rsp->gp_state == GP_IDLE;
++	if (need_sync)
++		rsp->gp_state = GP_PENDING;
++	spin_unlock_irq(&rsp->rss_lock);
++
++	BUG_ON(need_wait && need_sync);
++
++	if (need_sync) {
++		rsp->sync();
++		rsp->gp_state = GP_PASSED;
++		wake_up_all(&rsp->gp_wait);
++	} else if (need_wait) {
++		wait_event(rsp->gp_wait, rsp->gp_state == GP_PASSED);
++	} else {
++		/*
++		 * Possible when there's a pending CB from a rcu_sync_exit().
++		 * Nobody has yet been allowed the 'fast' path and thus we can
++		 * avoid doing any sync(). The callback will get 'dropped'.
++		 */
++		BUG_ON(rsp->gp_state != GP_PASSED);
++	}
++}
++
++/**
++ * rcu_sync_func() - Callback function managing reader access to fastpath
++ * @rsp: Pointer to rcu_sync structure to use for synchronization
++ *
++ * This function is passed to one of the call_rcu() functions by
++ * rcu_sync_exit(), so that it is invoked after a grace period following the
++ * that invocation of rcu_sync_exit().  It takes action based on events that
++ * have taken place in the meantime, so that closely spaced rcu_sync_enter()
++ * and rcu_sync_exit() pairs need not wait for a grace period.
++ *
++ * If another rcu_sync_enter() is invoked before the grace period
++ * ended, reset state to allow the next rcu_sync_exit() to let the
++ * readers back onto their fastpaths (after a grace period).  If both
++ * another rcu_sync_enter() and its matching rcu_sync_exit() are invoked
++ * before the grace period ended, re-invoke call_rcu() on behalf of that
++ * rcu_sync_exit().  Otherwise, set all state back to idle so that readers
++ * can again use their fastpaths.
++ */
++static void rcu_sync_func(struct rcu_head *rcu)
++{
++	struct rcu_sync *rsp = container_of(rcu, struct rcu_sync, cb_head);
++	unsigned long flags;
++
++	BUG_ON(rsp->gp_state != GP_PASSED);
++	BUG_ON(rsp->cb_state == CB_IDLE);
++
++	spin_lock_irqsave(&rsp->rss_lock, flags);
++	if (rsp->gp_count) {
++		/*
++		 * A new rcu_sync_begin() has happened; drop the callback.
++		 */
++		rsp->cb_state = CB_IDLE;
++	} else if (rsp->cb_state == CB_REPLAY) {
++		/*
++		 * A new rcu_sync_exit() has happened; requeue the callback
++		 * to catch a later GP.
++		 */
++		rsp->cb_state = CB_PENDING;
++		rsp->call(&rsp->cb_head, rcu_sync_func);
++	} else {
++		/*
++		 * We're at least a GP after rcu_sync_exit(); eveybody will now
++		 * have observed the write side critical section. Let 'em rip!.
++		 */
++		rsp->cb_state = CB_IDLE;
++		rsp->gp_state = GP_IDLE;
++	}
++	spin_unlock_irqrestore(&rsp->rss_lock, flags);
++}
++
++/**
++ * rcu_sync_exit() - Allow readers back onto fast patch after grace period
++ * @rsp: Pointer to rcu_sync structure to use for synchronization
++ *
++ * This function is used by updaters who have completed, and can therefore
++ * now allow readers to make use of their fastpaths after a grace period
++ * has elapsed.  After this grace period has completed, all subsequent
++ * calls to rcu_sync_is_idle() will return true, which tells readers that
++ * they can once again use their fastpaths.
++ */
++void rcu_sync_exit(struct rcu_sync *rsp)
++{
++	spin_lock_irq(&rsp->rss_lock);
++	if (!--rsp->gp_count) {
++		if (rsp->cb_state == CB_IDLE) {
++			rsp->cb_state = CB_PENDING;
++			rsp->call(&rsp->cb_head, rcu_sync_func);
++		} else if (rsp->cb_state == CB_PENDING) {
++			rsp->cb_state = CB_REPLAY;
++		}
++	}
++	spin_unlock_irq(&rsp->rss_lock);
++}

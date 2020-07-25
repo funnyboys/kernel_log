@@ -1,0 +1,233 @@
+commit 07beb1651adcd324f4d91584d5cab75d5882a9c2
+Author: Ioana Ciornei <ioana.ciornei@nxp.com>
+Date:   Sun May 31 00:08:14 2020 +0300
+
+    dpaa2-eth: Keep congestion group taildrop enabled when PFC on
+    
+    Leave congestion group taildrop enabled for all traffic classes
+    when PFC is enabled. Notification threshold is low enough such
+    that it will be hit first and this also ensures that FQs on
+    traffic classes which are not PFC enabled won't drain the buffer
+    pool.
+    
+    FQ taildrop threshold is kept disabled as long as any form of
+    flow control is on. Since FQ taildrop works with bytes, not number
+    of frames, we can't guarantee it will not interfere with the
+    congestion notification mechanism for all frame sizes.
+    
+    Signed-off-by: Ioana Ciornei <ioana.ciornei@nxp.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/ethernet/freescale/dpaa2/dpaa2-eth-dcb.c b/drivers/net/ethernet/freescale/dpaa2/dpaa2-eth-dcb.c
+index 7ee07872af4d..83dee575c2fa 100644
+--- a/drivers/net/ethernet/freescale/dpaa2/dpaa2-eth-dcb.c
++++ b/drivers/net/ethernet/freescale/dpaa2/dpaa2-eth-dcb.c
+@@ -63,6 +63,7 @@ static int dpaa2_eth_dcbnl_ieee_setpfc(struct net_device *net_dev,
+ {
+ 	struct dpaa2_eth_priv *priv = netdev_priv(net_dev);
+ 	struct dpni_link_cfg link_cfg = {0};
++	bool tx_pause;
+ 	int err;
+ 
+ 	if (pfc->mbc || pfc->delay)
+@@ -75,8 +76,8 @@ static int dpaa2_eth_dcbnl_ieee_setpfc(struct net_device *net_dev,
+ 	/* We allow PFC configuration even if it won't have any effect until
+ 	 * general pause frames are enabled
+ 	 */
+-	if (!dpaa2_eth_rx_pause_enabled(priv->link_state.options) ||
+-	    !dpaa2_eth_tx_pause_enabled(priv->link_state.options))
++	tx_pause = dpaa2_eth_tx_pause_enabled(priv->link_state.options);
++	if (!dpaa2_eth_rx_pause_enabled(priv->link_state.options) || !tx_pause)
+ 		netdev_warn(net_dev, "Pause support must be enabled in order for PFC to work!\n");
+ 
+ 	link_cfg.rate = priv->link_state.rate;
+@@ -97,6 +98,9 @@ static int dpaa2_eth_dcbnl_ieee_setpfc(struct net_device *net_dev,
+ 		return err;
+ 
+ 	memcpy(&priv->pfc, pfc, sizeof(priv->pfc));
++	priv->pfc_enabled = !!pfc->pfc_en;
++
++	dpaa2_eth_set_rx_taildrop(priv, tx_pause, priv->pfc_enabled);
+ 
+ 	return 0;
+ }
+
+commit f395b69f40f580491ef56f2395a98e3189baa53c
+Author: Ioana Ciornei <ioana.ciornei@nxp.com>
+Date:   Sun May 31 00:08:13 2020 +0300
+
+    dpaa2-eth: Add PFC support through DCB ops
+    
+    Add support in dpaa2-eth for PFC (Priority Flow Control)
+    through the DCB ops.
+    
+    Instruct the hardware to respond to received PFC frames.
+    Current firmware doesn't allow us to selectively enable PFC
+    on the Rx side for some priorities only, so we will react to
+    all incoming PFC frames (and stop transmitting on the traffic
+    classes specified in the frame).
+    
+    Also, configure the hardware to generate PFC frames based on Rx
+    congestion notifications. When a certain number of frames accumulate in
+    the ingress queues corresponding to a traffic class, priority flow
+    control frames are generated for that TC.
+    
+    The number of PFC traffic classes available can be queried through
+    lldptool. Also, which of those traffic classes have PFC enabled is also
+    controlled through the same dcbnl_rtnl_ops callbacks.
+    
+    Signed-off-by: Ioana Ciornei <ioana.ciornei@nxp.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/ethernet/freescale/dpaa2/dpaa2-eth-dcb.c b/drivers/net/ethernet/freescale/dpaa2/dpaa2-eth-dcb.c
+new file mode 100644
+index 000000000000..7ee07872af4d
+--- /dev/null
++++ b/drivers/net/ethernet/freescale/dpaa2/dpaa2-eth-dcb.c
+@@ -0,0 +1,146 @@
++// SPDX-License-Identifier: (GPL-2.0+ OR BSD-3-Clause)
++/* Copyright 2020 NXP */
++
++#include "dpaa2-eth.h"
++
++static int dpaa2_eth_dcbnl_ieee_getpfc(struct net_device *net_dev,
++				       struct ieee_pfc *pfc)
++{
++	struct dpaa2_eth_priv *priv = netdev_priv(net_dev);
++
++	if (!(priv->link_state.options & DPNI_LINK_OPT_PFC_PAUSE))
++		return 0;
++
++	memcpy(pfc, &priv->pfc, sizeof(priv->pfc));
++	pfc->pfc_cap = dpaa2_eth_tc_count(priv);
++
++	return 0;
++}
++
++static inline bool is_prio_enabled(u8 pfc_en, u8 tc)
++{
++	return !!(pfc_en & (1 << tc));
++}
++
++static int set_pfc_cn(struct dpaa2_eth_priv *priv, u8 pfc_en)
++{
++	struct dpni_congestion_notification_cfg cfg = {0};
++	int i, err;
++
++	cfg.notification_mode = DPNI_CONG_OPT_FLOW_CONTROL;
++	cfg.units = DPNI_CONGESTION_UNIT_FRAMES;
++	cfg.message_iova = 0ULL;
++	cfg.message_ctx = 0ULL;
++
++	for (i = 0; i < dpaa2_eth_tc_count(priv); i++) {
++		if (is_prio_enabled(pfc_en, i)) {
++			cfg.threshold_entry = DPAA2_ETH_CN_THRESH_ENTRY(priv);
++			cfg.threshold_exit = DPAA2_ETH_CN_THRESH_EXIT(priv);
++		} else {
++			/* For priorities not set in the pfc_en mask, we leave
++			 * the congestion thresholds at zero, which effectively
++			 * disables generation of PFC frames for them
++			 */
++			cfg.threshold_entry = 0;
++			cfg.threshold_exit = 0;
++		}
++
++		err = dpni_set_congestion_notification(priv->mc_io, 0,
++						       priv->mc_token,
++						       DPNI_QUEUE_RX, i, &cfg);
++		if (err) {
++			netdev_err(priv->net_dev,
++				   "dpni_set_congestion_notification failed\n");
++			return err;
++		}
++	}
++
++	return 0;
++}
++
++static int dpaa2_eth_dcbnl_ieee_setpfc(struct net_device *net_dev,
++				       struct ieee_pfc *pfc)
++{
++	struct dpaa2_eth_priv *priv = netdev_priv(net_dev);
++	struct dpni_link_cfg link_cfg = {0};
++	int err;
++
++	if (pfc->mbc || pfc->delay)
++		return -EOPNOTSUPP;
++
++	/* If same PFC enabled mask, nothing to do */
++	if (priv->pfc.pfc_en == pfc->pfc_en)
++		return 0;
++
++	/* We allow PFC configuration even if it won't have any effect until
++	 * general pause frames are enabled
++	 */
++	if (!dpaa2_eth_rx_pause_enabled(priv->link_state.options) ||
++	    !dpaa2_eth_tx_pause_enabled(priv->link_state.options))
++		netdev_warn(net_dev, "Pause support must be enabled in order for PFC to work!\n");
++
++	link_cfg.rate = priv->link_state.rate;
++	link_cfg.options = priv->link_state.options;
++	if (pfc->pfc_en)
++		link_cfg.options |= DPNI_LINK_OPT_PFC_PAUSE;
++	else
++		link_cfg.options &= ~DPNI_LINK_OPT_PFC_PAUSE;
++	err = dpni_set_link_cfg(priv->mc_io, 0, priv->mc_token, &link_cfg);
++	if (err) {
++		netdev_err(net_dev, "dpni_set_link_cfg failed\n");
++		return err;
++	}
++
++	/* Configure congestion notifications for the enabled priorities */
++	err = set_pfc_cn(priv, pfc->pfc_en);
++	if (err)
++		return err;
++
++	memcpy(&priv->pfc, pfc, sizeof(priv->pfc));
++
++	return 0;
++}
++
++static u8 dpaa2_eth_dcbnl_getdcbx(struct net_device *net_dev)
++{
++	struct dpaa2_eth_priv *priv = netdev_priv(net_dev);
++
++	return priv->dcbx_mode;
++}
++
++static u8 dpaa2_eth_dcbnl_setdcbx(struct net_device *net_dev, u8 mode)
++{
++	struct dpaa2_eth_priv *priv = netdev_priv(net_dev);
++
++	return (mode != (priv->dcbx_mode)) ? 1 : 0;
++}
++
++static u8 dpaa2_eth_dcbnl_getcap(struct net_device *net_dev, int capid, u8 *cap)
++{
++	struct dpaa2_eth_priv *priv = netdev_priv(net_dev);
++
++	switch (capid) {
++	case DCB_CAP_ATTR_PFC:
++		*cap = true;
++		break;
++	case DCB_CAP_ATTR_PFC_TCS:
++		*cap = 1 << (dpaa2_eth_tc_count(priv) - 1);
++		break;
++	case DCB_CAP_ATTR_DCBX:
++		*cap = priv->dcbx_mode;
++		break;
++	default:
++		*cap = false;
++		break;
++	}
++
++	return 0;
++}
++
++const struct dcbnl_rtnl_ops dpaa2_eth_dcbnl_ops = {
++	.ieee_getpfc	= dpaa2_eth_dcbnl_ieee_getpfc,
++	.ieee_setpfc	= dpaa2_eth_dcbnl_ieee_setpfc,
++	.getdcbx	= dpaa2_eth_dcbnl_getdcbx,
++	.setdcbx	= dpaa2_eth_dcbnl_setdcbx,
++	.getcap		= dpaa2_eth_dcbnl_getcap,
++};

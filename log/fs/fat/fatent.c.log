@@ -1,0 +1,2646 @@
+commit 898310032b96c198014a8bbace0fd26259b2db77
+Author: OGAWA Hirofumi <hirofumi@mail.parknet.co.jp>
+Date:   Thu Jun 4 16:50:59 2020 -0700
+
+    fat: improve the readahead for FAT entries
+    
+    Current readahead for FAT entries is very simple but is having some flaws,
+    so it is not working well for some environments.  This patch improves the
+    readahead more or less.
+    
+    The key points of modification are,
+    
+      - make the readahead size tunable by using bdi->ra_pages
+      - care the bdi->io_pages to avoid the small size I/O request
+      - update readahead window before fully exhausting
+    
+    With this patch, on slow USB connected 2TB hdd:
+    
+    [before]
+    383.18sec
+    
+    [after]
+    51.03sec
+    
+    Signed-off-by: OGAWA Hirofumi <hirofumi@mail.parknet.co.jp>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Tested-by: hyeongseok.kim <hyeongseok.kim@lge.com>
+    Reviewed-by: hyeongseok.kim <hyeongseok.kim@lge.com>
+    Link: http://lkml.kernel.org/r/87d08e1dlh.fsf@mail.parknet.co.jp
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/fs/fat/fatent.c b/fs/fat/fatent.c
+index 3647c65a0f48..bbfe18c07417 100644
+--- a/fs/fat/fatent.c
++++ b/fs/fat/fatent.c
+@@ -632,20 +632,80 @@ int fat_free_clusters(struct inode *inode, int cluster)
+ }
+ EXPORT_SYMBOL_GPL(fat_free_clusters);
+ 
+-/* 128kb is the whole sectors for FAT12 and FAT16 */
+-#define FAT_READA_SIZE		(128 * 1024)
++struct fatent_ra {
++	sector_t cur;
++	sector_t limit;
++
++	unsigned int ra_blocks;
++	sector_t ra_advance;
++	sector_t ra_next;
++	sector_t ra_limit;
++};
+ 
+-static void fat_ent_reada(struct super_block *sb, struct fat_entry *fatent,
+-			  unsigned long reada_blocks)
++static void fat_ra_init(struct super_block *sb, struct fatent_ra *ra,
++			struct fat_entry *fatent, int ent_limit)
+ {
+-	const struct fatent_operations *ops = MSDOS_SB(sb)->fatent_ops;
+-	sector_t blocknr;
+-	int i, offset;
++	struct msdos_sb_info *sbi = MSDOS_SB(sb);
++	const struct fatent_operations *ops = sbi->fatent_ops;
++	sector_t blocknr, block_end;
++	int offset;
++	/*
++	 * This is the sequential read, so ra_pages * 2 (but try to
++	 * align the optimal hardware IO size).
++	 * [BTW, 128kb covers the whole sectors for FAT12 and FAT16]
++	 */
++	unsigned long ra_pages = sb->s_bdi->ra_pages;
++	unsigned int reada_blocks;
+ 
++	if (ra_pages > sb->s_bdi->io_pages)
++		ra_pages = rounddown(ra_pages, sb->s_bdi->io_pages);
++	reada_blocks = ra_pages << (PAGE_SHIFT - sb->s_blocksize_bits + 1);
++
++	/* Initialize the range for sequential read */
+ 	ops->ent_blocknr(sb, fatent->entry, &offset, &blocknr);
++	ops->ent_blocknr(sb, ent_limit - 1, &offset, &block_end);
++	ra->cur = 0;
++	ra->limit = (block_end + 1) - blocknr;
+ 
+-	for (i = 0; i < reada_blocks; i++)
+-		sb_breadahead(sb, blocknr + i);
++	/* Advancing the window at half size */
++	ra->ra_blocks = reada_blocks >> 1;
++	ra->ra_advance = ra->cur;
++	ra->ra_next = ra->cur;
++	ra->ra_limit = ra->cur + min_t(sector_t, reada_blocks, ra->limit);
++}
++
++/* Assuming to be called before reading a new block (increments ->cur). */
++static void fat_ent_reada(struct super_block *sb, struct fatent_ra *ra,
++			  struct fat_entry *fatent)
++{
++	if (ra->ra_next >= ra->ra_limit)
++		return;
++
++	if (ra->cur >= ra->ra_advance) {
++		struct msdos_sb_info *sbi = MSDOS_SB(sb);
++		const struct fatent_operations *ops = sbi->fatent_ops;
++		struct blk_plug plug;
++		sector_t blocknr, diff;
++		int offset;
++
++		ops->ent_blocknr(sb, fatent->entry, &offset, &blocknr);
++
++		diff = blocknr - ra->cur;
++		blk_start_plug(&plug);
++		/*
++		 * FIXME: we would want to directly use the bio with
++		 * pages to reduce the number of segments.
++		 */
++		for (; ra->ra_next < ra->ra_limit; ra->ra_next++)
++			sb_breadahead(sb, ra->ra_next + diff);
++		blk_finish_plug(&plug);
++
++		/* Advance the readahead window */
++		ra->ra_advance += ra->ra_blocks;
++		ra->ra_limit += min_t(sector_t,
++				      ra->ra_blocks, ra->limit - ra->ra_limit);
++	}
++	ra->cur++;
+ }
+ 
+ int fat_count_free_clusters(struct super_block *sb)
+@@ -653,27 +713,20 @@ int fat_count_free_clusters(struct super_block *sb)
+ 	struct msdos_sb_info *sbi = MSDOS_SB(sb);
+ 	const struct fatent_operations *ops = sbi->fatent_ops;
+ 	struct fat_entry fatent;
+-	unsigned long reada_blocks, reada_mask, cur_block;
++	struct fatent_ra fatent_ra;
+ 	int err = 0, free;
+ 
+ 	lock_fat(sbi);
+ 	if (sbi->free_clusters != -1 && sbi->free_clus_valid)
+ 		goto out;
+ 
+-	reada_blocks = FAT_READA_SIZE >> sb->s_blocksize_bits;
+-	reada_mask = reada_blocks - 1;
+-	cur_block = 0;
+-
+ 	free = 0;
+ 	fatent_init(&fatent);
+ 	fatent_set_entry(&fatent, FAT_START_ENT);
++	fat_ra_init(sb, &fatent_ra, &fatent, sbi->max_cluster);
+ 	while (fatent.entry < sbi->max_cluster) {
+ 		/* readahead of fat blocks */
+-		if ((cur_block & reada_mask) == 0) {
+-			unsigned long rest = sbi->fat_length - cur_block;
+-			fat_ent_reada(sb, &fatent, min(reada_blocks, rest));
+-		}
+-		cur_block++;
++		fat_ent_reada(sb, &fatent_ra, &fatent);
+ 
+ 		err = fat_ent_read_block(sb, &fatent);
+ 		if (err)
+@@ -707,9 +760,9 @@ int fat_trim_fs(struct inode *inode, struct fstrim_range *range)
+ 	struct msdos_sb_info *sbi = MSDOS_SB(sb);
+ 	const struct fatent_operations *ops = sbi->fatent_ops;
+ 	struct fat_entry fatent;
++	struct fatent_ra fatent_ra;
+ 	u64 ent_start, ent_end, minlen, trimmed = 0;
+ 	u32 free = 0;
+-	unsigned long reada_blocks, reada_mask, cur_block = 0;
+ 	int err = 0;
+ 
+ 	/*
+@@ -727,19 +780,13 @@ int fat_trim_fs(struct inode *inode, struct fstrim_range *range)
+ 	if (ent_end >= sbi->max_cluster)
+ 		ent_end = sbi->max_cluster - 1;
+ 
+-	reada_blocks = FAT_READA_SIZE >> sb->s_blocksize_bits;
+-	reada_mask = reada_blocks - 1;
+-
+ 	fatent_init(&fatent);
+ 	lock_fat(sbi);
+ 	fatent_set_entry(&fatent, ent_start);
++	fat_ra_init(sb, &fatent_ra, &fatent, ent_end + 1);
+ 	while (fatent.entry <= ent_end) {
+ 		/* readahead of fat blocks */
+-		if ((cur_block & reada_mask) == 0) {
+-			unsigned long rest = sbi->fat_length - cur_block;
+-			fat_ent_reada(sb, &fatent, min(reada_blocks, rest));
+-		}
+-		cur_block++;
++		fat_ent_reada(sb, &fatent_ra, &fatent);
+ 
+ 		err = fat_ent_read_block(sb, &fatent);
+ 		if (err)
+
+commit 07bfa4415ab607e459b69bd86aa7e7602ce10b4f
+Author: OGAWA Hirofumi <hirofumi@mail.parknet.co.jp>
+Date:   Mon Sep 23 15:32:53 2019 -0700
+
+    fat: work around race with userspace's read via blockdev while mounting
+    
+    If userspace reads the buffer via blockdev while mounting,
+    sb_getblk()+modify can race with buffer read via blockdev.
+    
+    For example,
+    
+                FS                               userspace
+        bh = sb_getblk()
+        modify bh->b_data
+                                      read
+                                        ll_rw_block(bh)
+                                          fill bh->b_data by on-disk data
+                                          /* lost modified data by FS */
+                                          set_buffer_uptodate(bh)
+        set_buffer_uptodate(bh)
+    
+    Userspace should not use the blockdev while mounting though, the udev
+    seems to be already doing this.  Although I think the udev should try to
+    avoid this, workaround the race by small overhead.
+    
+    Link: http://lkml.kernel.org/r/87pnk7l3sw.fsf_-_@mail.parknet.co.jp
+    Signed-off-by: OGAWA Hirofumi <hirofumi@mail.parknet.co.jp>
+    Reported-by: Jan Stancek <jstancek@redhat.com>
+    Tested-by: Jan Stancek <jstancek@redhat.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/fs/fat/fatent.c b/fs/fat/fatent.c
+index 265983635f2b..3647c65a0f48 100644
+--- a/fs/fat/fatent.c
++++ b/fs/fat/fatent.c
+@@ -388,8 +388,11 @@ static int fat_mirror_bhs(struct super_block *sb, struct buffer_head **bhs,
+ 				err = -ENOMEM;
+ 				goto error;
+ 			}
++			/* Avoid race with userspace read via bdev */
++			lock_buffer(c_bh);
+ 			memcpy(c_bh->b_data, bhs[n]->b_data, sb->s_blocksize);
+ 			set_buffer_uptodate(c_bh);
++			unlock_buffer(c_bh);
+ 			mark_buffer_dirty_inode(c_bh, sbi->fat_inode);
+ 			if (sb->s_flags & SB_SYNCHRONOUS)
+ 				err = sync_dirty_buffer(c_bh);
+
+commit 59bd9ded4d7803d9f1f4d947064693513d18e724
+Author: Thomas Gleixner <tglx@linutronix.de>
+Date:   Tue May 28 10:10:12 2019 -0700
+
+    treewide: Replace GPLv2 boilerplate/reference with SPDX - rule 209
+    
+    Based on 1 normalized pattern(s):
+    
+      released under gpl v2
+    
+    extracted by the scancode license scanner the SPDX license identifier
+    
+      GPL-2.0-only
+    
+    has been chosen to replace the boilerplate/reference in 15 file(s).
+    
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Reviewed-by: Steve Winslow <swinslow@gmail.com>
+    Reviewed-by: Allison Randal <allison@lohutok.net>
+    Reviewed-by: Alexios Zavras <alexios.zavras@intel.com>
+    Cc: linux-spdx@vger.kernel.org
+    Link: https://lkml.kernel.org/r/20190528171438.895196075@linutronix.de
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/fs/fat/fatent.c b/fs/fat/fatent.c
+index 495edeafd60a..265983635f2b 100644
+--- a/fs/fat/fatent.c
++++ b/fs/fat/fatent.c
+@@ -1,6 +1,6 @@
++// SPDX-License-Identifier: GPL-2.0-only
+ /*
+  * Copyright (C) 2004, OGAWA Hirofumi
+- * Released under GPL v2.
+  */
+ 
+ #include <linux/blkdev.h>
+
+commit 306790f75ac2fe021a900395255e468807002c42
+Author: Carmeli Tamir <carmeli.tamir@gmail.com>
+Date:   Thu Jan 3 15:28:00 2019 -0800
+
+    fat: new inline functions to determine the FAT variant (32, 16 or 12)
+    
+    This patch introduces 3 new inline functions - is_fat12, is_fat16 and
+    is_fat32, and replaces every occurrence in the code in which the FS
+    variant (whether this is FAT12, FAT16 or FAT32) was previously checked
+    using msdos_sb_info->fat_bits.
+    
+    Link: http://lkml.kernel.org/r/1544990640-11604-4-git-send-email-carmeli.tamir@gmail.com
+    Signed-off-by: Carmeli Tamir <carmeli.tamir@gmail.com>
+    Acked-by: OGAWA Hirofumi <hirofumi@mail.parknet.co.jp>
+    Reviewed-by: Sergey Senozhatsky <sergey.senozhatsky@gmail.com>
+    Cc: Johannes Thumshirn <jthumshirn@suse.de>
+    Cc: Bart Van Assche <bvanassche@acm.org>
+    Cc: Martin K. Petersen <martin.petersen@oracle.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/fs/fat/fatent.c b/fs/fat/fatent.c
+index f58c0cacc531..495edeafd60a 100644
+--- a/fs/fat/fatent.c
++++ b/fs/fat/fatent.c
+@@ -290,19 +290,17 @@ void fat_ent_access_init(struct super_block *sb)
+ 
+ 	mutex_init(&sbi->fat_lock);
+ 
+-	switch (sbi->fat_bits) {
+-	case 32:
++	if (is_fat32(sbi)) {
+ 		sbi->fatent_shift = 2;
+ 		sbi->fatent_ops = &fat32_ops;
+-		break;
+-	case 16:
++	} else if (is_fat16(sbi)) {
+ 		sbi->fatent_shift = 1;
+ 		sbi->fatent_ops = &fat16_ops;
+-		break;
+-	case 12:
++	} else if (is_fat12(sbi)) {
+ 		sbi->fatent_shift = -1;
+ 		sbi->fatent_ops = &fat12_ops;
+-		break;
++	} else {
++		fat_fs_error(sb, "invalid FAT variant, %u bits", sbi->fat_bits);
+ 	}
+ }
+ 
+@@ -310,7 +308,7 @@ static void mark_fsinfo_dirty(struct super_block *sb)
+ {
+ 	struct msdos_sb_info *sbi = MSDOS_SB(sb);
+ 
+-	if (sb_rdonly(sb) || sbi->fat_bits != 32)
++	if (sb_rdonly(sb) || !is_fat32(sbi))
+ 		return;
+ 
+ 	__mark_inode_dirty(sbi->fsinfo_inode, I_DIRTY_SYNC);
+@@ -327,7 +325,7 @@ static inline int fat_ent_update_ptr(struct super_block *sb,
+ 	/* Is this fatent's blocks including this entry? */
+ 	if (!fatent->nr_bhs || bhs[0]->b_blocknr != blocknr)
+ 		return 0;
+-	if (sbi->fat_bits == 12) {
++	if (is_fat12(sbi)) {
+ 		if ((offset + 1) < sb->s_blocksize) {
+ 			/* This entry is on bhs[0]. */
+ 			if (fatent->nr_bhs == 2) {
+
+commit ac081c3be3fae6d0cc3e1862507fca3862d30b67
+Author: Khazhismel Kumykov <khazhy@google.com>
+Date:   Fri Oct 12 21:34:40 2018 -0700
+
+    fs/fat/fatent.c: add cond_resched() to fat_count_free_clusters()
+    
+    On non-preempt kernels this loop can take a long time (more than 50 ticks)
+    processing through entries.
+    
+    Link: http://lkml.kernel.org/r/20181010172623.57033-1-khazhy@google.com
+    Signed-off-by: Khazhismel Kumykov <khazhy@google.com>
+    Acked-by: OGAWA Hirofumi <hirofumi@mail.parknet.co.jp>
+    Reviewed-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/fs/fat/fatent.c b/fs/fat/fatent.c
+index defc2168de91..f58c0cacc531 100644
+--- a/fs/fat/fatent.c
++++ b/fs/fat/fatent.c
+@@ -682,6 +682,7 @@ int fat_count_free_clusters(struct super_block *sb)
+ 			if (ops->ent_get(&fatent) == FAT_ENT_FREE)
+ 				free++;
+ 		} while (fat_ent_next(sbi, &fatent));
++		cond_resched();
+ 	}
+ 	sbi->free_clusters = free;
+ 	sbi->free_clus_valid = 1;
+
+commit 0afa9626667c3659ef8bd82d42a11e39fedf235c
+Author: OGAWA Hirofumi <hirofumi@mail.parknet.co.jp>
+Date:   Tue Aug 21 21:59:44 2018 -0700
+
+    fat: validate ->i_start before using
+    
+    On corrupted FATfs may have invalid ->i_start.  To handle it, this checks
+    ->i_start before using, and return proper error code.
+    
+    Link: http://lkml.kernel.org/r/87o9f8y1t5.fsf_-_@mail.parknet.co.jp
+    Signed-off-by: OGAWA Hirofumi <hirofumi@mail.parknet.co.jp>
+    Reported-by: Anatoly Trosinenko <anatoly.trosinenko@gmail.com>
+    Tested-by: Anatoly Trosinenko <anatoly.trosinenko@gmail.com>
+    Cc: Alan Cox <gnomes@lxorguk.ukuu.org.uk>
+    Cc: Al Viro <viro@zeniv.linux.org.uk>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/fs/fat/fatent.c b/fs/fat/fatent.c
+index 25d43a5e8a4d..defc2168de91 100644
+--- a/fs/fat/fatent.c
++++ b/fs/fat/fatent.c
+@@ -24,7 +24,7 @@ static void fat12_ent_blocknr(struct super_block *sb, int entry,
+ {
+ 	struct msdos_sb_info *sbi = MSDOS_SB(sb);
+ 	int bytes = entry + (entry >> 1);
+-	WARN_ON(entry < FAT_START_ENT || sbi->max_cluster <= entry);
++	WARN_ON(!fat_valid_entry(sbi, entry));
+ 	*offset = bytes & (sb->s_blocksize - 1);
+ 	*blocknr = sbi->fat_start + (bytes >> sb->s_blocksize_bits);
+ }
+@@ -34,7 +34,7 @@ static void fat_ent_blocknr(struct super_block *sb, int entry,
+ {
+ 	struct msdos_sb_info *sbi = MSDOS_SB(sb);
+ 	int bytes = (entry << sbi->fatent_shift);
+-	WARN_ON(entry < FAT_START_ENT || sbi->max_cluster <= entry);
++	WARN_ON(!fat_valid_entry(sbi, entry));
+ 	*offset = bytes & (sb->s_blocksize - 1);
+ 	*blocknr = sbi->fat_start + (bytes >> sb->s_blocksize_bits);
+ }
+@@ -354,7 +354,7 @@ int fat_ent_read(struct inode *inode, struct fat_entry *fatent, int entry)
+ 	int err, offset;
+ 	sector_t blocknr;
+ 
+-	if (entry < FAT_START_ENT || sbi->max_cluster <= entry) {
++	if (!fat_valid_entry(sbi, entry)) {
+ 		fatent_brelse(fatent);
+ 		fat_fs_error(sb, "invalid access to FAT (entry 0x%08x)", entry);
+ 		return -EIO;
+
+commit f663b5b38fffeb31841f8bfaf0ef87a445b0ffee
+Author: Wentao Wang <witallwang@gmail.com>
+Date:   Tue Aug 21 21:59:41 2018 -0700
+
+    fat: add FITRIM ioctl for FAT file system
+    
+    Add FITRIM ioctl for FAT file system
+    
+    [witallwang@gmail.com: use u64s]
+      Link: http://lkml.kernel.org/r/87h8l37hub.fsf@mail.parknet.co.jp
+    [hirofumi@mail.parknet.co.jp: bug fixes, coding style fixes, add signal check]
+    Link: http://lkml.kernel.org/r/87fu10anhj.fsf@mail.parknet.co.jp
+    Signed-off-by: Wentao Wang <witallwang@gmail.com>
+    Signed-off-by: OGAWA Hirofumi <hirofumi@mail.parknet.co.jp>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/fs/fat/fatent.c b/fs/fat/fatent.c
+index bac10de678cc..25d43a5e8a4d 100644
+--- a/fs/fat/fatent.c
++++ b/fs/fat/fatent.c
+@@ -4,6 +4,7 @@
+  */
+ 
+ #include <linux/blkdev.h>
++#include <linux/sched/signal.h>
+ #include "fat.h"
+ 
+ struct fatent_operations {
+@@ -690,3 +691,104 @@ int fat_count_free_clusters(struct super_block *sb)
+ 	unlock_fat(sbi);
+ 	return err;
+ }
++
++static int fat_trim_clusters(struct super_block *sb, u32 clus, u32 nr_clus)
++{
++	struct msdos_sb_info *sbi = MSDOS_SB(sb);
++	return sb_issue_discard(sb, fat_clus_to_blknr(sbi, clus),
++				nr_clus * sbi->sec_per_clus, GFP_NOFS, 0);
++}
++
++int fat_trim_fs(struct inode *inode, struct fstrim_range *range)
++{
++	struct super_block *sb = inode->i_sb;
++	struct msdos_sb_info *sbi = MSDOS_SB(sb);
++	const struct fatent_operations *ops = sbi->fatent_ops;
++	struct fat_entry fatent;
++	u64 ent_start, ent_end, minlen, trimmed = 0;
++	u32 free = 0;
++	unsigned long reada_blocks, reada_mask, cur_block = 0;
++	int err = 0;
++
++	/*
++	 * FAT data is organized as clusters, trim at the granulary of cluster.
++	 *
++	 * fstrim_range is in byte, convert vaules to cluster index.
++	 * Treat sectors before data region as all used, not to trim them.
++	 */
++	ent_start = max_t(u64, range->start>>sbi->cluster_bits, FAT_START_ENT);
++	ent_end = ent_start + (range->len >> sbi->cluster_bits) - 1;
++	minlen = range->minlen >> sbi->cluster_bits;
++
++	if (ent_start >= sbi->max_cluster || range->len < sbi->cluster_size)
++		return -EINVAL;
++	if (ent_end >= sbi->max_cluster)
++		ent_end = sbi->max_cluster - 1;
++
++	reada_blocks = FAT_READA_SIZE >> sb->s_blocksize_bits;
++	reada_mask = reada_blocks - 1;
++
++	fatent_init(&fatent);
++	lock_fat(sbi);
++	fatent_set_entry(&fatent, ent_start);
++	while (fatent.entry <= ent_end) {
++		/* readahead of fat blocks */
++		if ((cur_block & reada_mask) == 0) {
++			unsigned long rest = sbi->fat_length - cur_block;
++			fat_ent_reada(sb, &fatent, min(reada_blocks, rest));
++		}
++		cur_block++;
++
++		err = fat_ent_read_block(sb, &fatent);
++		if (err)
++			goto error;
++		do {
++			if (ops->ent_get(&fatent) == FAT_ENT_FREE) {
++				free++;
++			} else if (free) {
++				if (free >= minlen) {
++					u32 clus = fatent.entry - free;
++
++					err = fat_trim_clusters(sb, clus, free);
++					if (err && err != -EOPNOTSUPP)
++						goto error;
++					if (!err)
++						trimmed += free;
++					err = 0;
++				}
++				free = 0;
++			}
++		} while (fat_ent_next(sbi, &fatent) && fatent.entry <= ent_end);
++
++		if (fatal_signal_pending(current)) {
++			err = -ERESTARTSYS;
++			goto error;
++		}
++
++		if (need_resched()) {
++			fatent_brelse(&fatent);
++			unlock_fat(sbi);
++			cond_resched();
++			lock_fat(sbi);
++		}
++	}
++	/* handle scenario when tail entries are all free */
++	if (free && free >= minlen) {
++		u32 clus = fatent.entry - free;
++
++		err = fat_trim_clusters(sb, clus, free);
++		if (err && err != -EOPNOTSUPP)
++			goto error;
++		if (!err)
++			trimmed += free;
++		err = 0;
++	}
++
++error:
++	fatent_brelse(&fatent);
++	unlock_fat(sbi);
++
++	range->len = trimmed << sbi->cluster_bits;
++
++	return err;
++}
+
+commit 1751e8a6cb935e555fcdbcb9ab4f0446e322ca3e
+Author: Linus Torvalds <torvalds@linux-foundation.org>
+Date:   Mon Nov 27 13:05:09 2017 -0800
+
+    Rename superblock flags (MS_xyz -> SB_xyz)
+    
+    This is a pure automated search-and-replace of the internal kernel
+    superblock flags.
+    
+    The s_flags are now called SB_*, with the names and the values for the
+    moment mirroring the MS_* flags that they're equivalent to.
+    
+    Note how the MS_xyz flags are the ones passed to the mount system call,
+    while the SB_xyz flags are what we then use in sb->s_flags.
+    
+    The script to do this was:
+    
+        # places to look in; re security/*: it generally should *not* be
+        # touched (that stuff parses mount(2) arguments directly), but
+        # there are two places where we really deal with superblock flags.
+        FILES="drivers/mtd drivers/staging/lustre fs ipc mm \
+                include/linux/fs.h include/uapi/linux/bfs_fs.h \
+                security/apparmor/apparmorfs.c security/apparmor/include/lib.h"
+        # the list of MS_... constants
+        SYMS="RDONLY NOSUID NODEV NOEXEC SYNCHRONOUS REMOUNT MANDLOCK \
+              DIRSYNC NOATIME NODIRATIME BIND MOVE REC VERBOSE SILENT \
+              POSIXACL UNBINDABLE PRIVATE SLAVE SHARED RELATIME KERNMOUNT \
+              I_VERSION STRICTATIME LAZYTIME SUBMOUNT NOREMOTELOCK NOSEC BORN \
+              ACTIVE NOUSER"
+    
+        SED_PROG=
+        for i in $SYMS; do SED_PROG="$SED_PROG -e s/MS_$i/SB_$i/g"; done
+    
+        # we want files that contain at least one of MS_...,
+        # with fs/namespace.c and fs/pnode.c excluded.
+        L=$(for i in $SYMS; do git grep -w -l MS_$i $FILES; done| sort|uniq|grep -v '^fs/namespace.c'|grep -v '^fs/pnode.c')
+    
+        for f in $L; do sed -i $f $SED_PROG; done
+    
+    Requested-by: Al Viro <viro@zeniv.linux.org.uk>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/fs/fat/fatent.c b/fs/fat/fatent.c
+index 48b2336692f9..bac10de678cc 100644
+--- a/fs/fat/fatent.c
++++ b/fs/fat/fatent.c
+@@ -392,7 +392,7 @@ static int fat_mirror_bhs(struct super_block *sb, struct buffer_head **bhs,
+ 			memcpy(c_bh->b_data, bhs[n]->b_data, sb->s_blocksize);
+ 			set_buffer_uptodate(c_bh);
+ 			mark_buffer_dirty_inode(c_bh, sbi->fat_inode);
+-			if (sb->s_flags & MS_SYNCHRONOUS)
++			if (sb->s_flags & SB_SYNCHRONOUS)
+ 				err = sync_dirty_buffer(c_bh);
+ 			brelse(c_bh);
+ 			if (err)
+@@ -597,7 +597,7 @@ int fat_free_clusters(struct inode *inode, int cluster)
+ 		}
+ 
+ 		if (nr_bhs + fatent.nr_bhs > MAX_BUF_PER_PAGE) {
+-			if (sb->s_flags & MS_SYNCHRONOUS) {
++			if (sb->s_flags & SB_SYNCHRONOUS) {
+ 				err = fat_sync_bhs(bhs, nr_bhs);
+ 				if (err)
+ 					goto error;
+@@ -612,7 +612,7 @@ int fat_free_clusters(struct inode *inode, int cluster)
+ 		fat_collect_bhs(bhs, &nr_bhs, &fatent);
+ 	} while (cluster != FAT_ENT_EOF);
+ 
+-	if (sb->s_flags & MS_SYNCHRONOUS) {
++	if (sb->s_flags & SB_SYNCHRONOUS) {
+ 		err = fat_sync_bhs(bhs, nr_bhs);
+ 		if (err)
+ 			goto error;
+
+commit bc98a42c1f7d0f886c0c1b75a92a004976a46d9f
+Author: David Howells <dhowells@redhat.com>
+Date:   Mon Jul 17 08:45:34 2017 +0100
+
+    VFS: Convert sb->s_flags & MS_RDONLY to sb_rdonly(sb)
+    
+    Firstly by applying the following with coccinelle's spatch:
+    
+            @@ expression SB; @@
+            -SB->s_flags & MS_RDONLY
+            +sb_rdonly(SB)
+    
+    to effect the conversion to sb_rdonly(sb), then by applying:
+    
+            @@ expression A, SB; @@
+            (
+            -(!sb_rdonly(SB)) && A
+            +!sb_rdonly(SB) && A
+            |
+            -A != (sb_rdonly(SB))
+            +A != sb_rdonly(SB)
+            |
+            -A == (sb_rdonly(SB))
+            +A == sb_rdonly(SB)
+            |
+            -!(sb_rdonly(SB))
+            +!sb_rdonly(SB)
+            |
+            -A && (sb_rdonly(SB))
+            +A && sb_rdonly(SB)
+            |
+            -A || (sb_rdonly(SB))
+            +A || sb_rdonly(SB)
+            |
+            -(sb_rdonly(SB)) != A
+            +sb_rdonly(SB) != A
+            |
+            -(sb_rdonly(SB)) == A
+            +sb_rdonly(SB) == A
+            |
+            -(sb_rdonly(SB)) && A
+            +sb_rdonly(SB) && A
+            |
+            -(sb_rdonly(SB)) || A
+            +sb_rdonly(SB) || A
+            )
+    
+            @@ expression A, B, SB; @@
+            (
+            -(sb_rdonly(SB)) ? 1 : 0
+            +sb_rdonly(SB)
+            |
+            -(sb_rdonly(SB)) ? A : B
+            +sb_rdonly(SB) ? A : B
+            )
+    
+    to remove left over excess bracketage and finally by applying:
+    
+            @@ expression A, SB; @@
+            (
+            -(A & MS_RDONLY) != sb_rdonly(SB)
+            +(bool)(A & MS_RDONLY) != sb_rdonly(SB)
+            |
+            -(A & MS_RDONLY) == sb_rdonly(SB)
+            +(bool)(A & MS_RDONLY) == sb_rdonly(SB)
+            )
+    
+    to make comparisons against the result of sb_rdonly() (which is a bool)
+    work correctly.
+    
+    Signed-off-by: David Howells <dhowells@redhat.com>
+
+diff --git a/fs/fat/fatent.c b/fs/fat/fatent.c
+index 1d9a8c4e9de0..48b2336692f9 100644
+--- a/fs/fat/fatent.c
++++ b/fs/fat/fatent.c
+@@ -309,7 +309,7 @@ static void mark_fsinfo_dirty(struct super_block *sb)
+ {
+ 	struct msdos_sb_info *sbi = MSDOS_SB(sb);
+ 
+-	if (sb->s_flags & MS_RDONLY || sbi->fat_bits != 32)
++	if (sb_rdonly(sb) || sbi->fat_bits != 32)
+ 		return;
+ 
+ 	__mark_inode_dirty(sbi->fsinfo_inode, I_DIRTY_SYNC);
+
+commit 8992de4cec126c6703ece0747239d071dbce725f
+Author: Julia Lawall <Julia.Lawall@lip6.fr>
+Date:   Wed Jan 20 14:59:52 2016 -0800
+
+    fat: constify fatent_operations structures
+    
+    The fatent_operations structures are never modified, so declare them as
+    const.
+    
+    Done with the help of Coccinelle.
+    
+    Signed-off-by: Julia Lawall <Julia.Lawall@lip6.fr>
+    Acked-by: OGAWA Hirofumi <hirofumi@mail.parknet.co.jp>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/fs/fat/fatent.c b/fs/fat/fatent.c
+index 8226557130a2..1d9a8c4e9de0 100644
+--- a/fs/fat/fatent.c
++++ b/fs/fat/fatent.c
+@@ -99,7 +99,7 @@ static int fat12_ent_bread(struct super_block *sb, struct fat_entry *fatent,
+ static int fat_ent_bread(struct super_block *sb, struct fat_entry *fatent,
+ 			 int offset, sector_t blocknr)
+ {
+-	struct fatent_operations *ops = MSDOS_SB(sb)->fatent_ops;
++	const struct fatent_operations *ops = MSDOS_SB(sb)->fatent_ops;
+ 
+ 	WARN_ON(blocknr < MSDOS_SB(sb)->fat_start);
+ 	fatent->fat_inode = MSDOS_SB(sb)->fat_inode;
+@@ -246,7 +246,7 @@ static int fat32_ent_next(struct fat_entry *fatent)
+ 	return 0;
+ }
+ 
+-static struct fatent_operations fat12_ops = {
++static const struct fatent_operations fat12_ops = {
+ 	.ent_blocknr	= fat12_ent_blocknr,
+ 	.ent_set_ptr	= fat12_ent_set_ptr,
+ 	.ent_bread	= fat12_ent_bread,
+@@ -255,7 +255,7 @@ static struct fatent_operations fat12_ops = {
+ 	.ent_next	= fat12_ent_next,
+ };
+ 
+-static struct fatent_operations fat16_ops = {
++static const struct fatent_operations fat16_ops = {
+ 	.ent_blocknr	= fat_ent_blocknr,
+ 	.ent_set_ptr	= fat16_ent_set_ptr,
+ 	.ent_bread	= fat_ent_bread,
+@@ -264,7 +264,7 @@ static struct fatent_operations fat16_ops = {
+ 	.ent_next	= fat16_ent_next,
+ };
+ 
+-static struct fatent_operations fat32_ops = {
++static const struct fatent_operations fat32_ops = {
+ 	.ent_blocknr	= fat_ent_blocknr,
+ 	.ent_set_ptr	= fat32_ent_set_ptr,
+ 	.ent_bread	= fat_ent_bread,
+@@ -320,7 +320,7 @@ static inline int fat_ent_update_ptr(struct super_block *sb,
+ 				     int offset, sector_t blocknr)
+ {
+ 	struct msdos_sb_info *sbi = MSDOS_SB(sb);
+-	struct fatent_operations *ops = sbi->fatent_ops;
++	const struct fatent_operations *ops = sbi->fatent_ops;
+ 	struct buffer_head **bhs = fatent->bhs;
+ 
+ 	/* Is this fatent's blocks including this entry? */
+@@ -349,7 +349,7 @@ int fat_ent_read(struct inode *inode, struct fat_entry *fatent, int entry)
+ {
+ 	struct super_block *sb = inode->i_sb;
+ 	struct msdos_sb_info *sbi = MSDOS_SB(inode->i_sb);
+-	struct fatent_operations *ops = sbi->fatent_ops;
++	const struct fatent_operations *ops = sbi->fatent_ops;
+ 	int err, offset;
+ 	sector_t blocknr;
+ 
+@@ -407,7 +407,7 @@ int fat_ent_write(struct inode *inode, struct fat_entry *fatent,
+ 		  int new, int wait)
+ {
+ 	struct super_block *sb = inode->i_sb;
+-	struct fatent_operations *ops = MSDOS_SB(sb)->fatent_ops;
++	const struct fatent_operations *ops = MSDOS_SB(sb)->fatent_ops;
+ 	int err;
+ 
+ 	ops->ent_put(fatent, new);
+@@ -432,7 +432,7 @@ static inline int fat_ent_next(struct msdos_sb_info *sbi,
+ static inline int fat_ent_read_block(struct super_block *sb,
+ 				     struct fat_entry *fatent)
+ {
+-	struct fatent_operations *ops = MSDOS_SB(sb)->fatent_ops;
++	const struct fatent_operations *ops = MSDOS_SB(sb)->fatent_ops;
+ 	sector_t blocknr;
+ 	int offset;
+ 
+@@ -463,7 +463,7 @@ int fat_alloc_clusters(struct inode *inode, int *cluster, int nr_cluster)
+ {
+ 	struct super_block *sb = inode->i_sb;
+ 	struct msdos_sb_info *sbi = MSDOS_SB(sb);
+-	struct fatent_operations *ops = sbi->fatent_ops;
++	const struct fatent_operations *ops = sbi->fatent_ops;
+ 	struct fat_entry fatent, prev_ent;
+ 	struct buffer_head *bhs[MAX_BUF_PER_PAGE];
+ 	int i, count, err, nr_bhs, idx_clus;
+@@ -551,7 +551,7 @@ int fat_free_clusters(struct inode *inode, int cluster)
+ {
+ 	struct super_block *sb = inode->i_sb;
+ 	struct msdos_sb_info *sbi = MSDOS_SB(sb);
+-	struct fatent_operations *ops = sbi->fatent_ops;
++	const struct fatent_operations *ops = sbi->fatent_ops;
+ 	struct fat_entry fatent;
+ 	struct buffer_head *bhs[MAX_BUF_PER_PAGE];
+ 	int i, err, nr_bhs;
+@@ -636,7 +636,7 @@ EXPORT_SYMBOL_GPL(fat_free_clusters);
+ static void fat_ent_reada(struct super_block *sb, struct fat_entry *fatent,
+ 			  unsigned long reada_blocks)
+ {
+-	struct fatent_operations *ops = MSDOS_SB(sb)->fatent_ops;
++	const struct fatent_operations *ops = MSDOS_SB(sb)->fatent_ops;
+ 	sector_t blocknr;
+ 	int i, offset;
+ 
+@@ -649,7 +649,7 @@ static void fat_ent_reada(struct super_block *sb, struct fat_entry *fatent,
+ int fat_count_free_clusters(struct super_block *sb)
+ {
+ 	struct msdos_sb_info *sbi = MSDOS_SB(sb);
+-	struct fatent_operations *ops = sbi->fatent_ops;
++	const struct fatent_operations *ops = sbi->fatent_ops;
+ 	struct fat_entry fatent;
+ 	unsigned long reada_blocks, reada_mask, cur_block;
+ 	int err = 0, free;
+
+commit 58932ef7f2f28e89ee37c6e2be94885e5078ba77
+Author: Alexander Kuleshov <kuleshovmail@gmail.com>
+Date:   Thu Apr 16 12:47:24 2015 -0700
+
+    fs/fat: remove unnecessary includes
+    
+    'fat.h' includes <linux/buffer_head.h> which includes <linux/fs.h> which
+    includes all the header files required for all *.c files fat filesystem.
+    
+    [akpm@linux-foundation.org: fs/fat/iode.c needs seq_file.h]
+    [sfr@canb.auug.org.au: put one actually necessary include file back]
+    Signed-off-by: Alexander Kuleshov <kuleshovmail@gmail.com>
+    Acked-by: OGAWA Hirofumi <hirofumi@mail.parknet.co.jp>
+    Signed-off-by: Stephen Rothwell <sfr@canb.auug.org.au>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/fs/fat/fatent.c b/fs/fat/fatent.c
+index 260705c58062..8226557130a2 100644
+--- a/fs/fat/fatent.c
++++ b/fs/fat/fatent.c
+@@ -3,9 +3,6 @@
+  * Released under GPL v2.
+  */
+ 
+-#include <linux/module.h>
+-#include <linux/fs.h>
+-#include <linux/msdos_fs.h>
+ #include <linux/blkdev.h>
+ #include "fat.h"
+ 
+
+commit 126ac0518c71ba0e54e599dc129b76027a7c2d23
+Author: Namjae Jeon <linkinjeon@gmail.com>
+Date:   Thu Oct 4 17:15:02 2012 -0700
+
+    fat: no need to reset EOF in ent_put for FAT32
+    
+    #define FAT_ENT_EOF(EOF_FAT32)
+    
+    there is no need to reset value of 'new' for FAT32 as the values is
+    already correct
+    
+    Signed-off-by: Namjae Jeon <linkinjeon@gmail.com>
+    Signed-off-by: Amit Sahrawat <amit.sahrawat83@gmail.com>
+    Acked-by: OGAWA Hirofumi <hirofumi@mail.parknet.co.jp>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/fs/fat/fatent.c b/fs/fat/fatent.c
+index 67fd23744720..260705c58062 100644
+--- a/fs/fat/fatent.c
++++ b/fs/fat/fatent.c
+@@ -186,9 +186,6 @@ static void fat16_ent_put(struct fat_entry *fatent, int new)
+ 
+ static void fat32_ent_put(struct fat_entry *fatent, int new)
+ {
+-	if (new == FAT_ENT_EOF)
+-		new = EOF_FAT32;
+-
+ 	WARN_ON(new & 0xf0000000);
+ 	new |= le32_to_cpu(*fatent->u.ent32_p) & ~0x0fffffff;
+ 	*fatent->u.ent32_p = cpu_to_le32(new);
+
+commit 441dff34aa39e1597bdf2fdd07fe83be56528b32
+Author: Cruz Julian Bishop <cruzjbishop@gmail.com>
+Date:   Thu Oct 4 17:14:59 2012 -0700
+
+    fs/fat: fix checkpatch issues in fatent.c
+    
+    1: Stop any lines going over 80 characters
+    2: Remove a blank line before EXPORT_SYMBOL_GPL
+    
+    Signed-off-by: Cruz Julian Bishop <cruzjbishop@gmail.com>
+    Acked-by: OGAWA Hirofumi <hirofumi@mail.parknet.co.jp>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/fs/fat/fatent.c b/fs/fat/fatent.c
+index 31f08ab62c56..67fd23744720 100644
+--- a/fs/fat/fatent.c
++++ b/fs/fat/fatent.c
+@@ -203,15 +203,18 @@ static int fat12_ent_next(struct fat_entry *fatent)
+ 
+ 	fatent->entry++;
+ 	if (fatent->nr_bhs == 1) {
+-		WARN_ON(ent12_p[0] > (u8 *)(bhs[0]->b_data + (bhs[0]->b_size - 2)));
+-		WARN_ON(ent12_p[1] > (u8 *)(bhs[0]->b_data + (bhs[0]->b_size - 1)));
++		WARN_ON(ent12_p[0] > (u8 *)(bhs[0]->b_data +
++							(bhs[0]->b_size - 2)));
++		WARN_ON(ent12_p[1] > (u8 *)(bhs[0]->b_data +
++							(bhs[0]->b_size - 1)));
+ 		if (nextp < (u8 *)(bhs[0]->b_data + (bhs[0]->b_size - 1))) {
+ 			ent12_p[0] = nextp - 1;
+ 			ent12_p[1] = nextp;
+ 			return 1;
+ 		}
+ 	} else {
+-		WARN_ON(ent12_p[0] != (u8 *)(bhs[0]->b_data + (bhs[0]->b_size - 1)));
++		WARN_ON(ent12_p[0] != (u8 *)(bhs[0]->b_data +
++							(bhs[0]->b_size - 1)));
+ 		WARN_ON(ent12_p[1] != (u8 *)bhs[1]->b_data);
+ 		ent12_p[0] = nextp - 1;
+ 		ent12_p[1] = nextp;
+@@ -631,7 +634,6 @@ int fat_free_clusters(struct inode *inode, int cluster)
+ 
+ 	return err;
+ }
+-
+ EXPORT_SYMBOL_GPL(fat_free_clusters);
+ 
+ /* 128kb is the whole sectors for FAT12 and FAT16 */
+
+commit 78491189ddb6d84d4a4abae992ed891a236d0263
+Author: Artem Bityutskiy <artem.bityutskiy@linux.intel.com>
+Date:   Thu May 31 16:26:13 2012 -0700
+
+    fat: switch to fsinfo_inode
+    
+    Currently FAT file-system maps the VFS "superblock" abstraction to the
+    FSINFO block.  The FSINFO block contains non-essential data about the
+    amount of free clusters and the next free cluster.  FAT file-system can
+    always find out this information by scanning the FAT table, but having it
+    in the FSINFO block may speed things up sometimes.  So FAT file-system
+    relies on the VFS superblock write-out services to make sure the FSINFO
+    block is written out to the media from time to time.
+    
+    The whole "superblock write-out" VFS infrastructure is served by the
+    'sync_supers()' kernel thread, which wakes up every 5 (by default) seconds
+    and writes out all dirty superblock using the '->write_super()' call-back.
+     But the problem with this thread is that it wastes power by waking up the
+    system every 5 seconds no matter what.  So we want to kill it completely
+    and thus, we need to make file-systems to stop using the '->write_super'
+    VFS service, and then remove it together with the kernel thread.
+    
+    This patch switches the FAT FSINFO block management from
+    '->write_super()'/'->s_dirt' to 'fsinfo_inode'/'->write_inode'.  Now,
+    instead of setting the 's_dirt' flag, we just mark the special
+    'fsinfo_inode' inode as dirty and let VFS invoke the '->write_inode'
+    call-back when needed, where we write-out the FSINFO block.
+    
+    This patch also makes sure we do not mark the 'fsinfo_inode' inode as
+    dirty if we are not FAT32 (FAT16 and FAT12 do not have the FSINFO block)
+    or if we are in R/O mode.
+    
+    As a bonus, we can also remove the '->sync_fs()' and '->write_super()' FAT
+    call-back function because they become unneeded.
+    
+    Signed-off-by: Artem Bityutskiy <artem.bityutskiy@linux.intel.com>
+    Cc: OGAWA Hirofumi <hirofumi@mail.parknet.co.jp>
+    Cc: Al Viro <viro@zeniv.linux.org.uk>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/fs/fat/fatent.c b/fs/fat/fatent.c
+index 81815487e04d..31f08ab62c56 100644
+--- a/fs/fat/fatent.c
++++ b/fs/fat/fatent.c
+@@ -310,7 +310,12 @@ void fat_ent_access_init(struct super_block *sb)
+ 
+ static void mark_fsinfo_dirty(struct super_block *sb)
+ {
+-	sb->s_dirt = 1;
++	struct msdos_sb_info *sbi = MSDOS_SB(sb);
++
++	if (sb->s_flags & MS_RDONLY || sbi->fat_bits != 32)
++		return;
++
++	__mark_inode_dirty(sbi->fsinfo_inode, I_DIRTY_SYNC);
+ }
+ 
+ static inline int fat_ent_update_ptr(struct super_block *sb,
+
+commit 330fe3c4c6509e0418c434b5bcf80e65cffab477
+Author: Artem Bityutskiy <artem.bityutskiy@linux.intel.com>
+Date:   Thu May 31 16:26:12 2012 -0700
+
+    fat: mark superblock as dirty less often
+    
+    Preparation for further changes.  It touches few functions in fatent.c and
+    prevents them from marking the superblock as dirty unnecessarily often.
+    Namely, instead of marking it as dirty in the internal tight loops - do it
+    only once at the end of the functions.  And instead of marking it as dirty
+    while holding the FAT table lock, do it outside the lock.
+    
+    The reason for this patch is that marking the superblock as dirty will
+    soon become a little bit heavier operation, so it is cleaner to do this
+    only when it is necessary.
+    
+    Signed-off-by: Artem Bityutskiy <artem.bityutskiy@linux.intel.com>
+    Cc: OGAWA Hirofumi <hirofumi@mail.parknet.co.jp>
+    Cc: Al Viro <viro@zeniv.linux.org.uk>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/fs/fat/fatent.c b/fs/fat/fatent.c
+index e49d27463b67..81815487e04d 100644
+--- a/fs/fat/fatent.c
++++ b/fs/fat/fatent.c
+@@ -503,7 +503,6 @@ int fat_alloc_clusters(struct inode *inode, int *cluster, int nr_cluster)
+ 				sbi->prev_free = entry;
+ 				if (sbi->free_clusters != -1)
+ 					sbi->free_clusters--;
+-				mark_fsinfo_dirty(sb);
+ 
+ 				cluster[idx_clus] = entry;
+ 				idx_clus++;
+@@ -525,11 +524,11 @@ int fat_alloc_clusters(struct inode *inode, int *cluster, int nr_cluster)
+ 	/* Couldn't allocate the free entries */
+ 	sbi->free_clusters = 0;
+ 	sbi->free_clus_valid = 1;
+-	mark_fsinfo_dirty(sb);
+ 	err = -ENOSPC;
+ 
+ out:
+ 	unlock_fat(sbi);
++	mark_fsinfo_dirty(sb);
+ 	fatent_brelse(&fatent);
+ 	if (!err) {
+ 		if (inode_needs_sync(inode))
+@@ -554,7 +553,7 @@ int fat_free_clusters(struct inode *inode, int cluster)
+ 	struct fat_entry fatent;
+ 	struct buffer_head *bhs[MAX_BUF_PER_PAGE];
+ 	int i, err, nr_bhs;
+-	int first_cl = cluster;
++	int first_cl = cluster, dirty_fsinfo = 0;
+ 
+ 	nr_bhs = 0;
+ 	fatent_init(&fatent);
+@@ -592,7 +591,7 @@ int fat_free_clusters(struct inode *inode, int cluster)
+ 		ops->ent_put(&fatent, FAT_ENT_FREE);
+ 		if (sbi->free_clusters != -1) {
+ 			sbi->free_clusters++;
+-			mark_fsinfo_dirty(sb);
++			dirty_fsinfo = 1;
+ 		}
+ 
+ 		if (nr_bhs + fatent.nr_bhs > MAX_BUF_PER_PAGE) {
+@@ -622,6 +621,8 @@ int fat_free_clusters(struct inode *inode, int cluster)
+ 	for (i = 0; i < nr_bhs; i++)
+ 		brelse(bhs[i]);
+ 	unlock_fat(sbi);
++	if (dirty_fsinfo)
++		mark_fsinfo_dirty(sb);
+ 
+ 	return err;
+ }
+
+commit 90b436657efb1a6d73bf0677fedee8a8c77032f6
+Author: Artem Bityutskiy <artem.bityutskiy@linux.intel.com>
+Date:   Thu May 31 16:26:12 2012 -0700
+
+    fat: introduce mark_fsinfo_dirty helper
+    
+    A preparation patch which introduces a 'mark_fsinfo_dirty()' helper
+    function which just sets the 's_dirt' flag to 1 so far.  I'll add more
+    code to this helper later, so I do not mark it as 'inline'.
+    
+    Signed-off-by: Artem Bityutskiy <artem.bityutskiy@linux.intel.com>
+    Cc: OGAWA Hirofumi <hirofumi@mail.parknet.co.jp>
+    Cc: Al Viro <viro@zeniv.linux.org.uk>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/fs/fat/fatent.c b/fs/fat/fatent.c
+index 2e81ac0df7e2..e49d27463b67 100644
+--- a/fs/fat/fatent.c
++++ b/fs/fat/fatent.c
+@@ -308,6 +308,11 @@ void fat_ent_access_init(struct super_block *sb)
+ 	}
+ }
+ 
++static void mark_fsinfo_dirty(struct super_block *sb)
++{
++	sb->s_dirt = 1;
++}
++
+ static inline int fat_ent_update_ptr(struct super_block *sb,
+ 				     struct fat_entry *fatent,
+ 				     int offset, sector_t blocknr)
+@@ -498,7 +503,7 @@ int fat_alloc_clusters(struct inode *inode, int *cluster, int nr_cluster)
+ 				sbi->prev_free = entry;
+ 				if (sbi->free_clusters != -1)
+ 					sbi->free_clusters--;
+-				sb->s_dirt = 1;
++				mark_fsinfo_dirty(sb);
+ 
+ 				cluster[idx_clus] = entry;
+ 				idx_clus++;
+@@ -520,7 +525,7 @@ int fat_alloc_clusters(struct inode *inode, int *cluster, int nr_cluster)
+ 	/* Couldn't allocate the free entries */
+ 	sbi->free_clusters = 0;
+ 	sbi->free_clus_valid = 1;
+-	sb->s_dirt = 1;
++	mark_fsinfo_dirty(sb);
+ 	err = -ENOSPC;
+ 
+ out:
+@@ -587,7 +592,7 @@ int fat_free_clusters(struct inode *inode, int cluster)
+ 		ops->ent_put(&fatent, FAT_ENT_FREE);
+ 		if (sbi->free_clusters != -1) {
+ 			sbi->free_clusters++;
+-			sb->s_dirt = 1;
++			mark_fsinfo_dirty(sb);
+ 		}
+ 
+ 		if (nr_bhs + fatent.nr_bhs > MAX_BUF_PER_PAGE) {
+@@ -677,7 +682,7 @@ int fat_count_free_clusters(struct super_block *sb)
+ 	}
+ 	sbi->free_clusters = free;
+ 	sbi->free_clus_valid = 1;
+-	sb->s_dirt = 1;
++	mark_fsinfo_dirty(sb);
+ 	fatent_brelse(&fatent);
+ out:
+ 	unlock_fat(sbi);
+
+commit 869f58c0cdba3ae6880ab6113617e62672198773
+Author: Alexey Fisher <bug-track@fisher-privat.net>
+Date:   Tue Apr 12 21:08:38 2011 +0900
+
+    fat: Replace all printk with fat_msg()
+    
+    Replace all printk with fat_msg()
+    
+    Signed-off-by: Alexey Fisher <bug-track@fisher-privat.net>
+    Signed-off-by: OGAWA Hirofumi <hirofumi@mail.parknet.co.jp>
+
+diff --git a/fs/fat/fatent.c b/fs/fat/fatent.c
+index b47d2c9f4fa1..2e81ac0df7e2 100644
+--- a/fs/fat/fatent.c
++++ b/fs/fat/fatent.c
+@@ -95,7 +95,7 @@ static int fat12_ent_bread(struct super_block *sb, struct fat_entry *fatent,
+ err_brelse:
+ 	brelse(bhs[0]);
+ err:
+-	printk(KERN_ERR "FAT: FAT read failed (blocknr %llu)\n", (llu)blocknr);
++	fat_msg(sb, KERN_ERR, "FAT read failed (blocknr %llu)", (llu)blocknr);
+ 	return -EIO;
+ }
+ 
+@@ -108,7 +108,7 @@ static int fat_ent_bread(struct super_block *sb, struct fat_entry *fatent,
+ 	fatent->fat_inode = MSDOS_SB(sb)->fat_inode;
+ 	fatent->bhs[0] = sb_bread(sb, blocknr);
+ 	if (!fatent->bhs[0]) {
+-		printk(KERN_ERR "FAT: FAT read failed (blocknr %llu)\n",
++		fat_msg(sb, KERN_ERR, "FAT read failed (blocknr %llu)",
+ 		       (llu)blocknr);
+ 		return -EIO;
+ 	}
+
+commit dd3932eddf428571762596e17b65f5dc92ca361b
+Author: Christoph Hellwig <hch@lst.de>
+Date:   Thu Sep 16 20:51:46 2010 +0200
+
+    block: remove BLKDEV_IFL_WAIT
+    
+    All the blkdev_issue_* helpers can only sanely be used for synchronous
+    caller.  To issue cache flushes or barriers asynchronously the caller needs
+    to set up a bio by itself with a completion callback to move the asynchronous
+    state machine ahead.  So drop the BLKDEV_IFL_WAIT flag that is always
+    specified when calling blkdev_issue_* and also remove the now unused flags
+    argument to blkdev_issue_flush and blkdev_issue_zeroout.  For
+    blkdev_issue_discard we need to keep it for the secure discard flag, which
+    gains a more descriptive name and loses the bitops vs flag confusion.
+    
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Signed-off-by: Jens Axboe <jaxboe@fusionio.com>
+
+diff --git a/fs/fat/fatent.c b/fs/fat/fatent.c
+index f9a0b7ae8648..b47d2c9f4fa1 100644
+--- a/fs/fat/fatent.c
++++ b/fs/fat/fatent.c
+@@ -578,8 +578,7 @@ int fat_free_clusters(struct inode *inode, int cluster)
+ 				sb_issue_discard(sb,
+ 					fat_clus_to_blknr(sbi, first_cl),
+ 					nr_clus * sbi->sec_per_clus,
+-					GFP_NOFS,
+-					BLKDEV_IFL_WAIT);
++					GFP_NOFS, 0);
+ 
+ 				first_cl = cluster;
+ 			}
+
+commit e045db80d07250312500b2ed707b84dc703189d6
+Author: Christoph Hellwig <hch@infradead.org>
+Date:   Wed Aug 18 05:29:19 2010 -0400
+
+    fat: do not send discards as barriers
+    
+    fat already uses synchronous discards, no need to add I/O barriers.
+    
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Signed-off-by: Tejun Heo <tj@kernel.org>
+    Signed-off-by: Jens Axboe <jaxboe@fusionio.com>
+
+diff --git a/fs/fat/fatent.c b/fs/fat/fatent.c
+index 3a56a82f5658..f9a0b7ae8648 100644
+--- a/fs/fat/fatent.c
++++ b/fs/fat/fatent.c
+@@ -579,7 +579,7 @@ int fat_free_clusters(struct inode *inode, int cluster)
+ 					fat_clus_to_blknr(sbi, first_cl),
+ 					nr_clus * sbi->sec_per_clus,
+ 					GFP_NOFS,
+-					BLKDEV_IFL_WAIT | BLKDEV_IFL_BARRIER);
++					BLKDEV_IFL_WAIT);
+ 
+ 				first_cl = cluster;
+ 			}
+
+commit 2cf6d26a354ab6362e301b5a323832b02867df47
+Author: Christoph Hellwig <hch@infradead.org>
+Date:   Wed Aug 18 05:29:10 2010 -0400
+
+    block: pass gfp_mask and flags to sb_issue_discard
+    
+    We'll need to get rid of the BLKDEV_IFL_BARRIER flag, and to facilitate
+    that and to make the interface less confusing pass all flags explicitly.
+    
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Acked-by: Mike Snitzer <snitzer@redhat.com>
+    Signed-off-by: Tejun Heo <tj@kernel.org>
+    Signed-off-by: Jens Axboe <jaxboe@fusionio.com>
+
+diff --git a/fs/fat/fatent.c b/fs/fat/fatent.c
+index 81184d3b75a3..3a56a82f5658 100644
+--- a/fs/fat/fatent.c
++++ b/fs/fat/fatent.c
+@@ -577,7 +577,9 @@ int fat_free_clusters(struct inode *inode, int cluster)
+ 
+ 				sb_issue_discard(sb,
+ 					fat_clus_to_blknr(sbi, first_cl),
+-					nr_clus * sbi->sec_per_clus);
++					nr_clus * sbi->sec_per_clus,
++					GFP_NOFS,
++					BLKDEV_IFL_WAIT | BLKDEV_IFL_BARRIER);
+ 
+ 				first_cl = cluster;
+ 			}
+
+commit 681142f9211b23e6aa2984259d38b76d7bdc05a8
+Author: Christoph Hellwig <hch@lst.de>
+Date:   Sat Nov 21 20:28:52 2009 +0900
+
+    fat: make discard a mount option
+    
+    Currently shipping discard capable SSDs and arrays have rather sub-optimal
+    implementations of the command and can the use of it can cause massive
+    slowdowns.  Make issueing these commands option as it's already in btrfs
+    and gfs2.
+    
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    [hirofumi@mail.parknet.co.jp: tweaks, and add "discard" to fat_show_options]
+    Signed-off-by: OGAWA Hirofumi <hirofumi@mail.parknet.co.jp>
+
+diff --git a/fs/fat/fatent.c b/fs/fat/fatent.c
+index a81037721a6f..81184d3b75a3 100644
+--- a/fs/fat/fatent.c
++++ b/fs/fat/fatent.c
+@@ -566,16 +566,21 @@ int fat_free_clusters(struct inode *inode, int cluster)
+ 			goto error;
+ 		}
+ 
+-		/* 
+-		 * Issue discard for the sectors we no longer care about,
+-		 * batching contiguous clusters into one request
+-		 */
+-		if (cluster != fatent.entry + 1) {
+-			int nr_clus = fatent.entry - first_cl + 1;
+-
+-			sb_issue_discard(sb, fat_clus_to_blknr(sbi, first_cl),
+-					 nr_clus * sbi->sec_per_clus);
+-			first_cl = cluster;
++		if (sbi->options.discard) {
++			/*
++			 * Issue discard for the sectors we no longer
++			 * care about, batching contiguous clusters
++			 * into one request
++			 */
++			if (cluster != fatent.entry + 1) {
++				int nr_clus = fatent.entry - first_cl + 1;
++
++				sb_issue_discard(sb,
++					fat_clus_to_blknr(sbi, first_cl),
++					nr_clus * sbi->sec_per_clus);
++
++				first_cl = cluster;
++			}
+ 		}
+ 
+ 		ops->ent_put(&fatent, FAT_ENT_FREE);
+
+commit 23059a0df5fad3d83b9a21fc2696a39148f49617
+Merge: 4858704da75b 21bea495943f
+Author: Linus Torvalds <torvalds@linux-foundation.org>
+Date:   Tue Jun 16 11:29:44 2009 -0700
+
+    Merge git://git.kernel.org/pub/scm/linux/kernel/git/hirofumi/fatfs-2.6
+    
+    * git://git.kernel.org/pub/scm/linux/kernel/git/hirofumi/fatfs-2.6:
+      fat: split fat_generic_ioctl
+      FAT: add 'errors' mount option
+
+commit b522412aeabadbb302fd4338eaabf09d10e2d29c
+Author: Al Viro <viro@zeniv.linux.org.uk>
+Date:   Sun Jun 7 13:44:36 2009 -0400
+
+    Sanitize ->fsync() for FAT
+    
+    * mark directory data blocks as assoc. metadata
+    * add new inode to deal with FAT, mark FAT blocks as assoc. metadata of that
+    * now ->fsync() is trivial both for files and directories
+    
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/fs/fat/fatent.c b/fs/fat/fatent.c
+index da6eea47872f..618f5305c2e4 100644
+--- a/fs/fat/fatent.c
++++ b/fs/fat/fatent.c
+@@ -73,6 +73,8 @@ static int fat12_ent_bread(struct super_block *sb, struct fat_entry *fatent,
+ 	struct buffer_head **bhs = fatent->bhs;
+ 
+ 	WARN_ON(blocknr < MSDOS_SB(sb)->fat_start);
++	fatent->fat_inode = MSDOS_SB(sb)->fat_inode;
++
+ 	bhs[0] = sb_bread(sb, blocknr);
+ 	if (!bhs[0])
+ 		goto err;
+@@ -103,6 +105,7 @@ static int fat_ent_bread(struct super_block *sb, struct fat_entry *fatent,
+ 	struct fatent_operations *ops = MSDOS_SB(sb)->fatent_ops;
+ 
+ 	WARN_ON(blocknr < MSDOS_SB(sb)->fat_start);
++	fatent->fat_inode = MSDOS_SB(sb)->fat_inode;
+ 	fatent->bhs[0] = sb_bread(sb, blocknr);
+ 	if (!fatent->bhs[0]) {
+ 		printk(KERN_ERR "FAT: FAT read failed (blocknr %llu)\n",
+@@ -167,9 +170,9 @@ static void fat12_ent_put(struct fat_entry *fatent, int new)
+ 	}
+ 	spin_unlock(&fat12_entry_lock);
+ 
+-	mark_buffer_dirty(fatent->bhs[0]);
++	mark_buffer_dirty_inode(fatent->bhs[0], fatent->fat_inode);
+ 	if (fatent->nr_bhs == 2)
+-		mark_buffer_dirty(fatent->bhs[1]);
++		mark_buffer_dirty_inode(fatent->bhs[1], fatent->fat_inode);
+ }
+ 
+ static void fat16_ent_put(struct fat_entry *fatent, int new)
+@@ -178,7 +181,7 @@ static void fat16_ent_put(struct fat_entry *fatent, int new)
+ 		new = EOF_FAT16;
+ 
+ 	*fatent->u.ent16_p = cpu_to_le16(new);
+-	mark_buffer_dirty(fatent->bhs[0]);
++	mark_buffer_dirty_inode(fatent->bhs[0], fatent->fat_inode);
+ }
+ 
+ static void fat32_ent_put(struct fat_entry *fatent, int new)
+@@ -189,7 +192,7 @@ static void fat32_ent_put(struct fat_entry *fatent, int new)
+ 	WARN_ON(new & 0xf0000000);
+ 	new |= le32_to_cpu(*fatent->u.ent32_p) & ~0x0fffffff;
+ 	*fatent->u.ent32_p = cpu_to_le32(new);
+-	mark_buffer_dirty(fatent->bhs[0]);
++	mark_buffer_dirty_inode(fatent->bhs[0], fatent->fat_inode);
+ }
+ 
+ static int fat12_ent_next(struct fat_entry *fatent)
+@@ -381,7 +384,7 @@ static int fat_mirror_bhs(struct super_block *sb, struct buffer_head **bhs,
+ 			}
+ 			memcpy(c_bh->b_data, bhs[n]->b_data, sb->s_blocksize);
+ 			set_buffer_uptodate(c_bh);
+-			mark_buffer_dirty(c_bh);
++			mark_buffer_dirty_inode(c_bh, sbi->fat_inode);
+ 			if (sb->s_flags & MS_SYNCHRONOUS)
+ 				err = sync_dirty_buffer(c_bh);
+ 			brelse(c_bh);
+
+commit 85c7859190c4197a7c34066db14c25903c401187
+Author: Denis Karpov <ext-denis.2.karpov@nokia.com>
+Date:   Thu Jun 4 02:34:22 2009 +0900
+
+    FAT: add 'errors' mount option
+    
+    On severe errors FAT remounts itself in read-only mode. Allow to
+    specify FAT fs desired behavior through 'errors' mount option:
+    panic, continue or remount read-only.
+    
+    `mount -t [fat|vfat] -o errors=[panic,remount-ro,continue] \
+            <bdev> <mount point>`
+    
+    This is analog to ext2 fs 'errors' mount option.
+    
+    Signed-off-by: Denis Karpov <ext-denis.2.karpov@nokia.com>
+    Signed-off-by: OGAWA Hirofumi <hirofumi@mail.parknet.co.jp>
+
+diff --git a/fs/fat/fatent.c b/fs/fat/fatent.c
+index da6eea47872f..60c31f7e678c 100644
+--- a/fs/fat/fatent.c
++++ b/fs/fat/fatent.c
+@@ -345,7 +345,7 @@ int fat_ent_read(struct inode *inode, struct fat_entry *fatent, int entry)
+ 
+ 	if (entry < FAT_START_ENT || sbi->max_cluster <= entry) {
+ 		fatent_brelse(fatent);
+-		fat_fs_panic(sb, "invalid access to FAT (entry 0x%08x)", entry);
++		fat_fs_error(sb, "invalid access to FAT (entry 0x%08x)", entry);
+ 		return -EIO;
+ 	}
+ 
+@@ -557,7 +557,7 @@ int fat_free_clusters(struct inode *inode, int cluster)
+ 			err = cluster;
+ 			goto error;
+ 		} else if (cluster == FAT_ENT_FREE) {
+-			fat_fs_panic(sb, "%s: deleting FAT entry beyond EOF",
++			fat_fs_error(sb, "%s: deleting FAT entry beyond EOF",
+ 				     __func__);
+ 			err = -EIO;
+ 			goto error;
+
+commit c3302931db090d87e9015c3a7ce5c97a7dd90f78
+Author: OGAWA Hirofumi <hirofumi@mail.parknet.co.jp>
+Date:   Thu Nov 6 12:53:58 2008 -0800
+
+    fat: i_blocks warning fix
+    
+    blkcnt_t type depends on CONFIG_LSF. Use unsigned long long always for
+    printk().  But lazy to type it, so add "llu" and use it.
+    
+    Signed-off-by: OGAWA Hirofumi <hirofumi@mail.parknet.co.jp>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/fs/fat/fatent.c b/fs/fat/fatent.c
+index 13513992da3c..da6eea47872f 100644
+--- a/fs/fat/fatent.c
++++ b/fs/fat/fatent.c
+@@ -93,8 +93,7 @@ static int fat12_ent_bread(struct super_block *sb, struct fat_entry *fatent,
+ err_brelse:
+ 	brelse(bhs[0]);
+ err:
+-	printk(KERN_ERR "FAT: FAT read failed (blocknr %llu)\n",
+-	       (unsigned long long)blocknr);
++	printk(KERN_ERR "FAT: FAT read failed (blocknr %llu)\n", (llu)blocknr);
+ 	return -EIO;
+ }
+ 
+@@ -107,7 +106,7 @@ static int fat_ent_bread(struct super_block *sb, struct fat_entry *fatent,
+ 	fatent->bhs[0] = sb_bread(sb, blocknr);
+ 	if (!fatent->bhs[0]) {
+ 		printk(KERN_ERR "FAT: FAT read failed (blocknr %llu)\n",
+-		       (unsigned long long)blocknr);
++		       (llu)blocknr);
+ 		return -EIO;
+ 	}
+ 	fatent->nr_bhs = 1;
+
+commit 5e35dd4651002207948f10c576fc7d9bad448815
+Author: OGAWA Hirofumi <hirofumi@mail.parknet.co.jp>
+Date:   Thu Nov 6 12:53:49 2008 -0800
+
+    fat: Fix fat_ent_update_ptr() for FAT12
+    
+    This fixes the missing update for bhs/nr_bhs in case the caller
+    accessed from block boundary to first block of boundary.
+    
+    Signed-off-by: OGAWA Hirofumi <hirofumi@mail.parknet.co.jp>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/fs/fat/fatent.c b/fs/fat/fatent.c
+index 5b5f49061b7c..13513992da3c 100644
+--- a/fs/fat/fatent.c
++++ b/fs/fat/fatent.c
+@@ -317,10 +317,20 @@ static inline int fat_ent_update_ptr(struct super_block *sb,
+ 	/* Is this fatent's blocks including this entry? */
+ 	if (!fatent->nr_bhs || bhs[0]->b_blocknr != blocknr)
+ 		return 0;
+-	/* Does this entry need the next block? */
+-	if (sbi->fat_bits == 12 && (offset + 1) >= sb->s_blocksize) {
+-		if (fatent->nr_bhs != 2 || bhs[1]->b_blocknr != (blocknr + 1))
+-			return 0;
++	if (sbi->fat_bits == 12) {
++		if ((offset + 1) < sb->s_blocksize) {
++			/* This entry is on bhs[0]. */
++			if (fatent->nr_bhs == 2) {
++				brelse(bhs[1]);
++				fatent->nr_bhs = 1;
++			}
++		} else {
++			/* This entry needs the next block. */
++			if (fatent->nr_bhs != 2)
++				return 0;
++			if (bhs[1]->b_blocknr != (blocknr + 1))
++				return 0;
++		}
+ 	}
+ 	ops->ent_set_ptr(fatent, offset);
+ 	return 1;
+
+commit 9e975dae2970d22557662761c8505ce9fd165684
+Author: OGAWA Hirofumi <hirofumi@mail.parknet.co.jp>
+Date:   Thu Nov 6 12:53:46 2008 -0800
+
+    fat: split include/msdos_fs.h
+    
+    This splits __KERNEL__ stuff in include/msdos_fs.h into fs/fat/fat.h.
+    
+    Signed-off-by: OGAWA Hirofumi <hirofumi@mail.parknet.co.jp>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/fs/fat/fatent.c b/fs/fat/fatent.c
+index fb98b3d847ed..5b5f49061b7c 100644
+--- a/fs/fat/fatent.c
++++ b/fs/fat/fatent.c
+@@ -7,6 +7,7 @@
+ #include <linux/fs.h>
+ #include <linux/msdos_fs.h>
+ #include <linux/blkdev.h>
++#include "fat.h"
+ 
+ struct fatent_operations {
+ 	void (*ent_blocknr)(struct super_block *, int, int *, sector_t *);
+
+commit 8c540a96c175bdf55bda8707db04cec78b816454
+Author: David Woodhouse <David.Woodhouse@intel.com>
+Date:   Tue Aug 5 18:05:46 2008 +0100
+
+    Let the block device know when sectors can be discarded
+    
+    [hirofumi@mail.parknet.co.jp: discard _after_ checking for corrupt chains]
+    
+    Signed-off-by: David Woodhouse <David.Woodhouse@intel.com>
+    Acked-by: OGAWA Hirofumi <hirofumi@mail.parknet.co.jp>
+    Signed-off-by: Jens Axboe <jens.axboe@oracle.com>
+
+diff --git a/fs/fat/fatent.c b/fs/fat/fatent.c
+index 302e95c4af7e..fb98b3d847ed 100644
+--- a/fs/fat/fatent.c
++++ b/fs/fat/fatent.c
+@@ -6,6 +6,7 @@
+ #include <linux/module.h>
+ #include <linux/fs.h>
+ #include <linux/msdos_fs.h>
++#include <linux/blkdev.h>
+ 
+ struct fatent_operations {
+ 	void (*ent_blocknr)(struct super_block *, int, int *, sector_t *);
+@@ -535,6 +536,7 @@ int fat_free_clusters(struct inode *inode, int cluster)
+ 	struct fat_entry fatent;
+ 	struct buffer_head *bhs[MAX_BUF_PER_PAGE];
+ 	int i, err, nr_bhs;
++	int first_cl = cluster;
+ 
+ 	nr_bhs = 0;
+ 	fatent_init(&fatent);
+@@ -551,6 +553,18 @@ int fat_free_clusters(struct inode *inode, int cluster)
+ 			goto error;
+ 		}
+ 
++		/* 
++		 * Issue discard for the sectors we no longer care about,
++		 * batching contiguous clusters into one request
++		 */
++		if (cluster != fatent.entry + 1) {
++			int nr_clus = fatent.entry - first_cl + 1;
++
++			sb_issue_discard(sb, fat_clus_to_blknr(sbi, first_cl),
++					 nr_clus * sbi->sec_per_clus);
++			first_cl = cluster;
++		}
++
+ 		ops->ent_put(&fatent, FAT_ENT_FREE);
+ 		if (sbi->free_clusters != -1) {
+ 			sbi->free_clusters++;
+
+commit 8e24eea728068bbeb6a3c500b848f883a20bf225
+Author: Harvey Harrison <harvey.harrison@gmail.com>
+Date:   Wed Apr 30 00:55:09 2008 -0700
+
+    fs: replace remaining __FUNCTION__ occurrences
+    
+    __FUNCTION__ is gcc-specific, use __func__
+    
+    Signed-off-by: Harvey Harrison <harvey.harrison@gmail.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/fs/fat/fatent.c b/fs/fat/fatent.c
+index 13ab763cc510..302e95c4af7e 100644
+--- a/fs/fat/fatent.c
++++ b/fs/fat/fatent.c
+@@ -546,7 +546,7 @@ int fat_free_clusters(struct inode *inode, int cluster)
+ 			goto error;
+ 		} else if (cluster == FAT_ENT_FREE) {
+ 			fat_fs_panic(sb, "%s: deleting FAT entry beyond EOF",
+-				     __FUNCTION__);
++				     __func__);
+ 			err = -EIO;
+ 			goto error;
+ 		}
+
+commit e69be4c9c4ac1b6bb6380512557da0afa6262e98
+Author: OGAWA Hirofumi <hirofumi@mail.parknet.co.jp>
+Date:   Mon Apr 28 02:16:27 2008 -0700
+
+    fat: Remove fat_clusters_flush()
+    
+    This removes unneeded fat_clusters_flush().
+    
+    Signed-off-by: OGAWA Hirofumi <hirofumi@mail.parknet.co.jp>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/fs/fat/fatent.c b/fs/fat/fatent.c
+index c7c8ab2209e1..13ab763cc510 100644
+--- a/fs/fat/fatent.c
++++ b/fs/fat/fatent.c
+@@ -585,8 +585,6 @@ int fat_free_clusters(struct inode *inode, int cluster)
+ 		brelse(bhs[i]);
+ 	unlock_fat(sbi);
+ 
+-	fat_clusters_flush(sb);
+-
+ 	return err;
+ }
+ 
+
+commit 606e423e43bac0c2f7b85b682eb1ddd2a634586e
+Author: OGAWA Hirofumi <hirofumi@mail.parknet.co.jp>
+Date:   Mon Apr 28 02:16:27 2008 -0700
+
+    fat: Update free_clusters even if it is untrusted
+    
+    Currently, free_clusters is not updated until it is trusted, because
+    Windows doesn't update it correctly.
+    
+    But if user is using FAT driver of Linux, it updates free_clusters
+    correctly.  Instead, this updates it even if it's untrusted, so if
+    free_clustes is correct, now keep correct value.
+    
+    Signed-off-by: OGAWA Hirofumi <hirofumi@mail.parknet.co.jp>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/fs/fat/fatent.c b/fs/fat/fatent.c
+index 5fb366992b73..c7c8ab2209e1 100644
+--- a/fs/fat/fatent.c
++++ b/fs/fat/fatent.c
+@@ -450,7 +450,8 @@ int fat_alloc_clusters(struct inode *inode, int *cluster, int nr_cluster)
+ 	BUG_ON(nr_cluster > (MAX_BUF_PER_PAGE / 2));	/* fixed limit */
+ 
+ 	lock_fat(sbi);
+-	if (sbi->free_clusters != -1 && sbi->free_clusters < nr_cluster) {
++	if (sbi->free_clusters != -1 && sbi->free_clus_valid &&
++	    sbi->free_clusters < nr_cluster) {
+ 		unlock_fat(sbi);
+ 		return -ENOSPC;
+ 	}
+@@ -504,6 +505,7 @@ int fat_alloc_clusters(struct inode *inode, int *cluster, int nr_cluster)
+ 
+ 	/* Couldn't allocate the free entries */
+ 	sbi->free_clusters = 0;
++	sbi->free_clus_valid = 1;
+ 	sb->s_dirt = 1;
+ 	err = -ENOSPC;
+ 
+@@ -615,7 +617,7 @@ int fat_count_free_clusters(struct super_block *sb)
+ 	int err = 0, free;
+ 
+ 	lock_fat(sbi);
+-	if (sbi->free_clusters != -1)
++	if (sbi->free_clusters != -1 && sbi->free_clus_valid)
+ 		goto out;
+ 
+ 	reada_blocks = FAT_READA_SIZE >> sb->s_blocksize_bits;
+@@ -643,6 +645,7 @@ int fat_count_free_clusters(struct super_block *sb)
+ 		} while (fat_ent_next(sbi, &fatent));
+ 	}
+ 	sbi->free_clusters = free;
++	sbi->free_clus_valid = 1;
+ 	sb->s_dirt = 1;
+ 	fatent_brelse(&fatent);
+ out:
+
+commit 9f966be8996f2829406324c68e4c67c2d64d864b
+Author: OGAWA Hirofumi <hirofumi@mail.parknet.co.jp>
+Date:   Tue Jan 8 15:32:41 2008 -0800
+
+    fat: optimize fat_count_free_clusters()
+    
+    On large partition, scanning the free clusters is very slow if users
+    doesn't use "usefree" option.
+    
+    For optimizing it, this patch uses sb_breadahead() to read of FAT
+    sectors. On some user's 15GB partition, this patch improved it very
+    much (1min => 600ms).
+    
+    The following is the result of 2GB partition on my machine.
+    
+    without patch:
+            root@devron (/)# time df -h > /dev/null
+    
+            real    0m1.202s
+            user    0m0.000s
+            sys     0m0.440s
+    
+    with patch:
+            root@devron (/)# time df -h > /dev/null
+    
+            real    0m0.378s
+            user    0m0.012s
+            sys     0m0.168s
+    
+    Signed-off-by: OGAWA Hirofumi <hirofumi@mail.parknet.co.jp>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/fs/fat/fatent.c b/fs/fat/fatent.c
+index 2c1b73fb82ae..5fb366992b73 100644
+--- a/fs/fat/fatent.c
++++ b/fs/fat/fatent.c
+@@ -590,21 +590,49 @@ int fat_free_clusters(struct inode *inode, int cluster)
+ 
+ EXPORT_SYMBOL_GPL(fat_free_clusters);
+ 
++/* 128kb is the whole sectors for FAT12 and FAT16 */
++#define FAT_READA_SIZE		(128 * 1024)
++
++static void fat_ent_reada(struct super_block *sb, struct fat_entry *fatent,
++			  unsigned long reada_blocks)
++{
++	struct fatent_operations *ops = MSDOS_SB(sb)->fatent_ops;
++	sector_t blocknr;
++	int i, offset;
++
++	ops->ent_blocknr(sb, fatent->entry, &offset, &blocknr);
++
++	for (i = 0; i < reada_blocks; i++)
++		sb_breadahead(sb, blocknr + i);
++}
++
+ int fat_count_free_clusters(struct super_block *sb)
+ {
+ 	struct msdos_sb_info *sbi = MSDOS_SB(sb);
+ 	struct fatent_operations *ops = sbi->fatent_ops;
+ 	struct fat_entry fatent;
++	unsigned long reada_blocks, reada_mask, cur_block;
+ 	int err = 0, free;
+ 
+ 	lock_fat(sbi);
+ 	if (sbi->free_clusters != -1)
+ 		goto out;
+ 
++	reada_blocks = FAT_READA_SIZE >> sb->s_blocksize_bits;
++	reada_mask = reada_blocks - 1;
++	cur_block = 0;
++
+ 	free = 0;
+ 	fatent_init(&fatent);
+ 	fatent_set_entry(&fatent, FAT_START_ENT);
+ 	while (fatent.entry < sbi->max_cluster) {
++		/* readahead of fat blocks */
++		if ((cur_block & reada_mask) == 0) {
++			unsigned long rest = sbi->fat_length - cur_block;
++			fat_ent_reada(sb, &fatent, min(reada_blocks, rest));
++		}
++		cur_block++;
++
+ 		err = fat_ent_read_block(sb, &fatent);
+ 		if (err)
+ 			goto out;
+
+commit 98283bb49c6c8c070ebde9f47489d3e9a83c1323
+Author: OGAWA Hirofumi <hirofumi@mail.parknet.co.jp>
+Date:   Mon Jul 16 09:40:05 2007 +0900
+
+    fat: Fix the race of read/write the FAT12 entry
+    
+    FAT12 entry is 12bits, so it needs 2 phase to update the value.  And
+    writer and reader access it without any lock, so reader can get the
+    half updated value.
+    
+    This fixes the long standing race condition by adding a global
+    spinlock to only FAT12 for avoiding any impact against FAT16/32.
+    
+    Signed-off-by: OGAWA Hirofumi <hirofumi@mail.parknet.co.jp>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/fs/fat/fatent.c b/fs/fat/fatent.c
+index ab171ea8e869..2c1b73fb82ae 100644
+--- a/fs/fat/fatent.c
++++ b/fs/fat/fatent.c
+@@ -17,6 +17,8 @@ struct fatent_operations {
+ 	int (*ent_next)(struct fat_entry *);
+ };
+ 
++static DEFINE_SPINLOCK(fat12_entry_lock);
++
+ static void fat12_ent_blocknr(struct super_block *sb, int entry,
+ 			      int *offset, sector_t *blocknr)
+ {
+@@ -116,10 +118,13 @@ static int fat12_ent_get(struct fat_entry *fatent)
+ 	u8 **ent12_p = fatent->u.ent12_p;
+ 	int next;
+ 
++	spin_lock(&fat12_entry_lock);
+ 	if (fatent->entry & 1)
+ 		next = (*ent12_p[0] >> 4) | (*ent12_p[1] << 4);
+ 	else
+ 		next = (*ent12_p[1] << 8) | *ent12_p[0];
++	spin_unlock(&fat12_entry_lock);
++
+ 	next &= 0x0fff;
+ 	if (next >= BAD_FAT12)
+ 		next = FAT_ENT_EOF;
+@@ -151,6 +156,7 @@ static void fat12_ent_put(struct fat_entry *fatent, int new)
+ 	if (new == FAT_ENT_EOF)
+ 		new = EOF_FAT12;
+ 
++	spin_lock(&fat12_entry_lock);
+ 	if (fatent->entry & 1) {
+ 		*ent12_p[0] = (new << 4) | (*ent12_p[0] & 0x0f);
+ 		*ent12_p[1] = new >> 4;
+@@ -158,6 +164,7 @@ static void fat12_ent_put(struct fat_entry *fatent, int new)
+ 		*ent12_p[0] = new & 0xff;
+ 		*ent12_p[1] = (*ent12_p[1] & 0xf0) | (new >> 8);
+ 	}
++	spin_unlock(&fat12_entry_lock);
+ 
+ 	mark_buffer_dirty(fatent->bhs[0]);
+ 	if (fatent->nr_bhs == 2)
+
+commit 6b9438e1323a2be10dcc039f6321e7ca18b9459e
+Author: Arjan van de Ven <arjan@infradead.org>
+Date:   Thu Mar 23 03:00:48 2006 -0800
+
+    [PATCH] fat_lock is used as a mutex, convert it to using the new mutex primitive
+    
+    The fat code uses the fat_lock always in a mutex way (taking and releasing
+    the lock in the same function), the patch below converts it into the new
+    mutex primitive.  Please consider this patch for the code.
+    
+    Signed-off-by: Arjan van de Ven <arjan@infradead.org>
+    Acked-by: OGAWA Hirofumi <hirofumi@mail.parknet.co.jp>
+    Cc: Ingo Molnar <mingo@elte.hu>
+    Signed-off-by: Andrew Morton <akpm@osdl.org>
+    Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+
+diff --git a/fs/fat/fatent.c b/fs/fat/fatent.c
+index a1a9e0451217..ab171ea8e869 100644
+--- a/fs/fat/fatent.c
++++ b/fs/fat/fatent.c
+@@ -267,19 +267,19 @@ static struct fatent_operations fat32_ops = {
+ 
+ static inline void lock_fat(struct msdos_sb_info *sbi)
+ {
+-	down(&sbi->fat_lock);
++	mutex_lock(&sbi->fat_lock);
+ }
+ 
+ static inline void unlock_fat(struct msdos_sb_info *sbi)
+ {
+-	up(&sbi->fat_lock);
++	mutex_unlock(&sbi->fat_lock);
+ }
+ 
+ void fat_ent_access_init(struct super_block *sb)
+ {
+ 	struct msdos_sb_info *sbi = MSDOS_SB(sb);
+ 
+-	init_MUTEX(&sbi->fat_lock);
++	mutex_init(&sbi->fat_lock);
+ 
+ 	switch (sbi->fat_bits) {
+ 	case 32:
+
+commit 7c709d00d614d0f2b6a80895b2a1aedbe04e8478
+Author: OGAWA Hirofumi <hirofumi@mail.parknet.co.jp>
+Date:   Sun Jan 8 01:02:10 2006 -0800
+
+    [PATCH] fat: s/EXPORT_SYMBOL/EXPORT_SYMBOL_GPL/
+    
+    All EXPORT_SYMBOL of fatfs is only for vfat/msdos. _GPL would be proper.
+    
+    Signed-off-by: OGAWA Hirofumi <hirofumi@mail.parknet.co.jp>
+    Signed-off-by: Andrew Morton <akpm@osdl.org>
+    Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+
+diff --git a/fs/fat/fatent.c b/fs/fat/fatent.c
+index 20a22875f0a1..a1a9e0451217 100644
+--- a/fs/fat/fatent.c
++++ b/fs/fat/fatent.c
+@@ -581,7 +581,7 @@ int fat_free_clusters(struct inode *inode, int cluster)
+ 	return err;
+ }
+ 
+-EXPORT_SYMBOL(fat_free_clusters);
++EXPORT_SYMBOL_GPL(fat_free_clusters);
+ 
+ int fat_count_free_clusters(struct super_block *sb)
+ {
+
+commit a6bf6b211cdb92c315c24719a522d8b6f3998210
+Author: OGAWA Hirofumi <hirofumi@mail.parknet.co.jp>
+Date:   Sun Jan 8 01:02:08 2006 -0800
+
+    [PATCH] fat: move fat_clusters_flush() to write_super()
+    
+    It is overkill to update the FS_INFO whenever modifying
+    prev_free/free_clusters, because those are just a hint.
+    
+    So, this patch uses ->write_super() for updating FS_INFO instead.
+    
+    Signed-off-by: OGAWA Hirofumi <hirofumi@mail.parknet.co.jp>
+    Signed-off-by: Andrew Morton <akpm@osdl.org>
+    Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+
+diff --git a/fs/fat/fatent.c b/fs/fat/fatent.c
+index 4164cd54c4d1..20a22875f0a1 100644
+--- a/fs/fat/fatent.c
++++ b/fs/fat/fatent.c
+@@ -476,6 +476,7 @@ int fat_alloc_clusters(struct inode *inode, int *cluster, int nr_cluster)
+ 				sbi->prev_free = entry;
+ 				if (sbi->free_clusters != -1)
+ 					sbi->free_clusters--;
++				sb->s_dirt = 1;
+ 
+ 				cluster[idx_clus] = entry;
+ 				idx_clus++;
+@@ -496,6 +497,7 @@ int fat_alloc_clusters(struct inode *inode, int *cluster, int nr_cluster)
+ 
+ 	/* Couldn't allocate the free entries */
+ 	sbi->free_clusters = 0;
++	sb->s_dirt = 1;
+ 	err = -ENOSPC;
+ 
+ out:
+@@ -509,7 +511,6 @@ int fat_alloc_clusters(struct inode *inode, int *cluster, int nr_cluster)
+ 	}
+ 	for (i = 0; i < nr_bhs; i++)
+ 		brelse(bhs[i]);
+-	fat_clusters_flush(sb);
+ 
+ 	if (err && idx_clus)
+ 		fat_free_clusters(inode, cluster[0]);
+@@ -542,8 +543,10 @@ int fat_free_clusters(struct inode *inode, int cluster)
+ 		}
+ 
+ 		ops->ent_put(&fatent, FAT_ENT_FREE);
+-		if (sbi->free_clusters != -1)
++		if (sbi->free_clusters != -1) {
+ 			sbi->free_clusters++;
++			sb->s_dirt = 1;
++		}
+ 
+ 		if (nr_bhs + fatent.nr_bhs > MAX_BUF_PER_PAGE) {
+ 			if (sb->s_flags & MS_SYNCHRONOUS) {
+@@ -605,6 +608,7 @@ int fat_count_free_clusters(struct super_block *sb)
+ 		} while (fat_ent_next(sbi, &fatent));
+ 	}
+ 	sbi->free_clusters = free;
++	sb->s_dirt = 1;
+ 	fatent_brelse(&fatent);
+ out:
+ 	unlock_fat(sbi);
+
+commit 1da177e4c3f41524e886b7f1b8a0c1fc7321cac2
+Author: Linus Torvalds <torvalds@ppc970.osdl.org>
+Date:   Sat Apr 16 15:20:36 2005 -0700
+
+    Linux-2.6.12-rc2
+    
+    Initial git repository build. I'm not bothering with the full history,
+    even though we have it. We can create a separate "historical" git
+    archive of that later if we want to, and in the meantime it's about
+    3.2GB when imported into git - space that would just make the early
+    git days unnecessarily complicated, when we don't have a lot of good
+    infrastructure for it.
+    
+    Let it rip!
+
+diff --git a/fs/fat/fatent.c b/fs/fat/fatent.c
+new file mode 100644
+index 000000000000..4164cd54c4d1
+--- /dev/null
++++ b/fs/fat/fatent.c
+@@ -0,0 +1,612 @@
++/*
++ * Copyright (C) 2004, OGAWA Hirofumi
++ * Released under GPL v2.
++ */
++
++#include <linux/module.h>
++#include <linux/fs.h>
++#include <linux/msdos_fs.h>
++
++struct fatent_operations {
++	void (*ent_blocknr)(struct super_block *, int, int *, sector_t *);
++	void (*ent_set_ptr)(struct fat_entry *, int);
++	int (*ent_bread)(struct super_block *, struct fat_entry *,
++			 int, sector_t);
++	int (*ent_get)(struct fat_entry *);
++	void (*ent_put)(struct fat_entry *, int);
++	int (*ent_next)(struct fat_entry *);
++};
++
++static void fat12_ent_blocknr(struct super_block *sb, int entry,
++			      int *offset, sector_t *blocknr)
++{
++	struct msdos_sb_info *sbi = MSDOS_SB(sb);
++	int bytes = entry + (entry >> 1);
++	WARN_ON(entry < FAT_START_ENT || sbi->max_cluster <= entry);
++	*offset = bytes & (sb->s_blocksize - 1);
++	*blocknr = sbi->fat_start + (bytes >> sb->s_blocksize_bits);
++}
++
++static void fat_ent_blocknr(struct super_block *sb, int entry,
++			    int *offset, sector_t *blocknr)
++{
++	struct msdos_sb_info *sbi = MSDOS_SB(sb);
++	int bytes = (entry << sbi->fatent_shift);
++	WARN_ON(entry < FAT_START_ENT || sbi->max_cluster <= entry);
++	*offset = bytes & (sb->s_blocksize - 1);
++	*blocknr = sbi->fat_start + (bytes >> sb->s_blocksize_bits);
++}
++
++static void fat12_ent_set_ptr(struct fat_entry *fatent, int offset)
++{
++	struct buffer_head **bhs = fatent->bhs;
++	if (fatent->nr_bhs == 1) {
++		WARN_ON(offset >= (bhs[0]->b_size - 1));
++		fatent->u.ent12_p[0] = bhs[0]->b_data + offset;
++		fatent->u.ent12_p[1] = bhs[0]->b_data + (offset + 1);
++	} else {
++		WARN_ON(offset != (bhs[0]->b_size - 1));
++		fatent->u.ent12_p[0] = bhs[0]->b_data + offset;
++		fatent->u.ent12_p[1] = bhs[1]->b_data;
++	}
++}
++
++static void fat16_ent_set_ptr(struct fat_entry *fatent, int offset)
++{
++	WARN_ON(offset & (2 - 1));
++	fatent->u.ent16_p = (__le16 *)(fatent->bhs[0]->b_data + offset);
++}
++
++static void fat32_ent_set_ptr(struct fat_entry *fatent, int offset)
++{
++	WARN_ON(offset & (4 - 1));
++	fatent->u.ent32_p = (__le32 *)(fatent->bhs[0]->b_data + offset);
++}
++
++static int fat12_ent_bread(struct super_block *sb, struct fat_entry *fatent,
++			   int offset, sector_t blocknr)
++{
++	struct buffer_head **bhs = fatent->bhs;
++
++	WARN_ON(blocknr < MSDOS_SB(sb)->fat_start);
++	bhs[0] = sb_bread(sb, blocknr);
++	if (!bhs[0])
++		goto err;
++
++	if ((offset + 1) < sb->s_blocksize)
++		fatent->nr_bhs = 1;
++	else {
++		/* This entry is block boundary, it needs the next block */
++		blocknr++;
++		bhs[1] = sb_bread(sb, blocknr);
++		if (!bhs[1])
++			goto err_brelse;
++		fatent->nr_bhs = 2;
++	}
++	fat12_ent_set_ptr(fatent, offset);
++	return 0;
++
++err_brelse:
++	brelse(bhs[0]);
++err:
++	printk(KERN_ERR "FAT: FAT read failed (blocknr %llu)\n",
++	       (unsigned long long)blocknr);
++	return -EIO;
++}
++
++static int fat_ent_bread(struct super_block *sb, struct fat_entry *fatent,
++			 int offset, sector_t blocknr)
++{
++	struct fatent_operations *ops = MSDOS_SB(sb)->fatent_ops;
++
++	WARN_ON(blocknr < MSDOS_SB(sb)->fat_start);
++	fatent->bhs[0] = sb_bread(sb, blocknr);
++	if (!fatent->bhs[0]) {
++		printk(KERN_ERR "FAT: FAT read failed (blocknr %llu)\n",
++		       (unsigned long long)blocknr);
++		return -EIO;
++	}
++	fatent->nr_bhs = 1;
++	ops->ent_set_ptr(fatent, offset);
++	return 0;
++}
++
++static int fat12_ent_get(struct fat_entry *fatent)
++{
++	u8 **ent12_p = fatent->u.ent12_p;
++	int next;
++
++	if (fatent->entry & 1)
++		next = (*ent12_p[0] >> 4) | (*ent12_p[1] << 4);
++	else
++		next = (*ent12_p[1] << 8) | *ent12_p[0];
++	next &= 0x0fff;
++	if (next >= BAD_FAT12)
++		next = FAT_ENT_EOF;
++	return next;
++}
++
++static int fat16_ent_get(struct fat_entry *fatent)
++{
++	int next = le16_to_cpu(*fatent->u.ent16_p);
++	WARN_ON((unsigned long)fatent->u.ent16_p & (2 - 1));
++	if (next >= BAD_FAT16)
++		next = FAT_ENT_EOF;
++	return next;
++}
++
++static int fat32_ent_get(struct fat_entry *fatent)
++{
++	int next = le32_to_cpu(*fatent->u.ent32_p) & 0x0fffffff;
++	WARN_ON((unsigned long)fatent->u.ent32_p & (4 - 1));
++	if (next >= BAD_FAT32)
++		next = FAT_ENT_EOF;
++	return next;
++}
++
++static void fat12_ent_put(struct fat_entry *fatent, int new)
++{
++	u8 **ent12_p = fatent->u.ent12_p;
++
++	if (new == FAT_ENT_EOF)
++		new = EOF_FAT12;
++
++	if (fatent->entry & 1) {
++		*ent12_p[0] = (new << 4) | (*ent12_p[0] & 0x0f);
++		*ent12_p[1] = new >> 4;
++	} else {
++		*ent12_p[0] = new & 0xff;
++		*ent12_p[1] = (*ent12_p[1] & 0xf0) | (new >> 8);
++	}
++
++	mark_buffer_dirty(fatent->bhs[0]);
++	if (fatent->nr_bhs == 2)
++		mark_buffer_dirty(fatent->bhs[1]);
++}
++
++static void fat16_ent_put(struct fat_entry *fatent, int new)
++{
++	if (new == FAT_ENT_EOF)
++		new = EOF_FAT16;
++
++	*fatent->u.ent16_p = cpu_to_le16(new);
++	mark_buffer_dirty(fatent->bhs[0]);
++}
++
++static void fat32_ent_put(struct fat_entry *fatent, int new)
++{
++	if (new == FAT_ENT_EOF)
++		new = EOF_FAT32;
++
++	WARN_ON(new & 0xf0000000);
++	new |= le32_to_cpu(*fatent->u.ent32_p) & ~0x0fffffff;
++	*fatent->u.ent32_p = cpu_to_le32(new);
++	mark_buffer_dirty(fatent->bhs[0]);
++}
++
++static int fat12_ent_next(struct fat_entry *fatent)
++{
++	u8 **ent12_p = fatent->u.ent12_p;
++	struct buffer_head **bhs = fatent->bhs;
++	u8 *nextp = ent12_p[1] + 1 + (fatent->entry & 1);
++
++	fatent->entry++;
++	if (fatent->nr_bhs == 1) {
++		WARN_ON(ent12_p[0] > (u8 *)(bhs[0]->b_data + (bhs[0]->b_size - 2)));
++		WARN_ON(ent12_p[1] > (u8 *)(bhs[0]->b_data + (bhs[0]->b_size - 1)));
++		if (nextp < (u8 *)(bhs[0]->b_data + (bhs[0]->b_size - 1))) {
++			ent12_p[0] = nextp - 1;
++			ent12_p[1] = nextp;
++			return 1;
++		}
++	} else {
++		WARN_ON(ent12_p[0] != (u8 *)(bhs[0]->b_data + (bhs[0]->b_size - 1)));
++		WARN_ON(ent12_p[1] != (u8 *)bhs[1]->b_data);
++		ent12_p[0] = nextp - 1;
++		ent12_p[1] = nextp;
++		brelse(bhs[0]);
++		bhs[0] = bhs[1];
++		fatent->nr_bhs = 1;
++		return 1;
++	}
++	ent12_p[0] = NULL;
++	ent12_p[1] = NULL;
++	return 0;
++}
++
++static int fat16_ent_next(struct fat_entry *fatent)
++{
++	const struct buffer_head *bh = fatent->bhs[0];
++	fatent->entry++;
++	if (fatent->u.ent16_p < (__le16 *)(bh->b_data + (bh->b_size - 2))) {
++		fatent->u.ent16_p++;
++		return 1;
++	}
++	fatent->u.ent16_p = NULL;
++	return 0;
++}
++
++static int fat32_ent_next(struct fat_entry *fatent)
++{
++	const struct buffer_head *bh = fatent->bhs[0];
++	fatent->entry++;
++	if (fatent->u.ent32_p < (__le32 *)(bh->b_data + (bh->b_size - 4))) {
++		fatent->u.ent32_p++;
++		return 1;
++	}
++	fatent->u.ent32_p = NULL;
++	return 0;
++}
++
++static struct fatent_operations fat12_ops = {
++	.ent_blocknr	= fat12_ent_blocknr,
++	.ent_set_ptr	= fat12_ent_set_ptr,
++	.ent_bread	= fat12_ent_bread,
++	.ent_get	= fat12_ent_get,
++	.ent_put	= fat12_ent_put,
++	.ent_next	= fat12_ent_next,
++};
++
++static struct fatent_operations fat16_ops = {
++	.ent_blocknr	= fat_ent_blocknr,
++	.ent_set_ptr	= fat16_ent_set_ptr,
++	.ent_bread	= fat_ent_bread,
++	.ent_get	= fat16_ent_get,
++	.ent_put	= fat16_ent_put,
++	.ent_next	= fat16_ent_next,
++};
++
++static struct fatent_operations fat32_ops = {
++	.ent_blocknr	= fat_ent_blocknr,
++	.ent_set_ptr	= fat32_ent_set_ptr,
++	.ent_bread	= fat_ent_bread,
++	.ent_get	= fat32_ent_get,
++	.ent_put	= fat32_ent_put,
++	.ent_next	= fat32_ent_next,
++};
++
++static inline void lock_fat(struct msdos_sb_info *sbi)
++{
++	down(&sbi->fat_lock);
++}
++
++static inline void unlock_fat(struct msdos_sb_info *sbi)
++{
++	up(&sbi->fat_lock);
++}
++
++void fat_ent_access_init(struct super_block *sb)
++{
++	struct msdos_sb_info *sbi = MSDOS_SB(sb);
++
++	init_MUTEX(&sbi->fat_lock);
++
++	switch (sbi->fat_bits) {
++	case 32:
++		sbi->fatent_shift = 2;
++		sbi->fatent_ops = &fat32_ops;
++		break;
++	case 16:
++		sbi->fatent_shift = 1;
++		sbi->fatent_ops = &fat16_ops;
++		break;
++	case 12:
++		sbi->fatent_shift = -1;
++		sbi->fatent_ops = &fat12_ops;
++		break;
++	}
++}
++
++static inline int fat_ent_update_ptr(struct super_block *sb,
++				     struct fat_entry *fatent,
++				     int offset, sector_t blocknr)
++{
++	struct msdos_sb_info *sbi = MSDOS_SB(sb);
++	struct fatent_operations *ops = sbi->fatent_ops;
++	struct buffer_head **bhs = fatent->bhs;
++
++	/* Is this fatent's blocks including this entry? */
++	if (!fatent->nr_bhs || bhs[0]->b_blocknr != blocknr)
++		return 0;
++	/* Does this entry need the next block? */
++	if (sbi->fat_bits == 12 && (offset + 1) >= sb->s_blocksize) {
++		if (fatent->nr_bhs != 2 || bhs[1]->b_blocknr != (blocknr + 1))
++			return 0;
++	}
++	ops->ent_set_ptr(fatent, offset);
++	return 1;
++}
++
++int fat_ent_read(struct inode *inode, struct fat_entry *fatent, int entry)
++{
++	struct super_block *sb = inode->i_sb;
++	struct msdos_sb_info *sbi = MSDOS_SB(inode->i_sb);
++	struct fatent_operations *ops = sbi->fatent_ops;
++	int err, offset;
++	sector_t blocknr;
++
++	if (entry < FAT_START_ENT || sbi->max_cluster <= entry) {
++		fatent_brelse(fatent);
++		fat_fs_panic(sb, "invalid access to FAT (entry 0x%08x)", entry);
++		return -EIO;
++	}
++
++	fatent_set_entry(fatent, entry);
++	ops->ent_blocknr(sb, entry, &offset, &blocknr);
++
++	if (!fat_ent_update_ptr(sb, fatent, offset, blocknr)) {
++		fatent_brelse(fatent);
++		err = ops->ent_bread(sb, fatent, offset, blocknr);
++		if (err)
++			return err;
++	}
++	return ops->ent_get(fatent);
++}
++
++/* FIXME: We can write the blocks as more big chunk. */
++static int fat_mirror_bhs(struct super_block *sb, struct buffer_head **bhs,
++			  int nr_bhs)
++{
++	struct msdos_sb_info *sbi = MSDOS_SB(sb);
++	struct buffer_head *c_bh;
++	int err, n, copy;
++
++	err = 0;
++	for (copy = 1; copy < sbi->fats; copy++) {
++		sector_t backup_fat = sbi->fat_length * copy;
++
++		for (n = 0; n < nr_bhs; n++) {
++			c_bh = sb_getblk(sb, backup_fat + bhs[n]->b_blocknr);
++			if (!c_bh) {
++				err = -ENOMEM;
++				goto error;
++			}
++			memcpy(c_bh->b_data, bhs[n]->b_data, sb->s_blocksize);
++			set_buffer_uptodate(c_bh);
++			mark_buffer_dirty(c_bh);
++			if (sb->s_flags & MS_SYNCHRONOUS)
++				err = sync_dirty_buffer(c_bh);
++			brelse(c_bh);
++			if (err)
++				goto error;
++		}
++	}
++error:
++	return err;
++}
++
++int fat_ent_write(struct inode *inode, struct fat_entry *fatent,
++		  int new, int wait)
++{
++	struct super_block *sb = inode->i_sb;
++	struct fatent_operations *ops = MSDOS_SB(sb)->fatent_ops;
++	int err;
++
++	ops->ent_put(fatent, new);
++	if (wait) {
++		err = fat_sync_bhs(fatent->bhs, fatent->nr_bhs);
++		if (err)
++			return err;
++	}
++	return fat_mirror_bhs(sb, fatent->bhs, fatent->nr_bhs);
++}
++
++static inline int fat_ent_next(struct msdos_sb_info *sbi,
++			       struct fat_entry *fatent)
++{
++	if (sbi->fatent_ops->ent_next(fatent)) {
++		if (fatent->entry < sbi->max_cluster)
++			return 1;
++	}
++	return 0;
++}
++
++static inline int fat_ent_read_block(struct super_block *sb,
++				     struct fat_entry *fatent)
++{
++	struct fatent_operations *ops = MSDOS_SB(sb)->fatent_ops;
++	sector_t blocknr;
++	int offset;
++
++	fatent_brelse(fatent);
++	ops->ent_blocknr(sb, fatent->entry, &offset, &blocknr);
++	return ops->ent_bread(sb, fatent, offset, blocknr);
++}
++
++static void fat_collect_bhs(struct buffer_head **bhs, int *nr_bhs,
++			    struct fat_entry *fatent)
++{
++	int n, i;
++
++	for (n = 0; n < fatent->nr_bhs; n++) {
++		for (i = 0; i < *nr_bhs; i++) {
++			if (fatent->bhs[n] == bhs[i])
++				break;
++		}
++		if (i == *nr_bhs) {
++			get_bh(fatent->bhs[n]);
++			bhs[i] = fatent->bhs[n];
++			(*nr_bhs)++;
++		}
++	}
++}
++
++int fat_alloc_clusters(struct inode *inode, int *cluster, int nr_cluster)
++{
++	struct super_block *sb = inode->i_sb;
++	struct msdos_sb_info *sbi = MSDOS_SB(sb);
++	struct fatent_operations *ops = sbi->fatent_ops;
++	struct fat_entry fatent, prev_ent;
++	struct buffer_head *bhs[MAX_BUF_PER_PAGE];
++	int i, count, err, nr_bhs, idx_clus;
++
++	BUG_ON(nr_cluster > (MAX_BUF_PER_PAGE / 2));	/* fixed limit */
++
++	lock_fat(sbi);
++	if (sbi->free_clusters != -1 && sbi->free_clusters < nr_cluster) {
++		unlock_fat(sbi);
++		return -ENOSPC;
++	}
++
++	err = nr_bhs = idx_clus = 0;
++	count = FAT_START_ENT;
++	fatent_init(&prev_ent);
++	fatent_init(&fatent);
++	fatent_set_entry(&fatent, sbi->prev_free + 1);
++	while (count < sbi->max_cluster) {
++		if (fatent.entry >= sbi->max_cluster)
++			fatent.entry = FAT_START_ENT;
++		fatent_set_entry(&fatent, fatent.entry);
++		err = fat_ent_read_block(sb, &fatent);
++		if (err)
++			goto out;
++
++		/* Find the free entries in a block */
++		do {
++			if (ops->ent_get(&fatent) == FAT_ENT_FREE) {
++				int entry = fatent.entry;
++
++				/* make the cluster chain */
++				ops->ent_put(&fatent, FAT_ENT_EOF);
++				if (prev_ent.nr_bhs)
++					ops->ent_put(&prev_ent, entry);
++
++				fat_collect_bhs(bhs, &nr_bhs, &fatent);
++
++				sbi->prev_free = entry;
++				if (sbi->free_clusters != -1)
++					sbi->free_clusters--;
++
++				cluster[idx_clus] = entry;
++				idx_clus++;
++				if (idx_clus == nr_cluster)
++					goto out;
++
++				/*
++				 * fat_collect_bhs() gets ref-count of bhs,
++				 * so we can still use the prev_ent.
++				 */
++				prev_ent = fatent;
++			}
++			count++;
++			if (count == sbi->max_cluster)
++				break;
++		} while (fat_ent_next(sbi, &fatent));
++	}
++
++	/* Couldn't allocate the free entries */
++	sbi->free_clusters = 0;
++	err = -ENOSPC;
++
++out:
++	unlock_fat(sbi);
++	fatent_brelse(&fatent);
++	if (!err) {
++		if (inode_needs_sync(inode))
++			err = fat_sync_bhs(bhs, nr_bhs);
++		if (!err)
++			err = fat_mirror_bhs(sb, bhs, nr_bhs);
++	}
++	for (i = 0; i < nr_bhs; i++)
++		brelse(bhs[i]);
++	fat_clusters_flush(sb);
++
++	if (err && idx_clus)
++		fat_free_clusters(inode, cluster[0]);
++
++	return err;
++}
++
++int fat_free_clusters(struct inode *inode, int cluster)
++{
++	struct super_block *sb = inode->i_sb;
++	struct msdos_sb_info *sbi = MSDOS_SB(sb);
++	struct fatent_operations *ops = sbi->fatent_ops;
++	struct fat_entry fatent;
++	struct buffer_head *bhs[MAX_BUF_PER_PAGE];
++	int i, err, nr_bhs;
++
++	nr_bhs = 0;
++	fatent_init(&fatent);
++	lock_fat(sbi);
++	do {
++		cluster = fat_ent_read(inode, &fatent, cluster);
++		if (cluster < 0) {
++			err = cluster;
++			goto error;
++		} else if (cluster == FAT_ENT_FREE) {
++			fat_fs_panic(sb, "%s: deleting FAT entry beyond EOF",
++				     __FUNCTION__);
++			err = -EIO;
++			goto error;
++		}
++
++		ops->ent_put(&fatent, FAT_ENT_FREE);
++		if (sbi->free_clusters != -1)
++			sbi->free_clusters++;
++
++		if (nr_bhs + fatent.nr_bhs > MAX_BUF_PER_PAGE) {
++			if (sb->s_flags & MS_SYNCHRONOUS) {
++				err = fat_sync_bhs(bhs, nr_bhs);
++				if (err)
++					goto error;
++			}
++			err = fat_mirror_bhs(sb, bhs, nr_bhs);
++			if (err)
++				goto error;
++			for (i = 0; i < nr_bhs; i++)
++				brelse(bhs[i]);
++			nr_bhs = 0;
++		}
++		fat_collect_bhs(bhs, &nr_bhs, &fatent);
++	} while (cluster != FAT_ENT_EOF);
++
++	if (sb->s_flags & MS_SYNCHRONOUS) {
++		err = fat_sync_bhs(bhs, nr_bhs);
++		if (err)
++			goto error;
++	}
++	err = fat_mirror_bhs(sb, bhs, nr_bhs);
++error:
++	fatent_brelse(&fatent);
++	for (i = 0; i < nr_bhs; i++)
++		brelse(bhs[i]);
++	unlock_fat(sbi);
++
++	fat_clusters_flush(sb);
++
++	return err;
++}
++
++EXPORT_SYMBOL(fat_free_clusters);
++
++int fat_count_free_clusters(struct super_block *sb)
++{
++	struct msdos_sb_info *sbi = MSDOS_SB(sb);
++	struct fatent_operations *ops = sbi->fatent_ops;
++	struct fat_entry fatent;
++	int err = 0, free;
++
++	lock_fat(sbi);
++	if (sbi->free_clusters != -1)
++		goto out;
++
++	free = 0;
++	fatent_init(&fatent);
++	fatent_set_entry(&fatent, FAT_START_ENT);
++	while (fatent.entry < sbi->max_cluster) {
++		err = fat_ent_read_block(sb, &fatent);
++		if (err)
++			goto out;
++
++		do {
++			if (ops->ent_get(&fatent) == FAT_ENT_FREE)
++				free++;
++		} while (fat_ent_next(sbi, &fatent));
++	}
++	sbi->free_clusters = free;
++	fatent_brelse(&fatent);
++out:
++	unlock_fat(sbi);
++	return err;
++}

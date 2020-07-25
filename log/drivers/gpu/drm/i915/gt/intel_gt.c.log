@@ -1,0 +1,2819 @@
+commit 16e87459673a5cbef35cc0f2e15c664b10a4cdb6
+Author: Chris Wilson <chris@chris-wilson.co.uk>
+Date:   Thu Apr 30 12:18:12 2020 +0100
+
+    drm/i915/gt: Move the batch buffer pool from the engine to the gt
+    
+    Since the introduction of 'soft-rc6', we aim to park the device quickly
+    and that results in frequent idling of the whole device. Currently upon
+    idling we free the batch buffer pool, and so this renders the cache
+    ineffective for many workloads. If we want to have an effective cache of
+    recently allocated buffers available for reuse, we need to decouple that
+    cache from the engine powermanagement and make it timer based. As there
+    is no reason then to keep it within the engine (where it once made
+    retirement order easier to track), we can move it up the hierarchy to the
+    owner of the memory allocations.
+    
+    v2: Hook up to debugfs/drop_caches to clear the cache on demand.
+    
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Cc: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+    Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+    Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20200430111819.10262-2-chris@chris-wilson.co.uk
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index 52593edf8aa0..f069551e412f 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -7,6 +7,7 @@
+ #include "i915_drv.h"
+ #include "intel_context.h"
+ #include "intel_gt.h"
++#include "intel_gt_buffer_pool.h"
+ #include "intel_gt_clock_utils.h"
+ #include "intel_gt_pm.h"
+ #include "intel_gt_requests.h"
+@@ -28,6 +29,7 @@ void intel_gt_init_early(struct intel_gt *gt, struct drm_i915_private *i915)
+ 	INIT_LIST_HEAD(&gt->closed_vma);
+ 	spin_lock_init(&gt->closed_lock);
+ 
++	intel_gt_init_buffer_pool(gt);
+ 	intel_gt_init_reset(gt);
+ 	intel_gt_init_requests(gt);
+ 	intel_gt_init_timelines(gt);
+@@ -621,6 +623,7 @@ void intel_gt_driver_release(struct intel_gt *gt)
+ 
+ 	intel_gt_pm_fini(gt);
+ 	intel_gt_fini_scratch(gt);
++	intel_gt_fini_buffer_pool(gt);
+ }
+ 
+ void intel_gt_driver_late_release(struct intel_gt *gt)
+
+commit be1cb55a07bfc528d826962f1e421a44ed5f8311
+Author: Chris Wilson <chris@chris-wilson.co.uk>
+Date:   Wed Apr 29 18:24:29 2020 +0100
+
+    drm/i915/gt: Keep a no-frills swappable copy of the default context state
+    
+    We need to keep the default context state around to instantiate new
+    contexts (aka golden rendercontext), and we also keep it pinned while
+    the engine is active so that we can quickly reset a hanging context.
+    However, the default contexts are large enough to merit keeping in
+    swappable memory as opposed to kernel memory, so we store them inside
+    shmemfs. Currently, we use the normal GEM objects to create the default
+    context image, but we can throw away all but the shmemfs file.
+    
+    This greatly simplifies the tricky power management code which wants to
+    run underneath the normal GT locking, and we definitely do not want to
+    use any high level objects that may appear to recurse back into the GT.
+    Though perhaps the primary advantage of the complex GEM object is that
+    we aggressively cache the mapping, but here we are recreating the
+    vm_area everytime time we unpark. At the worst, we add a lightweight
+    cache, but first find a microbenchmark that is impacted.
+    
+    Having started to create some utility functions to make working with
+    shmemfs objects easier, we can start putting them to wider use, where
+    GEM objects are overkill, such as storing persistent error state.
+    
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Cc: Matthew Auld <matthew.auld@intel.com>
+    Cc: Ramalingam C <ramalingam.c@intel.com>
+    Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+    Reviewed-by: Matthew Auld <matthew.auld@intel.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20200429172429.6054-1-chris@chris-wilson.co.uk
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index d9cf8194c997..52593edf8aa0 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -16,6 +16,7 @@
+ #include "intel_rps.h"
+ #include "intel_uncore.h"
+ #include "intel_pm.h"
++#include "shmem_utils.h"
+ 
+ void intel_gt_init_early(struct intel_gt *gt, struct drm_i915_private *i915)
+ {
+@@ -371,18 +372,6 @@ static struct i915_address_space *kernel_vm(struct intel_gt *gt)
+ 		return i915_vm_get(&gt->ggtt->vm);
+ }
+ 
+-static int __intel_context_flush_retire(struct intel_context *ce)
+-{
+-	struct intel_timeline *tl;
+-
+-	tl = intel_context_timeline_lock(ce);
+-	if (IS_ERR(tl))
+-		return PTR_ERR(tl);
+-
+-	intel_context_timeline_unlock(tl);
+-	return 0;
+-}
+-
+ static int __engines_record_defaults(struct intel_gt *gt)
+ {
+ 	struct i915_request *requests[I915_NUM_ENGINES] = {};
+@@ -448,8 +437,7 @@ static int __engines_record_defaults(struct intel_gt *gt)
+ 
+ 	for (id = 0; id < ARRAY_SIZE(requests); id++) {
+ 		struct i915_request *rq;
+-		struct i915_vma *state;
+-		void *vaddr;
++		struct file *state;
+ 
+ 		rq = requests[id];
+ 		if (!rq)
+@@ -461,48 +449,16 @@ static int __engines_record_defaults(struct intel_gt *gt)
+ 		}
+ 
+ 		GEM_BUG_ON(!test_bit(CONTEXT_ALLOC_BIT, &rq->context->flags));
+-		state = rq->context->state;
+-		if (!state)
++		if (!rq->context->state)
+ 			continue;
+ 
+-		/* Serialise with retirement on another CPU */
+-		GEM_BUG_ON(!i915_request_completed(rq));
+-		err = __intel_context_flush_retire(rq->context);
+-		if (err)
+-			goto out;
+-
+-		/* We want to be able to unbind the state from the GGTT */
+-		GEM_BUG_ON(intel_context_is_pinned(rq->context));
+-
+-		/*
+-		 * As we will hold a reference to the logical state, it will
+-		 * not be torn down with the context, and importantly the
+-		 * object will hold onto its vma (making it possible for a
+-		 * stray GTT write to corrupt our defaults). Unmap the vma
+-		 * from the GTT to prevent such accidents and reclaim the
+-		 * space.
+-		 */
+-		err = i915_vma_unbind(state);
+-		if (err)
+-			goto out;
+-
+-		i915_gem_object_lock(state->obj);
+-		err = i915_gem_object_set_to_cpu_domain(state->obj, false);
+-		i915_gem_object_unlock(state->obj);
+-		if (err)
+-			goto out;
+-
+-		i915_gem_object_set_cache_coherency(state->obj, I915_CACHE_LLC);
+-
+-		/* Check we can acquire the image of the context state */
+-		vaddr = i915_gem_object_pin_map(state->obj, I915_MAP_FORCE_WB);
+-		if (IS_ERR(vaddr)) {
+-			err = PTR_ERR(vaddr);
++		/* Keep a copy of the state's backing pages; free the obj */
++		state = shmem_create_from_object(rq->context->state->obj);
++		if (IS_ERR(state)) {
++			err = PTR_ERR(state);
+ 			goto out;
+ 		}
+-
+-		rq->engine->default_state = i915_gem_object_get(state->obj);
+-		i915_gem_object_unpin_map(state->obj);
++		rq->engine->default_state = state;
+ 	}
+ 
+ out:
+
+commit 9c878557b1ebd23316b65e4099313a4b0c21eac4
+Author: Chris Wilson <chris@chris-wilson.co.uk>
+Date:   Fri Apr 24 17:28:05 2020 +0100
+
+    drm/i915/gt: Use the RPM config register to determine clk frequencies
+    
+    For many configuration details within RC6 and RPS we are programming
+    intervals for the internal clocks. From gen11, these clocks are
+    configuration via the RPM_CONFIG and so for convenience, we would like
+    to convert to/from more natural units (ns).
+    
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Cc: Andi Shyti <andi.shyti@intel.com>
+    Cc: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+    Reviewed-by: Andi Shyti <andi.shyti@intel.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20200424162805.25920-2-chris@chris-wilson.co.uk
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index 1c99cc72305a..d9cf8194c997 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -7,6 +7,7 @@
+ #include "i915_drv.h"
+ #include "intel_context.h"
+ #include "intel_gt.h"
++#include "intel_gt_clock_utils.h"
+ #include "intel_gt_pm.h"
+ #include "intel_gt_requests.h"
+ #include "intel_mocs.h"
+@@ -576,6 +577,8 @@ int intel_gt_init(struct intel_gt *gt)
+ 	 */
+ 	intel_uncore_forcewake_get(gt->uncore, FORCEWAKE_ALL);
+ 
++	intel_gt_init_clock_frequency(gt);
++
+ 	err = intel_gt_init_scratch(gt, IS_GEN(gt->i915, 2) ? SZ_256K : SZ_4K);
+ 	if (err)
+ 		goto out_fw;
+
+commit a9410a6250643079a614c500240fc5942e66b383
+Author: Daniele Ceraolo Spurio <daniele.ceraolospurio@intel.com>
+Date:   Thu Mar 26 11:11:21 2020 -0700
+
+    drm/i915/uc: do not free err log on uc_fini
+    
+    We need to keep the GuC error logs around to debug the load failure,
+    so we can't clean them in the error unwind, which includes uc_fini().
+    Moving the cleanup to driver remove ensures that the logs stick around
+    long enough for us to dump them.
+    
+    v2: reword commit msg (John)
+    
+    Signed-off-by: Daniele Ceraolo Spurio <daniele.ceraolospurio@intel.com>
+    Cc: Michal Wajdeczko <michal.wajdeczko@intel.com>
+    Reviewed-by: John Harrison <John.C.Harrison@Intel.com>
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20200326181121.16869-7-daniele.ceraolospurio@intel.com
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index d09f7596cb98..1c99cc72305a 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -635,8 +635,7 @@ void intel_gt_driver_remove(struct intel_gt *gt)
+ {
+ 	__intel_gt_disable(gt);
+ 
+-	intel_uc_fini_hw(&gt->uc);
+-	intel_uc_fini(&gt->uc);
++	intel_uc_driver_remove(&gt->uc);
+ 
+ 	intel_engines_release(gt);
+ }
+
+commit 22ca8a452e5791c9721e1ba61e95651fc00a9e4d
+Author: Chris Wilson <chris@chris-wilson.co.uk>
+Date:   Thu Mar 12 11:53:07 2020 +0000
+
+    drm/i915/gt: Wait for RCUs frees before asserting idle on unload
+    
+    During driver unload, we have many asserts that we have released our
+    bookkeeping structs and are idle. In some cases, these struct are
+    protected by RCU and we do not release them until after an RCU grace
+    period.
+    
+    Reported-by: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+    Fixes: 130a95e9098e ("drm/i915/gem: Consolidate ctx->engines[] release")
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+    Cc: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+    Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+    Reviewed-by: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20200312115307.16460-1-chris@chris-wilson.co.uk
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index 3dea8881e915..d09f7596cb98 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -667,6 +667,9 @@ void intel_gt_driver_release(struct intel_gt *gt)
+ 
+ void intel_gt_driver_late_release(struct intel_gt *gt)
+ {
++	/* We need to wait for inflight RCU frees to release their grip */
++	rcu_barrier();
++
+ 	intel_uc_driver_late_release(&gt->uc);
+ 	intel_gt_fini_requests(gt);
+ 	intel_gt_fini_reset(gt);
+
+commit 6065682f99542f6f255d13500f7e56cf194c3ca3
+Author: Chris Wilson <chris@chris-wilson.co.uk>
+Date:   Fri Feb 21 23:51:35 2020 +0000
+
+    drm/i915/gt: Push the GPU cancellation to the backend
+    
+    Upon unregistering the user interface, we mark the GPU as wedged to
+    ensure we push no new work to the GPU, and to flush all current work
+    from the GPU. Move this call to the GT backend.
+    
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Cc: Andi Shyti <andi.shyti@intel.com>
+    Reviewed-by: Andi Shyti <andi.shyti@intel.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20200221235135.2883006-1-chris@chris-wilson.co.uk
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index cd64f81a3e60..3dea8881e915 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -644,6 +644,13 @@ void intel_gt_driver_remove(struct intel_gt *gt)
+ void intel_gt_driver_unregister(struct intel_gt *gt)
+ {
+ 	intel_rps_driver_unregister(&gt->rps);
++
++	/*
++	 * Upon unregistering the device to prevent any new users, cancel
++	 * all in-flight requests so that we can quickly unbind the active
++	 * resources.
++	 */
++	intel_gt_set_wedged(gt);
+ }
+ 
+ void intel_gt_driver_release(struct intel_gt *gt)
+
+commit 3acffa8cba757a60c0fe24874e0456df8e494778
+Author: Daniele Ceraolo Spurio <daniele.ceraolospurio@intel.com>
+Date:   Tue Feb 18 14:33:25 2020 -0800
+
+    drm/i915/uc: Abort early on uc_init failure
+    
+    Now that we can differentiate wants vs uses GuC/HuC, intel_uc_init is
+    restricted to running only if we have successfully fetched the required
+    blob(s) and are committed to using the microcontroller(s).
+    The only remaining thing that can go wrong in uc_init is the allocation
+    of GuC/HuC related objects; if we get such a failure better to bail out
+    immediately instead of wedging later, like we do for e.g.
+    intel_engines_init, since without objects we can't use the HW, including
+    not being able to attempt the firmware load.
+    
+    While at it, remove the unneeded fw_cleanup call (this is handled
+    outside of gt_init) and add a probe failure injection point for testing.
+    Also, update the logs for <g/h>uc_init failures to probe_failure() since
+    they will cause the driver load to fail.
+    
+    Signed-off-by: Daniele Ceraolo Spurio <daniele.ceraolospurio@intel.com>
+    Cc: Michal Wajdeczko <michal.wajdeczko@intel.com>
+    Cc: John Harrison <John.C.Harrison@Intel.com>
+    Cc: Matthew Brost <matthew.brost@intel.com>
+    Reviewed-by: Fernando Pacheco <fernando.pacheco@intel.com>
+    Reviewed-by: Michal Wajdeczko <michal.wajdeczko@intel.com>
+    Reviewed-by: Andi Shyti <andi.shyti@intel.com>
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20200218223327.11058-8-daniele.ceraolospurio@intel.com
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index f1f1b306e0af..cd64f81a3e60 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -592,7 +592,9 @@ int intel_gt_init(struct intel_gt *gt)
+ 	if (err)
+ 		goto err_engines;
+ 
+-	intel_uc_init(&gt->uc);
++	err = intel_uc_init(&gt->uc);
++	if (err)
++		goto err_engines;
+ 
+ 	err = intel_gt_resume(gt);
+ 	if (err)
+
+commit e3793468b4660a9825eb3a149aab1bcd0de7a4f2
+Author: Chris Wilson <chris@chris-wilson.co.uk>
+Date:   Thu Jan 30 18:17:10 2020 +0000
+
+    drm/i915: Use the async worker to avoid reclaim tainting the ggtt->mutex
+    
+    On Braswell and Broxton (also known as Valleyview and Apollolake), we
+    need to serialise updates of the GGTT using the big stop_machine()
+    hammer. This has the side effect of appearing to lockdep as a possible
+    reclaim (since it uses the cpuhp mutex and that is tainted by per-cpu
+    allocations). However, we want to use vm->mutex (including ggtt->mutex)
+    from within the shrinker and so must avoid such possible taints. For this
+    purpose, we introduced the asynchronous vma binding and we can apply it
+    to the PIN_GLOBAL so long as take care to add the necessary waits for
+    the worker afterwards.
+    
+    Closes: https://gitlab.freedesktop.org/drm/intel/issues/211
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Reviewed-by: Matthew Auld <matthew.auld@intel.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20200130181710.2030251-3-chris@chris-wilson.co.uk
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index 51019611bc1e..f1f1b306e0af 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -344,7 +344,7 @@ static int intel_gt_init_scratch(struct intel_gt *gt, unsigned int size)
+ 		goto err_unref;
+ 	}
+ 
+-	ret = i915_vma_pin(vma, 0, 0, PIN_GLOBAL | PIN_HIGH);
++	ret = i915_ggtt_pin(vma, 0, PIN_HIGH);
+ 	if (ret)
+ 		goto err_unref;
+ 
+
+commit 1a6c83efa046a194e4f8985cb6d278b059b9c1be
+Author: Wambui Karuga <wambui.karugax@gmail.com>
+Date:   Tue Jan 28 10:14:35 2020 +0300
+
+    drm/i915/gt: convert to new logging macros in gt/intel_gt.c
+    
+    Convert remaining instances of the printk based logging macros in
+    i915/gt/intel_gt to the struct drm_device based logging macros.
+    
+    Signed-off-by: Wambui Karuga <wambui.karugax@gmail.com>
+    Signed-off-by: Jani Nikula <jani.nikula@intel.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20200128071437.9284-7-wambui.karugax@gmail.com
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index 143268083135..51019611bc1e 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -198,16 +198,16 @@ static void gen6_check_faults(struct intel_gt *gt)
+ 	for_each_engine(engine, gt, id) {
+ 		fault = GEN6_RING_FAULT_REG_READ(engine);
+ 		if (fault & RING_FAULT_VALID) {
+-			DRM_DEBUG_DRIVER("Unexpected fault\n"
+-					 "\tAddr: 0x%08lx\n"
+-					 "\tAddress space: %s\n"
+-					 "\tSource ID: %d\n"
+-					 "\tType: %d\n",
+-					 fault & PAGE_MASK,
+-					 fault & RING_FAULT_GTTSEL_MASK ?
+-					 "GGTT" : "PPGTT",
+-					 RING_FAULT_SRCID(fault),
+-					 RING_FAULT_FAULT_TYPE(fault));
++			drm_dbg(&engine->i915->drm, "Unexpected fault\n"
++				"\tAddr: 0x%08lx\n"
++				"\tAddress space: %s\n"
++				"\tSource ID: %d\n"
++				"\tType: %d\n",
++				fault & PAGE_MASK,
++				fault & RING_FAULT_GTTSEL_MASK ?
++				"GGTT" : "PPGTT",
++				RING_FAULT_SRCID(fault),
++				RING_FAULT_FAULT_TYPE(fault));
+ 		}
+ 	}
+ }
+@@ -239,18 +239,17 @@ static void gen8_check_faults(struct intel_gt *gt)
+ 		fault_addr = ((u64)(fault_data1 & FAULT_VA_HIGH_BITS) << 44) |
+ 			     ((u64)fault_data0 << 12);
+ 
+-		DRM_DEBUG_DRIVER("Unexpected fault\n"
+-				 "\tAddr: 0x%08x_%08x\n"
+-				 "\tAddress space: %s\n"
+-				 "\tEngine ID: %d\n"
+-				 "\tSource ID: %d\n"
+-				 "\tType: %d\n",
+-				 upper_32_bits(fault_addr),
+-				 lower_32_bits(fault_addr),
+-				 fault_data1 & FAULT_GTT_SEL ? "GGTT" : "PPGTT",
+-				 GEN8_RING_FAULT_ENGINE_ID(fault),
+-				 RING_FAULT_SRCID(fault),
+-				 RING_FAULT_FAULT_TYPE(fault));
++		drm_dbg(&uncore->i915->drm, "Unexpected fault\n"
++			"\tAddr: 0x%08x_%08x\n"
++			"\tAddress space: %s\n"
++			"\tEngine ID: %d\n"
++			"\tSource ID: %d\n"
++			"\tType: %d\n",
++			upper_32_bits(fault_addr), lower_32_bits(fault_addr),
++			fault_data1 & FAULT_GTT_SEL ? "GGTT" : "PPGTT",
++			GEN8_RING_FAULT_ENGINE_ID(fault),
++			RING_FAULT_SRCID(fault),
++			RING_FAULT_FAULT_TYPE(fault));
+ 	}
+ }
+ 
+
+commit 70a76a9b8e9d553c02deaf8503cd01a316016be0
+Author: Chris Wilson <chris@chris-wilson.co.uk>
+Date:   Tue Jan 28 20:43:15 2020 +0000
+
+    drm/i915/gt: Hook up CS_MASTER_ERROR_INTERRUPT
+    
+    Now that we have offline error capture and can reset an engine from
+    inside an atomic context while also preserving the GPU state for
+    post-mortem analysis, it is time to handle error interrupts thrown by
+    the command parser.
+    
+    This provides a much, much faster mechanism for us to detect known
+    problems than using heartbeats/hangchecks, and also provides a mechanism
+    for when those are disabled. However, it is limited to problems the HW
+    can detect in the CS and so not a complete solution for detecting lockups.
+    
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+    Reviewed-by: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20200128204318.4182039-2-chris@chris-wilson.co.uk
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index 88b6c904607c..143268083135 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -455,6 +455,11 @@ static int __engines_record_defaults(struct intel_gt *gt)
+ 		if (!rq)
+ 			continue;
+ 
++		if (rq->fence.error) {
++			err = -EIO;
++			goto out;
++		}
++
+ 		GEM_BUG_ON(!test_bit(CONTEXT_ALLOC_BIT, &rq->context->flags));
+ 		state = rq->context->state;
+ 		if (!state)
+
+commit 9c6527116e8f292c997b49cd791157b58f0286ac
+Author: Chris Wilson <chris@chris-wilson.co.uk>
+Date:   Sun Jan 26 19:46:18 2020 +0000
+
+    drm/i915: Restore the kernel context after verifying the w/a
+    
+    As a safety net, flush the engine verifications and restore the kernel
+    context.
+    
+    Closes: https://gitlab.freedesktop.org/drm/intel/issues/971
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Acked-by: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20200126194618.2131078-1-chris@chris-wilson.co.uk
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index da2b6e2ae692..88b6c904607c 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -538,6 +538,10 @@ static int __engines_verify_workarounds(struct intel_gt *gt)
+ 			err = -EIO;
+ 	}
+ 
++	/* Flush and restore the kernel context for safety */
++	if (intel_gt_wait_for_idle(gt, I915_GEM_IDLE_TIMEOUT) == -ETIME)
++		err = -EIO;
++
+ 	return err;
+ }
+ 
+
+commit 2c86e55d2ab55b036d901384eae43fdae4487459
+Author: Matthew Auld <matthew.auld@intel.com>
+Date:   Tue Jan 7 13:40:09 2020 +0000
+
+    drm/i915/gtt: split up i915_gem_gtt
+    
+    Attempt to split i915_gem_gtt.[ch] into more manageable chunks.
+    
+    Suggested-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Signed-off-by: Matthew Auld <matthew.auld@intel.com>
+    Cc: Chris Wilson <chris@chris-wilson.co.uk>
+    Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20200107134009.3255354-1-chris@chris-wilson.co.uk
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index 8a17abfbb19f..da2b6e2ae692 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -366,7 +366,7 @@ static void intel_gt_fini_scratch(struct intel_gt *gt)
+ static struct i915_address_space *kernel_vm(struct intel_gt *gt)
+ {
+ 	if (INTEL_PPGTT(gt->i915) > INTEL_PPGTT_ALIASING)
+-		return &i915_ppgtt_create(gt->i915)->vm;
++		return &i915_ppgtt_create(gt)->vm;
+ 	else
+ 		return i915_vm_get(&gt->ggtt->vm);
+ }
+
+commit d03b224f425295ba17e5a6f29713da310e9a0d72
+Author: Chris Wilson <chris@chris-wilson.co.uk>
+Date:   Thu Dec 26 11:18:34 2019 +0000
+
+    drm/i915/gt: Apply sanitiization just before resume
+    
+    Bring sanitization completely underneath the umbrella of intel_gt, and
+    perform it exclusively after suspend and before the next resume.
+    
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Acked-by: Andi Shyti <andi.shyti@intel.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20191226111834.2545953-1-chris@chris-wilson.co.uk
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index e4f7cc7dd88a..8a17abfbb19f 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -38,8 +38,6 @@ void intel_gt_init_early(struct intel_gt *gt, struct drm_i915_private *i915)
+ void intel_gt_init_hw_early(struct intel_gt *gt, struct i915_ggtt *ggtt)
+ {
+ 	gt->ggtt = ggtt;
+-
+-	intel_gt_sanitize(gt, false);
+ }
+ 
+ static void init_unused_ring(struct intel_gt *gt, u32 base)
+@@ -77,10 +75,6 @@ int intel_gt_init_hw(struct intel_gt *gt)
+ 	struct intel_uncore *uncore = gt->uncore;
+ 	int ret;
+ 
+-	ret = intel_gt_terminally_wedged(gt);
+-	if (ret)
+-		return ret;
+-
+ 	gt->last_init_time = ktime_get();
+ 
+ 	/* Double layer security blanket, see i915_gem_init() */
+
+commit c2d78a9b73d4b66d38e51245ea0e06c446cf2c46
+Author: Chris Wilson <chris@chris-wilson.co.uk>
+Date:   Wed Dec 25 23:07:03 2019 +0000
+
+    drm/i915/gt: Stop poking at engine->serial at a high level
+    
+    In record defaults, if we emit a request we expect a context switck on
+    parking. We need take no further action, so don't even mess with the low
+    level engine->serial where it is not warranted.
+    
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Cc: Andi Shyti <andi.shyti@intel.com>
+    Acked-by: Andi Shyti <andi.shyti@intel.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20191225230703.2498794-1-chris@chris-wilson.co.uk
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index ec84b5e62fef..e4f7cc7dd88a 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -410,14 +410,13 @@ static int __engines_record_defaults(struct intel_gt *gt)
+ 		struct intel_context *ce;
+ 		struct i915_request *rq;
+ 
++		/* We must be able to switch to something! */
++		GEM_BUG_ON(!engine->kernel_context);
++
+ 		err = intel_renderstate_init(&so, engine);
+ 		if (err)
+ 			goto out;
+ 
+-		/* We must be able to switch to something! */
+-		GEM_BUG_ON(!engine->kernel_context);
+-		engine->serial++; /* force the kernel context switch */
+-
+ 		ce = intel_context_create(engine);
+ 		if (IS_ERR(ce)) {
+ 			err = PTR_ERR(ce);
+
+commit 9dd4b065446aebf61b84ba05fb4d78c39e33113b
+Author: Andi Shyti <andi.shyti@intel.com>
+Date:   Sun Dec 22 14:40:46 2019 +0000
+
+    drm/i915/gt: Move pm debug files into a gt aware debugfs
+    
+    The GT system is becoming more and more a stand-alone system in
+    i915 and it's fair to assign it its own debugfs directory.
+    
+    rc6, rps and llc debugfs files are gt related, move them into the
+    gt debugfs directory.
+    
+    Signed-off-by: Andi Shyti <andi.shyti@intel.com>
+    Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20191222144046.1674865-3-chris@chris-wilson.co.uk
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index 172102a6c5fb..ec84b5e62fef 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -3,6 +3,7 @@
+  * Copyright © 2019 Intel Corporation
+  */
+ 
++#include "debugfs_gt.h"
+ #include "i915_drv.h"
+ #include "intel_context.h"
+ #include "intel_gt.h"
+@@ -325,6 +326,8 @@ void intel_gt_chipset_flush(struct intel_gt *gt)
+ void intel_gt_driver_register(struct intel_gt *gt)
+ {
+ 	intel_rps_driver_register(&gt->rps);
++
++	debugfs_gt_register(gt);
+ }
+ 
+ static int intel_gt_init_scratch(struct intel_gt *gt, unsigned int size)
+
+commit 7d70a1233d11ce9286e1a04c4f1bcd263e3e405e
+Author: Chris Wilson <chris@chris-wilson.co.uk>
+Date:   Sun Dec 22 14:40:45 2019 +0000
+
+    drm/i915/gt: Merge engine init/setup loops
+    
+    Now that we don't need to create GEM contexts in the middle of engine
+    construction, we can pull the engine init/setup loops together.
+    
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Cc: Andi Shyti <andi.shyti@intel.com>
+    Reviewed-by: Andi Shyti <andi.shyti@intel.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20191222144046.1674865-2-chris@chris-wilson.co.uk
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index 4a2d0eb05663..172102a6c5fb 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -584,10 +584,6 @@ int intel_gt_init(struct intel_gt *gt)
+ 		goto err_pm;
+ 	}
+ 
+-	err = intel_engines_setup(gt);
+-	if (err)
+-		goto err_vm;
+-
+ 	err = intel_engines_init(gt);
+ 	if (err)
+ 		goto err_engines;
+@@ -618,7 +614,6 @@ int intel_gt_init(struct intel_gt *gt)
+ 	intel_uc_fini(&gt->uc);
+ err_engines:
+ 	intel_engines_release(gt);
+-err_vm:
+ 	i915_vm_put(fetch_and_zero(&gt->vm));
+ err_pm:
+ 	intel_gt_pm_fini(gt);
+
+commit cfe6b30fc37cc8a6ac9241e450c91ad7a7d6874c
+Author: Chris Wilson <chris@chris-wilson.co.uk>
+Date:   Sun Dec 22 14:40:44 2019 +0000
+
+    drm/i915/gt: Pull intel_gt_init_hw() into intel_gt_resume()
+    
+    Since intel_gt_resume() is always immediately proceeded by init_hw, pull
+    the call into intel_gt_resume, where we have the rpm and fw already
+    held.
+    
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Cc: Andi Shyti <andi.shyti@intel.com>
+    Reviewed-by: Andi Shyti <andi.shyti@intel.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20191222144046.1674865-1-chris@chris-wilson.co.uk
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index f29c44bf992f..4a2d0eb05663 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -594,14 +594,9 @@ int intel_gt_init(struct intel_gt *gt)
+ 
+ 	intel_uc_init(&gt->uc);
+ 
+-	err = intel_gt_init_hw(gt);
+-	if (err)
+-		goto err_uc_init;
+-
+-	/* Only when the HW is re-initialised, can we replay the requests */
+ 	err = intel_gt_resume(gt);
+ 	if (err)
+-		goto err_gt_init_hw;
++		goto err_uc_init;
+ 
+ 	err = __engines_record_defaults(gt);
+ 	if (err)
+@@ -618,7 +613,6 @@ int intel_gt_init(struct intel_gt *gt)
+ 	goto out_fw;
+ err_gt:
+ 	__intel_gt_disable(gt);
+-err_gt_init_hw:
+ 	intel_uc_fini_hw(&gt->uc);
+ err_uc_init:
+ 	intel_uc_fini(&gt->uc);
+
+commit e26b6d4341476f6944f57bb78fffcdf332c5948b
+Author: Chris Wilson <chris@chris-wilson.co.uk>
+Date:   Sun Dec 22 12:07:52 2019 +0000
+
+    drm/i915/gt: Pull GT initialisation under intel_gt_init()
+    
+    Begin pulling the GT setup underneath a single GT umbrella; let intel_gt
+    take ownership of its engines! As hinted, the complication is the
+    lifetime of the probed engine versus the active lifetime of the GT
+    backends. We need to detect the engine layout early and keep it until
+    the end so that we can sanitize state on takeover and release.
+    
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Cc: Andi Shyti <andi.shyti@intel.com>
+    Acked-by: Andi Shyti <andi.shyti@intel.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20191222120752.1368352-1-chris@chris-wilson.co.uk
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index af4f8c810009..f29c44bf992f 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -4,11 +4,13 @@
+  */
+ 
+ #include "i915_drv.h"
++#include "intel_context.h"
+ #include "intel_gt.h"
+ #include "intel_gt_pm.h"
+ #include "intel_gt_requests.h"
+ #include "intel_mocs.h"
+ #include "intel_rc6.h"
++#include "intel_renderstate.h"
+ #include "intel_rps.h"
+ #include "intel_uncore.h"
+ #include "intel_pm.h"
+@@ -372,32 +374,276 @@ static struct i915_address_space *kernel_vm(struct intel_gt *gt)
+ 		return i915_vm_get(&gt->ggtt->vm);
+ }
+ 
++static int __intel_context_flush_retire(struct intel_context *ce)
++{
++	struct intel_timeline *tl;
++
++	tl = intel_context_timeline_lock(ce);
++	if (IS_ERR(tl))
++		return PTR_ERR(tl);
++
++	intel_context_timeline_unlock(tl);
++	return 0;
++}
++
++static int __engines_record_defaults(struct intel_gt *gt)
++{
++	struct i915_request *requests[I915_NUM_ENGINES] = {};
++	struct intel_engine_cs *engine;
++	enum intel_engine_id id;
++	int err = 0;
++
++	/*
++	 * As we reset the gpu during very early sanitisation, the current
++	 * register state on the GPU should reflect its defaults values.
++	 * We load a context onto the hw (with restore-inhibit), then switch
++	 * over to a second context to save that default register state. We
++	 * can then prime every new context with that state so they all start
++	 * from the same default HW values.
++	 */
++
++	for_each_engine(engine, gt, id) {
++		struct intel_renderstate so;
++		struct intel_context *ce;
++		struct i915_request *rq;
++
++		err = intel_renderstate_init(&so, engine);
++		if (err)
++			goto out;
++
++		/* We must be able to switch to something! */
++		GEM_BUG_ON(!engine->kernel_context);
++		engine->serial++; /* force the kernel context switch */
++
++		ce = intel_context_create(engine);
++		if (IS_ERR(ce)) {
++			err = PTR_ERR(ce);
++			goto out;
++		}
++
++		rq = intel_context_create_request(ce);
++		if (IS_ERR(rq)) {
++			err = PTR_ERR(rq);
++			intel_context_put(ce);
++			goto out;
++		}
++
++		err = intel_engine_emit_ctx_wa(rq);
++		if (err)
++			goto err_rq;
++
++		err = intel_renderstate_emit(&so, rq);
++		if (err)
++			goto err_rq;
++
++err_rq:
++		requests[id] = i915_request_get(rq);
++		i915_request_add(rq);
++		intel_renderstate_fini(&so);
++		if (err)
++			goto out;
++	}
++
++	/* Flush the default context image to memory, and enable powersaving. */
++	if (intel_gt_wait_for_idle(gt, I915_GEM_IDLE_TIMEOUT) == -ETIME) {
++		err = -EIO;
++		goto out;
++	}
++
++	for (id = 0; id < ARRAY_SIZE(requests); id++) {
++		struct i915_request *rq;
++		struct i915_vma *state;
++		void *vaddr;
++
++		rq = requests[id];
++		if (!rq)
++			continue;
++
++		GEM_BUG_ON(!test_bit(CONTEXT_ALLOC_BIT, &rq->context->flags));
++		state = rq->context->state;
++		if (!state)
++			continue;
++
++		/* Serialise with retirement on another CPU */
++		GEM_BUG_ON(!i915_request_completed(rq));
++		err = __intel_context_flush_retire(rq->context);
++		if (err)
++			goto out;
++
++		/* We want to be able to unbind the state from the GGTT */
++		GEM_BUG_ON(intel_context_is_pinned(rq->context));
++
++		/*
++		 * As we will hold a reference to the logical state, it will
++		 * not be torn down with the context, and importantly the
++		 * object will hold onto its vma (making it possible for a
++		 * stray GTT write to corrupt our defaults). Unmap the vma
++		 * from the GTT to prevent such accidents and reclaim the
++		 * space.
++		 */
++		err = i915_vma_unbind(state);
++		if (err)
++			goto out;
++
++		i915_gem_object_lock(state->obj);
++		err = i915_gem_object_set_to_cpu_domain(state->obj, false);
++		i915_gem_object_unlock(state->obj);
++		if (err)
++			goto out;
++
++		i915_gem_object_set_cache_coherency(state->obj, I915_CACHE_LLC);
++
++		/* Check we can acquire the image of the context state */
++		vaddr = i915_gem_object_pin_map(state->obj, I915_MAP_FORCE_WB);
++		if (IS_ERR(vaddr)) {
++			err = PTR_ERR(vaddr);
++			goto out;
++		}
++
++		rq->engine->default_state = i915_gem_object_get(state->obj);
++		i915_gem_object_unpin_map(state->obj);
++	}
++
++out:
++	/*
++	 * If we have to abandon now, we expect the engines to be idle
++	 * and ready to be torn-down. The quickest way we can accomplish
++	 * this is by declaring ourselves wedged.
++	 */
++	if (err)
++		intel_gt_set_wedged(gt);
++
++	for (id = 0; id < ARRAY_SIZE(requests); id++) {
++		struct intel_context *ce;
++		struct i915_request *rq;
++
++		rq = requests[id];
++		if (!rq)
++			continue;
++
++		ce = rq->context;
++		i915_request_put(rq);
++		intel_context_put(ce);
++	}
++	return err;
++}
++
++static int __engines_verify_workarounds(struct intel_gt *gt)
++{
++	struct intel_engine_cs *engine;
++	enum intel_engine_id id;
++	int err = 0;
++
++	if (!IS_ENABLED(CONFIG_DRM_I915_DEBUG_GEM))
++		return 0;
++
++	for_each_engine(engine, gt, id) {
++		if (intel_engine_verify_workarounds(engine, "load"))
++			err = -EIO;
++	}
++
++	return err;
++}
++
++static void __intel_gt_disable(struct intel_gt *gt)
++{
++	intel_gt_set_wedged_on_init(gt);
++
++	intel_gt_suspend_prepare(gt);
++	intel_gt_suspend_late(gt);
++
++	GEM_BUG_ON(intel_gt_pm_is_awake(gt));
++}
++
+ int intel_gt_init(struct intel_gt *gt)
+ {
+ 	int err;
+ 
+-	err = intel_gt_init_scratch(gt, IS_GEN(gt->i915, 2) ? SZ_256K : SZ_4K);
++	err = i915_inject_probe_error(gt->i915, -ENODEV);
+ 	if (err)
+ 		return err;
+ 
++	/*
++	 * This is just a security blanket to placate dragons.
++	 * On some systems, we very sporadically observe that the first TLBs
++	 * used by the CS may be stale, despite us poking the TLB reset. If
++	 * we hold the forcewake during initialisation these problems
++	 * just magically go away.
++	 */
++	intel_uncore_forcewake_get(gt->uncore, FORCEWAKE_ALL);
++
++	err = intel_gt_init_scratch(gt, IS_GEN(gt->i915, 2) ? SZ_256K : SZ_4K);
++	if (err)
++		goto out_fw;
++
+ 	intel_gt_pm_init(gt);
+ 
+ 	gt->vm = kernel_vm(gt);
+ 	if (!gt->vm) {
+ 		err = -ENOMEM;
+-		goto err_scratch;
++		goto err_pm;
+ 	}
+ 
+-	return 0;
++	err = intel_engines_setup(gt);
++	if (err)
++		goto err_vm;
++
++	err = intel_engines_init(gt);
++	if (err)
++		goto err_engines;
++
++	intel_uc_init(&gt->uc);
++
++	err = intel_gt_init_hw(gt);
++	if (err)
++		goto err_uc_init;
+ 
+-err_scratch:
++	/* Only when the HW is re-initialised, can we replay the requests */
++	err = intel_gt_resume(gt);
++	if (err)
++		goto err_gt_init_hw;
++
++	err = __engines_record_defaults(gt);
++	if (err)
++		goto err_gt;
++
++	err = __engines_verify_workarounds(gt);
++	if (err)
++		goto err_gt;
++
++	err = i915_inject_probe_error(gt->i915, -EIO);
++	if (err)
++		goto err_gt;
++
++	goto out_fw;
++err_gt:
++	__intel_gt_disable(gt);
++err_gt_init_hw:
++	intel_uc_fini_hw(&gt->uc);
++err_uc_init:
++	intel_uc_fini(&gt->uc);
++err_engines:
++	intel_engines_release(gt);
++err_vm:
++	i915_vm_put(fetch_and_zero(&gt->vm));
++err_pm:
++	intel_gt_pm_fini(gt);
+ 	intel_gt_fini_scratch(gt);
++out_fw:
++	if (err)
++		intel_gt_set_wedged_on_init(gt);
++	intel_uncore_forcewake_put(gt->uncore, FORCEWAKE_ALL);
+ 	return err;
+ }
+ 
+ void intel_gt_driver_remove(struct intel_gt *gt)
+ {
+-	GEM_BUG_ON(gt->awake);
++	__intel_gt_disable(gt);
++
++	intel_uc_fini_hw(&gt->uc);
++	intel_uc_fini(&gt->uc);
++
++	intel_engines_release(gt);
+ }
+ 
+ void intel_gt_driver_unregister(struct intel_gt *gt)
+@@ -423,4 +669,5 @@ void intel_gt_driver_late_release(struct intel_gt *gt)
+ 	intel_gt_fini_requests(gt);
+ 	intel_gt_fini_reset(gt);
+ 	intel_gt_fini_timelines(gt);
++	intel_engines_free(gt);
+ }
+
+commit e6ba76480299a0d77c51d846f7467b1673aad25b
+Author: Chris Wilson <chris@chris-wilson.co.uk>
+Date:   Sat Dec 21 16:03:24 2019 +0000
+
+    drm/i915: Remove i915->kernel_context
+    
+    Allocate only an internal intel_context for the kernel_context, forgoing
+    a global GEM context for internal use as we only require a separate
+    address space (for our own protection).
+    
+    Now having weaned GT from requiring ce->gem_context, we can stop
+    referencing it entirely. This also means we no longer have to create random
+    and unnecessary GEM contexts for internal use.
+    
+    GEM contexts are now entirely for tracking GEM clients, and intel_context
+    the execution environment on the GPU.
+    
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Cc: Andi Shyti <andi.shyti@intel.com>
+    Acked-by: Andi Shyti <andi.shyti@intel.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20191221160324.1073045-1-chris@chris-wilson.co.uk
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index c4fd8d65b8a3..af4f8c810009 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -74,7 +74,6 @@ int intel_gt_init_hw(struct intel_gt *gt)
+ 	struct intel_uncore *uncore = gt->uncore;
+ 	int ret;
+ 
+-	BUG_ON(!i915->kernel_context);
+ 	ret = intel_gt_terminally_wedged(gt);
+ 	if (ret)
+ 		return ret;
+@@ -365,6 +364,14 @@ static void intel_gt_fini_scratch(struct intel_gt *gt)
+ 	i915_vma_unpin_and_release(&gt->scratch, 0);
+ }
+ 
++static struct i915_address_space *kernel_vm(struct intel_gt *gt)
++{
++	if (INTEL_PPGTT(gt->i915) > INTEL_PPGTT_ALIASING)
++		return &i915_ppgtt_create(gt->i915)->vm;
++	else
++		return i915_vm_get(&gt->ggtt->vm);
++}
++
+ int intel_gt_init(struct intel_gt *gt)
+ {
+ 	int err;
+@@ -375,7 +382,17 @@ int intel_gt_init(struct intel_gt *gt)
+ 
+ 	intel_gt_pm_init(gt);
+ 
++	gt->vm = kernel_vm(gt);
++	if (!gt->vm) {
++		err = -ENOMEM;
++		goto err_scratch;
++	}
++
+ 	return 0;
++
++err_scratch:
++	intel_gt_fini_scratch(gt);
++	return err;
+ }
+ 
+ void intel_gt_driver_remove(struct intel_gt *gt)
+@@ -390,6 +407,12 @@ void intel_gt_driver_unregister(struct intel_gt *gt)
+ 
+ void intel_gt_driver_release(struct intel_gt *gt)
+ {
++	struct i915_address_space *vm;
++
++	vm = fetch_and_zero(&gt->vm);
++	if (vm) /* FIXME being called twice on error paths :( */
++		i915_vm_put(vm);
++
+ 	intel_gt_pm_fini(gt);
+ 	intel_gt_fini_scratch(gt);
+ }
+
+commit b6422694c5853f7a4faf00431c9d7b5368138152
+Author: Chris Wilson <chris@chris-wilson.co.uk>
+Date:   Mon Nov 18 18:49:33 2019 +0000
+
+    drm/i915/gt: Only wait for register chipset flush if active
+    
+    Only serialise with the chipset using an mmio if the chipset is
+    currently active. We expect that any writes into the chipset range will
+    simply be forgotten until it wakes up.
+    
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Reviewed-by: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20191118184943.2593048-8-chris@chris-wilson.co.uk
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index b5a9b87e4ec9..c4fd8d65b8a3 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -304,7 +304,7 @@ void intel_gt_flush_ggtt_writes(struct intel_gt *gt)
+ 
+ 	intel_gt_chipset_flush(gt);
+ 
+-	with_intel_runtime_pm(uncore->rpm, wakeref) {
++	with_intel_runtime_pm_if_in_use(uncore->rpm, wakeref) {
+ 		unsigned long flags;
+ 
+ 		spin_lock_irqsave(&uncore->lock, flags);
+
+commit dea397e818b18f688734802465e45a35a976d4df
+Author: Chris Wilson <chris@chris-wilson.co.uk>
+Date:   Fri Nov 15 15:08:39 2019 +0000
+
+    drm/i915/gt: Flush retire.work timer object on unload
+    
+    We need to wait until the timer object is marked as deactivated before
+    unloading, so follow up our gentle cancel_delayed_work() with the
+    synchronous variant to ensure it is flushed off a remote cpu before we
+    mark the memory as freed.
+    
+    Bugzilla: https://bugs.freedesktop.org/show_bug.cgi?id=111994
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+    Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20191115150841.880349-1-chris@chris-wilson.co.uk
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index c39b21c8d328..b5a9b87e4ec9 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -397,6 +397,7 @@ void intel_gt_driver_release(struct intel_gt *gt)
+ void intel_gt_driver_late_release(struct intel_gt *gt)
+ {
+ 	intel_uc_driver_late_release(&gt->uc);
++	intel_gt_fini_requests(gt);
+ 	intel_gt_fini_reset(gt);
+ 	intel_gt_fini_timelines(gt);
+ }
+
+commit 797a615357ac0feb79c9ce41f5eaac3eb738a51f
+Author: Chris Wilson <chris@chris-wilson.co.uk>
+Date:   Fri Nov 1 14:10:06 2019 +0000
+
+    drm/i915/gt: Call intel_gt_sanitize() directly
+    
+    Assume all responsibility for operating on the HW to sanitize the GT
+    state upon load/resume in intel_gt_sanitize() itself.
+    
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Reviewed-by: Andi Shyti <andi.shyti@intel.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20191101141009.15581-1-chris@chris-wilson.co.uk
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index 15c0a0dfc424..c39b21c8d328 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -32,9 +32,11 @@ void intel_gt_init_early(struct intel_gt *gt, struct drm_i915_private *i915)
+ 	intel_uc_init_early(&gt->uc);
+ }
+ 
+-void intel_gt_init_hw_early(struct drm_i915_private *i915)
++void intel_gt_init_hw_early(struct intel_gt *gt, struct i915_ggtt *ggtt)
+ {
+-	i915->gt.ggtt = &i915->ggtt;
++	gt->ggtt = ggtt;
++
++	intel_gt_sanitize(gt, false);
+ }
+ 
+ static void init_unused_ring(struct intel_gt *gt, u32 base)
+
+commit 4605bb73a81938a33a5db49d841466303f24b581
+Author: Chris Wilson <chris@chris-wilson.co.uk>
+Date:   Fri Nov 1 13:04:06 2019 +0000
+
+    drm/i915/gt: Pull timeline initialise to intel_gt_init_early
+    
+    Our timelines are currently contained within an intel_gt, and we only
+    need to perform list/spinlock initialisation, so we can pull the
+    intel_timelines_init() into our intel_gt_init_early().
+    
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+    Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20191101130406.4142-1-chris@chris-wilson.co.uk
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index 898662c158ad..15c0a0dfc424 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -25,6 +25,7 @@ void intel_gt_init_early(struct intel_gt *gt, struct drm_i915_private *i915)
+ 
+ 	intel_gt_init_reset(gt);
+ 	intel_gt_init_requests(gt);
++	intel_gt_init_timelines(gt);
+ 	intel_gt_pm_init_early(gt);
+ 
+ 	intel_rps_init_early(&gt->rps);
+@@ -395,4 +396,5 @@ void intel_gt_driver_late_release(struct intel_gt *gt)
+ {
+ 	intel_uc_driver_late_release(&gt->uc);
+ 	intel_gt_fini_reset(gt);
++	intel_gt_fini_timelines(gt);
+ }
+
+commit a06375a9ac98a162ce2f7ef074fc60dee851bb18
+Author: Chris Wilson <chris@chris-wilson.co.uk>
+Date:   Wed Oct 30 10:38:23 2019 +0000
+
+    drm/i915/gt: Always track callers to intel_rps_mark_interactive()
+    
+    During startup, we may find ourselves in an interesting position where
+    we haven't fully enabled RPS before the display starts trying to use it.
+    This may lead to an imbalance in our "interactive" counter:
+    
+    <3>[    4.813326] intel_rps_mark_interactive:652 GEM_BUG_ON(!rps->power.interactive)
+    <4>[    4.813396] ------------[ cut here ]------------
+    <2>[    4.813398] kernel BUG at drivers/gpu/drm/i915/gt/intel_rps.c:652!
+    <4>[    4.813430] invalid opcode: 0000 [#1] PREEMPT SMP PTI
+    <4>[    4.813438] CPU: 1 PID: 18 Comm: kworker/1:0H Not tainted 5.4.0-rc5-CI-CI_DRM_7209+ #1
+    <4>[    4.813447] Hardware name:  /NUC7i5BNB, BIOS BNKBL357.86A.0054.2017.1025.1822 10/25/2017
+    <4>[    4.813525] Workqueue: events_highpri intel_atomic_cleanup_work [i915]
+    <4>[    4.813589] RIP: 0010:intel_rps_mark_interactive+0xb3/0xc0 [i915]
+    <4>[    4.813597] Code: bc 3f de e0 48 8b 35 84 2e 24 00 49 c7 c0 f3 d4 4e a0 b9 8c 02 00 00 48 c7 c2 80 9c 48 a0 48 c7 c7 3e 73 34 a0 e8 8d 3b e5 e0 <0f> 0b 90 66 2e 0f 1f 84 00 00 00 00 00 80 bf c0 00 00 00 00 74 32
+    <4>[    4.813616] RSP: 0018:ffffc900000efe00 EFLAGS: 00010286
+    <4>[    4.813623] RAX: 000000000000000e RBX: ffff8882583cc7f0 RCX: 0000000000000000
+    <4>[    4.813631] RDX: 0000000000000001 RSI: 0000000000000008 RDI: ffff888275969c00
+    <4>[    4.813639] RBP: 0000000000000000 R08: 0000000000000008 R09: ffff888275ace000
+    <4>[    4.813646] R10: ffffc900000efe00 R11: ffff888275969c00 R12: ffff8882583cc8d8
+    <4>[    4.813654] R13: ffff888276abce00 R14: 0000000000000000 R15: ffff88825e878860
+    <4>[    4.813662] FS:  0000000000000000(0000) GS:ffff888276a80000(0000) knlGS:0000000000000000
+    <4>[    4.813672] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+    <4>[    4.813678] CR2: 00007f051d5ca0a8 CR3: 0000000262f48001 CR4: 00000000003606e0
+    <4>[    4.813686] Call Trace:
+    <4>[    4.813755]  intel_cleanup_plane_fb+0x4e/0x60 [i915]
+    <4>[    4.813764]  drm_atomic_helper_cleanup_planes+0x4d/0x70
+    <4>[    4.813833]  intel_atomic_cleanup_work+0x15/0x80 [i915]
+    <4>[    4.813842]  process_one_work+0x26a/0x620
+    <4>[    4.813850]  worker_thread+0x37/0x380
+    <4>[    4.813857]  ? process_one_work+0x620/0x620
+    <4>[    4.813864]  kthread+0x119/0x130
+    <4>[    4.813870]  ? kthread_park+0x80/0x80
+    <4>[    4.813878]  ret_from_fork+0x3a/0x50
+    <4>[    4.813887] Modules linked in: i915(+) mei_hdcp x86_pkg_temp_thermal coretemp crct10dif_pclmul crc32_pclmul btusb btrtl btbcm btintel snd_hda_intel snd_intel_nhlt snd_hda_codec bluetooth snd_hwdep snd_hda_core ghash_clmulni_intel snd_pcm e1000e ecdh_generic ecc ptp pps_core mei_me mei prime_numbers
+    <4>[    4.813934] ---[ end trace c13289af88174ffc ]---
+    
+    The solution employed is to not worry about RPS state and keep the tally
+    of the interactive counter separate. When we do enable RPS, we will then
+    take the display activity into account.
+    
+    Fixes: 3e7abf814193 ("drm/i915: Extract GT render power state management")
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Cc: Andi Shyti <andi.shyti@intel.com>
+    Acked-by: Andi Shyti <andi.shyti@intel.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20191030103827.2413-1-chris@chris-wilson.co.uk
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index f2440113fdf8..898662c158ad 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -26,6 +26,8 @@ void intel_gt_init_early(struct intel_gt *gt, struct drm_i915_private *i915)
+ 	intel_gt_init_reset(gt);
+ 	intel_gt_init_requests(gt);
+ 	intel_gt_pm_init_early(gt);
++
++	intel_rps_init_early(&gt->rps);
+ 	intel_uc_init_early(&gt->uc);
+ }
+ 
+
+commit 3e7abf8141935ded77abeb622480bf4a14241ece
+Author: Andi Shyti <andi@etezian.org>
+Date:   Thu Oct 24 22:16:41 2019 +0100
+
+    drm/i915: Extract GT render power state management
+    
+    i915_irq.c is large. One reason for this is that has a large chunk of
+    the GT render power management stashed away in it. Extract that logic
+    out of i915_irq.c and intel_pm.c and put it under one roof.
+    
+    Based on a patch by Chris Wilson.
+    
+    Signed-off-by: Andi Shyti <andi.shyti@intel.com>
+    Cc: Chris Wilson <chris@chris-wilson.co.uk>
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20191024211642.7688-1-chris@chris-wilson.co.uk
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index 35127699591d..f2440113fdf8 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -9,6 +9,7 @@
+ #include "intel_gt_requests.h"
+ #include "intel_mocs.h"
+ #include "intel_rc6.h"
++#include "intel_rps.h"
+ #include "intel_uncore.h"
+ #include "intel_pm.h"
+ 
+@@ -31,9 +32,6 @@ void intel_gt_init_early(struct intel_gt *gt, struct drm_i915_private *i915)
+ void intel_gt_init_hw_early(struct drm_i915_private *i915)
+ {
+ 	i915->gt.ggtt = &i915->ggtt;
+-
+-	/* BIOS often leaves RC6 enabled, but disable it for hw init */
+-	intel_gt_pm_disable(&i915->gt);
+ }
+ 
+ static void init_unused_ring(struct intel_gt *gt, u32 base)
+@@ -320,8 +318,7 @@ void intel_gt_chipset_flush(struct intel_gt *gt)
+ 
+ void intel_gt_driver_register(struct intel_gt *gt)
+ {
+-	if (IS_GEN(gt->i915, 5))
+-		intel_gpu_ips_init(gt->i915);
++	intel_rps_driver_register(&gt->rps);
+ }
+ 
+ static int intel_gt_init_scratch(struct intel_gt *gt, unsigned int size)
+@@ -379,20 +376,16 @@ int intel_gt_init(struct intel_gt *gt)
+ void intel_gt_driver_remove(struct intel_gt *gt)
+ {
+ 	GEM_BUG_ON(gt->awake);
+-	intel_gt_pm_disable(gt);
+ }
+ 
+ void intel_gt_driver_unregister(struct intel_gt *gt)
+ {
+-	intel_gpu_ips_teardown();
++	intel_rps_driver_unregister(&gt->rps);
+ }
+ 
+ void intel_gt_driver_release(struct intel_gt *gt)
+ {
+-	/* Paranoia: make sure we have disabled everything before we exit. */
+-	intel_gt_pm_disable(gt);
+ 	intel_gt_pm_fini(gt);
+-
+ 	intel_gt_fini_scratch(gt);
+ }
+ 
+
+commit 058179e72e0956a2dfe4927db6cbe5fbfb2406aa
+Author: Chris Wilson <chris@chris-wilson.co.uk>
+Date:   Wed Oct 23 14:31:08 2019 +0100
+
+    drm/i915/gt: Replace hangcheck by heartbeats
+    
+    Replace sampling the engine state every so often with a periodic
+    heartbeat request to measure the health of an engine. This is coupled
+    with the forced-preemption to allow long running requests to survive so
+    long as they do not block other users.
+    
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Cc: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+    Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+    Cc: Jon Bloomfield <jon.bloomfield@intel.com>
+    Reviewed-by: Jon Bloomfield <jon.bloomfield@intel.com>
+    Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20191023133108.21401-5-chris@chris-wilson.co.uk
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index 1c4b6c9642ad..35127699591d 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -22,7 +22,6 @@ void intel_gt_init_early(struct intel_gt *gt, struct drm_i915_private *i915)
+ 	INIT_LIST_HEAD(&gt->closed_vma);
+ 	spin_lock_init(&gt->closed_lock);
+ 
+-	intel_gt_init_hangcheck(gt);
+ 	intel_gt_init_reset(gt);
+ 	intel_gt_init_requests(gt);
+ 	intel_gt_pm_init_early(gt);
+
+commit 5d904e3c5d40c3939d53659e9c473500c3c24039
+Author: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Date:   Thu Oct 17 10:45:00 2019 +0100
+
+    drm/i915: Pass in intel_gt at some for_each_engine sites
+    
+    Where the function, or code segment, operates on intel_gt, we need to
+    start passing it instead of i915 to for_each_engine(_masked).
+    
+    This is another partial step in migration of i915->engines[] to
+    gt->engines[].
+    
+    Signed-off-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+    Cc: Chris Wilson <chris@chris-wilson.co.uk>
+    Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20191017094500.21831-2-tvrtko.ursulin@linux.intel.com
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index c99b6b2f38c2..1c4b6c9642ad 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -197,7 +197,7 @@ static void gen6_check_faults(struct intel_gt *gt)
+ 	enum intel_engine_id id;
+ 	u32 fault;
+ 
+-	for_each_engine(engine, gt->i915, id) {
++	for_each_engine(engine, gt, id) {
+ 		fault = GEN6_RING_FAULT_REG_READ(engine);
+ 		if (fault & RING_FAULT_VALID) {
+ 			DRM_DEBUG_DRIVER("Unexpected fault\n"
+
+commit a50134b1983b8860e0e74e41579cbb19a7304ca7
+Author: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Date:   Thu Oct 17 17:18:52 2019 +0100
+
+    drm/i915: Make for_each_engine_masked work on intel_gt
+    
+    Medium term goal is to eliminate the i915->engine[] array and to get there
+    we have recently introduced equivalent array in intel_gt. Now we need to
+    migrate the code further towards this state.
+    
+    This next step is to eliminate usage of i915->engines[] from the
+    for_each_engine_masked iterator.
+    
+    For this to work we also need to use engine->id as index when populating
+    the gt->engine[] array and adjust the default engine set indexing to use
+    engine->legacy_idx instead of assuming gt->engines[] indexing.
+    
+    v2:
+      * Populate gt->engine[] earlier.
+      * Check that we don't duplicate engine->legacy_idx
+    
+    v3:
+      * Work around the initialization order issue between default_engines()
+        and intel_engines_driver_register() which sets engine->legacy_idx for
+        now. It will be fixed properly later.
+    
+    v4:
+      * Merge with forgotten v2.5.
+    
+    Signed-off-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+    Cc: Chris Wilson <chris@chris-wilson.co.uk>
+    Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20191017161852.8836-1-tvrtko.ursulin@linux.intel.com
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index b3619a2a5d0e..c99b6b2f38c2 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -186,7 +186,7 @@ intel_gt_clear_error_registers(struct intel_gt *gt,
+ 		struct intel_engine_cs *engine;
+ 		enum intel_engine_id id;
+ 
+-		for_each_engine_masked(engine, i915, engine_mask, id)
++		for_each_engine_masked(engine, gt, engine_mask, id)
+ 			gen8_clear_engine_error_register(engine);
+ 	}
+ }
+
+commit cd6a851385be878f086204aa0e7cd3bec9ea909f
+Author: Chris Wilson <chris@chris-wilson.co.uk>
+Date:   Mon Oct 7 16:45:31 2019 +0100
+
+    drm/i915/gt: Prefer local path to runtime powermanagement
+    
+    Avoid going to the base i915 device when we already have a path from gt
+    to the runtime powermanagement interface. The benefit is that it looks a
+    bit more self-consistent to always be acquiring the gt->uncore->rpm for
+    use with the gt->uncore.
+    
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Cc: Daniele Ceraolo Spurio <daniele.ceraolospurio@intel.com>
+    Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+    Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20191007154531.1750-1-chris@chris-wilson.co.uk
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index 8f44cf8c79b2..b3619a2a5d0e 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -273,7 +273,7 @@ void intel_gt_check_and_clear_faults(struct intel_gt *gt)
+ 
+ void intel_gt_flush_ggtt_writes(struct intel_gt *gt)
+ {
+-	struct drm_i915_private *i915 = gt->i915;
++	struct intel_uncore *uncore = gt->uncore;
+ 	intel_wakeref_t wakeref;
+ 
+ 	/*
+@@ -297,13 +297,12 @@ void intel_gt_flush_ggtt_writes(struct intel_gt *gt)
+ 
+ 	wmb();
+ 
+-	if (INTEL_INFO(i915)->has_coherent_ggtt)
++	if (INTEL_INFO(gt->i915)->has_coherent_ggtt)
+ 		return;
+ 
+ 	intel_gt_chipset_flush(gt);
+ 
+-	with_intel_runtime_pm(&i915->runtime_pm, wakeref) {
+-		struct intel_uncore *uncore = gt->uncore;
++	with_intel_runtime_pm(uncore->rpm, wakeref) {
+ 		unsigned long flags;
+ 
+ 		spin_lock_irqsave(&uncore->lock, flags);
+
+commit 0e5493cab5ef90fb91f89a2dc84259c7a7d7fd50
+Author: CQ Tang <cq.tang@intel.com>
+Date:   Fri Oct 4 18:04:32 2019 +0100
+
+    drm/i915/stolen: make the object creation interface consistent
+    
+    Our other backends return an actual error value upon failure. Do the
+    same for stolen objects, which currently just return NULL on failure.
+    
+    Signed-off-by: CQ Tang <cq.tang@intel.com>
+    Signed-off-by: Matthew Auld <matthew.auld@intel.com>
+    Cc: Chris Wilson <chris@chris-wilson.co.uk>
+    Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20191004170452.15410-2-matthew.auld@intel.com
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index 53220741e49e..8f44cf8c79b2 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -334,7 +334,7 @@ static int intel_gt_init_scratch(struct intel_gt *gt, unsigned int size)
+ 	int ret;
+ 
+ 	obj = i915_gem_object_create_stolen(i915, size);
+-	if (!obj)
++	if (IS_ERR(obj))
+ 		obj = i915_gem_object_create_internal(i915, size);
+ 	if (IS_ERR(obj)) {
+ 		DRM_ERROR("Failed to allocate scratch page\n");
+
+commit 661019754202d610203a9cf09d26fdd8677e41c6
+Author: Chris Wilson <chris@chris-wilson.co.uk>
+Date:   Fri Oct 4 14:40:06 2019 +0100
+
+    drm/i915: Move request runtime management onto gt
+    
+    Requests are run from the gt and are tided into the gt runtime power
+    management, so pull the runtime request management under gt/
+    
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20191004134015.13204-12-chris@chris-wilson.co.uk
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index 7205595369be..53220741e49e 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -6,6 +6,7 @@
+ #include "i915_drv.h"
+ #include "intel_gt.h"
+ #include "intel_gt_pm.h"
++#include "intel_gt_requests.h"
+ #include "intel_mocs.h"
+ #include "intel_rc6.h"
+ #include "intel_uncore.h"
+@@ -23,6 +24,7 @@ void intel_gt_init_early(struct intel_gt *gt, struct drm_i915_private *i915)
+ 
+ 	intel_gt_init_hangcheck(gt);
+ 	intel_gt_init_reset(gt);
++	intel_gt_init_requests(gt);
+ 	intel_gt_pm_init_early(gt);
+ 	intel_uc_init_early(&gt->uc);
+ }
+
+commit 2850748ef8763ab46958e43a4d1c445f29eeb37d
+Author: Chris Wilson <chris@chris-wilson.co.uk>
+Date:   Fri Oct 4 14:39:58 2019 +0100
+
+    drm/i915: Pull i915_vma_pin under the vm->mutex
+    
+    Replace the struct_mutex requirement for pinning the i915_vma with the
+    local vm->mutex instead. Note that the vm->mutex is tainted by the
+    shrinker (we require unbinding from inside fs-reclaim) and so we cannot
+    allocate while holding that mutex. Instead we have to preallocate
+    workers to do allocate and apply the PTE updates after we have we
+    reserved their slot in the drm_mm (using fences to order the PTE writes
+    with the GPU work and with later unbind).
+    
+    In adding the asynchronous vma binding, one subtle requirement is to
+    avoid coupling the binding fence into the backing object->resv. That is
+    the asynchronous binding only applies to the vma timeline itself and not
+    to the pages as that is a more global timeline (the binding of one vma
+    does not need to be ordered with another vma, nor does the implicit GEM
+    fencing depend on a vma, only on writes to the backing store). Keeping
+    the vma binding distinct from the backing store timelines is verified by
+    a number of async gem_exec_fence and gem_exec_schedule tests. The way we
+    do this is quite simple, we keep the fence for the vma binding separate
+    and only wait on it as required, and never add it to the obj->resv
+    itself.
+    
+    Another consequence in reducing the locking around the vma is the
+    destruction of the vma is no longer globally serialised by struct_mutex.
+    A natural solution would be to add a kref to i915_vma, but that requires
+    decoupling the reference cycles, possibly by introducing a new
+    i915_mm_pages object that is own by both obj->mm and vma->pages.
+    However, we have not taken that route due to the overshadowing lmem/ttm
+    discussions, and instead play a series of complicated games with
+    trylocks to (hopefully) ensure that only one destruction path is called!
+    
+    v2: Add some commentary, and some helpers to reduce patch churn.
+    
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+    Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20191004134015.13204-4-chris@chris-wilson.co.uk
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index 0e5909ee0657..7205595369be 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -302,11 +302,12 @@ void intel_gt_flush_ggtt_writes(struct intel_gt *gt)
+ 
+ 	with_intel_runtime_pm(&i915->runtime_pm, wakeref) {
+ 		struct intel_uncore *uncore = gt->uncore;
++		unsigned long flags;
+ 
+-		spin_lock_irq(&uncore->lock);
++		spin_lock_irqsave(&uncore->lock, flags);
+ 		intel_uncore_posting_read_fw(uncore,
+ 					     RING_HEAD(RENDER_RING_BASE));
+-		spin_unlock_irq(&uncore->lock);
++		spin_unlock_irqrestore(&uncore->lock, flags);
+ 	}
+ }
+ 
+
+commit c113236718e89561f309705f1a78126b3df93a21
+Author: Andi Shyti <andi.shyti@intel.com>
+Date:   Fri Sep 27 12:08:49 2019 +0100
+
+    drm/i915: Extract GT render sleep (rc6) management
+    
+    Continuing the theme of breaking intel_pm.c up in a reasonable chunk of
+    powermanagement utilities, pull out the rc6 setup into its GT handler.
+    
+    Based on a patch by Chris Wilson.
+    
+    Signed-off-by: Andi Shyti <andi.shyti@intel.com>
+    Cc: Chris Wilson <chris@chris-wilson.co.uk>
+    Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20190919143840.20384-1-andi.shyti@intel.com
+    Link: https://patchwork.freedesktop.org/patch/msgid/20190927110849.28734-1-chris@chris-wilson.co.uk
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index eef9bdae8ebb..0e5909ee0657 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -7,6 +7,7 @@
+ #include "intel_gt.h"
+ #include "intel_gt_pm.h"
+ #include "intel_mocs.h"
++#include "intel_rc6.h"
+ #include "intel_uncore.h"
+ #include "intel_pm.h"
+ 
+@@ -369,6 +370,8 @@ int intel_gt_init(struct intel_gt *gt)
+ 	if (err)
+ 		return err;
+ 
++	intel_gt_pm_init(gt);
++
+ 	return 0;
+ }
+ 
+@@ -387,8 +390,8 @@ void intel_gt_driver_release(struct intel_gt *gt)
+ {
+ 	/* Paranoia: make sure we have disabled everything before we exit. */
+ 	intel_gt_pm_disable(gt);
++	intel_gt_pm_fini(gt);
+ 
+-	intel_cleanup_gt_powersave(gt->i915);
+ 	intel_gt_fini_scratch(gt);
+ }
+ 
+
+commit 61fa60ff6e6a0e16e9bcc15f632ce5437afa6494
+Author: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Date:   Tue Sep 10 15:38:20 2019 +0100
+
+    drm/i915: Move GT init to intel_gt.c
+    
+    Code in i915_gem_init_hw is all about GT init so move it to intel_gt.c
+    renaming to intel_gt_init_hw.
+    
+    Existing intel_gt_init_hw is renamed to intel_gt_init_hw_early since it
+    is currently called from driver probe.
+    
+    Signed-off-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+    Cc: Andi Shyti <andi.shyti@intel.com>
+    Cc: Chris Wilson <chris@chris-wilson.co.uk>
+    Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20190910143823.10686-2-tvrtko.ursulin@linux.intel.com
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index e2cc697d27fb..eef9bdae8ebb 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -6,6 +6,7 @@
+ #include "i915_drv.h"
+ #include "intel_gt.h"
+ #include "intel_gt_pm.h"
++#include "intel_mocs.h"
+ #include "intel_uncore.h"
+ #include "intel_pm.h"
+ 
+@@ -25,7 +26,7 @@ void intel_gt_init_early(struct intel_gt *gt, struct drm_i915_private *i915)
+ 	intel_uc_init_early(&gt->uc);
+ }
+ 
+-void intel_gt_init_hw(struct drm_i915_private *i915)
++void intel_gt_init_hw_early(struct drm_i915_private *i915)
+ {
+ 	i915->gt.ggtt = &i915->ggtt;
+ 
+@@ -33,6 +34,95 @@ void intel_gt_init_hw(struct drm_i915_private *i915)
+ 	intel_gt_pm_disable(&i915->gt);
+ }
+ 
++static void init_unused_ring(struct intel_gt *gt, u32 base)
++{
++	struct intel_uncore *uncore = gt->uncore;
++
++	intel_uncore_write(uncore, RING_CTL(base), 0);
++	intel_uncore_write(uncore, RING_HEAD(base), 0);
++	intel_uncore_write(uncore, RING_TAIL(base), 0);
++	intel_uncore_write(uncore, RING_START(base), 0);
++}
++
++static void init_unused_rings(struct intel_gt *gt)
++{
++	struct drm_i915_private *i915 = gt->i915;
++
++	if (IS_I830(i915)) {
++		init_unused_ring(gt, PRB1_BASE);
++		init_unused_ring(gt, SRB0_BASE);
++		init_unused_ring(gt, SRB1_BASE);
++		init_unused_ring(gt, SRB2_BASE);
++		init_unused_ring(gt, SRB3_BASE);
++	} else if (IS_GEN(i915, 2)) {
++		init_unused_ring(gt, SRB0_BASE);
++		init_unused_ring(gt, SRB1_BASE);
++	} else if (IS_GEN(i915, 3)) {
++		init_unused_ring(gt, PRB1_BASE);
++		init_unused_ring(gt, PRB2_BASE);
++	}
++}
++
++int intel_gt_init_hw(struct intel_gt *gt)
++{
++	struct drm_i915_private *i915 = gt->i915;
++	struct intel_uncore *uncore = gt->uncore;
++	int ret;
++
++	BUG_ON(!i915->kernel_context);
++	ret = intel_gt_terminally_wedged(gt);
++	if (ret)
++		return ret;
++
++	gt->last_init_time = ktime_get();
++
++	/* Double layer security blanket, see i915_gem_init() */
++	intel_uncore_forcewake_get(uncore, FORCEWAKE_ALL);
++
++	if (HAS_EDRAM(i915) && INTEL_GEN(i915) < 9)
++		intel_uncore_rmw(uncore, HSW_IDICR, 0, IDIHASHMSK(0xf));
++
++	if (IS_HASWELL(i915))
++		intel_uncore_write(uncore,
++				   MI_PREDICATE_RESULT_2,
++				   IS_HSW_GT3(i915) ?
++				   LOWER_SLICE_ENABLED : LOWER_SLICE_DISABLED);
++
++	/* Apply the GT workarounds... */
++	intel_gt_apply_workarounds(gt);
++	/* ...and determine whether they are sticking. */
++	intel_gt_verify_workarounds(gt, "init");
++
++	intel_gt_init_swizzling(gt);
++
++	/*
++	 * At least 830 can leave some of the unused rings
++	 * "active" (ie. head != tail) after resume which
++	 * will prevent c3 entry. Makes sure all unused rings
++	 * are totally idle.
++	 */
++	init_unused_rings(gt);
++
++	ret = i915_ppgtt_init_hw(gt);
++	if (ret) {
++		DRM_ERROR("Enabling PPGTT failed (%d)\n", ret);
++		goto out;
++	}
++
++	/* We can't enable contexts until all firmware is loaded */
++	ret = intel_uc_init_hw(&gt->uc);
++	if (ret) {
++		i915_probe_error(i915, "Enabling uc failed (%d)\n", ret);
++		goto out;
++	}
++
++	intel_mocs_init(gt);
++
++out:
++	intel_uncore_forcewake_put(uncore, FORCEWAKE_ALL);
++	return ret;
++}
++
+ static void rmw_set(struct intel_uncore *uncore, i915_reg_t reg, u32 set)
+ {
+ 	intel_uncore_rmw(uncore, reg, 0, set);
+
+commit 42014f69bb235f1123a6f8befb58b3e350a6f180
+Author: Andi Shyti <andi.shyti@intel.com>
+Date:   Thu Sep 5 14:14:03 2019 +0300
+
+    drm/i915: Hook up GT power management
+    
+    Refactor the GT power management interface to work through the GT now
+    that it is under the control of gt/
+    
+    Based on a patch by Chris Wilson.
+    
+    Signed-off-by: Andi Shyti <andi.shyti@intel.com>
+    Cc: Chris Wilson <chris@chris-wilson.co.uk>
+    Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20190905111403.10071-1-andi.shyti@intel.com
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index d48ec9a76ed1..e2cc697d27fb 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -7,6 +7,7 @@
+ #include "intel_gt.h"
+ #include "intel_gt_pm.h"
+ #include "intel_uncore.h"
++#include "intel_pm.h"
+ 
+ void intel_gt_init_early(struct intel_gt *gt, struct drm_i915_private *i915)
+ {
+@@ -27,6 +28,9 @@ void intel_gt_init_early(struct intel_gt *gt, struct drm_i915_private *i915)
+ void intel_gt_init_hw(struct drm_i915_private *i915)
+ {
+ 	i915->gt.ggtt = &i915->ggtt;
++
++	/* BIOS often leaves RC6 enabled, but disable it for hw init */
++	intel_gt_pm_disable(&i915->gt);
+ }
+ 
+ static void rmw_set(struct intel_uncore *uncore, i915_reg_t reg, u32 set)
+@@ -222,7 +226,13 @@ void intel_gt_chipset_flush(struct intel_gt *gt)
+ 		intel_gtt_chipset_flush();
+ }
+ 
+-int intel_gt_init_scratch(struct intel_gt *gt, unsigned int size)
++void intel_gt_driver_register(struct intel_gt *gt)
++{
++	if (IS_GEN(gt->i915, 5))
++		intel_gpu_ips_init(gt->i915);
++}
++
++static int intel_gt_init_scratch(struct intel_gt *gt, unsigned int size)
+ {
+ 	struct drm_i915_private *i915 = gt->i915;
+ 	struct drm_i915_gem_object *obj;
+@@ -256,11 +266,42 @@ int intel_gt_init_scratch(struct intel_gt *gt, unsigned int size)
+ 	return ret;
+ }
+ 
+-void intel_gt_fini_scratch(struct intel_gt *gt)
++static void intel_gt_fini_scratch(struct intel_gt *gt)
+ {
+ 	i915_vma_unpin_and_release(&gt->scratch, 0);
+ }
+ 
++int intel_gt_init(struct intel_gt *gt)
++{
++	int err;
++
++	err = intel_gt_init_scratch(gt, IS_GEN(gt->i915, 2) ? SZ_256K : SZ_4K);
++	if (err)
++		return err;
++
++	return 0;
++}
++
++void intel_gt_driver_remove(struct intel_gt *gt)
++{
++	GEM_BUG_ON(gt->awake);
++	intel_gt_pm_disable(gt);
++}
++
++void intel_gt_driver_unregister(struct intel_gt *gt)
++{
++	intel_gpu_ips_teardown();
++}
++
++void intel_gt_driver_release(struct intel_gt *gt)
++{
++	/* Paranoia: make sure we have disabled everything before we exit. */
++	intel_gt_pm_disable(gt);
++
++	intel_cleanup_gt_powersave(gt->i915);
++	intel_gt_fini_scratch(gt);
++}
++
+ void intel_gt_driver_late_release(struct intel_gt *gt)
+ {
+ 	intel_uc_driver_late_release(&gt->uc);
+
+commit e5dadff4b09376e8ed92ecc0c12f1b9b3b1fbd19
+Author: Chris Wilson <chris@chris-wilson.co.uk>
+Date:   Thu Aug 15 21:57:09 2019 +0100
+
+    drm/i915: Protect request retirement with timeline->mutex
+    
+    Forgo the struct_mutex requirement for request retirement as we have
+    been transitioning over to only using the timeline->mutex for
+    controlling the lifetime of a request on that timeline.
+    
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Reviewed-by: Matthew Auld <matthew.auld@intel.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20190815205709.24285-4-chris@chris-wilson.co.uk
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index 914bd2db3bc7..d48ec9a76ed1 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -15,8 +15,6 @@ void intel_gt_init_early(struct intel_gt *gt, struct drm_i915_private *i915)
+ 
+ 	spin_lock_init(&gt->irq_lock);
+ 
+-	INIT_LIST_HEAD(&gt->active_rings);
+-
+ 	INIT_LIST_HEAD(&gt->closed_vma);
+ 	spin_lock_init(&gt->closed_lock);
+ 
+
+commit d762043f7ab142291be07f15ac7ff83b7485e3e6
+Author: Andi Shyti <andi.shyti@intel.com>
+Date:   Sun Aug 11 15:28:00 2019 +0100
+
+    drm/i915: Extract GT powermanagement interrupt handling
+    
+    i915_irq.c is large. It serves as the central dispatch and handler for
+    all of our device interrupts. Pull out the GT pm interrupt handling
+    (leaving the central dispatch) so that we can encapsulate the logic a
+    little better.
+    
+    Based on a patch by Chris Wilson.
+    
+    Signed-off-by: Andi Shyti <andi.shyti@intel.com>
+    Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20190811142801.2460-1-chris@chris-wilson.co.uk
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index c543467a8a1c..914bd2db3bc7 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -13,9 +13,11 @@ void intel_gt_init_early(struct intel_gt *gt, struct drm_i915_private *i915)
+ 	gt->i915 = i915;
+ 	gt->uncore = &i915->uncore;
+ 
++	spin_lock_init(&gt->irq_lock);
++
+ 	INIT_LIST_HEAD(&gt->active_rings);
+-	INIT_LIST_HEAD(&gt->closed_vma);
+ 
++	INIT_LIST_HEAD(&gt->closed_vma);
+ 	spin_lock_init(&gt->closed_lock);
+ 
+ 	intel_gt_init_hangcheck(gt);
+
+commit 6401fafbec5a3363b7313669818b468a2dd79903
+Author: Jani Nikula <jani.nikula@intel.com>
+Date:   Thu Aug 8 16:42:48 2019 +0300
+
+    drm/i915: extract gem/i915_gem_stolen.h from i915_drv.h
+    
+    It used to be handy that we only had a couple of headers, but over time
+    i915_drv.h has become unwieldy. Extract declarations to a separate
+    header file corresponding to the implementation module, clarifying the
+    modularity of the driver.
+    
+    Ensure the new header is self-contained, and do so with minimal further
+    includes, using forward declarations as needed. Include the new header
+    from i915_drv.h to avoid sprinkling includes all over the place; this
+    can be changed as a follow-up if necessary.
+    
+    No functional changes.
+    
+    Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Signed-off-by: Jani Nikula <jani.nikula@intel.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/0141b4e1f1bf2deb65730ce6973863a3a16ab38f.1565271681.git.jani.nikula@intel.com
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index 75d8c5ee6ecb..c543467a8a1c 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -4,7 +4,6 @@
+  */
+ 
+ #include "i915_drv.h"
+-
+ #include "intel_gt.h"
+ #include "intel_gt_pm.h"
+ #include "intel_uncore.h"
+
+commit 1aff1903d0ff53f055088a77948ac8d8224d42db
+Author: Chris Wilson <chris@chris-wilson.co.uk>
+Date:   Fri Aug 2 22:21:36 2019 +0100
+
+    drm/i915: Hide unshrinkable context objects from the shrinker
+    
+    The shrinker cannot touch objects used by the contexts (logical state
+    and ring). Currently we mark those as "pin_global" to let the shrinker
+    skip over them, however, if we remove them from the shrinker lists
+    entirely, we don't event have to include them in our shrink accounting.
+    
+    By keeping the unshrinkable objects in our shrinker tracking, we report
+    a large number of objects available to be shrunk, and leave the shrinker
+    deeply unsatisfied when we fail to reclaim those. The shrinker will
+    persist in trying to reclaim the unavailable objects, forcing the system
+    into a livelock (not even hitting the dread oomkiller).
+    
+    v2: Extend unshrinkable protection for perma-pinned scratch and guc
+    allocations (Tvrtko)
+    v3: Notice that we should be pinned when marking unshrinkable and so the
+    link cannot be empty; merge duplicate paths.
+    
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+    Reviewed-by: Matthew Auld <matthew.auld@intel.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20190802212137.22207-1-chris@chris-wilson.co.uk
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index 5a7d1a34e429..75d8c5ee6ecb 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -248,7 +248,8 @@ int intel_gt_init_scratch(struct intel_gt *gt, unsigned int size)
+ 	if (ret)
+ 		goto err_unref;
+ 
+-	gt->scratch = vma;
++	gt->scratch = i915_vma_make_unshrinkable(vma);
++
+ 	return 0;
+ 
+ err_unref:
+
+commit 6f76098fe0f3f0b519b2ad528b4319195d6d0f73
+Author: Daniele Ceraolo Spurio <daniele.ceraolospurio@intel.com>
+Date:   Wed Jul 31 17:57:08 2019 -0700
+
+    drm/i915/uc: Move uC early functions inside the GT ones
+    
+    uC is a subcomponent of GT, so initialize/clean it as part of it. The
+    wopcm_init_early doesn't have to be happen before the uC one, but since
+    in other parts of the code we consider WOPCM first do the same for
+    consistency.
+    
+    v2: s/cleanup_early/late_release to match the caller
+    v3: s/late_release/driver_late_release/ (Chris)
+    
+    Signed-off-by: Daniele Ceraolo Spurio <daniele.ceraolospurio@intel.com>
+    Cc: Michal Wajdeczko <michal.wajdeczko@intel.com>
+    Cc: Chris Wilson <chris@chris-wilson.co.uk>
+    Cc: Tvrtko Ursulin <tvrtko.ursulin@linux.intel.com>
+    Reviewed-by: Michal Wajdeczko <michal.wajdeczko@intel.com> #v1
+    Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20190801005709.34092-2-daniele.ceraolospurio@intel.com
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index 720f0cab7aae..5a7d1a34e429 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -22,6 +22,7 @@ void intel_gt_init_early(struct intel_gt *gt, struct drm_i915_private *i915)
+ 	intel_gt_init_hangcheck(gt);
+ 	intel_gt_init_reset(gt);
+ 	intel_gt_pm_init_early(gt);
++	intel_uc_init_early(&gt->uc);
+ }
+ 
+ void intel_gt_init_hw(struct drm_i915_private *i915)
+@@ -262,5 +263,6 @@ void intel_gt_fini_scratch(struct intel_gt *gt)
+ 
+ void intel_gt_driver_late_release(struct intel_gt *gt)
+ {
++	intel_uc_driver_late_release(&gt->uc);
+ 	intel_gt_fini_reset(gt);
+ }
+
+commit 6cf72db68d20230380a7a37dae31943c4d1d6e07
+Author: Daniele Ceraolo Spurio <daniele.ceraolospurio@intel.com>
+Date:   Wed Jul 31 17:57:07 2019 -0700
+
+    drm/i915/gt: Move gt_cleanup_early out of gem_cleanup_early
+    
+    We don't call the init_early function from within the gem code, so we
+    shouldn't do it for the cleanup either.
+    
+    v2: while at it, s/gt_cleanup_early/gt_late_release (Chris)
+    v3: s/late_release/driver_late_release/ (Chris)
+    
+    Signed-off-by: Daniele Ceraolo Spurio <daniele.ceraolospurio@intel.com>
+    Cc: Chris Wilson <chris@chris-wilson.co.uk>
+    Cc: Tvrtko Ursulin <tvrtko.ursulin@linux.intel.com>
+    Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com> #v1
+    Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20190801005709.34092-1-daniele.ceraolospurio@intel.com
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index caa07eb20a64..720f0cab7aae 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -260,7 +260,7 @@ void intel_gt_fini_scratch(struct intel_gt *gt)
+ 	i915_vma_unpin_and_release(&gt->scratch, 0);
+ }
+ 
+-void intel_gt_cleanup_early(struct intel_gt *gt)
++void intel_gt_driver_late_release(struct intel_gt *gt)
+ {
+ 	intel_gt_fini_reset(gt);
+ }
+
+commit 91b59cd98a970f566b81418b9bd6f14f918f62d8
+Author: Lucas De Marchi <lucas.demarchi@intel.com>
+Date:   Tue Jul 30 11:04:03 2019 -0700
+
+    drm/i915/tgl: Move fault registers to their new offset
+    
+    The fault registers moved to another offset. The old location is now
+    taken by the global MOCS registers, to be added in a follow up change.
+    
+    Based on previous patches by Michel Thierry <michel.thierry@intel.com>.
+    
+    Signed-off-by: Lucas De Marchi <lucas.demarchi@intel.com>
+    Reviewed-by: Daniele Ceraolo Spurio <daniele.ceraolospurio@intel.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20190730180407.5993-2-lucas.demarchi@intel.com
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index f7e69db4019d..caa07eb20a64 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -79,7 +79,10 @@ intel_gt_clear_error_registers(struct intel_gt *gt,
+ 				   I915_MASTER_ERROR_INTERRUPT);
+ 	}
+ 
+-	if (INTEL_GEN(i915) >= 8) {
++	if (INTEL_GEN(i915) >= 12) {
++		rmw_clear(uncore, GEN12_RING_FAULT_REG, RING_FAULT_VALID);
++		intel_uncore_posting_read(uncore, GEN12_RING_FAULT_REG);
++	} else if (INTEL_GEN(i915) >= 8) {
+ 		rmw_clear(uncore, GEN8_RING_FAULT_REG, RING_FAULT_VALID);
+ 		intel_uncore_posting_read(uncore, GEN8_RING_FAULT_REG);
+ 	} else if (INTEL_GEN(i915) >= 6) {
+@@ -117,14 +120,27 @@ static void gen6_check_faults(struct intel_gt *gt)
+ static void gen8_check_faults(struct intel_gt *gt)
+ {
+ 	struct intel_uncore *uncore = gt->uncore;
+-	u32 fault = intel_uncore_read(uncore, GEN8_RING_FAULT_REG);
++	i915_reg_t fault_reg, fault_data0_reg, fault_data1_reg;
++	u32 fault;
++
++	if (INTEL_GEN(gt->i915) >= 12) {
++		fault_reg = GEN12_RING_FAULT_REG;
++		fault_data0_reg = GEN12_FAULT_TLB_DATA0;
++		fault_data1_reg = GEN12_FAULT_TLB_DATA1;
++	} else {
++		fault_reg = GEN8_RING_FAULT_REG;
++		fault_data0_reg = GEN8_FAULT_TLB_DATA0;
++		fault_data1_reg = GEN8_FAULT_TLB_DATA1;
++	}
+ 
++	fault = intel_uncore_read(uncore, fault_reg);
+ 	if (fault & RING_FAULT_VALID) {
+ 		u32 fault_data0, fault_data1;
+ 		u64 fault_addr;
+ 
+-		fault_data0 = intel_uncore_read(uncore, GEN8_FAULT_TLB_DATA0);
+-		fault_data1 = intel_uncore_read(uncore, GEN8_FAULT_TLB_DATA1);
++		fault_data0 = intel_uncore_read(uncore, fault_data0_reg);
++		fault_data1 = intel_uncore_read(uncore, fault_data1_reg);
++
+ 		fault_addr = ((u64)(fault_data1 & FAULT_VA_HIGH_BITS) << 44) |
+ 			     ((u64)fault_data0 << 12);
+ 
+
+commit cb823ed9915b0d4064f3f51e936fbe13c089948a
+Author: Chris Wilson <chris@chris-wilson.co.uk>
+Date:   Fri Jul 12 20:29:53 2019 +0100
+
+    drm/i915/gt: Use intel_gt as the primary object for handling resets
+    
+    Having taken the first step in encapsulating the functionality by moving
+    the related files under gt/, the next step is to start encapsulating by
+    passing around the relevant structs rather than the global
+    drm_i915_private. In this step, we pass intel_gt to intel_reset.c
+    
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+    Cc: Daniele Ceraolo Spurio <daniele.ceraolospurio@intel.com>
+    Reviewed-by: Daniele Ceraolo Spurio <daniele.ceraolospurio@intel.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20190712192953.9187-1-chris@chris-wilson.co.uk
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index 8cca6b22b386..f7e69db4019d 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -19,6 +19,8 @@ void intel_gt_init_early(struct intel_gt *gt, struct drm_i915_private *i915)
+ 
+ 	spin_lock_init(&gt->closed_lock);
+ 
++	intel_gt_init_hangcheck(gt);
++	intel_gt_init_reset(gt);
+ 	intel_gt_pm_init_early(gt);
+ }
+ 
+@@ -241,3 +243,8 @@ void intel_gt_fini_scratch(struct intel_gt *gt)
+ {
+ 	i915_vma_unpin_and_release(&gt->scratch, 0);
+ }
++
++void intel_gt_cleanup_early(struct intel_gt *gt)
++{
++	intel_gt_fini_reset(gt);
++}
+
+commit db56f974941b75b2c96e577100e7abe64b03d9b9
+Author: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Date:   Fri Jun 21 08:08:11 2019 +0100
+
+    drm/i915: Eliminate dual personality of i915_scratch_offset
+    
+    Scratch vma lives under gt but the API used to work on i915. Make this
+    consistent by renaming the function to intel_gt_scratch_offset and make
+    it take struct intel_gt.
+    
+    v2:
+     * Move to intel_gt. (Chris)
+    
+    Signed-off-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+    Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20190621070811.7006-33-tvrtko.ursulin@linux.intel.com
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index e22ee3e823fa..8cca6b22b386 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -203,3 +203,41 @@ void intel_gt_chipset_flush(struct intel_gt *gt)
+ 	if (INTEL_GEN(gt->i915) < 6)
+ 		intel_gtt_chipset_flush();
+ }
++
++int intel_gt_init_scratch(struct intel_gt *gt, unsigned int size)
++{
++	struct drm_i915_private *i915 = gt->i915;
++	struct drm_i915_gem_object *obj;
++	struct i915_vma *vma;
++	int ret;
++
++	obj = i915_gem_object_create_stolen(i915, size);
++	if (!obj)
++		obj = i915_gem_object_create_internal(i915, size);
++	if (IS_ERR(obj)) {
++		DRM_ERROR("Failed to allocate scratch page\n");
++		return PTR_ERR(obj);
++	}
++
++	vma = i915_vma_instance(obj, &gt->ggtt->vm, NULL);
++	if (IS_ERR(vma)) {
++		ret = PTR_ERR(vma);
++		goto err_unref;
++	}
++
++	ret = i915_vma_pin(vma, 0, 0, PIN_GLOBAL | PIN_HIGH);
++	if (ret)
++		goto err_unref;
++
++	gt->scratch = vma;
++	return 0;
++
++err_unref:
++	i915_gem_object_put(obj);
++	return ret;
++}
++
++void intel_gt_fini_scratch(struct intel_gt *gt)
++{
++	i915_vma_unpin_and_release(&gt->scratch, 0);
++}
+
+commit d8a4424839eead6da07835e7d2f8b8f54ad6c6b0
+Author: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Date:   Fri Jun 21 08:08:06 2019 +0100
+
+    drm/i915: Store ggtt pointer in intel_gt
+    
+    This will become useful in the following patch.
+    
+    v2:
+     * Assign the pointer through a helper on the top level to work around
+       the layering violation. (Chris)
+    
+    v3:
+     * Handle selftests.
+    
+    v4:
+     * Move call to intel_gt_init_hw into mock_init_ggtt. (Chris)
+    
+    Signed-off-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+    Reviewed-by: Rodrigo Vivi <rodrigo.vivi@intel.com>
+    Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20190621070811.7006-28-tvrtko.ursulin@linux.intel.com
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index f632b7b5b490..e22ee3e823fa 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -22,6 +22,11 @@ void intel_gt_init_early(struct intel_gt *gt, struct drm_i915_private *i915)
+ 	intel_gt_pm_init_early(gt);
+ }
+ 
++void intel_gt_init_hw(struct drm_i915_private *i915)
++{
++	i915->gt.ggtt = &i915->ggtt;
++}
++
+ static void rmw_set(struct intel_uncore *uncore, i915_reg_t reg, u32 set)
+ {
+ 	intel_uncore_rmw(uncore, reg, 0, set);
+
+commit baea429dc5ed90cf9afbdf326fa527581745c8f1
+Author: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Date:   Fri Jun 21 08:08:02 2019 +0100
+
+    drm/i915: Move i915_gem_chipset_flush to intel_gt
+    
+    This aligns better with the rest of restructuring.
+    
+    v2:
+     * Move call out of line. (Chris)
+    
+    Signed-off-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+    Suggested-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20190621070811.7006-24-tvrtko.ursulin@linux.intel.com
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index 4fd9977fe284..f632b7b5b490 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -180,7 +180,7 @@ void intel_gt_flush_ggtt_writes(struct intel_gt *gt)
+ 	if (INTEL_INFO(i915)->has_coherent_ggtt)
+ 		return;
+ 
+-	i915_gem_chipset_flush(i915);
++	intel_gt_chipset_flush(gt);
+ 
+ 	with_intel_runtime_pm(&i915->runtime_pm, wakeref) {
+ 		struct intel_uncore *uncore = gt->uncore;
+@@ -191,3 +191,10 @@ void intel_gt_flush_ggtt_writes(struct intel_gt *gt)
+ 		spin_unlock_irq(&uncore->lock);
+ 	}
+ }
++
++void intel_gt_chipset_flush(struct intel_gt *gt)
++{
++	wmb();
++	if (INTEL_GEN(gt->i915) < 6)
++		intel_gtt_chipset_flush();
++}
+
+commit a1c8a09e0c7c39ee079fc7755cd665efefd9ef73
+Author: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Date:   Fri Jun 21 08:08:01 2019 +0100
+
+    drm/i915: Convert i915_gem_flush_ggtt_writes to intel_gt
+    
+    Having introduced struct intel_gt (named the anonymous structure in i915)
+    we can start using it to compartmentalize our code better. It makes more
+    sense logically to have the code internally like this and it will also
+    help with future split between gt and display in i915.
+    
+    v2:
+     * Keep ggtt flush before fb obj flush. (Chris)
+    
+    v3:
+     * Fix refactoring fail.
+     * Always flush ggtt writes. (Chris)
+    
+    Signed-off-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+    Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20190621070811.7006-23-tvrtko.ursulin@linux.intel.com
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index 5c9be38713db..4fd9977fe284 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -150,3 +150,44 @@ void intel_gt_check_and_clear_faults(struct intel_gt *gt)
+ 
+ 	intel_gt_clear_error_registers(gt, ALL_ENGINES);
+ }
++
++void intel_gt_flush_ggtt_writes(struct intel_gt *gt)
++{
++	struct drm_i915_private *i915 = gt->i915;
++	intel_wakeref_t wakeref;
++
++	/*
++	 * No actual flushing is required for the GTT write domain for reads
++	 * from the GTT domain. Writes to it "immediately" go to main memory
++	 * as far as we know, so there's no chipset flush. It also doesn't
++	 * land in the GPU render cache.
++	 *
++	 * However, we do have to enforce the order so that all writes through
++	 * the GTT land before any writes to the device, such as updates to
++	 * the GATT itself.
++	 *
++	 * We also have to wait a bit for the writes to land from the GTT.
++	 * An uncached read (i.e. mmio) seems to be ideal for the round-trip
++	 * timing. This issue has only been observed when switching quickly
++	 * between GTT writes and CPU reads from inside the kernel on recent hw,
++	 * and it appears to only affect discrete GTT blocks (i.e. on LLC
++	 * system agents we cannot reproduce this behaviour, until Cannonlake
++	 * that was!).
++	 */
++
++	wmb();
++
++	if (INTEL_INFO(i915)->has_coherent_ggtt)
++		return;
++
++	i915_gem_chipset_flush(i915);
++
++	with_intel_runtime_pm(&i915->runtime_pm, wakeref) {
++		struct intel_uncore *uncore = gt->uncore;
++
++		spin_lock_irq(&uncore->lock);
++		intel_uncore_posting_read_fw(uncore,
++					     RING_HEAD(RENDER_RING_BASE));
++		spin_unlock_irq(&uncore->lock);
++	}
++}
+
+commit eaf522f62b7454c4c040c4672c36ad0f4cb21fcd
+Author: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Date:   Fri Jun 21 08:07:44 2019 +0100
+
+    drm/i915: Make i915_check_and_clear_faults take intel_gt
+    
+    Continuing the conversion and elimination of implicit dev_priv.
+    
+    Signed-off-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+    Suggested-by: Rodrigo Vivi <rodrigo.vivi@intel.com>
+    Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20190621070811.7006-6-tvrtko.ursulin@linux.intel.com
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index f760c2e0253e..5c9be38713db 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -7,6 +7,7 @@
+ 
+ #include "intel_gt.h"
+ #include "intel_gt_pm.h"
++#include "intel_uncore.h"
+ 
+ void intel_gt_init_early(struct intel_gt *gt, struct drm_i915_private *i915)
+ {
+@@ -20,3 +21,132 @@ void intel_gt_init_early(struct intel_gt *gt, struct drm_i915_private *i915)
+ 
+ 	intel_gt_pm_init_early(gt);
+ }
++
++static void rmw_set(struct intel_uncore *uncore, i915_reg_t reg, u32 set)
++{
++	intel_uncore_rmw(uncore, reg, 0, set);
++}
++
++static void rmw_clear(struct intel_uncore *uncore, i915_reg_t reg, u32 clr)
++{
++	intel_uncore_rmw(uncore, reg, clr, 0);
++}
++
++static void clear_register(struct intel_uncore *uncore, i915_reg_t reg)
++{
++	intel_uncore_rmw(uncore, reg, 0, 0);
++}
++
++static void gen8_clear_engine_error_register(struct intel_engine_cs *engine)
++{
++	GEN6_RING_FAULT_REG_RMW(engine, RING_FAULT_VALID, 0);
++	GEN6_RING_FAULT_REG_POSTING_READ(engine);
++}
++
++void
++intel_gt_clear_error_registers(struct intel_gt *gt,
++			       intel_engine_mask_t engine_mask)
++{
++	struct drm_i915_private *i915 = gt->i915;
++	struct intel_uncore *uncore = gt->uncore;
++	u32 eir;
++
++	if (!IS_GEN(i915, 2))
++		clear_register(uncore, PGTBL_ER);
++
++	if (INTEL_GEN(i915) < 4)
++		clear_register(uncore, IPEIR(RENDER_RING_BASE));
++	else
++		clear_register(uncore, IPEIR_I965);
++
++	clear_register(uncore, EIR);
++	eir = intel_uncore_read(uncore, EIR);
++	if (eir) {
++		/*
++		 * some errors might have become stuck,
++		 * mask them.
++		 */
++		DRM_DEBUG_DRIVER("EIR stuck: 0x%08x, masking\n", eir);
++		rmw_set(uncore, EMR, eir);
++		intel_uncore_write(uncore, GEN2_IIR,
++				   I915_MASTER_ERROR_INTERRUPT);
++	}
++
++	if (INTEL_GEN(i915) >= 8) {
++		rmw_clear(uncore, GEN8_RING_FAULT_REG, RING_FAULT_VALID);
++		intel_uncore_posting_read(uncore, GEN8_RING_FAULT_REG);
++	} else if (INTEL_GEN(i915) >= 6) {
++		struct intel_engine_cs *engine;
++		enum intel_engine_id id;
++
++		for_each_engine_masked(engine, i915, engine_mask, id)
++			gen8_clear_engine_error_register(engine);
++	}
++}
++
++static void gen6_check_faults(struct intel_gt *gt)
++{
++	struct intel_engine_cs *engine;
++	enum intel_engine_id id;
++	u32 fault;
++
++	for_each_engine(engine, gt->i915, id) {
++		fault = GEN6_RING_FAULT_REG_READ(engine);
++		if (fault & RING_FAULT_VALID) {
++			DRM_DEBUG_DRIVER("Unexpected fault\n"
++					 "\tAddr: 0x%08lx\n"
++					 "\tAddress space: %s\n"
++					 "\tSource ID: %d\n"
++					 "\tType: %d\n",
++					 fault & PAGE_MASK,
++					 fault & RING_FAULT_GTTSEL_MASK ?
++					 "GGTT" : "PPGTT",
++					 RING_FAULT_SRCID(fault),
++					 RING_FAULT_FAULT_TYPE(fault));
++		}
++	}
++}
++
++static void gen8_check_faults(struct intel_gt *gt)
++{
++	struct intel_uncore *uncore = gt->uncore;
++	u32 fault = intel_uncore_read(uncore, GEN8_RING_FAULT_REG);
++
++	if (fault & RING_FAULT_VALID) {
++		u32 fault_data0, fault_data1;
++		u64 fault_addr;
++
++		fault_data0 = intel_uncore_read(uncore, GEN8_FAULT_TLB_DATA0);
++		fault_data1 = intel_uncore_read(uncore, GEN8_FAULT_TLB_DATA1);
++		fault_addr = ((u64)(fault_data1 & FAULT_VA_HIGH_BITS) << 44) |
++			     ((u64)fault_data0 << 12);
++
++		DRM_DEBUG_DRIVER("Unexpected fault\n"
++				 "\tAddr: 0x%08x_%08x\n"
++				 "\tAddress space: %s\n"
++				 "\tEngine ID: %d\n"
++				 "\tSource ID: %d\n"
++				 "\tType: %d\n",
++				 upper_32_bits(fault_addr),
++				 lower_32_bits(fault_addr),
++				 fault_data1 & FAULT_GTT_SEL ? "GGTT" : "PPGTT",
++				 GEN8_RING_FAULT_ENGINE_ID(fault),
++				 RING_FAULT_SRCID(fault),
++				 RING_FAULT_FAULT_TYPE(fault));
++	}
++}
++
++void intel_gt_check_and_clear_faults(struct intel_gt *gt)
++{
++	struct drm_i915_private *i915 = gt->i915;
++
++	/* From GEN8 onwards we only have one 'All Engine Fault Register' */
++	if (INTEL_GEN(i915) >= 8)
++		gen8_check_faults(gt);
++	else if (INTEL_GEN(i915) >= 6)
++		gen6_check_faults(gt);
++	else
++		return;
++
++	intel_gt_clear_error_registers(gt, ALL_ENGINES);
++}
+
+commit 99f2eb966749eb3e7523323a2f09b2f677d3a2d0
+Author: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Date:   Fri Jun 21 08:07:43 2019 +0100
+
+    drm/i915: Move intel_gt_pm_init under intel_gt_init_early
+    
+    And also rename to intel_gt_pm_init_early and make it operate on gt.
+    
+    Signed-off-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+    Suggested-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20190621070811.7006-5-tvrtko.ursulin@linux.intel.com
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index eccb52cf37b6..f760c2e0253e 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -6,6 +6,7 @@
+ #include "i915_drv.h"
+ 
+ #include "intel_gt.h"
++#include "intel_gt_pm.h"
+ 
+ void intel_gt_init_early(struct intel_gt *gt, struct drm_i915_private *i915)
+ {
+@@ -16,4 +17,6 @@ void intel_gt_init_early(struct intel_gt *gt, struct drm_i915_private *i915)
+ 	INIT_LIST_HEAD(&gt->closed_vma);
+ 
+ 	spin_lock_init(&gt->closed_lock);
++
++	intel_gt_pm_init_early(gt);
+ }
+
+commit 724e9564c5acd40c422db2ccb57b1f66433021aa
+Author: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Date:   Fri Jun 21 08:07:42 2019 +0100
+
+    drm/i915: Store some backpointers in struct intel_gt
+    
+    We need an easy way to get back to i915 and uncore.
+    
+    Signed-off-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+    Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20190621070811.7006-4-tvrtko.ursulin@linux.intel.com
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index 10adee1120e6..eccb52cf37b6 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -3,10 +3,15 @@
+  * Copyright © 2019 Intel Corporation
+  */
+ 
++#include "i915_drv.h"
++
+ #include "intel_gt.h"
+ 
+-void intel_gt_init_early(struct intel_gt *gt)
++void intel_gt_init_early(struct intel_gt *gt, struct drm_i915_private *i915)
+ {
++	gt->i915 = i915;
++	gt->uncore = &i915->uncore;
++
+ 	INIT_LIST_HEAD(&gt->active_rings);
+ 	INIT_LIST_HEAD(&gt->closed_vma);
+ 
+
+commit 24635c5152af5a6b79eec17d721685277f8d4cfc
+Author: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+Date:   Fri Jun 21 08:07:41 2019 +0100
+
+    drm/i915: Move intel_gt initialization to a separate file
+    
+    As it will grow in a following patch make a new home for it.
+    
+    v2:
+     * Convert mock_gem_device as well. (Chris)
+    
+    v3:
+     * Rename to intel_gt_init_early and move call site to i915_drv.c. (Chris)
+    
+    v4:
+     * Adjust SPDX tags.
+     * No need to gt/ path when including intel_gt_types.h. (Chris)
+    
+    Signed-off-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+    Reviewed-by: Rodrigo Vivi <rodrigo.vivi@intel.com>
+    Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20190621070811.7006-3-tvrtko.ursulin@linux.intel.com
+
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+new file mode 100644
+index 000000000000..10adee1120e6
+--- /dev/null
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -0,0 +1,14 @@
++// SPDX-License-Identifier: MIT
++/*
++ * Copyright © 2019 Intel Corporation
++ */
++
++#include "intel_gt.h"
++
++void intel_gt_init_early(struct intel_gt *gt)
++{
++	INIT_LIST_HEAD(&gt->active_rings);
++	INIT_LIST_HEAD(&gt->closed_vma);
++
++	spin_lock_init(&gt->closed_lock);
++}

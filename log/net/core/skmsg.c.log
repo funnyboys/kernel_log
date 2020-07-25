@@ -1,0 +1,2652 @@
+commit 8025751d4d55a2f32be6bdf825b6a80c299875f5
+Author: John Fastabend <john.fastabend@gmail.com>
+Date:   Thu Jun 25 16:13:18 2020 -0700
+
+    bpf, sockmap: RCU dereferenced psock may be used outside RCU block
+    
+    If an ingress verdict program specifies message sizes greater than
+    skb->len and there is an ENOMEM error due to memory pressure we
+    may call the rcv_msg handler outside the strp_data_ready() caller
+    context. This is because on an ENOMEM error the strparser will
+    retry from a workqueue. The caller currently protects the use of
+    psock by calling the strp_data_ready() inside a rcu_read_lock/unlock
+    block.
+    
+    But, in above workqueue error case the psock is accessed outside
+    the read_lock/unlock block of the caller. So instead of using
+    psock directly we must do a look up against the sk again to
+    ensure the psock is available.
+    
+    There is an an ugly piece here where we must handle
+    the case where we paused the strp and removed the psock. On
+    psock removal we first pause the strparser and then remove
+    the psock. If the strparser is paused while an skb is
+    scheduled on the workqueue the skb will be dropped on the
+    flow and kfree_skb() is called. If the workqueue manages
+    to get called before we pause the strparser but runs the rcvmsg
+    callback after the psock is removed we will hit the unlikely
+    case where we run the sockmap rcvmsg handler but do not have
+    a psock. For now we will follow strparser logic and drop the
+    skb on the floor with skb_kfree(). This is ugly because the
+    data is dropped. To date this has not caused problems in practice
+    because either the application controlling the sockmap is
+    coordinating with the datapath so that skbs are "flushed"
+    before removal or we simply wait for the sock to be closed before
+    removing it.
+    
+    This patch fixes the describe RCU bug and dropping the skb doesn't
+    make things worse. Future patches will improve this by allowing
+    the normal case where skbs are not merged to skip the strparser
+    altogether. In practice many (most?) use cases have no need to
+    merge skbs so its both a code complexity hit as seen above and
+    a performance issue. For example, in the Cilium case we always
+    set the strparser up to return sbks 1:1 without any merging and
+    have avoided above issues.
+    
+    Fixes: e91de6afa81c1 ("bpf: Fix running sk_skb program types with ktls")
+    Signed-off-by: John Fastabend <john.fastabend@gmail.com>
+    Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+    Acked-by: Martin KaFai Lau <kafai@fb.com>
+    Link: https://lore.kernel.org/bpf/159312679888.18340.15248924071966273998.stgit@john-XPS-13-9370
+
+diff --git a/net/core/skmsg.c b/net/core/skmsg.c
+index c41ab6906b21..6a32a1fd34f8 100644
+--- a/net/core/skmsg.c
++++ b/net/core/skmsg.c
+@@ -781,11 +781,18 @@ static void sk_psock_verdict_apply(struct sk_psock *psock,
+ 
+ static void sk_psock_strp_read(struct strparser *strp, struct sk_buff *skb)
+ {
+-	struct sk_psock *psock = sk_psock_from_strp(strp);
++	struct sk_psock *psock;
+ 	struct bpf_prog *prog;
+ 	int ret = __SK_DROP;
++	struct sock *sk;
+ 
+ 	rcu_read_lock();
++	sk = strp->sk;
++	psock = sk_psock(sk);
++	if (unlikely(!psock)) {
++		kfree_skb(skb);
++		goto out;
++	}
+ 	prog = READ_ONCE(psock->progs.skb_verdict);
+ 	if (likely(prog)) {
+ 		skb_orphan(skb);
+@@ -794,6 +801,7 @@ static void sk_psock_strp_read(struct strparser *strp, struct sk_buff *skb)
+ 		ret = sk_psock_map_verd(ret, tcp_skb_bpf_redirect_fetch(skb));
+ 	}
+ 	sk_psock_verdict_apply(psock, skb, ret);
++out:
+ 	rcu_read_unlock();
+ }
+ 
+
+commit 93dd5f185916b05e931cffae636596f21f98546e
+Author: John Fastabend <john.fastabend@gmail.com>
+Date:   Thu Jun 25 16:12:59 2020 -0700
+
+    bpf, sockmap: RCU splat with redirect and strparser error or TLS
+    
+    There are two paths to generate the below RCU splat the first and
+    most obvious is the result of the BPF verdict program issuing a
+    redirect on a TLS socket (This is the splat shown below). Unlike
+    the non-TLS case the caller of the *strp_read() hooks does not
+    wrap the call in a rcu_read_lock/unlock. Then if the BPF program
+    issues a redirect action we hit the RCU splat.
+    
+    However, in the non-TLS socket case the splat appears to be
+    relatively rare, because the skmsg caller into the strp_data_ready()
+    is wrapped in a rcu_read_lock/unlock. Shown here,
+    
+     static void sk_psock_strp_data_ready(struct sock *sk)
+     {
+            struct sk_psock *psock;
+    
+            rcu_read_lock();
+            psock = sk_psock(sk);
+            if (likely(psock)) {
+                    if (tls_sw_has_ctx_rx(sk)) {
+                            psock->parser.saved_data_ready(sk);
+                    } else {
+                            write_lock_bh(&sk->sk_callback_lock);
+                            strp_data_ready(&psock->parser.strp);
+                            write_unlock_bh(&sk->sk_callback_lock);
+                    }
+            }
+            rcu_read_unlock();
+     }
+    
+    If the above was the only way to run the verdict program we
+    would be safe. But, there is a case where the strparser may throw an
+    ENOMEM error while parsing the skb. This is a result of a failed
+    skb_clone, or alloc_skb_for_msg while building a new merged skb when
+    the msg length needed spans multiple skbs. This will in turn put the
+    skb on the strp_wrk workqueue in the strparser code. The skb will
+    later be dequeued and verdict programs run, but now from a
+    different context without the rcu_read_lock()/unlock() critical
+    section in sk_psock_strp_data_ready() shown above. In practice
+    I have not seen this yet, because as far as I know most users of the
+    verdict programs are also only working on single skbs. In this case no
+    merge happens which could trigger the above ENOMEM errors. In addition
+    the system would need to be under memory pressure. For example, we
+    can't hit the above case in selftests because we missed having tests
+    to merge skbs. (Added in later patch)
+    
+    To fix the below splat extend the rcu_read_lock/unnlock block to
+    include the call to sk_psock_tls_verdict_apply(). This will fix both
+    TLS redirect case and non-TLS redirect+error case. Also remove
+    psock from the sk_psock_tls_verdict_apply() function signature its
+    not used there.
+    
+    [ 1095.937597] WARNING: suspicious RCU usage
+    [ 1095.940964] 5.7.0-rc7-02911-g463bac5f1ca79 #1 Tainted: G        W
+    [ 1095.944363] -----------------------------
+    [ 1095.947384] include/linux/skmsg.h:284 suspicious rcu_dereference_check() usage!
+    [ 1095.950866]
+    [ 1095.950866] other info that might help us debug this:
+    [ 1095.950866]
+    [ 1095.957146]
+    [ 1095.957146] rcu_scheduler_active = 2, debug_locks = 1
+    [ 1095.961482] 1 lock held by test_sockmap/15970:
+    [ 1095.964501]  #0: ffff9ea6b25de660 (sk_lock-AF_INET){+.+.}-{0:0}, at: tls_sw_recvmsg+0x13a/0x840 [tls]
+    [ 1095.968568]
+    [ 1095.968568] stack backtrace:
+    [ 1095.975001] CPU: 1 PID: 15970 Comm: test_sockmap Tainted: G        W         5.7.0-rc7-02911-g463bac5f1ca79 #1
+    [ 1095.977883] Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS 1.12.0-1 04/01/2014
+    [ 1095.980519] Call Trace:
+    [ 1095.982191]  dump_stack+0x8f/0xd0
+    [ 1095.984040]  sk_psock_skb_redirect+0xa6/0xf0
+    [ 1095.986073]  sk_psock_tls_strp_read+0x1d8/0x250
+    [ 1095.988095]  tls_sw_recvmsg+0x714/0x840 [tls]
+    
+    v2: Improve commit message to identify non-TLS redirect plus error case
+        condition as well as more common TLS case. In the process I decided
+        doing the rcu_read_unlock followed by the lock/unlock inside branches
+        was unnecessarily complex. We can just extend the current rcu block
+        and get the same effeective without the shuffling and branching.
+        Thanks Martin!
+    
+    Fixes: e91de6afa81c1 ("bpf: Fix running sk_skb program types with ktls")
+    Reported-by: Jakub Sitnicki <jakub@cloudflare.com>
+    Reported-by: kernel test robot <rong.a.chen@intel.com>
+    Signed-off-by: John Fastabend <john.fastabend@gmail.com>
+    Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+    Acked-by: Martin KaFai Lau <kafai@fb.com>
+    Acked-by: Jakub Sitnicki <jakub@cloudflare.com>
+    Link: https://lore.kernel.org/bpf/159312677907.18340.11064813152758406626.stgit@john-XPS-13-9370
+
+diff --git a/net/core/skmsg.c b/net/core/skmsg.c
+index 351afbf6bfba..c41ab6906b21 100644
+--- a/net/core/skmsg.c
++++ b/net/core/skmsg.c
+@@ -683,7 +683,7 @@ static struct sk_psock *sk_psock_from_strp(struct strparser *strp)
+ 	return container_of(parser, struct sk_psock, parser);
+ }
+ 
+-static void sk_psock_skb_redirect(struct sk_psock *psock, struct sk_buff *skb)
++static void sk_psock_skb_redirect(struct sk_buff *skb)
+ {
+ 	struct sk_psock *psock_other;
+ 	struct sock *sk_other;
+@@ -715,12 +715,11 @@ static void sk_psock_skb_redirect(struct sk_psock *psock, struct sk_buff *skb)
+ 	}
+ }
+ 
+-static void sk_psock_tls_verdict_apply(struct sk_psock *psock,
+-				       struct sk_buff *skb, int verdict)
++static void sk_psock_tls_verdict_apply(struct sk_buff *skb, int verdict)
+ {
+ 	switch (verdict) {
+ 	case __SK_REDIRECT:
+-		sk_psock_skb_redirect(psock, skb);
++		sk_psock_skb_redirect(skb);
+ 		break;
+ 	case __SK_PASS:
+ 	case __SK_DROP:
+@@ -741,8 +740,8 @@ int sk_psock_tls_strp_read(struct sk_psock *psock, struct sk_buff *skb)
+ 		ret = sk_psock_bpf_run(psock, prog, skb);
+ 		ret = sk_psock_map_verd(ret, tcp_skb_bpf_redirect_fetch(skb));
+ 	}
++	sk_psock_tls_verdict_apply(skb, ret);
+ 	rcu_read_unlock();
+-	sk_psock_tls_verdict_apply(psock, skb, ret);
+ 	return ret;
+ }
+ EXPORT_SYMBOL_GPL(sk_psock_tls_strp_read);
+@@ -770,7 +769,7 @@ static void sk_psock_verdict_apply(struct sk_psock *psock,
+ 		}
+ 		goto out_free;
+ 	case __SK_REDIRECT:
+-		sk_psock_skb_redirect(psock, skb);
++		sk_psock_skb_redirect(skb);
+ 		break;
+ 	case __SK_DROP:
+ 		/* fall-through */
+@@ -794,8 +793,8 @@ static void sk_psock_strp_read(struct strparser *strp, struct sk_buff *skb)
+ 		ret = sk_psock_bpf_run(psock, prog, skb);
+ 		ret = sk_psock_map_verd(ret, tcp_skb_bpf_redirect_fetch(skb));
+ 	}
+-	rcu_read_unlock();
+ 	sk_psock_verdict_apply(psock, skb, ret);
++	rcu_read_unlock();
+ }
+ 
+ static int sk_psock_strp_read_done(struct strparser *strp, int err)
+
+commit e91de6afa81c10e9f855c5695eb9a53168d96b73
+Author: John Fastabend <john.fastabend@gmail.com>
+Date:   Fri May 29 16:06:59 2020 -0700
+
+    bpf: Fix running sk_skb program types with ktls
+    
+    KTLS uses a stream parser to collect TLS messages and send them to
+    the upper layer tls receive handler. This ensures the tls receiver
+    has a full TLS header to parse when it is run. However, when a
+    socket has BPF_SK_SKB_STREAM_VERDICT program attached before KTLS
+    is enabled we end up with two stream parsers running on the same
+    socket.
+    
+    The result is both try to run on the same socket. First the KTLS
+    stream parser runs and calls read_sock() which will tcp_read_sock
+    which in turn calls tcp_rcv_skb(). This dequeues the skb from the
+    sk_receive_queue. When this is done KTLS code then data_ready()
+    callback which because we stacked KTLS on top of the bpf stream
+    verdict program has been replaced with sk_psock_start_strp(). This
+    will in turn kick the stream parser again and eventually do the
+    same thing KTLS did above calling into tcp_rcv_skb() and dequeuing
+    a skb from the sk_receive_queue.
+    
+    At this point the data stream is broke. Part of the stream was
+    handled by the KTLS side some other bytes may have been handled
+    by the BPF side. Generally this results in either missing data
+    or more likely a "Bad Message" complaint from the kTLS receive
+    handler as the BPF program steals some bytes meant to be in a
+    TLS header and/or the TLS header length is no longer correct.
+    
+    We've already broke the idealized model where we can stack ULPs
+    in any order with generic callbacks on the TX side to handle this.
+    So in this patch we do the same thing but for RX side. We add
+    a sk_psock_strp_enabled() helper so TLS can learn a BPF verdict
+    program is running and add a tls_sw_has_ctx_rx() helper so BPF
+    side can learn there is a TLS ULP on the socket.
+    
+    Then on BPF side we omit calling our stream parser to avoid
+    breaking the data stream for the KTLS receiver. Then on the
+    KTLS side we call BPF_SK_SKB_STREAM_VERDICT once the KTLS
+    receiver is done with the packet but before it posts the
+    msg to userspace. This gives us symmetry between the TX and
+    RX halfs and IMO makes it usable again. On the TX side we
+    process packets in this order BPF -> TLS -> TCP and on
+    the receive side in the reverse order TCP -> TLS -> BPF.
+    
+    Discovered while testing OpenSSL 3.0 Alpha2.0 release.
+    
+    Fixes: d829e9c4112b5 ("tls: convert to generic sk_msg interface")
+    Signed-off-by: John Fastabend <john.fastabend@gmail.com>
+    Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+    Link: https://lore.kernel.org/bpf/159079361946.5745.605854335665044485.stgit@john-Precision-5820-Tower
+    Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+
+diff --git a/net/core/skmsg.c b/net/core/skmsg.c
+index 9d72f71e9b47..351afbf6bfba 100644
+--- a/net/core/skmsg.c
++++ b/net/core/skmsg.c
+@@ -7,6 +7,7 @@
+ 
+ #include <net/sock.h>
+ #include <net/tcp.h>
++#include <net/tls.h>
+ 
+ static bool sk_msg_try_coalesce_ok(struct sk_msg *msg, int elem_first_coalesce)
+ {
+@@ -714,6 +715,38 @@ static void sk_psock_skb_redirect(struct sk_psock *psock, struct sk_buff *skb)
+ 	}
+ }
+ 
++static void sk_psock_tls_verdict_apply(struct sk_psock *psock,
++				       struct sk_buff *skb, int verdict)
++{
++	switch (verdict) {
++	case __SK_REDIRECT:
++		sk_psock_skb_redirect(psock, skb);
++		break;
++	case __SK_PASS:
++	case __SK_DROP:
++	default:
++		break;
++	}
++}
++
++int sk_psock_tls_strp_read(struct sk_psock *psock, struct sk_buff *skb)
++{
++	struct bpf_prog *prog;
++	int ret = __SK_PASS;
++
++	rcu_read_lock();
++	prog = READ_ONCE(psock->progs.skb_verdict);
++	if (likely(prog)) {
++		tcp_skb_bpf_redirect_clear(skb);
++		ret = sk_psock_bpf_run(psock, prog, skb);
++		ret = sk_psock_map_verd(ret, tcp_skb_bpf_redirect_fetch(skb));
++	}
++	rcu_read_unlock();
++	sk_psock_tls_verdict_apply(psock, skb, ret);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(sk_psock_tls_strp_read);
++
+ static void sk_psock_verdict_apply(struct sk_psock *psock,
+ 				   struct sk_buff *skb, int verdict)
+ {
+@@ -792,9 +825,13 @@ static void sk_psock_strp_data_ready(struct sock *sk)
+ 	rcu_read_lock();
+ 	psock = sk_psock(sk);
+ 	if (likely(psock)) {
+-		write_lock_bh(&sk->sk_callback_lock);
+-		strp_data_ready(&psock->parser.strp);
+-		write_unlock_bh(&sk->sk_callback_lock);
++		if (tls_sw_has_ctx_rx(sk)) {
++			psock->parser.saved_data_ready(sk);
++		} else {
++			write_lock_bh(&sk->sk_callback_lock);
++			strp_data_ready(&psock->parser.strp);
++			write_unlock_bh(&sk->sk_callback_lock);
++		}
+ 	}
+ 	rcu_read_unlock();
+ }
+
+commit ca2f5f21dbbd5e3a00cd3e97f728aa2ca0b2e011
+Author: John Fastabend <john.fastabend@gmail.com>
+Date:   Fri May 29 16:06:41 2020 -0700
+
+    bpf: Refactor sockmap redirect code so its easy to reuse
+    
+    We will need this block of code called from tls context shortly
+    lets refactor the redirect logic so its easy to use. This also
+    cleans up the switch stmt so we have fewer fallthrough cases.
+    
+    No logic changes are intended.
+    
+    Fixes: d829e9c4112b5 ("tls: convert to generic sk_msg interface")
+    Signed-off-by: John Fastabend <john.fastabend@gmail.com>
+    Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+    Reviewed-by: Jakub Sitnicki <jakub@cloudflare.com>
+    Acked-by: Song Liu <songliubraving@fb.com>
+    Link: https://lore.kernel.org/bpf/159079360110.5745.7024009076049029819.stgit@john-Precision-5820-Tower
+    Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+
+diff --git a/net/core/skmsg.c b/net/core/skmsg.c
+index c479372f2cd2..9d72f71e9b47 100644
+--- a/net/core/skmsg.c
++++ b/net/core/skmsg.c
+@@ -682,13 +682,43 @@ static struct sk_psock *sk_psock_from_strp(struct strparser *strp)
+ 	return container_of(parser, struct sk_psock, parser);
+ }
+ 
+-static void sk_psock_verdict_apply(struct sk_psock *psock,
+-				   struct sk_buff *skb, int verdict)
++static void sk_psock_skb_redirect(struct sk_psock *psock, struct sk_buff *skb)
+ {
+ 	struct sk_psock *psock_other;
+ 	struct sock *sk_other;
+ 	bool ingress;
+ 
++	sk_other = tcp_skb_bpf_redirect_fetch(skb);
++	if (unlikely(!sk_other)) {
++		kfree_skb(skb);
++		return;
++	}
++	psock_other = sk_psock(sk_other);
++	if (!psock_other || sock_flag(sk_other, SOCK_DEAD) ||
++	    !sk_psock_test_state(psock_other, SK_PSOCK_TX_ENABLED)) {
++		kfree_skb(skb);
++		return;
++	}
++
++	ingress = tcp_skb_bpf_ingress(skb);
++	if ((!ingress && sock_writeable(sk_other)) ||
++	    (ingress &&
++	     atomic_read(&sk_other->sk_rmem_alloc) <=
++	     sk_other->sk_rcvbuf)) {
++		if (!ingress)
++			skb_set_owner_w(skb, sk_other);
++		skb_queue_tail(&psock_other->ingress_skb, skb);
++		schedule_work(&psock_other->work);
++	} else {
++		kfree_skb(skb);
++	}
++}
++
++static void sk_psock_verdict_apply(struct sk_psock *psock,
++				   struct sk_buff *skb, int verdict)
++{
++	struct sock *sk_other;
++
+ 	switch (verdict) {
+ 	case __SK_PASS:
+ 		sk_other = psock->sk;
+@@ -707,25 +737,8 @@ static void sk_psock_verdict_apply(struct sk_psock *psock,
+ 		}
+ 		goto out_free;
+ 	case __SK_REDIRECT:
+-		sk_other = tcp_skb_bpf_redirect_fetch(skb);
+-		if (unlikely(!sk_other))
+-			goto out_free;
+-		psock_other = sk_psock(sk_other);
+-		if (!psock_other || sock_flag(sk_other, SOCK_DEAD) ||
+-		    !sk_psock_test_state(psock_other, SK_PSOCK_TX_ENABLED))
+-			goto out_free;
+-		ingress = tcp_skb_bpf_ingress(skb);
+-		if ((!ingress && sock_writeable(sk_other)) ||
+-		    (ingress &&
+-		     atomic_read(&sk_other->sk_rmem_alloc) <=
+-		     sk_other->sk_rcvbuf)) {
+-			if (!ingress)
+-				skb_set_owner_w(skb, sk_other);
+-			skb_queue_tail(&psock_other->ingress_skb, skb);
+-			schedule_work(&psock_other->work);
+-			break;
+-		}
+-		/* fall-through */
++		sk_psock_skb_redirect(psock, skb);
++		break;
+ 	case __SK_DROP:
+ 		/* fall-through */
+ 	default:
+
+commit 3d9f773cf2876c01a505b9fe27270901d464e90a
+Author: David Miller <davem@davemloft.net>
+Date:   Mon Feb 24 15:01:43 2020 +0100
+
+    bpf: Use bpf_prog_run_pin_on_cpu() at simple call sites.
+    
+    All of these cases are strictly of the form:
+    
+            preempt_disable();
+            BPF_PROG_RUN(...);
+            preempt_enable();
+    
+    Replace this with bpf_prog_run_pin_on_cpu() which wraps BPF_PROG_RUN()
+    with:
+    
+            migrate_disable();
+            BPF_PROG_RUN(...);
+            migrate_enable();
+    
+    On non RT enabled kernels this maps to preempt_disable/enable() and on RT
+    enabled kernels this solely prevents migration, which is sufficient as
+    there is no requirement to prevent reentrancy to any BPF program from a
+    preempting task. The only requirement is that the program stays on the same
+    CPU.
+    
+    Therefore, this is a trivially correct transformation.
+    
+    The seccomp loop does not need protection over the loop. It only needs
+    protection per BPF filter program
+    
+    [ tglx: Converted to bpf_prog_run_pin_on_cpu() ]
+    
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+    Link: https://lore.kernel.org/bpf/20200224145643.691493094@linutronix.de
+
+diff --git a/net/core/skmsg.c b/net/core/skmsg.c
+index eeb28cb85664..c479372f2cd2 100644
+--- a/net/core/skmsg.c
++++ b/net/core/skmsg.c
+@@ -628,7 +628,6 @@ int sk_psock_msg_verdict(struct sock *sk, struct sk_psock *psock,
+ 	struct bpf_prog *prog;
+ 	int ret;
+ 
+-	preempt_disable();
+ 	rcu_read_lock();
+ 	prog = READ_ONCE(psock->progs.msg_parser);
+ 	if (unlikely(!prog)) {
+@@ -638,7 +637,7 @@ int sk_psock_msg_verdict(struct sock *sk, struct sk_psock *psock,
+ 
+ 	sk_msg_compute_data_pointers(msg);
+ 	msg->sk = sk;
+-	ret = BPF_PROG_RUN(prog, msg);
++	ret = bpf_prog_run_pin_on_cpu(prog, msg);
+ 	ret = sk_psock_map_verd(ret, msg->sk_redir);
+ 	psock->apply_bytes = msg->apply_bytes;
+ 	if (ret == __SK_REDIRECT) {
+@@ -653,7 +652,6 @@ int sk_psock_msg_verdict(struct sock *sk, struct sk_psock *psock,
+ 	}
+ out:
+ 	rcu_read_unlock();
+-	preempt_enable();
+ 	return ret;
+ }
+ EXPORT_SYMBOL_GPL(sk_psock_msg_verdict);
+@@ -665,9 +663,7 @@ static int sk_psock_bpf_run(struct sk_psock *psock, struct bpf_prog *prog,
+ 
+ 	skb->sk = psock->sk;
+ 	bpf_compute_data_end_sk_skb(skb);
+-	preempt_disable();
+-	ret = BPF_PROG_RUN(prog, skb);
+-	preempt_enable();
++	ret = bpf_prog_run_pin_on_cpu(prog, skb);
+ 	/* strparser clones the skb before handing it to a upper layer,
+ 	 * meaning skb_orphan has been called. We NULL sk on the way out
+ 	 * to ensure we don't trigger a BUG_ON() in skb/sk operations
+
+commit f1ff5ce2cd5ef3335f19c0f6576582c87045b04f
+Author: Jakub Sitnicki <jakub@cloudflare.com>
+Date:   Tue Feb 18 17:10:14 2020 +0000
+
+    net, sk_msg: Clear sk_user_data pointer on clone if tagged
+    
+    sk_user_data can hold a pointer to an object that is not intended to be
+    shared between the parent socket and the child that gets a pointer copy on
+    clone. This is the case when sk_user_data points at reference-counted
+    object, like struct sk_psock.
+    
+    One way to resolve it is to tag the pointer with a no-copy flag by
+    repurposing its lowest bit. Based on the bit-flag value we clear the child
+    sk_user_data pointer after cloning the parent socket.
+    
+    The no-copy flag is stored in the pointer itself as opposed to externally,
+    say in socket flags, to guarantee that the pointer and the flag are copied
+    from parent to child socket in an atomic fashion. Parent socket state is
+    subject to change while copying, we don't hold any locks at that time.
+    
+    This approach relies on an assumption that sk_user_data holds a pointer to
+    an object aligned at least 2 bytes. A manual audit of existing users of
+    rcu_dereference_sk_user_data helper confirms our assumption.
+    
+    Also, an RCU-protected sk_user_data is not likely to hold a pointer to a
+    char value or a pathological case of "struct { char c; }". To be safe, warn
+    when the flag-bit is set when setting sk_user_data to catch any future
+    misuses.
+    
+    It is worth considering why clearing sk_user_data unconditionally is not an
+    option. There exist users, DRBD, NVMe, and Xen drivers being among them,
+    that rely on the pointer being copied when cloning the listening socket.
+    
+    Potentially we could distinguish these users by checking if the listening
+    socket has been created in kernel-space via sock_create_kern, and hence has
+    sk_kern_sock flag set. However, this is not the case for NVMe and Xen
+    drivers, which create sockets without marking them as belonging to the
+    kernel.
+    
+    Signed-off-by: Jakub Sitnicki <jakub@cloudflare.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+    Acked-by: John Fastabend <john.fastabend@gmail.com>
+    Acked-by: Martin KaFai Lau <kafai@fb.com>
+    Link: https://lore.kernel.org/bpf/20200218171023.844439-3-jakub@cloudflare.com
+
+diff --git a/net/core/skmsg.c b/net/core/skmsg.c
+index ded2d5227678..eeb28cb85664 100644
+--- a/net/core/skmsg.c
++++ b/net/core/skmsg.c
+@@ -512,7 +512,7 @@ struct sk_psock *sk_psock_init(struct sock *sk, int node)
+ 	sk_psock_set_state(psock, SK_PSOCK_TX_ENABLED);
+ 	refcount_set(&psock->refcnt, 1);
+ 
+-	rcu_assign_sk_user_data(sk, psock);
++	rcu_assign_sk_user_data_nocopy(sk, psock);
+ 	sock_hold(sk);
+ 
+ 	return psock;
+
+commit 58c8db929db1c1d785a6f5d8f8692e5dbcc35e84
+Author: Jakub Sitnicki <jakub@cloudflare.com>
+Date:   Tue Jan 21 13:31:47 2020 +0100
+
+    net, sk_msg: Don't check if sock is locked when tearing down psock
+    
+    As John Fastabend reports [0], psock state tear-down can happen on receive
+    path *after* unlocking the socket, if the only other psock user, that is
+    sockmap or sockhash, releases its psock reference before tcp_bpf_recvmsg
+    does so:
+    
+     tcp_bpf_recvmsg()
+      psock = sk_psock_get(sk)                         <- refcnt 2
+      lock_sock(sk);
+      ...
+                                      sock_map_free()  <- refcnt 1
+      release_sock(sk)
+      sk_psock_put()                                   <- refcnt 0
+    
+    Remove the lockdep check for socket lock in psock tear-down that got
+    introduced in 7e81a3530206 ("bpf: Sockmap, ensure sock lock held during
+    tear down").
+    
+    [0] https://lore.kernel.org/netdev/5e25dc995d7d_74082aaee6e465b441@john-XPS-13-9370.notmuch/
+    
+    Fixes: 7e81a3530206 ("bpf: Sockmap, ensure sock lock held during tear down")
+    Reported-by: syzbot+d73682fcf7fee6982fe3@syzkaller.appspotmail.com
+    Suggested-by: John Fastabend <john.fastabend@gmail.com>
+    Signed-off-by: Jakub Sitnicki <jakub@cloudflare.com>
+    Acked-by: John Fastabend <john.fastabend@gmail.com>
+    Acked-by: Daniel Borkmann <daniel@iogearbox.net>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/core/skmsg.c b/net/core/skmsg.c
+index 3866d7e20c07..ded2d5227678 100644
+--- a/net/core/skmsg.c
++++ b/net/core/skmsg.c
+@@ -594,8 +594,6 @@ EXPORT_SYMBOL_GPL(sk_psock_destroy);
+ 
+ void sk_psock_drop(struct sock *sk, struct sk_psock *psock)
+ {
+-	sock_owned_by_me(sk);
+-
+ 	sk_psock_cork_free(psock);
+ 	sk_psock_zap_ingress(psock);
+ 
+
+commit 7e81a35302066c5a00b4c72d83e3ea4cad6eeb5b
+Author: John Fastabend <john.fastabend@gmail.com>
+Date:   Sat Jan 11 06:12:00 2020 +0000
+
+    bpf: Sockmap, ensure sock lock held during tear down
+    
+    The sock_map_free() and sock_hash_free() paths used to delete sockmap
+    and sockhash maps walk the maps and destroy psock and bpf state associated
+    with the socks in the map. When done the socks no longer have BPF programs
+    attached and will function normally. This can happen while the socks in
+    the map are still "live" meaning data may be sent/received during the walk.
+    
+    Currently, though we don't take the sock_lock when the psock and bpf state
+    is removed through this path. Specifically, this means we can be writing
+    into the ops structure pointers such as sendmsg, sendpage, recvmsg, etc.
+    while they are also being called from the networking side. This is not
+    safe, we never used proper READ_ONCE/WRITE_ONCE semantics here if we
+    believed it was safe. Further its not clear to me its even a good idea
+    to try and do this on "live" sockets while networking side might also
+    be using the socket. Instead of trying to reason about using the socks
+    from both sides lets realize that every use case I'm aware of rarely
+    deletes maps, in fact kubernetes/Cilium case builds map at init and
+    never tears it down except on errors. So lets do the simple fix and
+    grab sock lock.
+    
+    This patch wraps sock deletes from maps in sock lock and adds some
+    annotations so we catch any other cases easier.
+    
+    Fixes: 604326b41a6fb ("bpf, sockmap: convert to generic sk_msg interface")
+    Signed-off-by: John Fastabend <john.fastabend@gmail.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+    Acked-by: Song Liu <songliubraving@fb.com>
+    Cc: stable@vger.kernel.org
+    Link: https://lore.kernel.org/bpf/20200111061206.8028-3-john.fastabend@gmail.com
+
+diff --git a/net/core/skmsg.c b/net/core/skmsg.c
+index ded2d5227678..3866d7e20c07 100644
+--- a/net/core/skmsg.c
++++ b/net/core/skmsg.c
+@@ -594,6 +594,8 @@ EXPORT_SYMBOL_GPL(sk_psock_destroy);
+ 
+ void sk_psock_drop(struct sock *sk, struct sk_psock *psock)
+ {
++	sock_owned_by_me(sk);
++
+ 	sk_psock_cork_free(psock);
+ 	sk_psock_zap_ingress(psock);
+ 
+
+commit 031097d9e079e40dce401031d1012e83d80eaf01
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Wed Nov 27 12:16:41 2019 -0800
+
+    net: skmsg: fix TLS 1.3 crash with full sk_msg
+    
+    TLS 1.3 started using the entry at the end of the SG array
+    for chaining-in the single byte content type entry. This mostly
+    works:
+    
+    [ E E E E E E . . ]
+      ^           ^
+       start       end
+    
+                     E < content type
+                   /
+    [ E E E E E E C . ]
+      ^           ^
+       start       end
+    
+    (Where E denotes a populated SG entry; C denotes a chaining entry.)
+    
+    If the array is full, however, the end will point to the start:
+    
+    [ E E E E E E E E ]
+      ^
+       start
+       end
+    
+    And we end up overwriting the start:
+    
+        E < content type
+       /
+    [ C E E E E E E E ]
+      ^
+       start
+       end
+    
+    The sg array is supposed to be a circular buffer with start and
+    end markers pointing anywhere. In case where start > end
+    (i.e. the circular buffer has "wrapped") there is an extra entry
+    reserved at the end to chain the two halves together.
+    
+    [ E E E E E E . . l ]
+    
+    (Where l is the reserved entry for "looping" back to front.
+    
+    As suggested by John, let's reserve another entry for chaining
+    SG entries after the main circular buffer. Note that this entry
+    has to be pointed to by the end entry so its position is not fixed.
+    
+    Examples of full messages:
+    
+    [ E E E E E E E E . l ]
+      ^               ^
+       start           end
+    
+       <---------------.
+    [ E E . E E E E E E l ]
+          ^ ^
+       end   start
+    
+    Now the end will always point to an unused entry, so TLS 1.3
+    can always use it.
+    
+    Fixes: 130b392c6cd6 ("net: tls: Add tls 1.3 support")
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Reviewed-by: Simon Horman <simon.horman@netronome.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/core/skmsg.c b/net/core/skmsg.c
+index a469d2124f3f..ded2d5227678 100644
+--- a/net/core/skmsg.c
++++ b/net/core/skmsg.c
+@@ -421,7 +421,7 @@ static int sk_psock_skb_ingress(struct sk_psock *psock, struct sk_buff *skb)
+ 	copied = skb->len;
+ 	msg->sg.start = 0;
+ 	msg->sg.size = copied;
+-	msg->sg.end = num_sge == MAX_MSG_FRAGS ? 0 : num_sge;
++	msg->sg.end = num_sge;
+ 	msg->skb = skb;
+ 
+ 	sk_psock_queue_msg(psock, msg);
+
+commit 8163999db445021f2651a8a47b5632483e8722ea
+Author: John Fastabend <john.fastabend@gmail.com>
+Date:   Thu Nov 21 08:25:09 2019 -0800
+
+    bpf: skmsg, fix potential psock NULL pointer dereference
+    
+    Report from Dan Carpenter,
+    
+     net/core/skmsg.c:792 sk_psock_write_space()
+     error: we previously assumed 'psock' could be null (see line 790)
+    
+     net/core/skmsg.c
+       789 psock = sk_psock(sk);
+       790 if (likely(psock && sk_psock_test_state(psock, SK_PSOCK_TX_ENABLED)))
+     Check for NULL
+       791 schedule_work(&psock->work);
+       792 write_space = psock->saved_write_space;
+                         ^^^^^^^^^^^^^^^^^^^^^^^^
+       793          rcu_read_unlock();
+       794          write_space(sk);
+    
+    Ensure psock dereference on line 792 only occurs if psock is not null.
+    
+    Reported-by: Dan Carpenter <dan.carpenter@oracle.com>
+    Fixes: 604326b41a6f ("bpf, sockmap: convert to generic sk_msg interface")
+    Signed-off-by: John Fastabend <john.fastabend@gmail.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/core/skmsg.c b/net/core/skmsg.c
+index ad31e4e53d0a..a469d2124f3f 100644
+--- a/net/core/skmsg.c
++++ b/net/core/skmsg.c
+@@ -793,15 +793,18 @@ static void sk_psock_strp_data_ready(struct sock *sk)
+ static void sk_psock_write_space(struct sock *sk)
+ {
+ 	struct sk_psock *psock;
+-	void (*write_space)(struct sock *sk);
++	void (*write_space)(struct sock *sk) = NULL;
+ 
+ 	rcu_read_lock();
+ 	psock = sk_psock(sk);
+-	if (likely(psock && sk_psock_test_state(psock, SK_PSOCK_TX_ENABLED)))
+-		schedule_work(&psock->work);
+-	write_space = psock->saved_write_space;
++	if (likely(psock)) {
++		if (sk_psock_test_state(psock, SK_PSOCK_TX_ENABLED))
++			schedule_work(&psock->work);
++		write_space = psock->saved_write_space;
++	}
+ 	rcu_read_unlock();
+-	write_space(sk);
++	if (write_space)
++		write_space(sk);
+ }
+ 
+ int sk_psock_init_strp(struct sock *sk, struct sk_psock *psock)
+
+commit 683916f6a84023407761d843048f1aea486b2612
+Author: Jakub Kicinski <jakub.kicinski@netronome.com>
+Date:   Mon Nov 4 15:36:57 2019 -0800
+
+    net/tls: fix sk_msg trim on fallback to copy mode
+    
+    sk_msg_trim() tries to only update curr pointer if it falls into
+    the trimmed region. The logic, however, does not take into the
+    account pointer wrapping that sk_msg_iter_var_prev() does nor
+    (as John points out) the fact that msg->sg is a ring buffer.
+    
+    This means that when the message was trimmed completely, the new
+    curr pointer would have the value of MAX_MSG_FRAGS - 1, which is
+    neither smaller than any other value, nor would it actually be
+    correct.
+    
+    Special case the trimming to 0 length a little bit and rework
+    the comparison between curr and end to take into account wrapping.
+    
+    This bug caused the TLS code to not copy all of the message, if
+    zero copy filled in fewer sg entries than memcopy would need.
+    
+    Big thanks to Alexander Potapenko for the non-KMSAN reproducer.
+    
+    v2:
+     - take into account that msg->sg is a ring buffer (John).
+    
+    Link: https://lore.kernel.org/netdev/20191030160542.30295-1-jakub.kicinski@netronome.com/ (v1)
+    
+    Fixes: d829e9c4112b ("tls: convert to generic sk_msg interface")
+    Reported-by: syzbot+f8495bff23a879a6d0bd@syzkaller.appspotmail.com
+    Reported-by: syzbot+6f50c99e8f6194bf363f@syzkaller.appspotmail.com
+    Co-developed-by: John Fastabend <john.fastabend@gmail.com>
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Signed-off-by: John Fastabend <john.fastabend@gmail.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/core/skmsg.c b/net/core/skmsg.c
+index cf390e0aa73d..ad31e4e53d0a 100644
+--- a/net/core/skmsg.c
++++ b/net/core/skmsg.c
+@@ -270,18 +270,28 @@ void sk_msg_trim(struct sock *sk, struct sk_msg *msg, int len)
+ 
+ 	msg->sg.data[i].length -= trim;
+ 	sk_mem_uncharge(sk, trim);
++	/* Adjust copybreak if it falls into the trimmed part of last buf */
++	if (msg->sg.curr == i && msg->sg.copybreak > msg->sg.data[i].length)
++		msg->sg.copybreak = msg->sg.data[i].length;
+ out:
+-	/* If we trim data before curr pointer update copybreak and current
+-	 * so that any future copy operations start at new copy location.
++	sk_msg_iter_var_next(i);
++	msg->sg.end = i;
++
++	/* If we trim data a full sg elem before curr pointer update
++	 * copybreak and current so that any future copy operations
++	 * start at new copy location.
+ 	 * However trimed data that has not yet been used in a copy op
+ 	 * does not require an update.
+ 	 */
+-	if (msg->sg.curr >= i) {
++	if (!msg->sg.size) {
++		msg->sg.curr = msg->sg.start;
++		msg->sg.copybreak = 0;
++	} else if (sk_msg_iter_dist(msg->sg.start, msg->sg.curr) >=
++		   sk_msg_iter_dist(msg->sg.start, msg->sg.end)) {
++		sk_msg_iter_var_prev(i);
+ 		msg->sg.curr = i;
+ 		msg->sg.copybreak = msg->sg.data[i].length;
+ 	}
+-	sk_msg_iter_var_next(i);
+-	msg->sg.end = i;
+ }
+ EXPORT_SYMBOL_GPL(sk_msg_trim);
+ 
+
+commit dd016aca28f67603f32c4e666805db519df2120a
+Author: Markus Elfring <elfring@users.sourceforge.net>
+Date:   Thu Aug 22 18:00:40 2019 +0200
+
+    net/core/skmsg: Delete an unnecessary check before the function call “consume_skb”
+    
+    The consume_skb() function performs also input parameter validation.
+    Thus the test around the call is not needed.
+    
+    This issue was detected by using the Coccinelle software.
+    
+    Signed-off-by: Markus Elfring <elfring@users.sourceforge.net>
+    Acked-by: Song Liu <songliubraving@fb.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/core/skmsg.c b/net/core/skmsg.c
+index 6832eeb4b785..cf390e0aa73d 100644
+--- a/net/core/skmsg.c
++++ b/net/core/skmsg.c
+@@ -190,8 +190,7 @@ static int __sk_msg_free(struct sock *sk, struct sk_msg *msg, u32 i,
+ 		sk_msg_check_to_free(msg, i, msg->sg.size);
+ 		sge = sk_msg_elem(msg, i);
+ 	}
+-	if (msg->skb)
+-		consume_skb(msg->skb);
++	consume_skb(msg->skb);
+ 	sk_msg_init(msg);
+ 	return freed;
+ }
+
+commit 95fa145479fbc0a0c1fd3274ceb42ec03c042a4a
+Author: John Fastabend <john.fastabend@gmail.com>
+Date:   Fri Jul 19 10:29:22 2019 -0700
+
+    bpf: sockmap/tls, close can race with map free
+    
+    When a map free is called and in parallel a socket is closed we
+    have two paths that can potentially reset the socket prot ops, the
+    bpf close() path and the map free path. This creates a problem
+    with which prot ops should be used from the socket closed side.
+    
+    If the map_free side completes first then we want to call the
+    original lowest level ops. However, if the tls path runs first
+    we want to call the sockmap ops. Additionally there was no locking
+    around prot updates in TLS code paths so the prot ops could
+    be changed multiple times once from TLS path and again from sockmap
+    side potentially leaving ops pointed at either TLS or sockmap
+    when psock and/or tls context have already been destroyed.
+    
+    To fix this race first only update ops inside callback lock
+    so that TLS, sockmap and lowest level all agree on prot state.
+    Second and a ULP callback update() so that lower layers can
+    inform the upper layer when they are being removed allowing the
+    upper layer to reset prot ops.
+    
+    This gets us close to allowing sockmap and tls to be stacked
+    in arbitrary order but will save that patch for *next trees.
+    
+    v4:
+     - make sure we don't free things for device;
+     - remove the checks which swap the callbacks back
+       only if TLS is at the top.
+    
+    Reported-by: syzbot+06537213db7ba2745c4a@syzkaller.appspotmail.com
+    Fixes: 02c558b2d5d6 ("bpf: sockmap, support for msg_peek in sk_msg with redirect ingress")
+    Signed-off-by: John Fastabend <john.fastabend@gmail.com>
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+    Reviewed-by: Dirk van der Merwe <dirk.vandermerwe@netronome.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/net/core/skmsg.c b/net/core/skmsg.c
+index 93bffaad2135..6832eeb4b785 100644
+--- a/net/core/skmsg.c
++++ b/net/core/skmsg.c
+@@ -585,12 +585,12 @@ EXPORT_SYMBOL_GPL(sk_psock_destroy);
+ 
+ void sk_psock_drop(struct sock *sk, struct sk_psock *psock)
+ {
+-	rcu_assign_sk_user_data(sk, NULL);
+ 	sk_psock_cork_free(psock);
+ 	sk_psock_zap_ingress(psock);
+-	sk_psock_restore_proto(sk, psock);
+ 
+ 	write_lock_bh(&sk->sk_callback_lock);
++	sk_psock_restore_proto(sk, psock);
++	rcu_assign_sk_user_data(sk, NULL);
+ 	if (psock->progs.skb_parser)
+ 		sk_psock_stop_strp(sk, psock);
+ 	write_unlock_bh(&sk->sk_callback_lock);
+
+commit cabede8b4f2b746232aa25730a0b752de1cb82ca
+Author: John Fastabend <john.fastabend@gmail.com>
+Date:   Mon May 13 07:19:55 2019 -0700
+
+    bpf: sockmap fix msg->sg.size account on ingress skb
+    
+    When converting a skb to msg->sg we forget to set the size after the
+    latest ktls/tls code conversion. This patch can be reached by doing
+    a redir into ingress path from BPF skb sock recv hook. Then trying to
+    read the size fails.
+    
+    Fix this by setting the size.
+    
+    Fixes: 604326b41a6fb ("bpf, sockmap: convert to generic sk_msg interface")
+    Signed-off-by: John Fastabend <john.fastabend@gmail.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/net/core/skmsg.c b/net/core/skmsg.c
+index 49d1efa329d7..93bffaad2135 100644
+--- a/net/core/skmsg.c
++++ b/net/core/skmsg.c
+@@ -411,6 +411,7 @@ static int sk_psock_skb_ingress(struct sk_psock *psock, struct sk_buff *skb)
+ 	sk_mem_charge(sk, skb->len);
+ 	copied = skb->len;
+ 	msg->sg.start = 0;
++	msg->sg.size = copied;
+ 	msg->sg.end = num_sge == MAX_MSG_FRAGS ? 0 : num_sge;
+ 	msg->skb = skb;
+ 
+
+commit 014894360ec95abe868e94416b3dd6569f6e2c0c
+Author: John Fastabend <john.fastabend@gmail.com>
+Date:   Mon May 13 07:19:19 2019 -0700
+
+    bpf: sockmap, only stop/flush strp if it was enabled at some point
+    
+    If we try to call strp_done on a parser that has never been
+    initialized, because the sockmap user is only using TX side for
+    example we get the following error.
+    
+      [  883.422081] WARNING: CPU: 1 PID: 208 at kernel/workqueue.c:3030 __flush_work+0x1ca/0x1e0
+      ...
+      [  883.422095] Workqueue: events sk_psock_destroy_deferred
+      [  883.422097] RIP: 0010:__flush_work+0x1ca/0x1e0
+    
+    This had been wrapped in a 'if (psock->parser.enabled)' logic which
+    was broken because the strp_done() was never actually being called
+    because we do a strp_stop() earlier in the tear down logic will
+    set parser.enabled to false. This could result in a use after free
+    if work was still in the queue and was resolved by the patch here,
+    1d79895aef18f ("sk_msg: Always cancel strp work before freeing the
+    psock"). However, calling strp_stop(), done by the patch marked in
+    the fixes tag, only is useful if we never initialized a strp parser
+    program and never initialized the strp to start with. Because if
+    we had initialized a stream parser strp_stop() would have been called
+    by sk_psock_drop() earlier in the tear down process.  By forcing the
+    strp to stop we get past the WARNING in strp_done that checks
+    the stopped flag but calling cancel_work_sync on work that has never
+    been initialized is also wrong and generates the warning above.
+    
+    To fix check if the parser program exists. If the program exists
+    then the strp work has been initialized and must be sync'd and
+    cancelled before free'ing any structures. If no program exists we
+    never initialized the stream parser in the first place so skip the
+    sync/cancel logic implemented by strp_done.
+    
+    Finally, remove the strp_done its not needed and in the case where we
+    are using the stream parser has already been called.
+    
+    Fixes: e8e3437762ad9 ("bpf: Stop the psock parser before canceling its work")
+    Signed-off-by: John Fastabend <john.fastabend@gmail.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/net/core/skmsg.c b/net/core/skmsg.c
+index cc94d921476c..49d1efa329d7 100644
+--- a/net/core/skmsg.c
++++ b/net/core/skmsg.c
+@@ -554,8 +554,10 @@ static void sk_psock_destroy_deferred(struct work_struct *gc)
+ 	struct sk_psock *psock = container_of(gc, struct sk_psock, gc);
+ 
+ 	/* No sk_callback_lock since already detached. */
+-	strp_stop(&psock->parser.strp);
+-	strp_done(&psock->parser.strp);
++
++	/* Parser has been stopped */
++	if (psock->progs.skb_parser)
++		strp_done(&psock->parser.strp);
+ 
+ 	cancel_work_sync(&psock->work);
+ 
+
+commit e8e3437762ad938880dd48a3c52d702e7cf3c124
+Author: Jakub Sitnicki <jakub@cloudflare.com>
+Date:   Thu Mar 7 11:35:43 2019 +0100
+
+    bpf: Stop the psock parser before canceling its work
+    
+    We might have never enabled (started) the psock's parser, in which case it
+    will not get stopped when destroying the psock. This leads to a warning
+    when trying to cancel parser's work from psock's deferred destructor:
+    
+    [  405.325769] WARNING: CPU: 1 PID: 3216 at net/strparser/strparser.c:526 strp_done+0x3c/0x40
+    [  405.326712] Modules linked in: [last unloaded: test_bpf]
+    [  405.327359] CPU: 1 PID: 3216 Comm: kworker/1:164 Tainted: G        W         5.0.0 #42
+    [  405.328294] Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS ?-20180531_142017-buildhw-08.phx2.fedoraproject.org-1.fc28 04/01/2014
+    [  405.329712] Workqueue: events sk_psock_destroy_deferred
+    [  405.330254] RIP: 0010:strp_done+0x3c/0x40
+    [  405.330706] Code: 28 e8 b8 d5 6b ff 48 8d bb 80 00 00 00 e8 9c d5 6b ff 48 8b 7b 18 48 85 ff 74 0d e8 1e a5 e8 ff 48 c7 43 18 00 00 00 00 5b c3 <0f> 0b eb cf 66 66 66 66 90 55 89 f5 53 48 89 fb 48 83 c7 28 e8 0b
+    [  405.332862] RSP: 0018:ffffc900026bbe50 EFLAGS: 00010246
+    [  405.333482] RAX: ffffffff819323e0 RBX: ffff88812cb83640 RCX: ffff88812cb829e8
+    [  405.334228] RDX: 0000000000000001 RSI: ffff88812cb837e8 RDI: ffff88812cb83640
+    [  405.335366] RBP: ffff88813fd22680 R08: 0000000000000000 R09: 000073746e657665
+    [  405.336472] R10: 8080808080808080 R11: 0000000000000001 R12: ffff88812cb83600
+    [  405.337760] R13: 0000000000000000 R14: ffff88811f401780 R15: ffff88812cb837e8
+    [  405.338777] FS:  0000000000000000(0000) GS:ffff88813fd00000(0000) knlGS:0000000000000000
+    [  405.339903] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+    [  405.340821] CR2: 00007fb11489a6b8 CR3: 000000012d4d6000 CR4: 00000000000406e0
+    [  405.341981] DR0: 0000000000000000 DR1: 0000000000000000 DR2: 0000000000000000
+    [  405.343131] DR3: 0000000000000000 DR6: 00000000fffe0ff0 DR7: 0000000000000400
+    [  405.344415] Call Trace:
+    [  405.344821]  sk_psock_destroy_deferred+0x23/0x1b0
+    [  405.345585]  process_one_work+0x1ae/0x3e0
+    [  405.346110]  worker_thread+0x3c/0x3b0
+    [  405.346576]  ? pwq_unbound_release_workfn+0xd0/0xd0
+    [  405.347187]  kthread+0x11d/0x140
+    [  405.347601]  ? __kthread_parkme+0x80/0x80
+    [  405.348108]  ret_from_fork+0x35/0x40
+    [  405.348566] ---[ end trace a4a3af4026a327d4 ]---
+    
+    Stop psock's parser just before canceling its work.
+    
+    Fixes: 1d79895aef18 ("sk_msg: Always cancel strp work before freeing the psock")
+    Reported-by: kernel test robot <rong.a.chen@intel.com>
+    Signed-off-by: Jakub Sitnicki <jakub@cloudflare.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/net/core/skmsg.c b/net/core/skmsg.c
+index ae6f06e45737..cc94d921476c 100644
+--- a/net/core/skmsg.c
++++ b/net/core/skmsg.c
+@@ -554,6 +554,7 @@ static void sk_psock_destroy_deferred(struct work_struct *gc)
+ 	struct sk_psock *psock = container_of(gc, struct sk_psock, gc);
+ 
+ 	/* No sk_callback_lock since already detached. */
++	strp_stop(&psock->parser.strp);
+ 	strp_done(&psock->parser.strp);
+ 
+ 	cancel_work_sync(&psock->work);
+
+commit a655fe9f194842693258f43b5382855db1c2f654
+Merge: 7499a288bf1a 27b4ad621e88
+Author: David S. Miller <davem@davemloft.net>
+Date:   Fri Feb 8 15:00:17 2019 -0800
+
+    Merge git://git.kernel.org/pub/scm/linux/kernel/git/davem/net
+    
+    An ipvlan bug fix in 'net' conflicted with the abstraction away
+    of the IPV6 specific support in 'net-next'.
+    
+    Similarly, a bug fix for mlx5 in 'net' conflicted with the flow
+    action conversion in 'net-next'.
+    
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+commit 1d79895aef18fa05789995d86d523c9b2ee58a02
+Author: Jakub Sitnicki <jakub@cloudflare.com>
+Date:   Mon Jan 28 10:13:35 2019 +0100
+
+    sk_msg: Always cancel strp work before freeing the psock
+    
+    Despite having stopped the parser, we still need to deinitialize it
+    by calling strp_done so that it cancels its work. Otherwise the worker
+    thread can run after we have freed the parser, and attempt to access
+    its workqueue resulting in a use-after-free:
+    
+    ==================================================================
+    BUG: KASAN: use-after-free in pwq_activate_delayed_work+0x1b/0x1d0
+    Read of size 8 at addr ffff888069975240 by task kworker/u2:2/93
+    
+    CPU: 0 PID: 93 Comm: kworker/u2:2 Not tainted 5.0.0-rc2-00335-g28f9d1a3d4fe-dirty #14
+    Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS 1.10.2-2.fc27 04/01/2014
+    Workqueue:            (null) (kstrp)
+    Call Trace:
+     print_address_description+0x6e/0x2b0
+     ? pwq_activate_delayed_work+0x1b/0x1d0
+     kasan_report+0xfd/0x177
+     ? pwq_activate_delayed_work+0x1b/0x1d0
+     ? pwq_activate_delayed_work+0x1b/0x1d0
+     pwq_activate_delayed_work+0x1b/0x1d0
+     ? process_one_work+0x4aa/0x660
+     pwq_dec_nr_in_flight+0x9b/0x100
+     worker_thread+0x82/0x680
+     ? process_one_work+0x660/0x660
+     kthread+0x1b9/0x1e0
+     ? __kthread_create_on_node+0x250/0x250
+     ret_from_fork+0x1f/0x30
+    
+    Allocated by task 111:
+     sk_psock_init+0x3c/0x1b0
+     sock_map_link.isra.2+0x103/0x4b0
+     sock_map_update_common+0x94/0x270
+     sock_map_update_elem+0x145/0x160
+     __se_sys_bpf+0x152e/0x1e10
+     do_syscall_64+0xb2/0x3e0
+     entry_SYSCALL_64_after_hwframe+0x44/0xa9
+    
+    Freed by task 112:
+     kfree+0x7f/0x140
+     process_one_work+0x40b/0x660
+     worker_thread+0x82/0x680
+     kthread+0x1b9/0x1e0
+     ret_from_fork+0x1f/0x30
+    
+    The buggy address belongs to the object at ffff888069975180
+     which belongs to the cache kmalloc-512 of size 512
+    The buggy address is located 192 bytes inside of
+     512-byte region [ffff888069975180, ffff888069975380)
+    The buggy address belongs to the page:
+    page:ffffea0001a65d00 count:1 mapcount:0 mapping:ffff88806d401280 index:0x0 compound_mapcount: 0
+    flags: 0x4000000000010200(slab|head)
+    raw: 4000000000010200 dead000000000100 dead000000000200 ffff88806d401280
+    raw: 0000000000000000 00000000800c000c 00000001ffffffff 0000000000000000
+    page dumped because: kasan: bad access detected
+    
+    Memory state around the buggy address:
+     ffff888069975100: fc fc fc fc fc fc fc fc fc fc fc fc fc fc fc fc
+     ffff888069975180: fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb
+    >ffff888069975200: fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb
+                                               ^
+     ffff888069975280: fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb
+     ffff888069975300: fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb
+    ==================================================================
+    
+    Reported-by: Marek Majkowski <marek@cloudflare.com>
+    Signed-off-by: Jakub Sitnicki <jakub@cloudflare.com>
+    Link: https://lore.kernel.org/netdev/CAJPywTLwgXNEZ2dZVoa=udiZmtrWJ0q5SuBW64aYs0Y1khXX3A@mail.gmail.com
+    Acked-by: Song Liu <songliubraving@fb.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/net/core/skmsg.c b/net/core/skmsg.c
+index d6d5c20d7044..8c826603bf36 100644
+--- a/net/core/skmsg.c
++++ b/net/core/skmsg.c
+@@ -545,8 +545,7 @@ static void sk_psock_destroy_deferred(struct work_struct *gc)
+ 	struct sk_psock *psock = container_of(gc, struct sk_psock, gc);
+ 
+ 	/* No sk_callback_lock since already detached. */
+-	if (psock->parser.enabled)
+-		strp_done(&psock->parser.strp);
++	strp_done(&psock->parser.strp);
+ 
+ 	cancel_work_sync(&psock->work);
+ 
+
+commit fda497e5f5b89ac3b2b3715e2571021c2ad55234
+Author: Vakul Garg <vakul.garg@nxp.com>
+Date:   Wed Jan 16 01:42:44 2019 +0000
+
+    Optimize sk_msg_clone() by data merge to end dst sg entry
+    
+    Function sk_msg_clone has been modified to merge the data from source sg
+    entry to destination sg entry if the cloned data resides in same page
+    and is contiguous to the end entry of destination sk_msg. This improves
+    kernel tls throughput to the tune of 10%.
+    
+    When the user space tls application calls sendmsg() with MSG_MORE, it leads
+    to calling sk_msg_clone() with new data being cloned placed continuous to
+    previously cloned data. Without this optimization, a new SG entry in
+    the destination sk_msg i.e. rec->msg_plaintext in tls_clone_plaintext_msg()
+    gets used. This leads to exhaustion of sg entries in rec->msg_plaintext
+    even before a full 16K of allowable record data is accumulated. Hence we
+    lose oppurtunity to encrypt and send a full 16K record.
+    
+    With this patch, the kernel tls can accumulate full 16K of record data
+    irrespective of the size of data passed in sendmsg() with MSG_MORE.
+    
+    Signed-off-by: Vakul Garg <vakul.garg@nxp.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/core/skmsg.c b/net/core/skmsg.c
+index d6d5c20d7044..e76ed8df9f13 100644
+--- a/net/core/skmsg.c
++++ b/net/core/skmsg.c
+@@ -78,11 +78,9 @@ int sk_msg_clone(struct sock *sk, struct sk_msg *dst, struct sk_msg *src,
+ {
+ 	int i = src->sg.start;
+ 	struct scatterlist *sge = sk_msg_elem(src, i);
++	struct scatterlist *sgd = NULL;
+ 	u32 sge_len, sge_off;
+ 
+-	if (sk_msg_full(dst))
+-		return -ENOSPC;
+-
+ 	while (off) {
+ 		if (sge->length > off)
+ 			break;
+@@ -94,16 +92,27 @@ int sk_msg_clone(struct sock *sk, struct sk_msg *dst, struct sk_msg *src,
+ 	}
+ 
+ 	while (len) {
+-		if (sk_msg_full(dst))
+-			return -ENOSPC;
+-
+ 		sge_len = sge->length - off;
+-		sge_off = sge->offset + off;
+ 		if (sge_len > len)
+ 			sge_len = len;
++
++		if (dst->sg.end)
++			sgd = sk_msg_elem(dst, dst->sg.end - 1);
++
++		if (sgd &&
++		    (sg_page(sge) == sg_page(sgd)) &&
++		    (sg_virt(sge) + off == sg_virt(sgd) + sgd->length)) {
++			sgd->length += sge_len;
++			dst->sg.size += sge_len;
++		} else if (!sk_msg_full(dst)) {
++			sge_off = sge->offset + off;
++			sk_msg_page_add(dst, sg_page(sge), sge_len, sge_off);
++		} else {
++			return -ENOSPC;
++		}
++
+ 		off = 0;
+ 		len -= sge_len;
+-		sk_msg_page_add(dst, sg_page(sge), sge_len, sge_off);
+ 		sk_mem_charge(sk, sge_len);
+ 		sk_msg_iter_var_next(i);
+ 		if (i == src->sg.end && len)
+
+commit e0c38a4d1f196a4b17d2eba36afff8f656a4f1de
+Merge: 7f9f852c75e7 90cadbbf341d
+Author: Linus Torvalds <torvalds@linux-foundation.org>
+Date:   Thu Dec 27 13:04:52 2018 -0800
+
+    Merge git://git.kernel.org/pub/scm/linux/kernel/git/davem/net-next
+    
+    Pull networking updates from David Miller:
+    
+     1) New ipset extensions for matching on destination MAC addresses, from
+        Stefano Brivio.
+    
+     2) Add ipv4 ttl and tos, plus ipv6 flow label and hop limit offloads to
+        nfp driver. From Stefano Brivio.
+    
+     3) Implement GRO for plain UDP sockets, from Paolo Abeni.
+    
+     4) Lots of work from Michał Mirosław to eliminate the VLAN_TAG_PRESENT
+        bit so that we could support the entire vlan_tci value.
+    
+     5) Rework the IPSEC policy lookups to better optimize more usecases,
+        from Florian Westphal.
+    
+     6) Infrastructure changes eliminating direct manipulation of SKB lists
+        wherever possible, and to always use the appropriate SKB list
+        helpers. This work is still ongoing...
+    
+     7) Lots of PHY driver and state machine improvements and
+        simplifications, from Heiner Kallweit.
+    
+     8) Various TSO deferral refinements, from Eric Dumazet.
+    
+     9) Add ntuple filter support to aquantia driver, from Dmitry Bogdanov.
+    
+    10) Batch dropping of XDP packets in tuntap, from Jason Wang.
+    
+    11) Lots of cleanups and improvements to the r8169 driver from Heiner
+        Kallweit, including support for ->xmit_more. This driver has been
+        getting some much needed love since he started working on it.
+    
+    12) Lots of new forwarding selftests from Petr Machata.
+    
+    13) Enable VXLAN learning in mlxsw driver, from Ido Schimmel.
+    
+    14) Packed ring support for virtio, from Tiwei Bie.
+    
+    15) Add new Aquantia AQtion USB driver, from Dmitry Bezrukov.
+    
+    16) Add XDP support to dpaa2-eth driver, from Ioana Ciocoi Radulescu.
+    
+    17) Implement coalescing on TCP backlog queue, from Eric Dumazet.
+    
+    18) Implement carrier change in tun driver, from Nicolas Dichtel.
+    
+    19) Support msg_zerocopy in UDP, from Willem de Bruijn.
+    
+    20) Significantly improve garbage collection of neighbor objects when
+        the table has many PERMANENT entries, from David Ahern.
+    
+    21) Remove egdev usage from nfp and mlx5, and remove the facility
+        completely from the tree as it no longer has any users. From Oz
+        Shlomo and others.
+    
+    22) Add a NETDEV_PRE_CHANGEADDR so that drivers can veto the change and
+        therefore abort the operation before the commit phase (which is the
+        NETDEV_CHANGEADDR event). From Petr Machata.
+    
+    23) Add indirect call wrappers to avoid retpoline overhead, and use them
+        in the GRO code paths. From Paolo Abeni.
+    
+    24) Add support for netlink FDB get operations, from Roopa Prabhu.
+    
+    25) Support bloom filter in mlxsw driver, from Nir Dotan.
+    
+    26) Add SKB extension infrastructure. This consolidates the handling of
+        the auxiliary SKB data used by IPSEC and bridge netfilter, and is
+        designed to support the needs to MPTCP which could be integrated in
+        the future.
+    
+    27) Lots of XDP TX optimizations in mlx5 from Tariq Toukan.
+    
+    * git://git.kernel.org/pub/scm/linux/kernel/git/davem/net-next: (1845 commits)
+      net: dccp: fix kernel crash on module load
+      drivers/net: appletalk/cops: remove redundant if statement and mask
+      bnx2x: Fix NULL pointer dereference in bnx2x_del_all_vlans() on some hw
+      net/net_namespace: Check the return value of register_pernet_subsys()
+      net/netlink_compat: Fix a missing check of nla_parse_nested
+      ieee802154: lowpan_header_create check must check daddr
+      net/mlx4_core: drop useless LIST_HEAD
+      mlxsw: spectrum: drop useless LIST_HEAD
+      net/mlx5e: drop useless LIST_HEAD
+      iptunnel: Set tun_flags in the iptunnel_metadata_reply from src
+      net/mlx5e: fix semicolon.cocci warnings
+      staging: octeon: fix build failure with XFRM enabled
+      net: Revert recent Spectre-v1 patches.
+      can: af_can: Fix Spectre v1 vulnerability
+      packet: validate address length if non-zero
+      nfc: af_nfc: Fix Spectre v1 vulnerability
+      phonet: af_phonet: Fix Spectre v1 vulnerability
+      net: core: Fix Spectre v1 vulnerability
+      net: minor cleanup in skb_ext_add()
+      net: drop the unused helper skb_ext_get()
+      ...
+
+commit 792bf4d871dea8b69be2aaabdd320d7c6ed15985
+Merge: eed9688f8513 4bbfd7467cfc
+Author: Linus Torvalds <torvalds@linux-foundation.org>
+Date:   Wed Dec 26 13:07:19 2018 -0800
+
+    Merge branch 'core-rcu-for-linus' of git://git.kernel.org/pub/scm/linux/kernel/git/tip/tip
+    
+    Pull RCU updates from Ingo Molnar:
+     "The biggest RCU changes in this cycle were:
+    
+       - Convert RCU's BUG_ON() and similar calls to WARN_ON() and similar.
+    
+       - Replace calls of RCU-bh and RCU-sched update-side functions to
+         their vanilla RCU counterparts. This series is a step towards
+         complete removal of the RCU-bh and RCU-sched update-side functions.
+    
+         ( Note that some of these conversions are going upstream via their
+           respective maintainers. )
+    
+       - Documentation updates, including a number of flavor-consolidation
+         updates from Joel Fernandes.
+    
+       - Miscellaneous fixes.
+    
+       - Automate generation of the initrd filesystem used for rcutorture
+         testing.
+    
+       - Convert spin_is_locked() assertions to instead use lockdep.
+    
+         ( Note that some of these conversions are going upstream via their
+           respective maintainers. )
+    
+       - SRCU updates, especially including a fix from Dennis Krein for a
+         bag-on-head-class bug.
+    
+       - RCU torture-test updates"
+    
+    * 'core-rcu-for-linus' of git://git.kernel.org/pub/scm/linux/kernel/git/tip/tip: (112 commits)
+      rcutorture: Don't do busted forward-progress testing
+      rcutorture: Use 100ms buckets for forward-progress callback histograms
+      rcutorture: Recover from OOM during forward-progress tests
+      rcutorture: Print forward-progress test age upon failure
+      rcutorture: Print time since GP end upon forward-progress failure
+      rcutorture: Print histogram of CB invocation at OOM time
+      rcutorture: Print GP age upon forward-progress failure
+      rcu: Print per-CPU callback counts for forward-progress failures
+      rcu: Account for nocb-CPU callback counts in RCU CPU stall warnings
+      rcutorture: Dump grace-period diagnostics upon forward-progress OOM
+      rcutorture: Prepare for asynchronous access to rcu_fwd_startat
+      torture: Remove unnecessary "ret" variables
+      rcutorture: Affinity forward-progress test to avoid housekeeping CPUs
+      rcutorture: Break up too-long rcu_torture_fwd_prog() function
+      rcutorture: Remove cbflood facility
+      torture: Bring any extra CPUs online during kernel startup
+      rcutorture: Add call_rcu() flooding forward-progress tests
+      rcutorture/formal: Replace synchronize_sched() with synchronize_rcu()
+      tools/kernel.h: Replace synchronize_sched() with synchronize_rcu()
+      net/decnet: Replace rcu_barrier_bh() with rcu_barrier()
+      ...
+
+commit ce28bb4453880759c5bdc2751629f1a865ea4a6e
+Merge: 64935310f2fc 6cafab50eea3
+Author: David S. Miller <davem@davemloft.net>
+Date:   Fri Dec 21 15:06:20 2018 -0800
+
+    Merge git://git.kernel.org/pub/scm/linux/kernel/git/davem/net
+
+commit 5c1e7e94a7faca70760f5a2939c6a6bb0e18a5d4
+Author: Vakul Garg <vakul.garg@nxp.com>
+Date:   Fri Dec 21 15:55:46 2018 +0000
+
+    Prevent overflow of sk_msg in sk_msg_clone()
+    
+    Fixed function sk_msg_clone() to prevent overflow of 'dst' while adding
+    pages in scatterlist entries. The overflow of 'dst' causes crash in kernel
+    tls module while doing record encryption.
+    
+    Crash fixed by this patch.
+    
+    [   78.796119] Unable to handle kernel NULL pointer dereference at virtual address 0000000000000008
+    [   78.804900] Mem abort info:
+    [   78.807683]   ESR = 0x96000004
+    [   78.810744]   Exception class = DABT (current EL), IL = 32 bits
+    [   78.816677]   SET = 0, FnV = 0
+    [   78.819727]   EA = 0, S1PTW = 0
+    [   78.822873] Data abort info:
+    [   78.825759]   ISV = 0, ISS = 0x00000004
+    [   78.829600]   CM = 0, WnR = 0
+    [   78.832576] user pgtable: 4k pages, 48-bit VAs, pgdp = 00000000bf8ee311
+    [   78.839195] [0000000000000008] pgd=0000000000000000
+    [   78.844081] Internal error: Oops: 96000004 [#1] PREEMPT SMP
+    [   78.849642] Modules linked in: tls xt_conntrack ipt_REJECT nf_reject_ipv4 ip6table_filter ip6_tables xt_CHECKSUM cpve cpufreq_conservative lm90 ina2xx crct10dif_ce
+    [   78.865377] CPU: 0 PID: 6007 Comm: openssl Not tainted 4.20.0-rc6-01647-g754d5da63145-dirty #107
+    [   78.874149] Hardware name: LS1043A RDB Board (DT)
+    [   78.878844] pstate: 60000005 (nZCv daif -PAN -UAO)
+    [   78.883632] pc : scatterwalk_copychunks+0x164/0x1c8
+    [   78.888500] lr : scatterwalk_copychunks+0x160/0x1c8
+    [   78.893366] sp : ffff00001d04b600
+    [   78.896668] x29: ffff00001d04b600 x28: ffff80006814c680
+    [   78.901970] x27: 0000000000000000 x26: ffff80006c8de786
+    [   78.907272] x25: ffff00001d04b760 x24: 000000000000001a
+    [   78.912573] x23: 0000000000000006 x22: ffff80006814e440
+    [   78.917874] x21: 0000000000000100 x20: 0000000000000000
+    [   78.923175] x19: 000081ffffffffff x18: 0000000000000400
+    [   78.928476] x17: 0000000000000008 x16: 0000000000000000
+    [   78.933778] x15: 0000000000000100 x14: 0000000000000001
+    [   78.939079] x13: 0000000000001080 x12: 0000000000000020
+    [   78.944381] x11: 0000000000001080 x10: 00000000ffff0002
+    [   78.949683] x9 : ffff80006814c248 x8 : 00000000ffff0000
+    [   78.954985] x7 : ffff80006814c318 x6 : ffff80006c8de786
+    [   78.960286] x5 : 0000000000000f80 x4 : ffff80006c8de000
+    [   78.965588] x3 : 0000000000000000 x2 : 0000000000001086
+    [   78.970889] x1 : ffff7e0001b74e02 x0 : 0000000000000000
+    [   78.976192] Process openssl (pid: 6007, stack limit = 0x00000000291367f9)
+    [   78.982968] Call trace:
+    [   78.985406]  scatterwalk_copychunks+0x164/0x1c8
+    [   78.989927]  skcipher_walk_next+0x28c/0x448
+    [   78.994099]  skcipher_walk_done+0xfc/0x258
+    [   78.998187]  gcm_encrypt+0x434/0x4c0
+    [   79.001758]  tls_push_record+0x354/0xa58 [tls]
+    [   79.006194]  bpf_exec_tx_verdict+0x1e4/0x3e8 [tls]
+    [   79.010978]  tls_sw_sendmsg+0x650/0x780 [tls]
+    [   79.015326]  inet_sendmsg+0x2c/0xf8
+    [   79.018806]  sock_sendmsg+0x18/0x30
+    [   79.022284]  __sys_sendto+0x104/0x138
+    [   79.025935]  __arm64_sys_sendto+0x24/0x30
+    [   79.029936]  el0_svc_common+0x60/0xe8
+    [   79.033588]  el0_svc_handler+0x2c/0x80
+    [   79.037327]  el0_svc+0x8/0xc
+    [   79.040200] Code: 6b01005f 54fff788 940169b1 f9000320 (b9400801)
+    [   79.046283] ---[ end trace 74db007d069c1cf7 ]---
+    
+    Fixes: d829e9c4112b ("tls: convert to generic sk_msg interface")
+    Signed-off-by: Vakul Garg <vakul.garg@nxp.com>
+    Acked-by: John Fastabend <john.fastabend@gmail.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/core/skmsg.c b/net/core/skmsg.c
+index 56a99d0c9aa0..b7dbb3c976cd 100644
+--- a/net/core/skmsg.c
++++ b/net/core/skmsg.c
+@@ -94,6 +94,9 @@ int sk_msg_clone(struct sock *sk, struct sk_msg *dst, struct sk_msg *src,
+ 	}
+ 
+ 	while (len) {
++		if (sk_msg_full(dst))
++			return -ENOSPC;
++
+ 		sge_len = sge->length - off;
+ 		sge_off = sge->offset + off;
+ 		if (sge_len > len)
+
+commit a136678c0bdbb650daff5df5eec1dab960e074a7
+Author: John Fastabend <john.fastabend@gmail.com>
+Date:   Thu Dec 20 11:35:34 2018 -0800
+
+    bpf: sk_msg, zap ingress queue on psock down
+    
+    In addition to releasing any cork'ed data on a psock when the psock
+    is removed we should also release any skb's in the ingress work queue.
+    Otherwise the skb's eventually get free'd but late in the tear
+    down process so we see the WARNING due to non-zero sk_forward_alloc.
+    
+      void sk_stream_kill_queues(struct sock *sk)
+      {
+            ...
+            WARN_ON(sk->sk_forward_alloc);
+            ...
+      }
+    
+    Fixes: 604326b41a6f ("bpf, sockmap: convert to generic sk_msg interface")
+    Signed-off-by: John Fastabend <john.fastabend@gmail.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/net/core/skmsg.c b/net/core/skmsg.c
+index 3df7627db4bb..86c9726fced8 100644
+--- a/net/core/skmsg.c
++++ b/net/core/skmsg.c
+@@ -572,6 +572,7 @@ void sk_psock_drop(struct sock *sk, struct sk_psock *psock)
+ {
+ 	rcu_assign_sk_user_data(sk, NULL);
+ 	sk_psock_cork_free(psock);
++	sk_psock_zap_ingress(psock);
+ 	sk_psock_restore_proto(sk, psock);
+ 
+ 	write_lock_bh(&sk->sk_callback_lock);
+
+commit 552de91068828daef50a227a665068cf8dde835e
+Author: John Fastabend <john.fastabend@gmail.com>
+Date:   Thu Dec 20 11:35:33 2018 -0800
+
+    bpf: sk_msg, fix socket data_ready events
+    
+    When a skb verdict program is in-use and either another BPF program
+    redirects to that socket or the new SK_PASS support is used the
+    data_ready callback does not wake up application. Instead because
+    the stream parser/verdict is using the sk data_ready callback we wake
+    up the stream parser/verdict block.
+    
+    Fix this by adding a helper to check if the stream parser block is
+    enabled on the sk and if so call the saved pointer which is the
+    upper layers wake up function.
+    
+    This fixes application stalls observed when an application is waiting
+    for data in a blocking read().
+    
+    Fixes: d829e9c4112b ("tls: convert to generic sk_msg interface")
+    Signed-off-by: John Fastabend <john.fastabend@gmail.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/net/core/skmsg.c b/net/core/skmsg.c
+index 8a91a460de8f..3df7627db4bb 100644
+--- a/net/core/skmsg.c
++++ b/net/core/skmsg.c
+@@ -403,7 +403,7 @@ static int sk_psock_skb_ingress(struct sk_psock *psock, struct sk_buff *skb)
+ 	msg->skb = skb;
+ 
+ 	sk_psock_queue_msg(psock, msg);
+-	sk->sk_data_ready(sk);
++	sk_psock_data_ready(sk, psock);
+ 	return copied;
+ }
+ 
+@@ -751,7 +751,7 @@ static int sk_psock_strp_parse(struct strparser *strp, struct sk_buff *skb)
+ }
+ 
+ /* Called with socket lock held. */
+-static void sk_psock_data_ready(struct sock *sk)
++static void sk_psock_strp_data_ready(struct sock *sk)
+ {
+ 	struct sk_psock *psock;
+ 
+@@ -799,7 +799,7 @@ void sk_psock_start_strp(struct sock *sk, struct sk_psock *psock)
+ 		return;
+ 
+ 	parser->saved_data_ready = sk->sk_data_ready;
+-	sk->sk_data_ready = sk_psock_data_ready;
++	sk->sk_data_ready = sk_psock_strp_data_ready;
+ 	sk->sk_write_space = sk_psock_write_space;
+ 	parser->enabled = true;
+ }
+
+commit 51199405f967207de372d9b60989eb87d7ae8809
+Author: John Fastabend <john.fastabend@gmail.com>
+Date:   Thu Dec 20 11:35:32 2018 -0800
+
+    bpf: skb_verdict, support SK_PASS on RX BPF path
+    
+    Add SK_PASS verdict support to SK_SKB_VERDICT programs. Now that
+    support for redirects exists we can implement SK_PASS as a redirect
+    to the same socket. This simplifies the BPF programs and avoids an
+    extra map lookup on RX path for simple visibility cases.
+    
+    Further, reduces user (BPF programmer in this context) confusion
+    when their program drops skb due to lack of support.
+    
+    Signed-off-by: John Fastabend <john.fastabend@gmail.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/net/core/skmsg.c b/net/core/skmsg.c
+index 56a99d0c9aa0..8a91a460de8f 100644
+--- a/net/core/skmsg.c
++++ b/net/core/skmsg.c
+@@ -669,6 +669,22 @@ static void sk_psock_verdict_apply(struct sk_psock *psock,
+ 	bool ingress;
+ 
+ 	switch (verdict) {
++	case __SK_PASS:
++		sk_other = psock->sk;
++		if (sock_flag(sk_other, SOCK_DEAD) ||
++		    !sk_psock_test_state(psock, SK_PSOCK_TX_ENABLED)) {
++			goto out_free;
++		}
++		if (atomic_read(&sk_other->sk_rmem_alloc) <=
++		    sk_other->sk_rcvbuf) {
++			struct tcp_skb_cb *tcp = TCP_SKB_CB(skb);
++
++			tcp->bpf.flags |= BPF_F_INGRESS;
++			skb_queue_tail(&psock->ingress_skb, skb);
++			schedule_work(&psock->work);
++			break;
++		}
++		goto out_free;
+ 	case __SK_REDIRECT:
+ 		sk_other = tcp_skb_bpf_redirect_fetch(skb);
+ 		if (unlikely(!sk_other))
+
+commit 0245b80e284d4fdabbf50589180482dc4d2cf277
+Author: Paul E. McKenney <paulmck@linux.ibm.com>
+Date:   Wed Nov 7 15:09:25 2018 -0800
+
+    net/core/skmsg: Replace call_rcu_sched() with call_rcu()
+    
+    Now that call_rcu()'s callback is not invoked until after all
+    preempt-disable regions of code have completed (in addition to explicitly
+    marked RCU read-side critical sections), call_rcu() can be used in place
+    of call_rcu_sched().  This commit therefore makes that change.
+    
+    Signed-off-by: Paul E. McKenney <paulmck@linux.ibm.com>
+    Cc: John Fastabend <john.fastabend@gmail.com>
+    Cc: Daniel Borkmann <daniel@iogearbox.net>
+    Cc: "David S. Miller" <davem@davemloft.net>
+    Cc: <netdev@vger.kernel.org>
+
+diff --git a/net/core/skmsg.c b/net/core/skmsg.c
+index 56a99d0c9aa0..c92d6ccce610 100644
+--- a/net/core/skmsg.c
++++ b/net/core/skmsg.c
+@@ -580,7 +580,7 @@ void sk_psock_drop(struct sock *sk, struct sk_psock *psock)
+ 	write_unlock_bh(&sk->sk_callback_lock);
+ 	sk_psock_clear_state(psock, SK_PSOCK_TX_ENABLED);
+ 
+-	call_rcu_sched(&psock->rcu, sk_psock_destroy);
++	call_rcu(&psock->rcu, sk_psock_destroy);
+ }
+ EXPORT_SYMBOL_GPL(sk_psock_drop);
+ 
+
+commit d829e9c4112b52f4f00195900fd4c685f61365ab
+Author: Daniel Borkmann <daniel@iogearbox.net>
+Date:   Sat Oct 13 02:45:59 2018 +0200
+
+    tls: convert to generic sk_msg interface
+    
+    Convert kTLS over to make use of sk_msg interface for plaintext and
+    encrypted scattergather data, so it reuses all the sk_msg helpers
+    and data structure which later on in a second step enables to glue
+    this to BPF.
+    
+    This also allows to remove quite a bit of open coded helpers which
+    are covered by the sk_msg API. Recent changes in kTLs 80ece6a03aaf
+    ("tls: Remove redundant vars from tls record structure") and
+    4e6d47206c32 ("tls: Add support for inplace records encryption")
+    changed the data path handling a bit; while we've kept the latter
+    optimization intact, we had to undo the former change to better
+    fit the sk_msg model, hence the sg_aead_in and sg_aead_out have
+    been brought back and are linked into the sk_msg sgs. Now the kTLS
+    record contains a msg_plaintext and msg_encrypted sk_msg each.
+    
+    In the original code, the zerocopy_from_iter() has been used out
+    of TX but also RX path. For the strparser skb-based RX path,
+    we've left the zerocopy_from_iter() in decrypt_internal() mostly
+    untouched, meaning it has been moved into tls_setup_from_iter()
+    with charging logic removed (as not used from RX). Given RX path
+    is not based on sk_msg objects, we haven't pursued setting up a
+    dummy sk_msg to call into sk_msg_zerocopy_from_iter(), but it
+    could be an option to prusue in a later step.
+    
+    Joint work with John.
+    
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+    Signed-off-by: John Fastabend <john.fastabend@gmail.com>
+    Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+
+diff --git a/net/core/skmsg.c b/net/core/skmsg.c
+index ae2b281c9c57..56a99d0c9aa0 100644
+--- a/net/core/skmsg.c
++++ b/net/core/skmsg.c
+@@ -73,6 +73,45 @@ int sk_msg_alloc(struct sock *sk, struct sk_msg *msg, int len,
+ }
+ EXPORT_SYMBOL_GPL(sk_msg_alloc);
+ 
++int sk_msg_clone(struct sock *sk, struct sk_msg *dst, struct sk_msg *src,
++		 u32 off, u32 len)
++{
++	int i = src->sg.start;
++	struct scatterlist *sge = sk_msg_elem(src, i);
++	u32 sge_len, sge_off;
++
++	if (sk_msg_full(dst))
++		return -ENOSPC;
++
++	while (off) {
++		if (sge->length > off)
++			break;
++		off -= sge->length;
++		sk_msg_iter_var_next(i);
++		if (i == src->sg.end && off)
++			return -ENOSPC;
++		sge = sk_msg_elem(src, i);
++	}
++
++	while (len) {
++		sge_len = sge->length - off;
++		sge_off = sge->offset + off;
++		if (sge_len > len)
++			sge_len = len;
++		off = 0;
++		len -= sge_len;
++		sk_msg_page_add(dst, sg_page(sge), sge_len, sge_off);
++		sk_mem_charge(sk, sge_len);
++		sk_msg_iter_var_next(i);
++		if (i == src->sg.end && len)
++			return -ENOSPC;
++		sge = sk_msg_elem(src, i);
++	}
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(sk_msg_clone);
++
+ void sk_msg_return_zero(struct sock *sk, struct sk_msg *msg, int bytes)
+ {
+ 	int i = msg->sg.start;
+
+commit 604326b41a6fb9b4a78b6179335decee0365cd8c
+Author: Daniel Borkmann <daniel@iogearbox.net>
+Date:   Sat Oct 13 02:45:58 2018 +0200
+
+    bpf, sockmap: convert to generic sk_msg interface
+    
+    Add a generic sk_msg layer, and convert current sockmap and later
+    kTLS over to make use of it. While sk_buff handles network packet
+    representation from netdevice up to socket, sk_msg handles data
+    representation from application to socket layer.
+    
+    This means that sk_msg framework spans across ULP users in the
+    kernel, and enables features such as introspection or filtering
+    of data with the help of BPF programs that operate on this data
+    structure.
+    
+    Latter becomes in particular useful for kTLS where data encryption
+    is deferred into the kernel, and as such enabling the kernel to
+    perform L7 introspection and policy based on BPF for TLS connections
+    where the record is being encrypted after BPF has run and came to
+    a verdict. In order to get there, first step is to transform open
+    coding of scatter-gather list handling into a common core framework
+    that subsystems can use.
+    
+    The code itself has been split and refactored into three bigger
+    pieces: i) the generic sk_msg API which deals with managing the
+    scatter gather ring, providing helpers for walking and mangling,
+    transferring application data from user space into it, and preparing
+    it for BPF pre/post-processing, ii) the plain sock map itself
+    where sockets can be attached to or detached from; these bits
+    are independent of i) which can now be used also without sock
+    map, and iii) the integration with plain TCP as one protocol
+    to be used for processing L7 application data (later this could
+    e.g. also be extended to other protocols like UDP). The semantics
+    are the same with the old sock map code and therefore no change
+    of user facing behavior or APIs. While pursuing this work it
+    also helped finding a number of bugs in the old sockmap code
+    that we've fixed already in earlier commits. The test_sockmap
+    kselftest suite passes through fine as well.
+    
+    Joint work with John.
+    
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+    Signed-off-by: John Fastabend <john.fastabend@gmail.com>
+    Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+
+diff --git a/net/core/skmsg.c b/net/core/skmsg.c
+new file mode 100644
+index 000000000000..ae2b281c9c57
+--- /dev/null
++++ b/net/core/skmsg.c
+@@ -0,0 +1,763 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright (c) 2017 - 2018 Covalent IO, Inc. http://covalent.io */
++
++#include <linux/skmsg.h>
++#include <linux/skbuff.h>
++#include <linux/scatterlist.h>
++
++#include <net/sock.h>
++#include <net/tcp.h>
++
++static bool sk_msg_try_coalesce_ok(struct sk_msg *msg, int elem_first_coalesce)
++{
++	if (msg->sg.end > msg->sg.start &&
++	    elem_first_coalesce < msg->sg.end)
++		return true;
++
++	if (msg->sg.end < msg->sg.start &&
++	    (elem_first_coalesce > msg->sg.start ||
++	     elem_first_coalesce < msg->sg.end))
++		return true;
++
++	return false;
++}
++
++int sk_msg_alloc(struct sock *sk, struct sk_msg *msg, int len,
++		 int elem_first_coalesce)
++{
++	struct page_frag *pfrag = sk_page_frag(sk);
++	int ret = 0;
++
++	len -= msg->sg.size;
++	while (len > 0) {
++		struct scatterlist *sge;
++		u32 orig_offset;
++		int use, i;
++
++		if (!sk_page_frag_refill(sk, pfrag))
++			return -ENOMEM;
++
++		orig_offset = pfrag->offset;
++		use = min_t(int, len, pfrag->size - orig_offset);
++		if (!sk_wmem_schedule(sk, use))
++			return -ENOMEM;
++
++		i = msg->sg.end;
++		sk_msg_iter_var_prev(i);
++		sge = &msg->sg.data[i];
++
++		if (sk_msg_try_coalesce_ok(msg, elem_first_coalesce) &&
++		    sg_page(sge) == pfrag->page &&
++		    sge->offset + sge->length == orig_offset) {
++			sge->length += use;
++		} else {
++			if (sk_msg_full(msg)) {
++				ret = -ENOSPC;
++				break;
++			}
++
++			sge = &msg->sg.data[msg->sg.end];
++			sg_unmark_end(sge);
++			sg_set_page(sge, pfrag->page, use, orig_offset);
++			get_page(pfrag->page);
++			sk_msg_iter_next(msg, end);
++		}
++
++		sk_mem_charge(sk, use);
++		msg->sg.size += use;
++		pfrag->offset += use;
++		len -= use;
++	}
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(sk_msg_alloc);
++
++void sk_msg_return_zero(struct sock *sk, struct sk_msg *msg, int bytes)
++{
++	int i = msg->sg.start;
++
++	do {
++		struct scatterlist *sge = sk_msg_elem(msg, i);
++
++		if (bytes < sge->length) {
++			sge->length -= bytes;
++			sge->offset += bytes;
++			sk_mem_uncharge(sk, bytes);
++			break;
++		}
++
++		sk_mem_uncharge(sk, sge->length);
++		bytes -= sge->length;
++		sge->length = 0;
++		sge->offset = 0;
++		sk_msg_iter_var_next(i);
++	} while (bytes && i != msg->sg.end);
++	msg->sg.start = i;
++}
++EXPORT_SYMBOL_GPL(sk_msg_return_zero);
++
++void sk_msg_return(struct sock *sk, struct sk_msg *msg, int bytes)
++{
++	int i = msg->sg.start;
++
++	do {
++		struct scatterlist *sge = &msg->sg.data[i];
++		int uncharge = (bytes < sge->length) ? bytes : sge->length;
++
++		sk_mem_uncharge(sk, uncharge);
++		bytes -= uncharge;
++		sk_msg_iter_var_next(i);
++	} while (i != msg->sg.end);
++}
++EXPORT_SYMBOL_GPL(sk_msg_return);
++
++static int sk_msg_free_elem(struct sock *sk, struct sk_msg *msg, u32 i,
++			    bool charge)
++{
++	struct scatterlist *sge = sk_msg_elem(msg, i);
++	u32 len = sge->length;
++
++	if (charge)
++		sk_mem_uncharge(sk, len);
++	if (!msg->skb)
++		put_page(sg_page(sge));
++	memset(sge, 0, sizeof(*sge));
++	return len;
++}
++
++static int __sk_msg_free(struct sock *sk, struct sk_msg *msg, u32 i,
++			 bool charge)
++{
++	struct scatterlist *sge = sk_msg_elem(msg, i);
++	int freed = 0;
++
++	while (msg->sg.size) {
++		msg->sg.size -= sge->length;
++		freed += sk_msg_free_elem(sk, msg, i, charge);
++		sk_msg_iter_var_next(i);
++		sk_msg_check_to_free(msg, i, msg->sg.size);
++		sge = sk_msg_elem(msg, i);
++	}
++	if (msg->skb)
++		consume_skb(msg->skb);
++	sk_msg_init(msg);
++	return freed;
++}
++
++int sk_msg_free_nocharge(struct sock *sk, struct sk_msg *msg)
++{
++	return __sk_msg_free(sk, msg, msg->sg.start, false);
++}
++EXPORT_SYMBOL_GPL(sk_msg_free_nocharge);
++
++int sk_msg_free(struct sock *sk, struct sk_msg *msg)
++{
++	return __sk_msg_free(sk, msg, msg->sg.start, true);
++}
++EXPORT_SYMBOL_GPL(sk_msg_free);
++
++static void __sk_msg_free_partial(struct sock *sk, struct sk_msg *msg,
++				  u32 bytes, bool charge)
++{
++	struct scatterlist *sge;
++	u32 i = msg->sg.start;
++
++	while (bytes) {
++		sge = sk_msg_elem(msg, i);
++		if (!sge->length)
++			break;
++		if (bytes < sge->length) {
++			if (charge)
++				sk_mem_uncharge(sk, bytes);
++			sge->length -= bytes;
++			sge->offset += bytes;
++			msg->sg.size -= bytes;
++			break;
++		}
++
++		msg->sg.size -= sge->length;
++		bytes -= sge->length;
++		sk_msg_free_elem(sk, msg, i, charge);
++		sk_msg_iter_var_next(i);
++		sk_msg_check_to_free(msg, i, bytes);
++	}
++	msg->sg.start = i;
++}
++
++void sk_msg_free_partial(struct sock *sk, struct sk_msg *msg, u32 bytes)
++{
++	__sk_msg_free_partial(sk, msg, bytes, true);
++}
++EXPORT_SYMBOL_GPL(sk_msg_free_partial);
++
++void sk_msg_free_partial_nocharge(struct sock *sk, struct sk_msg *msg,
++				  u32 bytes)
++{
++	__sk_msg_free_partial(sk, msg, bytes, false);
++}
++
++void sk_msg_trim(struct sock *sk, struct sk_msg *msg, int len)
++{
++	int trim = msg->sg.size - len;
++	u32 i = msg->sg.end;
++
++	if (trim <= 0) {
++		WARN_ON(trim < 0);
++		return;
++	}
++
++	sk_msg_iter_var_prev(i);
++	msg->sg.size = len;
++	while (msg->sg.data[i].length &&
++	       trim >= msg->sg.data[i].length) {
++		trim -= msg->sg.data[i].length;
++		sk_msg_free_elem(sk, msg, i, true);
++		sk_msg_iter_var_prev(i);
++		if (!trim)
++			goto out;
++	}
++
++	msg->sg.data[i].length -= trim;
++	sk_mem_uncharge(sk, trim);
++out:
++	/* If we trim data before curr pointer update copybreak and current
++	 * so that any future copy operations start at new copy location.
++	 * However trimed data that has not yet been used in a copy op
++	 * does not require an update.
++	 */
++	if (msg->sg.curr >= i) {
++		msg->sg.curr = i;
++		msg->sg.copybreak = msg->sg.data[i].length;
++	}
++	sk_msg_iter_var_next(i);
++	msg->sg.end = i;
++}
++EXPORT_SYMBOL_GPL(sk_msg_trim);
++
++int sk_msg_zerocopy_from_iter(struct sock *sk, struct iov_iter *from,
++			      struct sk_msg *msg, u32 bytes)
++{
++	int i, maxpages, ret = 0, num_elems = sk_msg_elem_used(msg);
++	const int to_max_pages = MAX_MSG_FRAGS;
++	struct page *pages[MAX_MSG_FRAGS];
++	ssize_t orig, copied, use, offset;
++
++	orig = msg->sg.size;
++	while (bytes > 0) {
++		i = 0;
++		maxpages = to_max_pages - num_elems;
++		if (maxpages == 0) {
++			ret = -EFAULT;
++			goto out;
++		}
++
++		copied = iov_iter_get_pages(from, pages, bytes, maxpages,
++					    &offset);
++		if (copied <= 0) {
++			ret = -EFAULT;
++			goto out;
++		}
++
++		iov_iter_advance(from, copied);
++		bytes -= copied;
++		msg->sg.size += copied;
++
++		while (copied) {
++			use = min_t(int, copied, PAGE_SIZE - offset);
++			sg_set_page(&msg->sg.data[msg->sg.end],
++				    pages[i], use, offset);
++			sg_unmark_end(&msg->sg.data[msg->sg.end]);
++			sk_mem_charge(sk, use);
++
++			offset = 0;
++			copied -= use;
++			sk_msg_iter_next(msg, end);
++			num_elems++;
++			i++;
++		}
++		/* When zerocopy is mixed with sk_msg_*copy* operations we
++		 * may have a copybreak set in this case clear and prefer
++		 * zerocopy remainder when possible.
++		 */
++		msg->sg.copybreak = 0;
++		msg->sg.curr = msg->sg.end;
++	}
++out:
++	/* Revert iov_iter updates, msg will need to use 'trim' later if it
++	 * also needs to be cleared.
++	 */
++	if (ret)
++		iov_iter_revert(from, msg->sg.size - orig);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(sk_msg_zerocopy_from_iter);
++
++int sk_msg_memcopy_from_iter(struct sock *sk, struct iov_iter *from,
++			     struct sk_msg *msg, u32 bytes)
++{
++	int ret = -ENOSPC, i = msg->sg.curr;
++	struct scatterlist *sge;
++	u32 copy, buf_size;
++	void *to;
++
++	do {
++		sge = sk_msg_elem(msg, i);
++		/* This is possible if a trim operation shrunk the buffer */
++		if (msg->sg.copybreak >= sge->length) {
++			msg->sg.copybreak = 0;
++			sk_msg_iter_var_next(i);
++			if (i == msg->sg.end)
++				break;
++			sge = sk_msg_elem(msg, i);
++		}
++
++		buf_size = sge->length - msg->sg.copybreak;
++		copy = (buf_size > bytes) ? bytes : buf_size;
++		to = sg_virt(sge) + msg->sg.copybreak;
++		msg->sg.copybreak += copy;
++		if (sk->sk_route_caps & NETIF_F_NOCACHE_COPY)
++			ret = copy_from_iter_nocache(to, copy, from);
++		else
++			ret = copy_from_iter(to, copy, from);
++		if (ret != copy) {
++			ret = -EFAULT;
++			goto out;
++		}
++		bytes -= copy;
++		if (!bytes)
++			break;
++		msg->sg.copybreak = 0;
++		sk_msg_iter_var_next(i);
++	} while (i != msg->sg.end);
++out:
++	msg->sg.curr = i;
++	return ret;
++}
++EXPORT_SYMBOL_GPL(sk_msg_memcopy_from_iter);
++
++static int sk_psock_skb_ingress(struct sk_psock *psock, struct sk_buff *skb)
++{
++	struct sock *sk = psock->sk;
++	int copied = 0, num_sge;
++	struct sk_msg *msg;
++
++	msg = kzalloc(sizeof(*msg), __GFP_NOWARN | GFP_ATOMIC);
++	if (unlikely(!msg))
++		return -EAGAIN;
++	if (!sk_rmem_schedule(sk, skb, skb->len)) {
++		kfree(msg);
++		return -EAGAIN;
++	}
++
++	sk_msg_init(msg);
++	num_sge = skb_to_sgvec(skb, msg->sg.data, 0, skb->len);
++	if (unlikely(num_sge < 0)) {
++		kfree(msg);
++		return num_sge;
++	}
++
++	sk_mem_charge(sk, skb->len);
++	copied = skb->len;
++	msg->sg.start = 0;
++	msg->sg.end = num_sge == MAX_MSG_FRAGS ? 0 : num_sge;
++	msg->skb = skb;
++
++	sk_psock_queue_msg(psock, msg);
++	sk->sk_data_ready(sk);
++	return copied;
++}
++
++static int sk_psock_handle_skb(struct sk_psock *psock, struct sk_buff *skb,
++			       u32 off, u32 len, bool ingress)
++{
++	if (ingress)
++		return sk_psock_skb_ingress(psock, skb);
++	else
++		return skb_send_sock_locked(psock->sk, skb, off, len);
++}
++
++static void sk_psock_backlog(struct work_struct *work)
++{
++	struct sk_psock *psock = container_of(work, struct sk_psock, work);
++	struct sk_psock_work_state *state = &psock->work_state;
++	struct sk_buff *skb;
++	bool ingress;
++	u32 len, off;
++	int ret;
++
++	/* Lock sock to avoid losing sk_socket during loop. */
++	lock_sock(psock->sk);
++	if (state->skb) {
++		skb = state->skb;
++		len = state->len;
++		off = state->off;
++		state->skb = NULL;
++		goto start;
++	}
++
++	while ((skb = skb_dequeue(&psock->ingress_skb))) {
++		len = skb->len;
++		off = 0;
++start:
++		ingress = tcp_skb_bpf_ingress(skb);
++		do {
++			ret = -EIO;
++			if (likely(psock->sk->sk_socket))
++				ret = sk_psock_handle_skb(psock, skb, off,
++							  len, ingress);
++			if (ret <= 0) {
++				if (ret == -EAGAIN) {
++					state->skb = skb;
++					state->len = len;
++					state->off = off;
++					goto end;
++				}
++				/* Hard errors break pipe and stop xmit. */
++				sk_psock_report_error(psock, ret ? -ret : EPIPE);
++				sk_psock_clear_state(psock, SK_PSOCK_TX_ENABLED);
++				kfree_skb(skb);
++				goto end;
++			}
++			off += ret;
++			len -= ret;
++		} while (len);
++
++		if (!ingress)
++			kfree_skb(skb);
++	}
++end:
++	release_sock(psock->sk);
++}
++
++struct sk_psock *sk_psock_init(struct sock *sk, int node)
++{
++	struct sk_psock *psock = kzalloc_node(sizeof(*psock),
++					      GFP_ATOMIC | __GFP_NOWARN,
++					      node);
++	if (!psock)
++		return NULL;
++
++	psock->sk = sk;
++	psock->eval =  __SK_NONE;
++
++	INIT_LIST_HEAD(&psock->link);
++	spin_lock_init(&psock->link_lock);
++
++	INIT_WORK(&psock->work, sk_psock_backlog);
++	INIT_LIST_HEAD(&psock->ingress_msg);
++	skb_queue_head_init(&psock->ingress_skb);
++
++	sk_psock_set_state(psock, SK_PSOCK_TX_ENABLED);
++	refcount_set(&psock->refcnt, 1);
++
++	rcu_assign_sk_user_data(sk, psock);
++	sock_hold(sk);
++
++	return psock;
++}
++EXPORT_SYMBOL_GPL(sk_psock_init);
++
++struct sk_psock_link *sk_psock_link_pop(struct sk_psock *psock)
++{
++	struct sk_psock_link *link;
++
++	spin_lock_bh(&psock->link_lock);
++	link = list_first_entry_or_null(&psock->link, struct sk_psock_link,
++					list);
++	if (link)
++		list_del(&link->list);
++	spin_unlock_bh(&psock->link_lock);
++	return link;
++}
++
++void __sk_psock_purge_ingress_msg(struct sk_psock *psock)
++{
++	struct sk_msg *msg, *tmp;
++
++	list_for_each_entry_safe(msg, tmp, &psock->ingress_msg, list) {
++		list_del(&msg->list);
++		sk_msg_free(psock->sk, msg);
++		kfree(msg);
++	}
++}
++
++static void sk_psock_zap_ingress(struct sk_psock *psock)
++{
++	__skb_queue_purge(&psock->ingress_skb);
++	__sk_psock_purge_ingress_msg(psock);
++}
++
++static void sk_psock_link_destroy(struct sk_psock *psock)
++{
++	struct sk_psock_link *link, *tmp;
++
++	list_for_each_entry_safe(link, tmp, &psock->link, list) {
++		list_del(&link->list);
++		sk_psock_free_link(link);
++	}
++}
++
++static void sk_psock_destroy_deferred(struct work_struct *gc)
++{
++	struct sk_psock *psock = container_of(gc, struct sk_psock, gc);
++
++	/* No sk_callback_lock since already detached. */
++	if (psock->parser.enabled)
++		strp_done(&psock->parser.strp);
++
++	cancel_work_sync(&psock->work);
++
++	psock_progs_drop(&psock->progs);
++
++	sk_psock_link_destroy(psock);
++	sk_psock_cork_free(psock);
++	sk_psock_zap_ingress(psock);
++
++	if (psock->sk_redir)
++		sock_put(psock->sk_redir);
++	sock_put(psock->sk);
++	kfree(psock);
++}
++
++void sk_psock_destroy(struct rcu_head *rcu)
++{
++	struct sk_psock *psock = container_of(rcu, struct sk_psock, rcu);
++
++	INIT_WORK(&psock->gc, sk_psock_destroy_deferred);
++	schedule_work(&psock->gc);
++}
++EXPORT_SYMBOL_GPL(sk_psock_destroy);
++
++void sk_psock_drop(struct sock *sk, struct sk_psock *psock)
++{
++	rcu_assign_sk_user_data(sk, NULL);
++	sk_psock_cork_free(psock);
++	sk_psock_restore_proto(sk, psock);
++
++	write_lock_bh(&sk->sk_callback_lock);
++	if (psock->progs.skb_parser)
++		sk_psock_stop_strp(sk, psock);
++	write_unlock_bh(&sk->sk_callback_lock);
++	sk_psock_clear_state(psock, SK_PSOCK_TX_ENABLED);
++
++	call_rcu_sched(&psock->rcu, sk_psock_destroy);
++}
++EXPORT_SYMBOL_GPL(sk_psock_drop);
++
++static int sk_psock_map_verd(int verdict, bool redir)
++{
++	switch (verdict) {
++	case SK_PASS:
++		return redir ? __SK_REDIRECT : __SK_PASS;
++	case SK_DROP:
++	default:
++		break;
++	}
++
++	return __SK_DROP;
++}
++
++int sk_psock_msg_verdict(struct sock *sk, struct sk_psock *psock,
++			 struct sk_msg *msg)
++{
++	struct bpf_prog *prog;
++	int ret;
++
++	preempt_disable();
++	rcu_read_lock();
++	prog = READ_ONCE(psock->progs.msg_parser);
++	if (unlikely(!prog)) {
++		ret = __SK_PASS;
++		goto out;
++	}
++
++	sk_msg_compute_data_pointers(msg);
++	msg->sk = sk;
++	ret = BPF_PROG_RUN(prog, msg);
++	ret = sk_psock_map_verd(ret, msg->sk_redir);
++	psock->apply_bytes = msg->apply_bytes;
++	if (ret == __SK_REDIRECT) {
++		if (psock->sk_redir)
++			sock_put(psock->sk_redir);
++		psock->sk_redir = msg->sk_redir;
++		if (!psock->sk_redir) {
++			ret = __SK_DROP;
++			goto out;
++		}
++		sock_hold(psock->sk_redir);
++	}
++out:
++	rcu_read_unlock();
++	preempt_enable();
++	return ret;
++}
++EXPORT_SYMBOL_GPL(sk_psock_msg_verdict);
++
++static int sk_psock_bpf_run(struct sk_psock *psock, struct bpf_prog *prog,
++			    struct sk_buff *skb)
++{
++	int ret;
++
++	skb->sk = psock->sk;
++	bpf_compute_data_end_sk_skb(skb);
++	preempt_disable();
++	ret = BPF_PROG_RUN(prog, skb);
++	preempt_enable();
++	/* strparser clones the skb before handing it to a upper layer,
++	 * meaning skb_orphan has been called. We NULL sk on the way out
++	 * to ensure we don't trigger a BUG_ON() in skb/sk operations
++	 * later and because we are not charging the memory of this skb
++	 * to any socket yet.
++	 */
++	skb->sk = NULL;
++	return ret;
++}
++
++static struct sk_psock *sk_psock_from_strp(struct strparser *strp)
++{
++	struct sk_psock_parser *parser;
++
++	parser = container_of(strp, struct sk_psock_parser, strp);
++	return container_of(parser, struct sk_psock, parser);
++}
++
++static void sk_psock_verdict_apply(struct sk_psock *psock,
++				   struct sk_buff *skb, int verdict)
++{
++	struct sk_psock *psock_other;
++	struct sock *sk_other;
++	bool ingress;
++
++	switch (verdict) {
++	case __SK_REDIRECT:
++		sk_other = tcp_skb_bpf_redirect_fetch(skb);
++		if (unlikely(!sk_other))
++			goto out_free;
++		psock_other = sk_psock(sk_other);
++		if (!psock_other || sock_flag(sk_other, SOCK_DEAD) ||
++		    !sk_psock_test_state(psock_other, SK_PSOCK_TX_ENABLED))
++			goto out_free;
++		ingress = tcp_skb_bpf_ingress(skb);
++		if ((!ingress && sock_writeable(sk_other)) ||
++		    (ingress &&
++		     atomic_read(&sk_other->sk_rmem_alloc) <=
++		     sk_other->sk_rcvbuf)) {
++			if (!ingress)
++				skb_set_owner_w(skb, sk_other);
++			skb_queue_tail(&psock_other->ingress_skb, skb);
++			schedule_work(&psock_other->work);
++			break;
++		}
++		/* fall-through */
++	case __SK_DROP:
++		/* fall-through */
++	default:
++out_free:
++		kfree_skb(skb);
++	}
++}
++
++static void sk_psock_strp_read(struct strparser *strp, struct sk_buff *skb)
++{
++	struct sk_psock *psock = sk_psock_from_strp(strp);
++	struct bpf_prog *prog;
++	int ret = __SK_DROP;
++
++	rcu_read_lock();
++	prog = READ_ONCE(psock->progs.skb_verdict);
++	if (likely(prog)) {
++		skb_orphan(skb);
++		tcp_skb_bpf_redirect_clear(skb);
++		ret = sk_psock_bpf_run(psock, prog, skb);
++		ret = sk_psock_map_verd(ret, tcp_skb_bpf_redirect_fetch(skb));
++	}
++	rcu_read_unlock();
++	sk_psock_verdict_apply(psock, skb, ret);
++}
++
++static int sk_psock_strp_read_done(struct strparser *strp, int err)
++{
++	return err;
++}
++
++static int sk_psock_strp_parse(struct strparser *strp, struct sk_buff *skb)
++{
++	struct sk_psock *psock = sk_psock_from_strp(strp);
++	struct bpf_prog *prog;
++	int ret = skb->len;
++
++	rcu_read_lock();
++	prog = READ_ONCE(psock->progs.skb_parser);
++	if (likely(prog))
++		ret = sk_psock_bpf_run(psock, prog, skb);
++	rcu_read_unlock();
++	return ret;
++}
++
++/* Called with socket lock held. */
++static void sk_psock_data_ready(struct sock *sk)
++{
++	struct sk_psock *psock;
++
++	rcu_read_lock();
++	psock = sk_psock(sk);
++	if (likely(psock)) {
++		write_lock_bh(&sk->sk_callback_lock);
++		strp_data_ready(&psock->parser.strp);
++		write_unlock_bh(&sk->sk_callback_lock);
++	}
++	rcu_read_unlock();
++}
++
++static void sk_psock_write_space(struct sock *sk)
++{
++	struct sk_psock *psock;
++	void (*write_space)(struct sock *sk);
++
++	rcu_read_lock();
++	psock = sk_psock(sk);
++	if (likely(psock && sk_psock_test_state(psock, SK_PSOCK_TX_ENABLED)))
++		schedule_work(&psock->work);
++	write_space = psock->saved_write_space;
++	rcu_read_unlock();
++	write_space(sk);
++}
++
++int sk_psock_init_strp(struct sock *sk, struct sk_psock *psock)
++{
++	static const struct strp_callbacks cb = {
++		.rcv_msg	= sk_psock_strp_read,
++		.read_sock_done	= sk_psock_strp_read_done,
++		.parse_msg	= sk_psock_strp_parse,
++	};
++
++	psock->parser.enabled = false;
++	return strp_init(&psock->parser.strp, sk, &cb);
++}
++
++void sk_psock_start_strp(struct sock *sk, struct sk_psock *psock)
++{
++	struct sk_psock_parser *parser = &psock->parser;
++
++	if (parser->enabled)
++		return;
++
++	parser->saved_data_ready = sk->sk_data_ready;
++	sk->sk_data_ready = sk_psock_data_ready;
++	sk->sk_write_space = sk_psock_write_space;
++	parser->enabled = true;
++}
++
++void sk_psock_stop_strp(struct sock *sk, struct sk_psock *psock)
++{
++	struct sk_psock_parser *parser = &psock->parser;
++
++	if (!parser->enabled)
++		return;
++
++	sk->sk_data_ready = parser->saved_data_ready;
++	parser->saved_data_ready = NULL;
++	strp_stop(&parser->strp);
++	parser->enabled = false;
++}

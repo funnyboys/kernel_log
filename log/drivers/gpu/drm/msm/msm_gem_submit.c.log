@@ -1,0 +1,4722 @@
+commit ab723b7a992a19b843f798b183f53f7472f598c8
+Author: Bas Nieuwenhuizen <bas@basnieuwenhuizen.nl>
+Date:   Fri Jan 24 00:57:10 2020 +0100
+
+    drm/msm: Add syncobj support.
+    
+    This
+    
+    1) Enables core DRM syncobj support.
+    2) Adds options to the submission ioctl to wait/signal syncobjs.
+    
+    Just like the wait fence fd, this does inline waits. Using the
+    scheduler would be nice but I believe it is out of scope for
+    this work.
+    
+    Support for timeline syncobjs is implemented and the interface
+    is ready for it, but I'm not enabling it yet until there is
+    some code for turnip to use it.
+    
+    The reset is mostly in there because in the presence of waiting
+    and signalling the same semaphores, resetting them after
+    signalling can become very annoying.
+    
+    v2:
+      - Fixed style issues
+      - Removed a cleanup issue in a failure case
+      - Moved to a copy_from_user per syncobj
+    
+    v3:
+     - Fixed a missing declaration introduced in v2
+     - Reworked to use ERR_PTR/PTR_ERR
+     - Simplified failure gotos.
+    
+    Used by: https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/2769
+    
+    Signed-off-by: Bas Nieuwenhuizen <bas@basnieuwenhuizen.nl>
+    Reviewed-by: Jordan Crouse <jcrouse@codeaurora.org>
+    Signed-off-by: Rob Clark <robdclark@chromium.org>
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index 385d4965a8d0..6630aa817505 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -8,7 +8,9 @@
+ #include <linux/sync_file.h>
+ #include <linux/uaccess.h>
+ 
++#include <drm/drm_drv.h>
+ #include <drm/drm_file.h>
++#include <drm/drm_syncobj.h>
+ 
+ #include "msm_drv.h"
+ #include "msm_gpu.h"
+@@ -391,6 +393,186 @@ static void submit_cleanup(struct msm_gem_submit *submit)
+ 	}
+ }
+ 
++
++struct msm_submit_post_dep {
++	struct drm_syncobj *syncobj;
++	uint64_t point;
++	struct dma_fence_chain *chain;
++};
++
++static struct drm_syncobj **msm_wait_deps(struct drm_device *dev,
++                                          struct drm_file *file,
++                                          uint64_t in_syncobjs_addr,
++                                          uint32_t nr_in_syncobjs,
++                                          size_t syncobj_stride,
++                                          struct msm_ringbuffer *ring)
++{
++	struct drm_syncobj **syncobjs = NULL;
++	struct drm_msm_gem_submit_syncobj syncobj_desc = {0};
++	int ret = 0;
++	uint32_t i, j;
++
++	syncobjs = kcalloc(nr_in_syncobjs, sizeof(*syncobjs),
++	                   GFP_KERNEL | __GFP_NOWARN | __GFP_NORETRY);
++	if (!syncobjs)
++		return ERR_PTR(-ENOMEM);
++
++	for (i = 0; i < nr_in_syncobjs; ++i) {
++		uint64_t address = in_syncobjs_addr + i * syncobj_stride;
++		struct dma_fence *fence;
++
++		if (copy_from_user(&syncobj_desc,
++			           u64_to_user_ptr(address),
++			           min(syncobj_stride, sizeof(syncobj_desc)))) {
++			ret = -EFAULT;
++			break;
++		}
++
++		if (syncobj_desc.point &&
++		    !drm_core_check_feature(dev, DRIVER_SYNCOBJ_TIMELINE)) {
++			ret = -EOPNOTSUPP;
++			break;
++		}
++
++		if (syncobj_desc.flags & ~MSM_SUBMIT_SYNCOBJ_FLAGS) {
++			ret = -EINVAL;
++			break;
++		}
++
++		ret = drm_syncobj_find_fence(file, syncobj_desc.handle,
++		                             syncobj_desc.point, 0, &fence);
++		if (ret)
++			break;
++
++		if (!dma_fence_match_context(fence, ring->fctx->context))
++			ret = dma_fence_wait(fence, true);
++
++		dma_fence_put(fence);
++		if (ret)
++			break;
++
++		if (syncobj_desc.flags & MSM_SUBMIT_SYNCOBJ_RESET) {
++			syncobjs[i] =
++				drm_syncobj_find(file, syncobj_desc.handle);
++			if (!syncobjs[i]) {
++				ret = -EINVAL;
++				break;
++			}
++		}
++	}
++
++	if (ret) {
++		for (j = 0; j <= i; ++j) {
++			if (syncobjs[j])
++				drm_syncobj_put(syncobjs[j]);
++		}
++		kfree(syncobjs);
++		return ERR_PTR(ret);
++	}
++	return syncobjs;
++}
++
++static void msm_reset_syncobjs(struct drm_syncobj **syncobjs,
++                               uint32_t nr_syncobjs)
++{
++	uint32_t i;
++
++	for (i = 0; syncobjs && i < nr_syncobjs; ++i) {
++		if (syncobjs[i])
++			drm_syncobj_replace_fence(syncobjs[i], NULL);
++	}
++}
++
++static struct msm_submit_post_dep *msm_parse_post_deps(struct drm_device *dev,
++                                                       struct drm_file *file,
++                                                       uint64_t syncobjs_addr,
++                                                       uint32_t nr_syncobjs,
++                                                       size_t syncobj_stride)
++{
++	struct msm_submit_post_dep *post_deps;
++	struct drm_msm_gem_submit_syncobj syncobj_desc = {0};
++	int ret = 0;
++	uint32_t i, j;
++
++	post_deps = kmalloc_array(nr_syncobjs, sizeof(*post_deps),
++	                          GFP_KERNEL | __GFP_NOWARN | __GFP_NORETRY);
++	if (!post_deps)
++		return ERR_PTR(-ENOMEM);
++
++	for (i = 0; i < nr_syncobjs; ++i) {
++		uint64_t address = syncobjs_addr + i * syncobj_stride;
++
++		if (copy_from_user(&syncobj_desc,
++			           u64_to_user_ptr(address),
++			           min(syncobj_stride, sizeof(syncobj_desc)))) {
++			ret = -EFAULT;
++			break;
++		}
++
++		post_deps[i].point = syncobj_desc.point;
++		post_deps[i].chain = NULL;
++
++		if (syncobj_desc.flags) {
++			ret = -EINVAL;
++			break;
++		}
++
++		if (syncobj_desc.point) {
++			if (!drm_core_check_feature(dev,
++			                            DRIVER_SYNCOBJ_TIMELINE)) {
++				ret = -EOPNOTSUPP;
++				break;
++			}
++
++			post_deps[i].chain =
++				kmalloc(sizeof(*post_deps[i].chain),
++				        GFP_KERNEL);
++			if (!post_deps[i].chain) {
++				ret = -ENOMEM;
++				break;
++			}
++		}
++
++		post_deps[i].syncobj =
++			drm_syncobj_find(file, syncobj_desc.handle);
++		if (!post_deps[i].syncobj) {
++			ret = -EINVAL;
++			break;
++		}
++	}
++
++	if (ret) {
++		for (j = 0; j <= i; ++j) {
++			kfree(post_deps[j].chain);
++			if (post_deps[j].syncobj)
++				drm_syncobj_put(post_deps[j].syncobj);
++		}
++
++		kfree(post_deps);
++		return ERR_PTR(ret);
++	}
++
++	return post_deps;
++}
++
++static void msm_process_post_deps(struct msm_submit_post_dep *post_deps,
++                                  uint32_t count, struct dma_fence *fence)
++{
++	uint32_t i;
++
++	for (i = 0; post_deps && i < count; ++i) {
++		if (post_deps[i].chain) {
++			drm_syncobj_add_point(post_deps[i].syncobj,
++			                      post_deps[i].chain,
++			                      fence, post_deps[i].point);
++			post_deps[i].chain = NULL;
++		} else {
++			drm_syncobj_replace_fence(post_deps[i].syncobj,
++			                          fence);
++		}
++	}
++}
++
+ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 		struct drm_file *file)
+ {
+@@ -403,6 +585,8 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 	struct sync_file *sync_file = NULL;
+ 	struct msm_gpu_submitqueue *queue;
+ 	struct msm_ringbuffer *ring;
++	struct msm_submit_post_dep *post_deps = NULL;
++	struct drm_syncobj **syncobjs_to_reset = NULL;
+ 	int out_fence_fd = -1;
+ 	struct pid *pid = get_pid(task_pid(current));
+ 	bool has_ww_ticket = false;
+@@ -411,6 +595,9 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 	if (!gpu)
+ 		return -ENXIO;
+ 
++	if (args->pad)
++		return -EINVAL;
++
+ 	/* for now, we just have 3d pipe.. eventually this would need to
+ 	 * be more clever to dispatch to appropriate gpu module:
+ 	 */
+@@ -458,9 +645,29 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 			return ret;
+ 	}
+ 
++	if (args->flags & MSM_SUBMIT_SYNCOBJ_IN) {
++		syncobjs_to_reset = msm_wait_deps(dev, file,
++		                                  args->in_syncobjs,
++		                                  args->nr_in_syncobjs,
++		                                  args->syncobj_stride, ring);
++		if (IS_ERR(syncobjs_to_reset))
++			return PTR_ERR(syncobjs_to_reset);
++	}
++
++	if (args->flags & MSM_SUBMIT_SYNCOBJ_OUT) {
++		post_deps = msm_parse_post_deps(dev, file,
++		                                args->out_syncobjs,
++		                                args->nr_out_syncobjs,
++		                                args->syncobj_stride);
++		if (IS_ERR(post_deps)) {
++			ret = PTR_ERR(post_deps);
++			goto out_post_unlock;
++		}
++	}
++
+ 	ret = mutex_lock_interruptible(&dev->struct_mutex);
+ 	if (ret)
+-		return ret;
++		goto out_post_unlock;
+ 
+ 	if (args->flags & MSM_SUBMIT_FENCE_FD_OUT) {
+ 		out_fence_fd = get_unused_fd_flags(O_CLOEXEC);
+@@ -587,6 +794,11 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 		args->fence_fd = out_fence_fd;
+ 	}
+ 
++	msm_reset_syncobjs(syncobjs_to_reset, args->nr_in_syncobjs);
++	msm_process_post_deps(post_deps, args->nr_out_syncobjs,
++	                      submit->fence);
++
++
+ out:
+ 	submit_cleanup(submit);
+ 	if (has_ww_ticket)
+@@ -597,5 +809,23 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 	if (ret && (out_fence_fd >= 0))
+ 		put_unused_fd(out_fence_fd);
+ 	mutex_unlock(&dev->struct_mutex);
++
++out_post_unlock:
++	if (!IS_ERR_OR_NULL(post_deps)) {
++		for (i = 0; i < args->nr_out_syncobjs; ++i) {
++			kfree(post_deps[i].chain);
++			drm_syncobj_put(post_deps[i].syncobj);
++		}
++		kfree(post_deps);
++	}
++
++	if (!IS_ERR_OR_NULL(syncobjs_to_reset)) {
++		for (i = 0; i < args->nr_in_syncobjs; ++i) {
++			if (syncobjs_to_reset[i])
++				drm_syncobj_put(syncobjs_to_reset[i]);
++		}
++		kfree(syncobjs_to_reset);
++	}
++
+ 	return ret;
+ }
+
+commit 80f30930b6e9bfcb264e8b2e82b05abf3e1a8727
+Author: Daniel Vetter <daniel.vetter@ffwll.ch>
+Date:   Mon Nov 25 10:43:55 2019 +0100
+
+    drm/msm: Use dma_resv locking wrappers
+    
+    I'll add more fancy logic to them soon, so everyone really has to use
+    them. Plus they already provide some nice additional debug
+    infrastructure on top of direct ww_mutex usage for the fences tracked
+    by dma_resv.
+    
+    Reviewed-by: Eric Anholt <eric@anholt.net>
+    Signed-off-by: Daniel Vetter <daniel.vetter@intel.com>
+    Cc: Rob Clark <robdclark@gmail.com>
+    Cc: Sean Paul <sean@poorly.run>
+    Cc: linux-arm-msm@vger.kernel.org
+    Cc: freedreno@lists.freedesktop.org
+    Link: https://patchwork.freedesktop.org/patch/msgid/20191125094356.161941-4-daniel.vetter@ffwll.ch
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index 7d04c47d0023..385d4965a8d0 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -157,7 +157,7 @@ static void submit_unlock_unpin_bo(struct msm_gem_submit *submit,
+ 		msm_gem_unpin_iova(&msm_obj->base, submit->aspace);
+ 
+ 	if (submit->bos[i].flags & BO_LOCKED)
+-		ww_mutex_unlock(&msm_obj->base.resv->lock);
++		dma_resv_unlock(msm_obj->base.resv);
+ 
+ 	if (backoff && !(submit->bos[i].flags & BO_VALID))
+ 		submit->bos[i].iova = 0;
+@@ -180,8 +180,8 @@ static int submit_lock_objects(struct msm_gem_submit *submit)
+ 		contended = i;
+ 
+ 		if (!(submit->bos[i].flags & BO_LOCKED)) {
+-			ret = ww_mutex_lock_interruptible(&msm_obj->base.resv->lock,
+-					&submit->ticket);
++			ret = dma_resv_lock_interruptible(msm_obj->base.resv,
++							  &submit->ticket);
+ 			if (ret)
+ 				goto fail;
+ 			submit->bos[i].flags |= BO_LOCKED;
+@@ -202,8 +202,8 @@ static int submit_lock_objects(struct msm_gem_submit *submit)
+ 	if (ret == -EDEADLK) {
+ 		struct msm_gem_object *msm_obj = submit->bos[contended].obj;
+ 		/* we lost out in a seqno race, lock and retry.. */
+-		ret = ww_mutex_lock_slow_interruptible(&msm_obj->base.resv->lock,
+-				&submit->ticket);
++		ret = dma_resv_lock_slow_interruptible(msm_obj->base.resv,
++						       &submit->ticket);
+ 		if (!ret) {
+ 			submit->bos[contended].flags |= BO_LOCKED;
+ 			slow_locked = contended;
+
+commit 92ec07677107974c31b32030a4f897398e452ca9
+Author: Daniel Vetter <daniel.vetter@ffwll.ch>
+Date:   Wed Nov 20 11:56:07 2019 +0100
+
+    drm/msm: Don't init ww_mutec acquire ctx before needed
+    
+    For locking semantics it really doesn't matter when we grab the
+    ticket. But for lockdep validation it does: the acquire ctx is a fake
+    lockdep. Since other drivers might want to do a full multi-lock dance
+    in their fault-handler, not just lock a single dma_resv. Therefore we
+    must init the acquire_ctx only after we've done all the copy_*_user or
+    anything else that might trigger a pagefault. For msm this means we
+    need to move it past submit_lookup_objects.
+    
+    Aside: Why is msm still using struct_mutex, it seems to be using
+    dma_resv_lock for general buffer state protection?
+    
+    v2:
+    - Add comment to explain why the ww ticket setup is separate (Rob)
+    - Fix up error handling, we need to make sure we don't call
+      ww_acquire_fini without _init.
+    
+    Reviewed-by: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+    Reviewed-and-tested-by: Rob Clark <robdclark@gmail.com>
+    Signed-off-by: Daniel Vetter <daniel.vetter@intel.com>
+    Cc: Rob Clark <robdclark@gmail.com>
+    Cc: Sean Paul <sean@poorly.run>
+    Cc: linux-arm-msm@vger.kernel.org
+    Cc: freedreno@lists.freedesktop.org
+    Link: https://patchwork.freedesktop.org/patch/msgid/20191120105607.3023-1-daniel.vetter@ffwll.ch
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index be5327af16fa..7d04c47d0023 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -54,7 +54,6 @@ static struct msm_gem_submit *submit_create(struct drm_device *dev,
+ 
+ 	INIT_LIST_HEAD(&submit->node);
+ 	INIT_LIST_HEAD(&submit->bo_list);
+-	ww_acquire_init(&submit->ticket, &reservation_ww_class);
+ 
+ 	return submit;
+ }
+@@ -390,8 +389,6 @@ static void submit_cleanup(struct msm_gem_submit *submit)
+ 		list_del_init(&msm_obj->submit_entry);
+ 		drm_gem_object_put(&msm_obj->base);
+ 	}
+-
+-	ww_acquire_fini(&submit->ticket);
+ }
+ 
+ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+@@ -408,6 +405,7 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 	struct msm_ringbuffer *ring;
+ 	int out_fence_fd = -1;
+ 	struct pid *pid = get_pid(task_pid(current));
++	bool has_ww_ticket = false;
+ 	unsigned i;
+ 	int ret, submitid;
+ 	if (!gpu)
+@@ -489,6 +487,9 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 	if (ret)
+ 		goto out;
+ 
++	/* copy_*_user while holding a ww ticket upsets lockdep */
++	ww_acquire_init(&submit->ticket, &reservation_ww_class);
++	has_ww_ticket = true;
+ 	ret = submit_lock_objects(submit);
+ 	if (ret)
+ 		goto out;
+@@ -588,6 +589,8 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 
+ out:
+ 	submit_cleanup(submit);
++	if (has_ww_ticket)
++		ww_acquire_fini(&submit->ticket);
+ 	if (ret)
+ 		msm_gem_submit_free(submit);
+ out_unlock:
+
+commit ed98359a9e3947141c31a51e8bb7752da24ae921
+Author: Gustavo A. R. Silva <gustavo@embeddedor.com>
+Date:   Mon Aug 5 18:49:28 2019 -0500
+
+    drm/msm: Use struct_size() helper
+    
+    One of the more common cases of allocation size calculations is finding
+    the size of a structure that has a zero-sized array at the end, along
+    with memory for some number of elements for that array. For example:
+    
+    struct msm_gem_submit {
+            ...
+            struct {
+                    ...
+            } bos[0];
+    };
+    
+    Make use of the struct_size() helper instead of an open-coded version
+    in order to avoid any potential type mistakes.
+    
+    So, replace the following form:
+    
+    sizeof(*submit) + ((u64)nr_bos * sizeof(submit->bos[0]))
+    
+    with:
+    
+    struct_size(submit, bos, nr_bos)
+    
+    This code was detected with the help of Coccinelle.
+    
+    Signed-off-by: Gustavo A. R. Silva <gustavo@embeddedor.com>
+    Signed-off-by: Rob Clark <robdclark@chromium.org>
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index 2fb4b2bb5b63..be5327af16fa 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -30,8 +30,8 @@ static struct msm_gem_submit *submit_create(struct drm_device *dev,
+ 		uint32_t nr_cmds)
+ {
+ 	struct msm_gem_submit *submit;
+-	uint64_t sz = sizeof(*submit) + ((u64)nr_bos * sizeof(submit->bos[0])) +
+-		((u64)nr_cmds * sizeof(submit->cmd[0]));
++	uint64_t sz = struct_size(submit, bos, nr_bos) +
++				  ((u64)nr_cmds * sizeof(submit->cmd[0]));
+ 
+ 	if (sz > SIZE_MAX)
+ 		return NULL;
+
+commit feea39a86dfdbad9d02264fd4730277b4e69764e
+Author: Sam Ravnborg <sam@ravnborg.org>
+Date:   Sun Aug 4 08:55:51 2019 +0200
+
+    drm/msm: drop use of drmP.h
+    
+    Drop the deprecated drmP.h header file, and trim msm_drv.h
+    to the relevant include files.
+    
+    This resulted in a suprisingly many edits as many files relied
+    on headers included via msm_drv.h.
+    But msm_drv.h is not supposed to carry include files it do not need, so
+    the individual files have to include what extra they needs.
+    
+    v2:
+    - Rebased on top of https://gitlab.freedesktop.org/drm/msm.git msm-next
+    
+    Signed-off-by: Sam Ravnborg <sam@ravnborg.org>
+    Cc: Rob Clark <robdclark@gmail.com>
+    Cc: Sean Paul <sean@poorly.run>
+    Cc: David Airlie <airlied@linux.ie>
+    Cc: Daniel Vetter <daniel@ffwll.ch>
+    Cc: Jordan Crouse <jcrouse@codeaurora.org>
+    Cc: Jeykumar Sankaran <jsanka@codeaurora.org>
+    Cc: Bruce Wang <bzwang@chromium.org>
+    Cc: Shayenne Moura <shayenneluzmoura@gmail.com>
+    Cc: Mamta Shukla <mamtashukla555@gmail.com>
+    Cc: Jonathan Marek <jonathan@marek.ca>
+    Cc: Carsten Behling <carsten.behling@googlemail.com>
+    Cc: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+    Cc: Maxime Ripard <maxime.ripard@bootlin.com>
+    Cc: Paul Kocialkowski <paul.kocialkowski@bootlin.com>
+    Cc: Sibi Sankar <sibis@codeaurora.org>
+    Cc: Todor Tomov <todor.tomov@linaro.org>
+    Cc: linux-arm-msm@vger.kernel.org
+    Cc: freedreno@lists.freedesktop.org
+    Signed-off-by: Sean Paul <seanpaul@chromium.org>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20190804065551.GA5211@ravnborg.org
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index 2e1556b7af26..2fb4b2bb5b63 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -4,7 +4,11 @@
+  * Author: Rob Clark <robdclark@gmail.com>
+  */
+ 
++#include <linux/file.h>
+ #include <linux/sync_file.h>
++#include <linux/uaccess.h>
++
++#include <drm/drm_file.h>
+ 
+ #include "msm_drv.h"
+ #include "msm_gpu.h"
+
+commit 52791eeec1d9f4a7e7fe08aaba0b1553149d93bc
+Author: Christian König <christian.koenig@amd.com>
+Date:   Sun Aug 11 10:06:32 2019 +0200
+
+    dma-buf: rename reservation_object to dma_resv
+    
+    Be more consistent with the naming of the other DMA-buf objects.
+    
+    Signed-off-by: Christian König <christian.koenig@amd.com>
+    Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Link: https://patchwork.freedesktop.org/patch/323401/
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index 348f8c2be806..2e1556b7af26 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -225,7 +225,7 @@ static int submit_fence_sync(struct msm_gem_submit *submit, bool no_implicit)
+ 			 * strange place to call it.  OTOH this is a
+ 			 * convenient can-fail point to hook it in.
+ 			 */
+-			ret = reservation_object_reserve_shared(msm_obj->base.resv,
++			ret = dma_resv_reserve_shared(msm_obj->base.resv,
+ 								1);
+ 			if (ret)
+ 				return ret;
+
+commit be8454afc50f43016ca8b6130d9673bdd0bd56ec
+Merge: fec88ab0af97 3729fe2bc2a0
+Author: Linus Torvalds <torvalds@linux-foundation.org>
+Date:   Mon Jul 15 19:04:27 2019 -0700
+
+    Merge tag 'drm-next-2019-07-16' of git://anongit.freedesktop.org/drm/drm
+    
+    Pull drm updates from Dave Airlie:
+     "The biggest thing in this is the AMD Navi GPU support, this again
+      contains a bunch of header files that are large. These are the new AMD
+      RX5700 GPUs that just recently became available.
+    
+      New drivers:
+       - ST-Ericsson MCDE driver
+       - Ingenic JZ47xx SoC
+    
+      UAPI change:
+       - HDR source metadata property
+    
+      Core:
+       - HDR inforframes and EDID parsing
+       - drm hdmi infoframe unpacking
+       - remove prime sg_table caching into dma-buf
+       - New gem vram helpers to reduce driver code
+       - Lots of drmP.h removal
+       - reservation fencing fix
+       - documentation updates
+       - drm_fb_helper_connector removed
+       - mode name command handler rewrite
+    
+      fbcon:
+       - Remove the fbcon notifiers
+    
+      ttm:
+       - forward progress fixes
+    
+      dma-buf:
+       - make mmap call optional
+       - debugfs refcount fixes
+       - dma-fence free with pending signals fix
+       - each dma-buf gets an inode
+    
+      Panels:
+       - Lots of additional panel bindings
+    
+      amdgpu:
+       - initial navi10 support
+       - avoid hw reset
+       - HDR metadata support
+       - new thermal sensors for vega asics
+       - RAS fixes
+       - use HMM rather than MMU notifier
+       - xgmi topology via kfd
+       - SR-IOV fixes
+       - driver reload fixes
+       - DC use a core bpc attribute
+       - Aux fixes for DC
+       - Bandwidth calc updates for DC
+       - Clock handling refactor
+       - kfd VEGAM support
+    
+      vmwgfx:
+       - Coherent memory support changes
+    
+      i915:
+       - HDR Support
+       - HDMI i2c link
+       - Icelake multi-segmented gamma support
+       - GuC firmware update
+       - Mule Creek Canyon PCH support for EHL
+       - EHL platform updtes
+       - move i915.alpha_support to i915.force_probe
+       - runtime PM refactoring
+       - VBT parsing refactoring
+       - DSI fixes
+       - struct mutex dependency reduction
+       - GEM code reorg
+    
+      mali-dp:
+       - Komeda driver features
+    
+      msm:
+       - dsi vs EPROBE_DEFER fixes
+       - msm8998 snapdragon 835 support
+       - a540 gpu support
+       - mdp5 and dpu interconnect support
+    
+      exynos:
+       - drmP.h removal
+    
+      tegra:
+       - misc fixes
+    
+      tda998x:
+       - audio support improvements
+       - pixel repeated mode support
+       - quantisation range handling corrections
+       - HDMI vendor info fix
+    
+      armada:
+       - interlace support fix
+       - overlay/video plane register handling refactor
+       - add gamma support
+    
+      rockchip:
+       - RX3328 support
+    
+      panfrost:
+       - expose perf counters via hidden ioctls
+    
+      vkms:
+       - enumerate CRC sources list
+    
+      ast:
+       - rework BO handling
+    
+      mgag200:
+       - rework BO handling
+    
+      dw-hdmi:
+       - suspend/resume support
+    
+      rcar-du:
+       - R8A774A1 Soc Support
+       - LVDS dual-link mode support
+       - Additional formats
+       - Misc fixes
+    
+      omapdrm:
+       - DSI command mode display support
+    
+      stm
+       - fb modifier support
+       - runtime PM support
+    
+      sun4i:
+       - use vmap ops
+    
+      vc4:
+       - binner bo binding rework
+    
+      v3d:
+       - compute shader support
+       - resync/sync fixes
+       - job management refactoring
+    
+      lima:
+       - NULL pointer in irq handler fix
+       - scheduler default timeout
+    
+      virtio:
+       - fence seqno support
+       - trace events
+    
+      bochs:
+       - misc fixes
+    
+      tc458767:
+       - IRQ/HDP handling
+    
+      sii902x:
+       - HDMI audio support
+    
+      atmel-hlcdc:
+       - misc fixes
+    
+      meson:
+       - zpos support"
+    
+    * tag 'drm-next-2019-07-16' of git://anongit.freedesktop.org/drm/drm: (1815 commits)
+      Revert "Merge branch 'vmwgfx-next' of git://people.freedesktop.org/~thomash/linux into drm-next"
+      Revert "mm: adjust apply_to_pfn_range interface for dropped token."
+      mm: adjust apply_to_pfn_range interface for dropped token.
+      drm/amdgpu/navi10: add uclk activity sensor
+      drm/amdgpu: properly guard the generic discovery code
+      drm/amdgpu: add missing documentation on new module parameters
+      drm/amdgpu: don't invalidate caches in RELEASE_MEM, only do the writeback
+      drm/amd/display: avoid 64-bit division
+      drm/amdgpu/psp11: simplify the ucode register logic
+      drm/amdgpu: properly guard DC support in navi code
+      drm/amd/powerplay: vega20: fix uninitialized variable use
+      drm/amd/display: dcn20: include linux/delay.h
+      amdgpu: make pmu support optional
+      drm/amd/powerplay: Zero initialize current_rpm in vega20_get_fan_speed_percent
+      drm/amd/powerplay: Zero initialize freq in smu_v11_0_get_current_clk_freq
+      drm/amd/powerplay: Use memset to initialize metrics structs
+      drm/amdgpu/mes10.1: Fix header guard
+      drm/amd/powerplay: add temperature sensor support for navi10
+      drm/amdgpu: fix scheduler timeout calc
+      drm/amdgpu: Prepare for hmm_range_register API change (v2)
+      ...
+
+commit caab277b1de0a22b675c4c95fc7b285ec2eb5bf5
+Author: Thomas Gleixner <tglx@linutronix.de>
+Date:   Mon Jun 3 07:44:50 2019 +0200
+
+    treewide: Replace GPLv2 boilerplate/reference with SPDX - rule 234
+    
+    Based on 1 normalized pattern(s):
+    
+      this program is free software you can redistribute it and or modify
+      it under the terms of the gnu general public license version 2 as
+      published by the free software foundation this program is
+      distributed in the hope that it will be useful but without any
+      warranty without even the implied warranty of merchantability or
+      fitness for a particular purpose see the gnu general public license
+      for more details you should have received a copy of the gnu general
+      public license along with this program if not see http www gnu org
+      licenses
+    
+    extracted by the scancode license scanner the SPDX license identifier
+    
+      GPL-2.0-only
+    
+    has been chosen to replace the boilerplate/reference in 503 file(s).
+    
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Reviewed-by: Alexios Zavras <alexios.zavras@intel.com>
+    Reviewed-by: Allison Randal <allison@lohutok.net>
+    Reviewed-by: Enrico Weigelt <info@metux.net>
+    Cc: linux-spdx@vger.kernel.org
+    Link: https://lkml.kernel.org/r/20190602204653.811534538@linutronix.de
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index 1b681306aca3..28838808e5d6 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -1,18 +1,7 @@
++// SPDX-License-Identifier: GPL-2.0-only
+ /*
+  * Copyright (C) 2013 Red Hat
+  * Author: Rob Clark <robdclark@gmail.com>
+- *
+- * This program is free software; you can redistribute it and/or modify it
+- * under the terms of the GNU General Public License version 2 as published by
+- * the Free Software Foundation.
+- *
+- * This program is distributed in the hope that it will be useful, but WITHOUT
+- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+- * more details.
+- *
+- * You should have received a copy of the GNU General Public License along with
+- * this program.  If not, see <http://www.gnu.org/licenses/>.
+  */
+ 
+ #include <linux/sync_file.h>
+
+commit 295b22ae596c1d2dd8a4eb597d576f43acb4da6f
+Author: Jordan Crouse <jcrouse@codeaurora.org>
+Date:   Tue May 7 12:02:07 2019 -0600
+
+    drm/msm: Pass the MMU domain index in struct msm_file_private
+    
+    Pass the index of the MMU domain in struct msm_file_private instead
+    of assuming gpu->id throughout the submit path. This clears the way
+    to change ctx->aspace to a per-instance pagetable.
+    
+    Signed-off-by: Jordan Crouse <jcrouse@codeaurora.org>
+    Signed-off-by: Rob Clark <robdclark@chromium.org>
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index 1b681306aca3..d3801bfa4407 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -32,8 +32,9 @@
+ #define BO_PINNED   0x2000
+ 
+ static struct msm_gem_submit *submit_create(struct drm_device *dev,
+-		struct msm_gpu *gpu, struct msm_gpu_submitqueue *queue,
+-		uint32_t nr_bos, uint32_t nr_cmds)
++		struct msm_gpu *gpu, struct msm_gem_address_space *aspace,
++		struct msm_gpu_submitqueue *queue, uint32_t nr_bos,
++		uint32_t nr_cmds)
+ {
+ 	struct msm_gem_submit *submit;
+ 	uint64_t sz = sizeof(*submit) + ((u64)nr_bos * sizeof(submit->bos[0])) +
+@@ -47,6 +48,7 @@ static struct msm_gem_submit *submit_create(struct drm_device *dev,
+ 		return NULL;
+ 
+ 	submit->dev = dev;
++	submit->aspace = aspace;
+ 	submit->gpu = gpu;
+ 	submit->fence = NULL;
+ 	submit->cmd = (void *)&submit->bos[nr_bos];
+@@ -160,7 +162,7 @@ static void submit_unlock_unpin_bo(struct msm_gem_submit *submit,
+ 	struct msm_gem_object *msm_obj = submit->bos[i].obj;
+ 
+ 	if (submit->bos[i].flags & BO_PINNED)
+-		msm_gem_unpin_iova(&msm_obj->base, submit->gpu->aspace);
++		msm_gem_unpin_iova(&msm_obj->base, submit->aspace);
+ 
+ 	if (submit->bos[i].flags & BO_LOCKED)
+ 		ww_mutex_unlock(&msm_obj->base.resv->lock);
+@@ -264,7 +266,7 @@ static int submit_pin_objects(struct msm_gem_submit *submit)
+ 
+ 		/* if locking succeeded, pin bo: */
+ 		ret = msm_gem_get_and_pin_iova(&msm_obj->base,
+-				submit->gpu->aspace, &iova);
++				submit->aspace, &iova);
+ 
+ 		if (ret)
+ 			break;
+@@ -477,7 +479,8 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 		}
+ 	}
+ 
+-	submit = submit_create(dev, gpu, queue, args->nr_bos, args->nr_cmds);
++	submit = submit_create(dev, gpu, ctx->aspace, queue, args->nr_bos,
++		args->nr_cmds);
+ 	if (!submit) {
+ 		ret = -ENOMEM;
+ 		goto out_unlock;
+
+commit 70b5f09e4389c789263c6d79c539b8378e3af3bc
+Merge: 42f1a013300d b02872df58ac
+Author: Dave Airlie <airlied@redhat.com>
+Date:   Wed Apr 24 11:54:26 2019 +1000
+
+    Merge tag 'drm-msm-next-2019-04-21' of https://gitlab.freedesktop.org/drm/msm into drm-next
+    
+    This time around it is a bunch of cleanup and fixes, expanding gpu
+    "zap" shader support (so we can take the GPU out of secure mode on
+    boot) to a6xx, and small UABI extension to support robustness (see
+    mesa MR 673).
+    
+    Signed-off-by: Dave Airlie <airlied@redhat.com>
+    From: Rob Clark <robdclark@gmail.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/CAF6AEGsHwsEfi4y2LYKSqeqDEYvffwVgKhiP8jHcHpxp13J5LQ@mail.gmail.com
+
+commit b673499ae738e7790b1b9f65e784999e5804abd3
+Author: Kristian H. Kristensen <hoegsberg@gmail.com>
+Date:   Wed Mar 20 10:09:10 2019 -0700
+
+    drm/msm: Split submit_lookup_objects() into two loops
+    
+    First loop does copy_from_user() without the table lock held and
+    just stores the handle. Second loop looks up buffer objects with the
+    table_lock held without potentially blocking or faulting. This lets us
+    clean up a bunch of custom, non-faulting copy_from_user() code.
+    
+    Signed-off-by: Kristian H. Kristensen <hoegsberg@chromium.org>
+    Signed-off-by: Rob Clark <robdclark@chromium.org>
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index 12b983fc0b56..648e0c1b92e6 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -74,27 +74,14 @@ void msm_gem_submit_free(struct msm_gem_submit *submit)
+ 	kfree(submit);
+ }
+ 
+-static inline unsigned long __must_check
+-copy_from_user_inatomic(void *to, const void __user *from, unsigned long n)
+-{
+-	if (access_ok(from, n))
+-		return __copy_from_user_inatomic(to, from, n);
+-	return -EFAULT;
+-}
+-
+ static int submit_lookup_objects(struct msm_gem_submit *submit,
+ 		struct drm_msm_gem_submit *args, struct drm_file *file)
+ {
+ 	unsigned i;
+ 	int ret = 0;
+ 
+-	spin_lock(&file->table_lock);
+-	pagefault_disable();
+-
+ 	for (i = 0; i < args->nr_bos; i++) {
+ 		struct drm_msm_gem_submit_bo submit_bo;
+-		struct drm_gem_object *obj;
+-		struct msm_gem_object *msm_obj;
+ 		void __user *userptr =
+ 			u64_to_user_ptr(args->bos + (i * sizeof(submit_bo)));
+ 
+@@ -103,15 +90,10 @@ static int submit_lookup_objects(struct msm_gem_submit *submit,
+ 		 */
+ 		submit->bos[i].flags = 0;
+ 
+-		if (copy_from_user_inatomic(&submit_bo, userptr, sizeof(submit_bo))) {
+-			pagefault_enable();
+-			spin_unlock(&file->table_lock);
+-			if (copy_from_user(&submit_bo, userptr, sizeof(submit_bo))) {
+-				ret = -EFAULT;
+-				goto out;
+-			}
+-			spin_lock(&file->table_lock);
+-			pagefault_disable();
++		if (copy_from_user(&submit_bo, userptr, sizeof(submit_bo))) {
++			ret = -EFAULT;
++			i = 0;
++			goto out;
+ 		}
+ 
+ /* at least one of READ and/or WRITE flags should be set: */
+@@ -121,19 +103,28 @@ static int submit_lookup_objects(struct msm_gem_submit *submit,
+ 			!(submit_bo.flags & MANDATORY_FLAGS)) {
+ 			DRM_ERROR("invalid flags: %x\n", submit_bo.flags);
+ 			ret = -EINVAL;
+-			goto out_unlock;
++			i = 0;
++			goto out;
+ 		}
+ 
++		submit->bos[i].handle = submit_bo.handle;
+ 		submit->bos[i].flags = submit_bo.flags;
+ 		/* in validate_objects() we figure out if this is true: */
+ 		submit->bos[i].iova  = submit_bo.presumed;
++	}
++
++	spin_lock(&file->table_lock);
++
++	for (i = 0; i < args->nr_bos; i++) {
++		struct drm_gem_object *obj;
++		struct msm_gem_object *msm_obj;
+ 
+ 		/* normally use drm_gem_object_lookup(), but for bulk lookup
+ 		 * all under single table_lock just hit object_idr directly:
+ 		 */
+-		obj = idr_find(&file->object_idr, submit_bo.handle);
++		obj = idr_find(&file->object_idr, submit->bos[i].handle);
+ 		if (!obj) {
+-			DRM_ERROR("invalid handle %u at index %u\n", submit_bo.handle, i);
++			DRM_ERROR("invalid handle %u at index %u\n", submit->bos[i].handle, i);
+ 			ret = -EINVAL;
+ 			goto out_unlock;
+ 		}
+@@ -142,7 +133,7 @@ static int submit_lookup_objects(struct msm_gem_submit *submit,
+ 
+ 		if (!list_empty(&msm_obj->submit_entry)) {
+ 			DRM_ERROR("handle %u at index %u already on submit list\n",
+-					submit_bo.handle, i);
++					submit->bos[i].handle, i);
+ 			ret = -EINVAL;
+ 			goto out_unlock;
+ 		}
+@@ -155,7 +146,6 @@ static int submit_lookup_objects(struct msm_gem_submit *submit,
+ 	}
+ 
+ out_unlock:
+-	pagefault_enable();
+ 	spin_unlock(&file->table_lock);
+ 
+ out:
+
+commit dd55cf6929e61922961b8515e73dc4d8443089d2
+Author: Rob Herring <robh@kernel.org>
+Date:   Sat Feb 2 09:41:56 2019 -0600
+
+    drm: msm: Switch to use drm_gem_object reservation_object
+    
+    Now that the base struct drm_gem_object has a reservation_object, use it
+    and remove the private BO one.
+    
+    We can't use the drm_gem_reservation_object_wait() helper for MSM
+    because (in theory) msm_gem_cpu_prep() will also do some cache
+    maintenance on the GEM object.
+    
+    Cc: David Airlie <airlied@linux.ie>
+    Cc: linux-arm-msm@vger.kernel.org
+    Cc: dri-devel@lists.freedesktop.org
+    Cc: freedreno@lists.freedesktop.org
+    Signed-off-by: Rob Herring <robh@kernel.org>
+    Acked-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+    Acked-by: Rob Clark <robdclark@gmail.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20190202154158.10443-4-robh@kernel.org
+    Signed-off-by: Maxime Ripard <maxime.ripard@bootlin.com>
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index 12b983fc0b56..df302521ec74 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -173,7 +173,7 @@ static void submit_unlock_unpin_bo(struct msm_gem_submit *submit,
+ 		msm_gem_unpin_iova(&msm_obj->base, submit->gpu->aspace);
+ 
+ 	if (submit->bos[i].flags & BO_LOCKED)
+-		ww_mutex_unlock(&msm_obj->resv->lock);
++		ww_mutex_unlock(&msm_obj->base.resv->lock);
+ 
+ 	if (backoff && !(submit->bos[i].flags & BO_VALID))
+ 		submit->bos[i].iova = 0;
+@@ -196,7 +196,7 @@ static int submit_lock_objects(struct msm_gem_submit *submit)
+ 		contended = i;
+ 
+ 		if (!(submit->bos[i].flags & BO_LOCKED)) {
+-			ret = ww_mutex_lock_interruptible(&msm_obj->resv->lock,
++			ret = ww_mutex_lock_interruptible(&msm_obj->base.resv->lock,
+ 					&submit->ticket);
+ 			if (ret)
+ 				goto fail;
+@@ -218,7 +218,7 @@ static int submit_lock_objects(struct msm_gem_submit *submit)
+ 	if (ret == -EDEADLK) {
+ 		struct msm_gem_object *msm_obj = submit->bos[contended].obj;
+ 		/* we lost out in a seqno race, lock and retry.. */
+-		ret = ww_mutex_lock_slow_interruptible(&msm_obj->resv->lock,
++		ret = ww_mutex_lock_slow_interruptible(&msm_obj->base.resv->lock,
+ 				&submit->ticket);
+ 		if (!ret) {
+ 			submit->bos[contended].flags |= BO_LOCKED;
+@@ -244,7 +244,7 @@ static int submit_fence_sync(struct msm_gem_submit *submit, bool no_implicit)
+ 			 * strange place to call it.  OTOH this is a
+ 			 * convenient can-fail point to hook it in.
+ 			 */
+-			ret = reservation_object_reserve_shared(msm_obj->resv,
++			ret = reservation_object_reserve_shared(msm_obj->base.resv,
+ 								1);
+ 			if (ret)
+ 				return ret;
+
+commit 96d4f267e40f9509e8a66e2b39e8b95655617693
+Author: Linus Torvalds <torvalds@linux-foundation.org>
+Date:   Thu Jan 3 18:57:57 2019 -0800
+
+    Remove 'type' argument from access_ok() function
+    
+    Nobody has actually used the type (VERIFY_READ vs VERIFY_WRITE) argument
+    of the user address range verification function since we got rid of the
+    old racy i386-only code to walk page tables by hand.
+    
+    It existed because the original 80386 would not honor the write protect
+    bit when in kernel mode, so you had to do COW by hand before doing any
+    user access.  But we haven't supported that in a long time, and these
+    days the 'type' argument is a purely historical artifact.
+    
+    A discussion about extending 'user_access_begin()' to do the range
+    checking resulted this patch, because there is no way we're going to
+    move the old VERIFY_xyz interface to that model.  And it's best done at
+    the end of the merge window when I've done most of my merges, so let's
+    just get this done once and for all.
+    
+    This patch was mostly done with a sed-script, with manual fix-ups for
+    the cases that weren't of the trivial 'access_ok(VERIFY_xyz' form.
+    
+    There were a couple of notable cases:
+    
+     - csky still had the old "verify_area()" name as an alias.
+    
+     - the iter_iov code had magical hardcoded knowledge of the actual
+       values of VERIFY_{READ,WRITE} (not that they mattered, since nothing
+       really used it)
+    
+     - microblaze used the type argument for a debug printout
+    
+    but other than those oddities this should be a total no-op patch.
+    
+    I tried to fix up all architectures, did fairly extensive grepping for
+    access_ok() uses, and the changes are trivial, but I may have missed
+    something.  Any missed conversion should be trivially fixable, though.
+    
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index a28465d90529..12b983fc0b56 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -77,7 +77,7 @@ void msm_gem_submit_free(struct msm_gem_submit *submit)
+ static inline unsigned long __must_check
+ copy_from_user_inatomic(void *to, const void __user *from, unsigned long n)
+ {
+-	if (access_ok(VERIFY_READ, from, n))
++	if (access_ok(from, n))
+ 		return __copy_from_user_inatomic(to, from, n);
+ 	return -EFAULT;
+ }
+
+commit 4971f090aa7f6ce5daa094ce4334f6618f93a7eb
+Merge: c76cd634eb5b 2a3c83f5fe07
+Author: Linus Torvalds <torvalds@linux-foundation.org>
+Date:   Tue Dec 25 11:48:26 2018 -0800
+
+    Merge tag 'drm-next-2018-12-14' of git://anongit.freedesktop.org/drm/drm
+    
+    Pull drm updates from Dave Airlie:
+     "Core:
+       - shared fencing staging removal
+       - drop transactional atomic helpers and move helpers to new location
+       - DP/MST atomic cleanup
+       - Leasing cleanups and drop EXPORT_SYMBOL
+       - Convert drivers to atomic helpers and generic fbdev.
+       - removed deprecated obj_ref/unref in favour of get/put
+       - Improve dumb callback documentation
+       - MODESET_LOCK_BEGIN/END helpers
+    
+      panels:
+       - CDTech panels, Banana Pi Panel, DLC1010GIG,
+       - Olimex LCD-O-LinuXino, Samsung S6D16D0, Truly NT35597 WQXGA,
+       - Himax HX8357D, simulated RTSM AEMv8.
+       - GPD Win2 panel
+       - AUO G101EVN010
+    
+      vgem:
+       - render node support
+    
+      ttm:
+       - move global init out of drivers
+       - fix LRU handling for ghost objects
+       - Support for simultaneous submissions to multiple engines
+    
+      scheduler:
+       - timeout/fault handling changes to help GPU recovery
+       - helpers for hw with preemption support
+    
+      i915:
+       - Scaler/Watermark fixes
+       - DP MST + powerwell fixes
+       - PSR fixes
+       - Break long get/put shmemfs pages
+       - Icelake fixes
+       - Icelake DSI video mode enablement
+       - Engine workaround improvements
+    
+      amdgpu:
+       - freesync support
+       - GPU reset enabled on CI, VI, SOC15 dGPUs
+       - ABM support in DC
+       - KFD support for vega12/polaris12
+       - SDMA paging queue on vega
+       - More amdkfd code sharing
+       - DCC scanout on GFX9
+       - DC kerneldoc
+       - Updated SMU firmware for GFX8 chips
+       - XGMI PSP + hive reset support
+       - GPU reset
+       - DC trace support
+       - Powerplay updates for newer Polaris
+       - Cursor plane update fast path
+       - kfd dma-buf support
+    
+      virtio-gpu:
+       - add EDID support
+    
+      vmwgfx:
+       - pageflip with damage support
+    
+      nouveau:
+       - Initial Turing TU104/TU106 modesetting support
+    
+      msm:
+       - a2xx gpu support for apq8060 and imx5
+       - a2xx gpummu support
+       - mdp4 display support for apq8060
+       - DPU fixes and cleanups
+       - enhanced profiling support
+       - debug object naming interface
+       - get_iova/page pinning decoupling
+    
+      tegra:
+       - Tegra194 host1x, VIC and display support enabled
+       - Audio over HDMI for Tegra186 and Tegra194
+    
+      exynos:
+       - DMA/IOMMU refactoring
+       - plane alpha + blend mode support
+       - Color format fixes for mixer driver
+    
+      rcar-du:
+       - R8A7744 and R8A77470 support
+       - R8A77965 LVDS support
+    
+      imx:
+       - fbdev emulation fix
+       - multi-tiled scalling fixes
+       - SPDX identifiers
+    
+      rockchip
+       - dw_hdmi support
+       - dw-mipi-dsi + dual dsi support
+       - mailbox read size fix
+    
+      qxl:
+       - fix cursor pinning
+    
+      vc4:
+       - YUV support (scaling + cursor)
+    
+      v3d:
+       - enable TFU (Texture Formatting Unit)
+    
+      mali-dp:
+       - add support for linear tiled formats
+    
+      sun4i:
+       - Display Engine 3 support
+       - H6 DE3 mixer 0 support
+       - H6 display engine support
+       - dw-hdmi support
+       - H6 HDMI phy support
+       - implicit fence waiting
+       - BGRX8888 support
+    
+      meson:
+       - Overlay plane support
+       - implicit fence waiting
+       - HDMI 1.4 4k modes
+    
+      bridge:
+       - i2c fixes for sii902x"
+    
+    * tag 'drm-next-2018-12-14' of git://anongit.freedesktop.org/drm/drm: (1403 commits)
+      drm/amd/display: Add fast path for cursor plane updates
+      drm/amdgpu: Enable GPU recovery by default for CI
+      drm/amd/display: Fix duplicating scaling/underscan connector state
+      drm/amd/display: Fix unintialized max_bpc state values
+      Revert "drm/amd/display: Set RMX_ASPECT as default"
+      drm/amdgpu: Fix stub function name
+      drm/msm/dpu: Fix clock issue after bind failure
+      drm/msm/dpu: Clean up dpu_media_info.h static inline functions
+      drm/msm/dpu: Further cleanups for static inline functions
+      drm/msm/dpu: Cleanup the debugfs functions
+      drm/msm/dpu: Remove dpu_irq and unused functions
+      drm/msm: Make irq_postinstall optional
+      drm/msm/dpu: Cleanup callers of dpu_hw_blk_init
+      drm/msm/dpu: Remove unused functions
+      drm/msm/dpu: Remove dpu_crtc_is_enabled()
+      drm/msm/dpu: Remove dpu_crtc_get_mixer_height
+      drm/msm/dpu: Remove dpu_dbg
+      drm/msm: dpu: Remove crtc_lock
+      drm/msm: dpu: Remove vblank_requested flag from dpu_crtc
+      drm/msm: dpu: Separate crtc assignment from vblank enable
+      ...
+
+commit 7a93d5c38e5ee68376ca88d9e3f9841451b9efb1
+Author: Rob Clark <robdclark@gmail.com>
+Date:   Tue Oct 23 14:42:37 2018 -0400
+
+    drm/msm/gpu: add submit flag to hint which buffers should be dumped
+    
+    To lower CPU  overhead, future userspace will be switching to pinning
+    iova and avoiding the use of relocs, and only include cmds table entries
+    for IB1 level cmdstream (but not IB2 or state-groups).
+    
+    This leaves the kernel unsure what to dump for rd/hangrd cmdstream
+    dumping.  So add a MSM_SUBMIT_BO_DUMP flag so userspace can indicate
+    buffers that contain cmdstream (or are otherwise important to dump).
+    
+    Signed-off-by: Rob Clark <robdclark@gmail.com>
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index a43e91e70bd9..3cbed4acb0f4 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -114,8 +114,11 @@ static int submit_lookup_objects(struct msm_gem_submit *submit,
+ 			pagefault_disable();
+ 		}
+ 
++/* at least one of READ and/or WRITE flags should be set: */
++#define MANDATORY_FLAGS (MSM_SUBMIT_BO_READ | MSM_SUBMIT_BO_WRITE)
++
+ 		if ((submit_bo.flags & ~MSM_SUBMIT_BO_FLAGS) ||
+-			!(submit_bo.flags & MSM_SUBMIT_BO_FLAGS)) {
++			!(submit_bo.flags & MANDATORY_FLAGS)) {
+ 			DRM_ERROR("invalid flags: %x\n", submit_bo.flags);
+ 			ret = -EINVAL;
+ 			goto out_unlock;
+
+commit 7ad0e8cf6317825d2b7fc52a9000fb16461c2857
+Author: Jordan Crouse <jcrouse@codeaurora.org>
+Date:   Wed Nov 7 15:35:51 2018 -0700
+
+    drm/msm: Count how many times iova memory is pinned
+    
+    Add a reference count to track how many times a particular
+    chunk of iova memory is pinned (mapped) in the iomu and
+    add msm_gem_unpin_iova to give up references.
+    
+    It is important to note that msm_gem_unpin_iova replaces
+    msm_gem_put_iova because the new implicit behavior
+    that an assigned iova in a given vma is now valid for the
+    life of the buffer and what we are really focusing on is
+    the use of that iova.
+    
+    For now the unmappings are lazy; once the reference counts
+    go to zero they *COULD* be unmapped dynamically but that
+    will require an outside force such as a shrinker or
+    mm_notifiers.  For now, we're just focusing on getting
+    the counting right and setting ourselves up to be ready
+    for the future.
+    
+    Signed-off-by: Jordan Crouse <jcrouse@codeaurora.org>
+    Signed-off-by: Rob Clark <robdclark@gmail.com>
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index 1322179386f6..a43e91e70bd9 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -167,7 +167,7 @@ static void submit_unlock_unpin_bo(struct msm_gem_submit *submit,
+ 	struct msm_gem_object *msm_obj = submit->bos[i].obj;
+ 
+ 	if (submit->bos[i].flags & BO_PINNED)
+-		msm_gem_put_iova(&msm_obj->base, submit->gpu->aspace);
++		msm_gem_unpin_iova(&msm_obj->base, submit->gpu->aspace);
+ 
+ 	if (submit->bos[i].flags & BO_LOCKED)
+ 		ww_mutex_unlock(&msm_obj->resv->lock);
+
+commit 9fe041f6fdfedd92e15dd81d96475ff04bdf879e
+Author: Jordan Crouse <jcrouse@codeaurora.org>
+Date:   Wed Nov 7 15:35:50 2018 -0700
+
+    drm/msm: Add msm_gem_get_and_pin_iova()
+    
+    Add a new function to get and pin the iova memory in one
+    step (basically renaming the old msm_gem_get_iova function)
+    and switch msm_gem_get_iova() to only allocate an iova but
+    not map it in the IOMMU. This is only currently used by
+    msm_ioctl_gem_info() since all other users of of the iova
+    expect that the memory be immediately available.
+    
+    Signed-off-by: Jordan Crouse <jcrouse@codeaurora.org>
+    Signed-off-by: Rob Clark <robdclark@gmail.com>
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index e31be7417f94..1322179386f6 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -270,7 +270,7 @@ static int submit_pin_objects(struct msm_gem_submit *submit)
+ 		uint64_t iova;
+ 
+ 		/* if locking succeeded, pin bo: */
+-		ret = msm_gem_get_iova(&msm_obj->base,
++		ret = msm_gem_get_and_pin_iova(&msm_obj->base,
+ 				submit->gpu->aspace, &iova);
+ 
+ 		if (ret)
+
+commit 4241db42e474ffc6d432e60eb5aaea98f12fda20
+Author: Jordan Crouse <jcrouse@codeaurora.org>
+Date:   Fri Nov 2 09:25:21 2018 -0600
+
+    drm/msm/gpu: Add trace events for tracking GPU submissions
+    
+    Add trace events to track the progress of a GPU submission
+    msm_gpu_submit occurs at the beginning of the submissions,
+    msm_gpu_submit_flush happens when the submission is put on
+    the ringbuffer and msm_submit_flush_retired is sent when
+    the operation is retired.
+    
+    To make it easier to track the operations a unique sequence
+    number is assigned to each submission and displayed in each
+    event output so a human or a script can easily associate
+    the events related to a specific submission.
+    
+    Signed-off-by: Jordan Crouse <jcrouse@codeaurora.org>
+    Signed-off-by: Rob Clark <robdclark@gmail.com>
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index a90aedd6883a..e31be7417f94 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -20,6 +20,7 @@
+ #include "msm_drv.h"
+ #include "msm_gpu.h"
+ #include "msm_gem.h"
++#include "msm_gpu_trace.h"
+ 
+ /*
+  * Cmdstream submission:
+@@ -48,7 +49,6 @@ static struct msm_gem_submit *submit_create(struct drm_device *dev,
+ 	submit->dev = dev;
+ 	submit->gpu = gpu;
+ 	submit->fence = NULL;
+-	submit->pid = get_pid(task_pid(current));
+ 	submit->cmd = (void *)&submit->bos[nr_bos];
+ 	submit->queue = queue;
+ 	submit->ring = gpu->rb[queue->prio];
+@@ -406,6 +406,7 @@ static void submit_cleanup(struct msm_gem_submit *submit)
+ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 		struct drm_file *file)
+ {
++	static atomic_t ident = ATOMIC_INIT(0);
+ 	struct msm_drm_private *priv = dev->dev_private;
+ 	struct drm_msm_gem_submit *args = data;
+ 	struct msm_file_private *ctx = file->driver_priv;
+@@ -416,9 +417,9 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 	struct msm_gpu_submitqueue *queue;
+ 	struct msm_ringbuffer *ring;
+ 	int out_fence_fd = -1;
++	struct pid *pid = get_pid(task_pid(current));
+ 	unsigned i;
+-	int ret;
+-
++	int ret, submitid;
+ 	if (!gpu)
+ 		return -ENXIO;
+ 
+@@ -441,7 +442,12 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 	if (!queue)
+ 		return -ENOENT;
+ 
++	/* Get a unique identifier for the submission for logging purposes */
++	submitid = atomic_inc_return(&ident) - 1;
++
+ 	ring = gpu->rb[queue->prio];
++	trace_msm_gpu_submit(pid_nr(pid), ring->id, submitid,
++		args->nr_bos, args->nr_cmds);
+ 
+ 	if (args->flags & MSM_SUBMIT_FENCE_FD_IN) {
+ 		in_fence = sync_file_get_fence(args->fence_fd);
+@@ -478,6 +484,9 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 		goto out_unlock;
+ 	}
+ 
++	submit->pid = pid;
++	submit->ident = submitid;
++
+ 	if (args->flags & MSM_SUBMIT_SUDO)
+ 		submit->in_rb = true;
+ 
+
+commit 2189463dba3eac10d7264a40ede12fc1a3c06fb1
+Author: Robert Foss <robert.foss@collabora.com>
+Date:   Mon Nov 5 11:13:12 2018 +0100
+
+    drm/msm: Move fence put to where failure occurs
+    
+    If dma_fence_wait fails to wait for a supplied in-fence in
+    msm_ioctl_gem_submit, make sure we release that in-fence.
+    
+    Also remove this dma_fence_put() from the 'out' label.
+    
+    Signed-off-by: Robert Foss <robert.foss@collabora.com>
+    Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Cc: stable@vger.kernel.org
+    Signed-off-by: Rob Clark <robdclark@gmail.com>
+    Signed-off-by: Sean Paul <seanpaul@chromium.org>
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index 66673ea9bf6f..6942604ad9a8 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -413,7 +413,6 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 	struct msm_file_private *ctx = file->driver_priv;
+ 	struct msm_gem_submit *submit;
+ 	struct msm_gpu *gpu = priv->gpu;
+-	struct dma_fence *in_fence = NULL;
+ 	struct sync_file *sync_file = NULL;
+ 	struct msm_gpu_submitqueue *queue;
+ 	struct msm_ringbuffer *ring;
+@@ -446,6 +445,8 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 	ring = gpu->rb[queue->prio];
+ 
+ 	if (args->flags & MSM_SUBMIT_FENCE_FD_IN) {
++		struct dma_fence *in_fence;
++
+ 		in_fence = sync_file_get_fence(args->fence_fd);
+ 
+ 		if (!in_fence)
+@@ -455,11 +456,13 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 		 * Wait if the fence is from a foreign context, or if the fence
+ 		 * array contains any fence from a foreign context.
+ 		 */
+-		if (!dma_fence_match_context(in_fence, ring->fctx->context)) {
++		ret = 0;
++		if (!dma_fence_match_context(in_fence, ring->fctx->context))
+ 			ret = dma_fence_wait(in_fence, true);
+-			if (ret)
+-				return ret;
+-		}
++
++		dma_fence_put(in_fence);
++		if (ret)
++			return ret;
+ 	}
+ 
+ 	ret = mutex_lock_interruptible(&dev->struct_mutex);
+@@ -585,8 +588,6 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 	}
+ 
+ out:
+-	if (in_fence)
+-		dma_fence_put(in_fence);
+ 	submit_cleanup(submit);
+ 	if (ret)
+ 		msm_gem_submit_free(submit);
+
+commit d52900437e95e2799953af21971a54fe5f8e33ff
+Author: Jordan Crouse <jcrouse@codeaurora.org>
+Date:   Mon Oct 15 15:31:54 2018 -0600
+
+    drm/msm/gpu: Don't map command buffers with nr_relocs equal to 0
+    
+    If a command buffer doesn't have any relocs assigned to it there then
+    is no need to map it in the kernel address space.
+    
+    Signed-off-by: Jordan Crouse <jcrouse@codeaurora.org>
+    Signed-off-by: Rob Clark <robdclark@gmail.com>
+    Signed-off-by: Sean Paul <seanpaul@chromium.org>
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index 7a7923e6220d..66673ea9bf6f 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -317,6 +317,9 @@ static int submit_reloc(struct msm_gem_submit *submit, struct msm_gem_object *ob
+ 	uint32_t *ptr;
+ 	int ret = 0;
+ 
++	if (!nr_relocs)
++		return 0;
++
+ 	if (offset % 4) {
+ 		DRM_ERROR("non-aligned cmdstream buffer: %u\n", offset);
+ 		return -EINVAL;
+
+commit ca05359f1e64cf8303ee532e50efe4ab7563d4a9
+Author: Christian König <christian.koenig@amd.com>
+Date:   Wed Sep 19 16:12:25 2018 +0200
+
+    dma-buf: allow reserving more than one shared fence slot
+    
+    Let's support simultaneous submissions to multiple engines.
+    
+    Signed-off-by: Christian König <christian.koenig@amd.com>
+    Reviewed-by: Michel Dänzer <michel.daenzer@amd.com>
+    Reviewed-by: Junwei Zhang <Jerry.Zhang@amd.com>
+    Reviewed-by: Huang Rui <ray.huang@amd.com>
+    Link: https://patchwork.kernel.org/patch/10626149/
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index 7a7923e6220d..a90aedd6883a 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -241,7 +241,8 @@ static int submit_fence_sync(struct msm_gem_submit *submit, bool no_implicit)
+ 			 * strange place to call it.  OTOH this is a
+ 			 * convenient can-fail point to hook it in.
+ 			 */
+-			ret = reservation_object_reserve_shared(msm_obj->resv);
++			ret = reservation_object_reserve_shared(msm_obj->resv,
++								1);
+ 			if (ret)
+ 				return ret;
+ 		}
+
+commit 64686886bbffe47a0b390f2073364ca04f7c2c71
+Author: Thomas Zimmermann <tzimmermann@suse.de>
+Date:   Wed Sep 26 13:48:58 2018 +0200
+
+    drm/msm: Replace drm_gem_object_{un/reference} with put, get functions
+    
+    This patch unifies the naming of DRM functions for reference counting
+    of struct drm_gem_object. The resulting code is more aligned with the
+    rest of the Linux kernel interfaces.
+    
+    Signed-off-by: Thomas Zimmermann <tzimmermann@suse.de>
+    Reviewed-by: Jordan Crouse <jcrouse@codeaurora.org>
+    Signed-off-by: Rob Clark <robdclark@gmail.com>
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index 7bd83e0afa97..7a7923e6220d 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -144,7 +144,7 @@ static int submit_lookup_objects(struct msm_gem_submit *submit,
+ 			goto out_unlock;
+ 		}
+ 
+-		drm_gem_object_reference(obj);
++		drm_gem_object_get(obj);
+ 
+ 		submit->bos[i].obj = msm_obj;
+ 
+@@ -396,7 +396,7 @@ static void submit_cleanup(struct msm_gem_submit *submit)
+ 		struct msm_gem_object *msm_obj = submit->bos[i].obj;
+ 		submit_unlock_unpin_bo(submit, i, false);
+ 		list_del_init(&msm_obj->submit_entry);
+-		drm_gem_object_unreference(&msm_obj->base);
++		drm_gem_object_put(&msm_obj->base);
+ 	}
+ 
+ 	ww_acquire_fini(&submit->ticket);
+
+commit 6a8bd08d0465b2b8d214007c58598e2c15312296
+Author: Rob Clark <robdclark@gmail.com>
+Date:   Wed Dec 13 15:12:57 2017 -0500
+
+    drm/msm: add sudo flag to submit ioctl
+    
+    This flags cause cmdstream to be executed from the ringbuffer (RB)
+    instead of IB1.  Normally not something you'd ever want to do, but
+    it is super useful for firmware debugging.
+    
+    Hidden behind CAP_SYS_RAWIO and a default=n kconfig option which
+    depends on EXPERT (and has a suitably scary warning), to prevent
+    it from being used on accident.
+    
+    Signed-off-by: Rob Clark <robdclark@gmail.com>
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index b8dc8f96caf2..7bd83e0afa97 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -430,6 +430,12 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 	if (MSM_PIPE_FLAGS(args->flags) & ~MSM_SUBMIT_FLAGS)
+ 		return -EINVAL;
+ 
++	if (args->flags & MSM_SUBMIT_SUDO) {
++		if (!IS_ENABLED(CONFIG_DRM_MSM_GPU_SUDO) ||
++		    !capable(CAP_SYS_RAWIO))
++			return -EINVAL;
++	}
++
+ 	queue = msm_submitqueue_get(ctx, args->queueid);
+ 	if (!queue)
+ 		return -ENOENT;
+@@ -471,6 +477,9 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 		goto out_unlock;
+ 	}
+ 
++	if (args->flags & MSM_SUBMIT_SUDO)
++		submit->in_rb = true;
++
+ 	ret = submit_lookup_objects(submit, args, file);
+ 	if (ret)
+ 		goto out;
+
+commit 544a32dbf05888ec012868db2e813233078bbdfb
+Author: Rob Clark <robdclark@gmail.com>
+Date:   Fri Sep 15 10:58:13 2017 -0400
+
+    drm/msm: preserve IOVAs in submit's bo table
+    
+    We need this if we want to dump the submit after cleanup (ie. from hang
+    or fault).  But in the backoff/unpin case we want to clear them.  So add
+    a flag so we can skip clearing the IOVAs in at cleanup.
+    
+    Signed-off-by: Rob Clark <robdclark@gmail.com>
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index 69868682f8f4..b8dc8f96caf2 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -161,7 +161,8 @@ static int submit_lookup_objects(struct msm_gem_submit *submit,
+ 	return ret;
+ }
+ 
+-static void submit_unlock_unpin_bo(struct msm_gem_submit *submit, int i)
++static void submit_unlock_unpin_bo(struct msm_gem_submit *submit,
++		int i, bool backoff)
+ {
+ 	struct msm_gem_object *msm_obj = submit->bos[i].obj;
+ 
+@@ -171,7 +172,7 @@ static void submit_unlock_unpin_bo(struct msm_gem_submit *submit, int i)
+ 	if (submit->bos[i].flags & BO_LOCKED)
+ 		ww_mutex_unlock(&msm_obj->resv->lock);
+ 
+-	if (!(submit->bos[i].flags & BO_VALID))
++	if (backoff && !(submit->bos[i].flags & BO_VALID))
+ 		submit->bos[i].iova = 0;
+ 
+ 	submit->bos[i].flags &= ~(BO_LOCKED | BO_PINNED);
+@@ -206,10 +207,10 @@ static int submit_lock_objects(struct msm_gem_submit *submit)
+ 
+ fail:
+ 	for (; i >= 0; i--)
+-		submit_unlock_unpin_bo(submit, i);
++		submit_unlock_unpin_bo(submit, i, true);
+ 
+ 	if (slow_locked > 0)
+-		submit_unlock_unpin_bo(submit, slow_locked);
++		submit_unlock_unpin_bo(submit, slow_locked, true);
+ 
+ 	if (ret == -EDEADLK) {
+ 		struct msm_gem_object *msm_obj = submit->bos[contended].obj;
+@@ -393,7 +394,7 @@ static void submit_cleanup(struct msm_gem_submit *submit)
+ 
+ 	for (i = 0; i < submit->nr_bos; i++) {
+ 		struct msm_gem_object *msm_obj = submit->bos[i].obj;
+-		submit_unlock_unpin_bo(submit, i);
++		submit_unlock_unpin_bo(submit, i, false);
+ 		list_del_init(&msm_obj->submit_entry);
+ 		drm_gem_object_unreference(&msm_obj->base);
+ 	}
+
+commit 3ceaa1411da4d0d5f3ea89e9ecd03af1b7bcd5eb
+Author: Jordan Crouse <jcrouse@codeaurora.org>
+Date:   Fri Oct 20 11:07:02 2017 -0600
+
+    drm/msm: Removed unused struct_mutex_task
+    
+    Recent changes to locking have rendered struct_mutex_task
+    unused.
+    
+    Unused since 0e08270a1f01.
+    
+    Signed-off-by: Jordan Crouse <jcrouse@codeaurora.org>
+    Signed-off-by: Rob Clark <robdclark@gmail.com>
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index d3551aa130fb..69868682f8f4 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -463,7 +463,6 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 			goto out_unlock;
+ 		}
+ 	}
+-	priv->struct_mutex_task = current;
+ 
+ 	submit = submit_create(dev, gpu, queue, args->nr_bos, args->nr_cmds);
+ 	if (!submit) {
+@@ -581,7 +580,6 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ out_unlock:
+ 	if (ret && (out_fence_fd >= 0))
+ 		put_unused_fd(out_fence_fd);
+-	priv->struct_mutex_task = NULL;
+ 	mutex_unlock(&dev->struct_mutex);
+ 	return ret;
+ }
+
+commit f97decac5f4c2d862e5b848694e3ffb29fc8acdd
+Author: Jordan Crouse <jcrouse@codeaurora.org>
+Date:   Fri Oct 20 11:06:57 2017 -0600
+
+    drm/msm: Support multiple ringbuffers
+    
+    Add the infrastructure to support the idea of multiple ringbuffers.
+    Assign each ringbuffer an id and use that as an index for the various
+    ring specific operations.
+    
+    The biggest delta is to support legacy fences. Each fence gets its own
+    sequence number but the legacy functions expect to use a unique integer.
+    To handle this we return a unique identifier for each submission but
+    map it to a specific ring/sequence under the covers. Newer users use
+    a dma_fence pointer anyway so they don't care about the actual sequence
+    ID or ring.
+    
+    The actual mechanics for multiple ringbuffers are very target specific
+    so this code just allows for the possibility but still only defines
+    one ringbuffer for each target family.
+    
+    Signed-off-by: Jordan Crouse <jcrouse@codeaurora.org>
+    Signed-off-by: Rob Clark <robdclark@gmail.com>
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index c196cc615e77..d3551aa130fb 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -51,6 +51,7 @@ static struct msm_gem_submit *submit_create(struct drm_device *dev,
+ 	submit->pid = get_pid(task_pid(current));
+ 	submit->cmd = (void *)&submit->bos[nr_bos];
+ 	submit->queue = queue;
++	submit->ring = gpu->rb[queue->prio];
+ 
+ 	/* initially, until copy_from_user() and bo lookup succeeds: */
+ 	submit->nr_bos = 0;
+@@ -247,7 +248,8 @@ static int submit_fence_sync(struct msm_gem_submit *submit, bool no_implicit)
+ 		if (no_implicit)
+ 			continue;
+ 
+-		ret = msm_gem_sync_object(&msm_obj->base, submit->gpu->fctx, write);
++		ret = msm_gem_sync_object(&msm_obj->base, submit->ring->fctx,
++			write);
+ 		if (ret)
+ 			break;
+ 	}
+@@ -410,6 +412,7 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 	struct dma_fence *in_fence = NULL;
+ 	struct sync_file *sync_file = NULL;
+ 	struct msm_gpu_submitqueue *queue;
++	struct msm_ringbuffer *ring;
+ 	int out_fence_fd = -1;
+ 	unsigned i;
+ 	int ret;
+@@ -430,6 +433,8 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 	if (!queue)
+ 		return -ENOENT;
+ 
++	ring = gpu->rb[queue->prio];
++
+ 	if (args->flags & MSM_SUBMIT_FENCE_FD_IN) {
+ 		in_fence = sync_file_get_fence(args->fence_fd);
+ 
+@@ -440,7 +445,7 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 		 * Wait if the fence is from a foreign context, or if the fence
+ 		 * array contains any fence from a foreign context.
+ 		 */
+-		if (!dma_fence_match_context(in_fence, gpu->fctx->context)) {
++		if (!dma_fence_match_context(in_fence, ring->fctx->context)) {
+ 			ret = dma_fence_wait(in_fence, true);
+ 			if (ret)
+ 				return ret;
+@@ -543,8 +548,7 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 
+ 	submit->nr_cmds = i;
+ 
+-	submit->fence = msm_fence_alloc(gpu->fctx);
+-
++	submit->fence = msm_fence_alloc(ring->fctx);
+ 	if (IS_ERR(submit->fence)) {
+ 		ret = PTR_ERR(submit->fence);
+ 		submit->fence = NULL;
+
+commit f7de15450e906ed6586b29bde609a5686cd0d034
+Author: Jordan Crouse <jcrouse@codeaurora.org>
+Date:   Fri Oct 20 11:06:55 2017 -0600
+
+    drm/msm: Add per-instance submit queues
+    
+    Currently the behavior of a command stream is provided by the user
+    application during submission and the application is expected to internally
+    maintain the settings for each 'context' or 'rendering queue' and specify
+    the correct ones.
+    
+    This works okay for simple cases but as applications become more
+    complex we will want to set context specific flags and do various
+    permission checks to allow certain contexts to enable additional
+    privileges.
+    
+    Add kernel-side submit queues to be analogous to 'contexts' or
+    'rendering queues' on the application side. Each file descriptor
+    instance will maintain its own list of queues. Queues cannot be
+    shared between file descriptors.
+    
+    For backwards compatibility context id '0' is defined as a default
+    context specifying no priority and no special flags. This is
+    intended to be the usual configuration for 99% of applications so
+    that a garden variety application can function correctly without
+    creating a queue. Only those applications requiring the specific
+    benefit of different queues need create one.
+    
+    Signed-off-by: Jordan Crouse <jcrouse@codeaurora.org>
+    Signed-off-by: Rob Clark <robdclark@gmail.com>
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index 93535cac0676..c196cc615e77 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -31,7 +31,8 @@
+ #define BO_PINNED   0x2000
+ 
+ static struct msm_gem_submit *submit_create(struct drm_device *dev,
+-		struct msm_gpu *gpu, uint32_t nr_bos, uint32_t nr_cmds)
++		struct msm_gpu *gpu, struct msm_gpu_submitqueue *queue,
++		uint32_t nr_bos, uint32_t nr_cmds)
+ {
+ 	struct msm_gem_submit *submit;
+ 	uint64_t sz = sizeof(*submit) + ((u64)nr_bos * sizeof(submit->bos[0])) +
+@@ -49,6 +50,7 @@ static struct msm_gem_submit *submit_create(struct drm_device *dev,
+ 	submit->fence = NULL;
+ 	submit->pid = get_pid(task_pid(current));
+ 	submit->cmd = (void *)&submit->bos[nr_bos];
++	submit->queue = queue;
+ 
+ 	/* initially, until copy_from_user() and bo lookup succeeds: */
+ 	submit->nr_bos = 0;
+@@ -66,6 +68,8 @@ void msm_gem_submit_free(struct msm_gem_submit *submit)
+ 	dma_fence_put(submit->fence);
+ 	list_del(&submit->node);
+ 	put_pid(submit->pid);
++	msm_submitqueue_put(submit->queue);
++
+ 	kfree(submit);
+ }
+ 
+@@ -405,6 +409,7 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 	struct msm_gpu *gpu = priv->gpu;
+ 	struct dma_fence *in_fence = NULL;
+ 	struct sync_file *sync_file = NULL;
++	struct msm_gpu_submitqueue *queue;
+ 	int out_fence_fd = -1;
+ 	unsigned i;
+ 	int ret;
+@@ -421,6 +426,10 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 	if (MSM_PIPE_FLAGS(args->flags) & ~MSM_SUBMIT_FLAGS)
+ 		return -EINVAL;
+ 
++	queue = msm_submitqueue_get(ctx, args->queueid);
++	if (!queue)
++		return -ENOENT;
++
+ 	if (args->flags & MSM_SUBMIT_FENCE_FD_IN) {
+ 		in_fence = sync_file_get_fence(args->fence_fd);
+ 
+@@ -451,7 +460,7 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 	}
+ 	priv->struct_mutex_task = current;
+ 
+-	submit = submit_create(dev, gpu, args->nr_bos, args->nr_cmds);
++	submit = submit_create(dev, gpu, queue, args->nr_bos, args->nr_cmds);
+ 	if (!submit) {
+ 		ret = -ENOMEM;
+ 		goto out_unlock;
+@@ -535,6 +544,7 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 	submit->nr_cmds = i;
+ 
+ 	submit->fence = msm_fence_alloc(gpu->fctx);
++
+ 	if (IS_ERR(submit->fence)) {
+ 		ret = PTR_ERR(submit->fence);
+ 		submit->fence = NULL;
+
+commit ad5149c4f65f7cb984ab85b366c6e7b573eaf48f
+Author: Rob Clark <robdclark@gmail.com>
+Date:   Tue Sep 12 14:23:05 2017 -0400
+
+    drm/msm: fix _NO_IMPLICIT fencing case
+    
+    We need to call reservation_object_reserve_shared() in both cases, but
+    this wasn't happening in the _NO_IMPLICIT submit case.
+    
+    Fixes: f0a42bb ("drm/msm: submit support for in-fences")
+    Reported-by: Jordan Crouse <jcrouse@codeaurora.org>
+    Signed-off-by: Rob Clark <robdclark@gmail.com>
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index 5d0a75d4b249..93535cac0676 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -221,7 +221,7 @@ static int submit_lock_objects(struct msm_gem_submit *submit)
+ 	return ret;
+ }
+ 
+-static int submit_fence_sync(struct msm_gem_submit *submit)
++static int submit_fence_sync(struct msm_gem_submit *submit, bool no_implicit)
+ {
+ 	int i, ret = 0;
+ 
+@@ -229,6 +229,20 @@ static int submit_fence_sync(struct msm_gem_submit *submit)
+ 		struct msm_gem_object *msm_obj = submit->bos[i].obj;
+ 		bool write = submit->bos[i].flags & MSM_SUBMIT_BO_WRITE;
+ 
++		if (!write) {
++			/* NOTE: _reserve_shared() must happen before
++			 * _add_shared_fence(), which makes this a slightly
++			 * strange place to call it.  OTOH this is a
++			 * convenient can-fail point to hook it in.
++			 */
++			ret = reservation_object_reserve_shared(msm_obj->resv);
++			if (ret)
++				return ret;
++		}
++
++		if (no_implicit)
++			continue;
++
+ 		ret = msm_gem_sync_object(&msm_obj->base, submit->gpu->fctx, write);
+ 		if (ret)
+ 			break;
+@@ -451,11 +465,9 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 	if (ret)
+ 		goto out;
+ 
+-	if (!(args->flags & MSM_SUBMIT_NO_IMPLICIT)) {
+-		ret = submit_fence_sync(submit);
+-		if (ret)
+-			goto out;
+-	}
++	ret = submit_fence_sync(submit, !!(args->flags & MSM_SUBMIT_NO_IMPLICIT));
++	if (ret)
++		goto out;
+ 
+ 	ret = submit_pin_objects(submit);
+ 	if (ret)
+
+commit 0ee931c4e31a5efb134c76440405e9219f896e33
+Author: Michal Hocko <mhocko@suse.com>
+Date:   Wed Sep 13 16:28:29 2017 -0700
+
+    mm: treewide: remove GFP_TEMPORARY allocation flag
+    
+    GFP_TEMPORARY was introduced by commit e12ba74d8ff3 ("Group short-lived
+    and reclaimable kernel allocations") along with __GFP_RECLAIMABLE.  It's
+    primary motivation was to allow users to tell that an allocation is
+    short lived and so the allocator can try to place such allocations close
+    together and prevent long term fragmentation.  As much as this sounds
+    like a reasonable semantic it becomes much less clear when to use the
+    highlevel GFP_TEMPORARY allocation flag.  How long is temporary? Can the
+    context holding that memory sleep? Can it take locks? It seems there is
+    no good answer for those questions.
+    
+    The current implementation of GFP_TEMPORARY is basically GFP_KERNEL |
+    __GFP_RECLAIMABLE which in itself is tricky because basically none of
+    the existing caller provide a way to reclaim the allocated memory.  So
+    this is rather misleading and hard to evaluate for any benefits.
+    
+    I have checked some random users and none of them has added the flag
+    with a specific justification.  I suspect most of them just copied from
+    other existing users and others just thought it might be a good idea to
+    use without any measuring.  This suggests that GFP_TEMPORARY just
+    motivates for cargo cult usage without any reasoning.
+    
+    I believe that our gfp flags are quite complex already and especially
+    those with highlevel semantic should be clearly defined to prevent from
+    confusion and abuse.  Therefore I propose dropping GFP_TEMPORARY and
+    replace all existing users to simply use GFP_KERNEL.  Please note that
+    SLAB users with shrinkers will still get __GFP_RECLAIMABLE heuristic and
+    so they will be placed properly for memory fragmentation prevention.
+    
+    I can see reasons we might want some gfp flag to reflect shorterm
+    allocations but I propose starting from a clear semantic definition and
+    only then add users with proper justification.
+    
+    This was been brought up before LSF this year by Matthew [1] and it
+    turned out that GFP_TEMPORARY really doesn't have a clear semantic.  It
+    seems to be a heuristic without any measured advantage for most (if not
+    all) its current users.  The follow up discussion has revealed that
+    opinions on what might be temporary allocation differ a lot between
+    developers.  So rather than trying to tweak existing users into a
+    semantic which they haven't expected I propose to simply remove the flag
+    and start from scratch if we really need a semantic for short term
+    allocations.
+    
+    [1] http://lkml.kernel.org/r/20170118054945.GD18349@bombadil.infradead.org
+    
+    [akpm@linux-foundation.org: fix typo]
+    [akpm@linux-foundation.org: coding-style fixes]
+    [sfr@canb.auug.org.au: drm/i915: fix up]
+      Link: http://lkml.kernel.org/r/20170816144703.378d4f4d@canb.auug.org.au
+    Link: http://lkml.kernel.org/r/20170728091904.14627-1-mhocko@kernel.org
+    Signed-off-by: Michal Hocko <mhocko@suse.com>
+    Signed-off-by: Stephen Rothwell <sfr@canb.auug.org.au>
+    Acked-by: Mel Gorman <mgorman@suse.de>
+    Acked-by: Vlastimil Babka <vbabka@suse.cz>
+    Cc: Matthew Wilcox <willy@infradead.org>
+    Cc: Neil Brown <neilb@suse.de>
+    Cc: "Theodore Ts'o" <tytso@mit.edu>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index 8a75c0bd8a78..5d0a75d4b249 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -40,7 +40,7 @@ static struct msm_gem_submit *submit_create(struct drm_device *dev,
+ 	if (sz > SIZE_MAX)
+ 		return NULL;
+ 
+-	submit = kmalloc(sz, GFP_TEMPORARY | __GFP_NOWARN | __GFP_NORETRY);
++	submit = kmalloc(sz, GFP_KERNEL | __GFP_NOWARN | __GFP_NORETRY);
+ 	if (!submit)
+ 		return NULL;
+ 
+
+commit b0135ab91af16be57e444e74023e48b1f379ab36
+Author: Jordan Crouse <jcrouse@codeaurora.org>
+Date:   Thu Jul 27 10:42:34 2017 -0600
+
+    drm/msm: args->fence should be args->flags
+    
+    Fix a typo in msm_ioctl_gem_submit - check args->flags for the
+    MSM_SUBMIT_NO_IMPLICIT flag instead of args->fence.
+    
+    Signed-off-by: Jordan Crouse <jcrouse@codeaurora.org>
+    Signed-off-by: Rob Clark <robdclark@gmail.com>
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index 8095658e8cb4..8a75c0bd8a78 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -451,7 +451,7 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 	if (ret)
+ 		goto out;
+ 
+-	if (!(args->fence & MSM_SUBMIT_NO_IMPLICIT)) {
++	if (!(args->flags & MSM_SUBMIT_NO_IMPLICIT)) {
+ 		ret = submit_fence_sync(submit);
+ 		if (ret)
+ 			goto out;
+
+commit 65e93108891e571f177c202add9288eda9ac4100
+Author: Dan Carpenter <dan.carpenter@oracle.com>
+Date:   Fri Jun 30 10:59:15 2017 +0300
+
+    drm/msm: fix an integer overflow test
+    
+    We recently added an integer overflow check but it needs an additional
+    tweak to work properly on 32 bit systems.
+    
+    The problem is that we're doing the right hand side of the assignment as
+    type unsigned long so the max it will have an integer overflow instead
+    of being larger than SIZE_MAX.  That means the "sz > SIZE_MAX" condition
+    is never true even on 32 bit systems.  We need to first cast it to u64
+    and then do the math.
+    
+    Fixes: 4a630fadbb29 ("drm/msm: Fix potential buffer overflow issue")
+    Signed-off-by: Dan Carpenter <dan.carpenter@oracle.com>
+    Acked-by: Jordan Crouse <jcrouse@codeaurora.org>
+    Signed-off-by: Rob Clark <robdclark@gmail.com>
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index 6bfca7470141..8095658e8cb4 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -34,8 +34,8 @@ static struct msm_gem_submit *submit_create(struct drm_device *dev,
+ 		struct msm_gpu *gpu, uint32_t nr_bos, uint32_t nr_cmds)
+ {
+ 	struct msm_gem_submit *submit;
+-	uint64_t sz = sizeof(*submit) + (nr_bos * sizeof(submit->bos[0])) +
+-		(nr_cmds * sizeof(submit->cmd[0]));
++	uint64_t sz = sizeof(*submit) + ((u64)nr_bos * sizeof(submit->bos[0])) +
++		((u64)nr_cmds * sizeof(submit->cmd[0]));
+ 
+ 	if (sz > SIZE_MAX)
+ 		return NULL;
+
+commit 4a630fadbb29d9efaedb525f1a8f7449ad107641
+Author: Kasin Li <donglil@codeaurora.org>
+Date:   Mon Jun 19 15:36:53 2017 -0600
+
+    drm/msm: Fix potential buffer overflow issue
+    
+    In function submit_create, if nr_cmds or nr_bos is assigned with
+    negative value, the allocated buffer may be small than intended.
+    Using this buffer will lead to buffer overflow issue.
+    
+    Signed-off-by: Kasin Li <donglil@codeaurora.org>
+    Signed-off-by: Jordan Crouse <jcrouse@codeaurora.org>
+    Signed-off-by: Rob Clark <robdclark@gmail.com>
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index 179cfc60b6ca..6bfca7470141 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -31,11 +31,14 @@
+ #define BO_PINNED   0x2000
+ 
+ static struct msm_gem_submit *submit_create(struct drm_device *dev,
+-		struct msm_gpu *gpu, int nr_bos, int nr_cmds)
++		struct msm_gpu *gpu, uint32_t nr_bos, uint32_t nr_cmds)
+ {
+ 	struct msm_gem_submit *submit;
+-	int sz = sizeof(*submit) + (nr_bos * sizeof(submit->bos[0])) +
+-			(nr_cmds * sizeof(*submit->cmd));
++	uint64_t sz = sizeof(*submit) + (nr_bos * sizeof(submit->bos[0])) +
++		(nr_cmds * sizeof(submit->cmd[0]));
++
++	if (sz > SIZE_MAX)
++		return NULL;
+ 
+ 	submit = kmalloc(sz, GFP_TEMPORARY | __GFP_NOWARN | __GFP_NORETRY);
+ 	if (!submit)
+
+commit 0e08270a1f01bceae17d32a0d75aad2388bd1ba2
+Author: Sushmita Susheelendra <ssusheel@codeaurora.org>
+Date:   Tue Jun 13 16:52:54 2017 -0600
+
+    drm/msm: Separate locking of buffer resources from struct_mutex
+    
+    Buffer object specific resources like pages, domains, sg list
+    need not be protected with struct_mutex. They can be protected
+    with a buffer object level lock. This simplifies locking and
+    makes it easier to avoid potential recursive locking scenarios
+    for SVM involving mmap_sem and struct_mutex. This also removes
+    unnecessary serialization when creating buffer objects, and also
+    between buffer object creation and GPU command submission.
+    
+    Signed-off-by: Sushmita Susheelendra <ssusheel@codeaurora.org>
+    [robclark: squash in handling new locking for shrinker]
+    Signed-off-by: Rob Clark <robdclark@gmail.com>
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index c8d01df993da..179cfc60b6ca 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -245,7 +245,7 @@ static int submit_pin_objects(struct msm_gem_submit *submit)
+ 		uint64_t iova;
+ 
+ 		/* if locking succeeded, pin bo: */
+-		ret = msm_gem_get_iova_locked(&msm_obj->base,
++		ret = msm_gem_get_iova(&msm_obj->base,
+ 				submit->gpu->aspace, &iova);
+ 
+ 		if (ret)
+@@ -301,7 +301,7 @@ static int submit_reloc(struct msm_gem_submit *submit, struct msm_gem_object *ob
+ 	/* For now, just map the entire thing.  Eventually we probably
+ 	 * to do it page-by-page, w/ kmap() if not vmap()d..
+ 	 */
+-	ptr = msm_gem_get_vaddr_locked(&obj->base);
++	ptr = msm_gem_get_vaddr(&obj->base);
+ 
+ 	if (IS_ERR(ptr)) {
+ 		ret = PTR_ERR(ptr);
+@@ -359,7 +359,7 @@ static int submit_reloc(struct msm_gem_submit *submit, struct msm_gem_object *ob
+ 	}
+ 
+ out:
+-	msm_gem_put_vaddr_locked(&obj->base);
++	msm_gem_put_vaddr(&obj->base);
+ 
+ 	return ret;
+ }
+
+commit 8bdcd949bbe7e7f9e60a3564baa600884f8f4ba7
+Author: Rob Clark <robdclark@gmail.com>
+Date:   Tue Jun 13 11:07:08 2017 -0400
+
+    drm/msm: pass address-space to _get_iova() and friends
+    
+    No functional change, that will come later.  But this will make it
+    easier to deal with dynamically created address spaces (ie. per-
+    process pagetables for gpu).
+    
+    Signed-off-by: Rob Clark <robdclark@gmail.com>
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index 7832e6421d25..c8d01df993da 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -158,7 +158,7 @@ static void submit_unlock_unpin_bo(struct msm_gem_submit *submit, int i)
+ 	struct msm_gem_object *msm_obj = submit->bos[i].obj;
+ 
+ 	if (submit->bos[i].flags & BO_PINNED)
+-		msm_gem_put_iova(&msm_obj->base, submit->gpu->id);
++		msm_gem_put_iova(&msm_obj->base, submit->gpu->aspace);
+ 
+ 	if (submit->bos[i].flags & BO_LOCKED)
+ 		ww_mutex_unlock(&msm_obj->resv->lock);
+@@ -246,7 +246,7 @@ static int submit_pin_objects(struct msm_gem_submit *submit)
+ 
+ 		/* if locking succeeded, pin bo: */
+ 		ret = msm_gem_get_iova_locked(&msm_obj->base,
+-				submit->gpu->id, &iova);
++				submit->gpu->aspace, &iova);
+ 
+ 		if (ret)
+ 			break;
+
+commit d72fea538fe6d783c1e63a2fc304019abf4be93a
+Author: Jordan Crouse <jcrouse@codeaurora.org>
+Date:   Mon May 8 14:34:58 2017 -0600
+
+    drm/msm: Fix the check for the command size
+    
+    The overrun check for the size of submitted commands is off by one.
+    It should allow the offset plus the size to be equal to the
+    size of the memory object when the command stream is very tightly
+    constructed.
+    
+    Signed-off-by: Jordan Crouse <jcrouse@codeaurora.org>
+    Signed-off-by: Rob Clark <robdclark@gmail.com>
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index 8ac4ca443914..7832e6421d25 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -495,8 +495,9 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 			goto out;
+ 		}
+ 
+-		if ((submit_cmd.size + submit_cmd.submit_offset) >=
+-				msm_obj->base.size) {
++		if (!submit_cmd.size ||
++			((submit_cmd.size + submit_cmd.submit_offset) >
++				msm_obj->base.size)) {
+ 			DRM_ERROR("invalid cmdstream size: %u\n", submit_cmd.size);
+ 			ret = -EINVAL;
+ 			goto out;
+
+commit 3cfac69cbd56e1a57a70bfbdb07560b788030404
+Author: Philipp Zabel <p.zabel@pengutronix.de>
+Date:   Fri Mar 17 19:38:40 2017 +0100
+
+    drm/msm: for array in-fences, check if all backing fences are from our own context before waiting
+    
+    Use the dma_fence_match_context helper to check if all backing fences
+    are from our own context, in which case we don't have to wait.
+    
+    Signed-off-by: Philipp Zabel <p.zabel@pengutronix.de>
+    Cc: Rob Clark <robdclark@gmail.com>
+    Cc: Gustavo Padovan <gustavo.padovan@collabora.com>
+    [rebased on code-motion]
+    Signed-off-by: Rob Clark <robdclark@gmail.com>
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index 1c545ebe6a5a..8ac4ca443914 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -410,12 +410,11 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 		if (!in_fence)
+ 			return -EINVAL;
+ 
+-		/* TODO if we get an array-fence due to userspace merging multiple
+-		 * fences, we need a way to determine if all the backing fences
+-		 * are from our own context..
++		/*
++		 * Wait if the fence is from a foreign context, or if the fence
++		 * array contains any fence from a foreign context.
+ 		 */
+-
+-		if (in_fence->context != gpu->fctx->context) {
++		if (!dma_fence_match_context(in_fence, gpu->fctx->context)) {
+ 			ret = dma_fence_wait(in_fence, true);
+ 			if (ret)
+ 				return ret;
+
+commit 48f243c95bdb17c1453d48142abad6aabed339e5
+Author: Rob Clark <robdclark@gmail.com>
+Date:   Sat Feb 25 10:36:30 2017 -0500
+
+    drm/msm: move submit fence wait out of struct_mutex
+    
+    Probably a symptom of needing finer grained locking, but if we wait on
+    the incoming fence-fd (which could come from a different context) while
+    holding struct_mutex, that blocks retire_worker so gpu fences cannot get
+    signalled.
+    
+    This causes a problem if userspace manages to get more than a frame
+    ahead, leaving the atomic-commit worker blocked waiting on fences that
+    cannot be signaled because submit is blocked waiting for a fence
+    signalled from vblank (after the atomic commit which is blocked).
+    
+    If we start having multiple fence ctxs for the gpu, submit_fence_sync()
+    would probably need to move outside of struct_mutex as well.
+    
+    Signed-off-by: Rob Clark <robdclark@gmail.com>
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index 1172fe7a9252..1c545ebe6a5a 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -404,6 +404,24 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 	if (MSM_PIPE_FLAGS(args->flags) & ~MSM_SUBMIT_FLAGS)
+ 		return -EINVAL;
+ 
++	if (args->flags & MSM_SUBMIT_FENCE_FD_IN) {
++		in_fence = sync_file_get_fence(args->fence_fd);
++
++		if (!in_fence)
++			return -EINVAL;
++
++		/* TODO if we get an array-fence due to userspace merging multiple
++		 * fences, we need a way to determine if all the backing fences
++		 * are from our own context..
++		 */
++
++		if (in_fence->context != gpu->fctx->context) {
++			ret = dma_fence_wait(in_fence, true);
++			if (ret)
++				return ret;
++		}
++	}
++
+ 	ret = mutex_lock_interruptible(&dev->struct_mutex);
+ 	if (ret)
+ 		return ret;
+@@ -431,27 +449,6 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 	if (ret)
+ 		goto out;
+ 
+-	if (args->flags & MSM_SUBMIT_FENCE_FD_IN) {
+-		in_fence = sync_file_get_fence(args->fence_fd);
+-
+-		if (!in_fence) {
+-			ret = -EINVAL;
+-			goto out;
+-		}
+-
+-		/* TODO if we get an array-fence due to userspace merging multiple
+-		 * fences, we need a way to determine if all the backing fences
+-		 * are from our own context..
+-		 */
+-
+-		if (in_fence->context != gpu->fctx->context) {
+-			ret = dma_fence_wait(in_fence, true);
+-			if (ret)
+-				goto out;
+-		}
+-
+-	}
+-
+ 	if (!(args->fence & MSM_SUBMIT_NO_IMPLICIT)) {
+ 		ret = submit_fence_sync(submit);
+ 		if (ret)
+
+commit 21c42da18ef128ca8fb4cc4ead888f5c61e3916a
+Author: Dan Carpenter <dan.carpenter@oracle.com>
+Date:   Mon Jan 16 14:58:08 2017 +0300
+
+    drm/msm: return -EFAULT if copy_from_user() fails
+    
+    copy_from_user_inatomic() is actually a local function that returns
+    -EFAULT or positive values on error.  Otherwise copy_from_user() returns
+    the number of bytes remaining to be copied.  We want to return -EFAULT
+    here.
+    
+    I removed an unlikely() because we just did a copy_from_user()
+    so I don't think it can possibly make a difference.
+    
+    Signed-off-by: Dan Carpenter <dan.carpenter@oracle.com>
+    Signed-off-by: Rob Clark <robdclark@gmail.com>
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index 489676568a10..1172fe7a9252 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -95,13 +95,13 @@ static int submit_lookup_objects(struct msm_gem_submit *submit,
+ 		 */
+ 		submit->bos[i].flags = 0;
+ 
+-		ret = copy_from_user_inatomic(&submit_bo, userptr, sizeof(submit_bo));
+-		if (unlikely(ret)) {
++		if (copy_from_user_inatomic(&submit_bo, userptr, sizeof(submit_bo))) {
+ 			pagefault_enable();
+ 			spin_unlock(&file->table_lock);
+-			ret = copy_from_user(&submit_bo, userptr, sizeof(submit_bo));
+-			if (ret)
++			if (copy_from_user(&submit_bo, userptr, sizeof(submit_bo))) {
++				ret = -EFAULT;
+ 				goto out;
++			}
+ 			spin_lock(&file->table_lock);
+ 			pagefault_disable();
+ 		}
+@@ -317,9 +317,10 @@ static int submit_reloc(struct msm_gem_submit *submit, struct msm_gem_object *ob
+ 		uint64_t iova;
+ 		bool valid;
+ 
+-		ret = copy_from_user(&submit_reloc, userptr, sizeof(submit_reloc));
+-		if (ret)
++		if (copy_from_user(&submit_reloc, userptr, sizeof(submit_reloc))) {
++			ret = -EFAULT;
+ 			goto out;
++		}
+ 
+ 		if (submit_reloc.submit_offset % 4) {
+ 			DRM_ERROR("non-aligned reloc offset: %u\n",
+
+commit a6cb3b864b21b7345f824a4faa12b723c8aaf099
+Author: Jordan Crouse <jcrouse@codeaurora.org>
+Date:   Tue Dec 20 08:54:31 2016 -0700
+
+    drm/msm: Verify that MSM_SUBMIT_BO_FLAGS are set
+    
+    For every submission buffer object one of MSM_SUBMIT_BO_WRITE
+    and MSM_SUBMIT_BO_READ must be set (and nothing else). If we
+    allowed zero then the buffer object would never get queued to
+    be unreferenced.
+    
+    Signed-off-by: Jordan Crouse <jcrouse@codeaurora.org>
+    Signed-off-by: Rob Clark <robdclark@gmail.com>
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index b6411ea6ed17..489676568a10 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -106,7 +106,8 @@ static int submit_lookup_objects(struct msm_gem_submit *submit,
+ 			pagefault_disable();
+ 		}
+ 
+-		if (submit_bo.flags & ~MSM_SUBMIT_BO_FLAGS) {
++		if ((submit_bo.flags & ~MSM_SUBMIT_BO_FLAGS) ||
++			!(submit_bo.flags & MSM_SUBMIT_BO_FLAGS)) {
+ 			DRM_ERROR("invalid flags: %x\n", submit_bo.flags);
+ 			ret = -EINVAL;
+ 			goto out_unlock;
+
+commit 6490abc4bc35fa4f3bdb9c7e49096943c50e29ea
+Author: Jordan Crouse <jcrouse@codeaurora.org>
+Date:   Tue Dec 20 08:54:30 2016 -0700
+
+    drm/msm: Put back the vaddr in submit_reloc()
+    
+    The error cases in submit_reloc() need to put back the virtual
+    address of the bo before failling. Add a single failure path
+    for the function.
+    
+    Signed-off-by: Jordan Crouse <jcrouse@codeaurora.org>
+    Signed-off-by: Rob Clark <robdclark@gmail.com>
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index 166e84e4f0d4..b6411ea6ed17 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -290,7 +290,7 @@ static int submit_reloc(struct msm_gem_submit *submit, struct msm_gem_object *ob
+ {
+ 	uint32_t i, last_offset = 0;
+ 	uint32_t *ptr;
+-	int ret;
++	int ret = 0;
+ 
+ 	if (offset % 4) {
+ 		DRM_ERROR("non-aligned cmdstream buffer: %u\n", offset);
+@@ -318,12 +318,13 @@ static int submit_reloc(struct msm_gem_submit *submit, struct msm_gem_object *ob
+ 
+ 		ret = copy_from_user(&submit_reloc, userptr, sizeof(submit_reloc));
+ 		if (ret)
+-			return -EFAULT;
++			goto out;
+ 
+ 		if (submit_reloc.submit_offset % 4) {
+ 			DRM_ERROR("non-aligned reloc offset: %u\n",
+ 					submit_reloc.submit_offset);
+-			return -EINVAL;
++			ret = -EINVAL;
++			goto out;
+ 		}
+ 
+ 		/* offset in dwords: */
+@@ -332,12 +333,13 @@ static int submit_reloc(struct msm_gem_submit *submit, struct msm_gem_object *ob
+ 		if ((off >= (obj->base.size / 4)) ||
+ 				(off < last_offset)) {
+ 			DRM_ERROR("invalid offset %u at reloc %u\n", off, i);
+-			return -EINVAL;
++			ret = -EINVAL;
++			goto out;
+ 		}
+ 
+ 		ret = submit_bo(submit, submit_reloc.reloc_idx, NULL, &iova, &valid);
+ 		if (ret)
+-			return ret;
++			goto out;
+ 
+ 		if (valid)
+ 			continue;
+@@ -354,9 +356,10 @@ static int submit_reloc(struct msm_gem_submit *submit, struct msm_gem_object *ob
+ 		last_offset = off;
+ 	}
+ 
++out:
+ 	msm_gem_put_vaddr_locked(&obj->base);
+ 
+-	return 0;
++	return ret;
+ }
+ 
+ static void submit_cleanup(struct msm_gem_submit *submit)
+
+commit 78babc1633c4b0664ea516500c2ace9bf1f17bc7
+Author: Rob Clark <robdclark@gmail.com>
+Date:   Fri Nov 11 12:06:46 2016 -0500
+
+    drm/msm: convert iova to 64b
+    
+    For a5xx the gpu is 64b so we need to change iova to 64b everywhere.  On
+    the display side, iova is still 32b so it can ignore the upper bits.
+    (Although all the armv8 devices have an iommu that can map 64b pa to 32b
+    iova.)
+    
+    Signed-off-by: Rob Clark <robdclark@gmail.com>
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index 25e8786fa4ca..166e84e4f0d4 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -241,7 +241,7 @@ static int submit_pin_objects(struct msm_gem_submit *submit)
+ 
+ 	for (i = 0; i < submit->nr_bos; i++) {
+ 		struct msm_gem_object *msm_obj = submit->bos[i].obj;
+-		uint32_t iova;
++		uint64_t iova;
+ 
+ 		/* if locking succeeded, pin bo: */
+ 		ret = msm_gem_get_iova_locked(&msm_obj->base,
+@@ -266,7 +266,7 @@ static int submit_pin_objects(struct msm_gem_submit *submit)
+ }
+ 
+ static int submit_bo(struct msm_gem_submit *submit, uint32_t idx,
+-		struct msm_gem_object **obj, uint32_t *iova, bool *valid)
++		struct msm_gem_object **obj, uint64_t *iova, bool *valid)
+ {
+ 	if (idx >= submit->nr_bos) {
+ 		DRM_ERROR("invalid buffer index: %u (out of %u)\n",
+@@ -312,7 +312,8 @@ static int submit_reloc(struct msm_gem_submit *submit, struct msm_gem_object *ob
+ 		struct drm_msm_gem_submit_reloc submit_reloc;
+ 		void __user *userptr =
+ 			u64_to_user_ptr(relocs + (i * sizeof(submit_reloc)));
+-		uint32_t iova, off;
++		uint32_t off;
++		uint64_t iova;
+ 		bool valid;
+ 
+ 		ret = copy_from_user(&submit_reloc, userptr, sizeof(submit_reloc));
+@@ -461,7 +462,7 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 		void __user *userptr =
+ 			u64_to_user_ptr(args->cmds + (i * sizeof(submit_cmd)));
+ 		struct msm_gem_object *msm_obj;
+-		uint32_t iova;
++		uint64_t iova;
+ 
+ 		ret = copy_from_user(&submit_cmd, userptr, sizeof(submit_cmd));
+ 		if (ret) {
+
+commit f54d1867005c3323f5d8ad83eed823e84226c429
+Author: Chris Wilson <chris@chris-wilson.co.uk>
+Date:   Tue Oct 25 13:00:45 2016 +0100
+
+    dma-buf: Rename struct fence to dma_fence
+    
+    I plan to usurp the short name of struct fence for a core kernel struct,
+    and so I need to rename the specialised fence/timeline for DMA
+    operations to make room.
+    
+    A consensus was reached in
+    https://lists.freedesktop.org/archives/dri-devel/2016-July/113083.html
+    that making clear this fence applies to DMA operations was a good thing.
+    Since then the patch has grown a bit as usage increases, so hopefully it
+    remains a good thing!
+    
+    (v2...: rebase, rerun spatch)
+    v3: Compile on msm, spotted a manual fixup that I broke.
+    v4: Try again for msm, sorry Daniel
+    
+    coccinelle script:
+    @@
+    
+    @@
+    - struct fence
+    + struct dma_fence
+    @@
+    
+    @@
+    - struct fence_ops
+    + struct dma_fence_ops
+    @@
+    
+    @@
+    - struct fence_cb
+    + struct dma_fence_cb
+    @@
+    
+    @@
+    - struct fence_array
+    + struct dma_fence_array
+    @@
+    
+    @@
+    - enum fence_flag_bits
+    + enum dma_fence_flag_bits
+    @@
+    
+    @@
+    (
+    - fence_init
+    + dma_fence_init
+    |
+    - fence_release
+    + dma_fence_release
+    |
+    - fence_free
+    + dma_fence_free
+    |
+    - fence_get
+    + dma_fence_get
+    |
+    - fence_get_rcu
+    + dma_fence_get_rcu
+    |
+    - fence_put
+    + dma_fence_put
+    |
+    - fence_signal
+    + dma_fence_signal
+    |
+    - fence_signal_locked
+    + dma_fence_signal_locked
+    |
+    - fence_default_wait
+    + dma_fence_default_wait
+    |
+    - fence_add_callback
+    + dma_fence_add_callback
+    |
+    - fence_remove_callback
+    + dma_fence_remove_callback
+    |
+    - fence_enable_sw_signaling
+    + dma_fence_enable_sw_signaling
+    |
+    - fence_is_signaled_locked
+    + dma_fence_is_signaled_locked
+    |
+    - fence_is_signaled
+    + dma_fence_is_signaled
+    |
+    - fence_is_later
+    + dma_fence_is_later
+    |
+    - fence_later
+    + dma_fence_later
+    |
+    - fence_wait_timeout
+    + dma_fence_wait_timeout
+    |
+    - fence_wait_any_timeout
+    + dma_fence_wait_any_timeout
+    |
+    - fence_wait
+    + dma_fence_wait
+    |
+    - fence_context_alloc
+    + dma_fence_context_alloc
+    |
+    - fence_array_create
+    + dma_fence_array_create
+    |
+    - to_fence_array
+    + to_dma_fence_array
+    |
+    - fence_is_array
+    + dma_fence_is_array
+    |
+    - trace_fence_emit
+    + trace_dma_fence_emit
+    |
+    - FENCE_TRACE
+    + DMA_FENCE_TRACE
+    |
+    - FENCE_WARN
+    + DMA_FENCE_WARN
+    |
+    - FENCE_ERR
+    + DMA_FENCE_ERR
+    )
+     (
+     ...
+     )
+    
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Reviewed-by: Gustavo Padovan <gustavo.padovan@collabora.co.uk>
+    Acked-by: Sumit Semwal <sumit.semwal@linaro.org>
+    Acked-by: Christian König <christian.koenig@amd.com>
+    Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+    Link: http://patchwork.freedesktop.org/patch/msgid/20161025120045.28839-1-chris@chris-wilson.co.uk
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index b6a0f37a65f3..25e8786fa4ca 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -60,7 +60,7 @@ static struct msm_gem_submit *submit_create(struct drm_device *dev,
+ 
+ void msm_gem_submit_free(struct msm_gem_submit *submit)
+ {
+-	fence_put(submit->fence);
++	dma_fence_put(submit->fence);
+ 	list_del(&submit->node);
+ 	put_pid(submit->pid);
+ 	kfree(submit);
+@@ -380,7 +380,7 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 	struct msm_file_private *ctx = file->driver_priv;
+ 	struct msm_gem_submit *submit;
+ 	struct msm_gpu *gpu = priv->gpu;
+-	struct fence *in_fence = NULL;
++	struct dma_fence *in_fence = NULL;
+ 	struct sync_file *sync_file = NULL;
+ 	int out_fence_fd = -1;
+ 	unsigned i;
+@@ -439,7 +439,7 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 		 */
+ 
+ 		if (in_fence->context != gpu->fctx->context) {
+-			ret = fence_wait(in_fence, true);
++			ret = dma_fence_wait(in_fence, true);
+ 			if (ret)
+ 				goto out;
+ 		}
+@@ -542,7 +542,7 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 
+ out:
+ 	if (in_fence)
+-		fence_put(in_fence);
++		dma_fence_put(in_fence);
+ 	submit_cleanup(submit);
+ 	if (ret)
+ 		msm_gem_submit_free(submit);
+
+commit ca09fb9f60b5f3ab2d57e761aaeea89a5147d784
+Merge: 9f4ef05bcdcf 08895a8b6b06
+Author: Dave Airlie <airlied@redhat.com>
+Date:   Wed Sep 28 12:08:49 2016 +1000
+
+    Merge tag 'v4.8-rc8' into drm-next
+    
+    Linux 4.8-rc8
+    
+    There was a lot of fallout in the imx/amdgpu/i915 drivers, so backmerge
+    it now to avoid troubles.
+    
+    * tag 'v4.8-rc8': (1442 commits)
+      Linux 4.8-rc8
+      fault_in_multipages_readable() throws set-but-unused error
+      mm: check VMA flags to avoid invalid PROT_NONE NUMA balancing
+      radix tree: fix sibling entry handling in radix_tree_descend()
+      radix tree test suite: Test radix_tree_replace_slot() for multiorder entries
+      fix memory leaks in tracing_buffers_splice_read()
+      tracing: Move mutex to protect against resetting of seq data
+      MIPS: Fix delay slot emulation count in debugfs
+      MIPS: SMP: Fix possibility of deadlock when bringing CPUs online
+      mm: delete unnecessary and unsafe init_tlb_ubc()
+      huge tmpfs: fix Committed_AS leak
+      shmem: fix tmpfs to handle the huge= option properly
+      blk-mq: skip unmapped queues in blk_mq_alloc_request_hctx
+      MIPS: Fix pre-r6 emulation FPU initialisation
+      arm64: kgdb: handle read-only text / modules
+      arm64: Call numa_store_cpu_info() earlier.
+      locking/hung_task: Fix typo in CONFIG_DETECT_HUNG_TASK help text
+      nvme-rdma: only clear queue flags after successful connect
+      i2c: qup: skip qup_i2c_suspend if the device is already runtime suspended
+      perf/core: Limit matching exclusive events to one PMU
+      ...
+
+commit 4cd0945901a6dd0190824a98471449df9129d21c
+Author: Rob Clark <robdclark@gmail.com>
+Date:   Thu Jun 16 16:43:49 2016 -0400
+
+    drm/msm: submit support for out-fences
+    
+    Signed-off-by: Rob Clark <robdclark@gmail.com>
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index 65284febb2f9..3ac14cd1e5b9 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -364,6 +364,8 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 	struct msm_gem_submit *submit;
+ 	struct msm_gpu *gpu = priv->gpu;
+ 	struct fence *in_fence = NULL;
++	struct sync_file *sync_file = NULL;
++	int out_fence_fd = -1;
+ 	unsigned i;
+ 	int ret;
+ 
+@@ -383,6 +385,14 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 	if (ret)
+ 		return ret;
+ 
++	if (args->flags & MSM_SUBMIT_FENCE_FD_OUT) {
++		out_fence_fd = get_unused_fd_flags(O_CLOEXEC);
++		if (out_fence_fd < 0) {
++			ret = out_fence_fd;
++			goto out_unlock;
++		}
++	}
++
+ 	submit = submit_create(dev, gpu, args->nr_bos, args->nr_cmds);
+ 	if (!submit) {
+ 		ret = -ENOMEM;
+@@ -495,10 +505,23 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 		goto out;
+ 	}
+ 
++	if (args->flags & MSM_SUBMIT_FENCE_FD_OUT) {
++		sync_file = sync_file_create(submit->fence);
++		if (!sync_file) {
++			ret = -ENOMEM;
++			goto out;
++		}
++	}
++
+ 	msm_gpu_submit(gpu, submit, ctx);
+ 
+ 	args->fence = submit->fence->seqno;
+ 
++	if (args->flags & MSM_SUBMIT_FENCE_FD_OUT) {
++		fd_install(out_fence_fd, sync_file->file);
++		args->fence_fd = out_fence_fd;
++	}
++
+ out:
+ 	if (in_fence)
+ 		fence_put(in_fence);
+@@ -506,6 +529,8 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 	if (ret)
+ 		msm_gem_submit_free(submit);
+ out_unlock:
++	if (ret && (out_fence_fd >= 0))
++		put_unused_fd(out_fence_fd);
+ 	mutex_unlock(&dev->struct_mutex);
+ 	return ret;
+ }
+
+commit f44d32c79fd591179820d6ce4645c4c2799e6d40
+Author: Rob Clark <robdclark@gmail.com>
+Date:   Thu Jun 16 16:37:38 2016 -0400
+
+    drm/msm: move fence allocation out of msm_gpu_submit()
+    
+    Prep work for next patch.
+    
+    Signed-off-by: Rob Clark <robdclark@gmail.com>
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index 3a4a8ddeb1db..65284febb2f9 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -488,7 +488,14 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 
+ 	submit->nr_cmds = i;
+ 
+-	ret = msm_gpu_submit(gpu, submit, ctx);
++	submit->fence = msm_fence_alloc(gpu->fctx);
++	if (IS_ERR(submit->fence)) {
++		ret = PTR_ERR(submit->fence);
++		submit->fence = NULL;
++		goto out;
++	}
++
++	msm_gpu_submit(gpu, submit, ctx);
+ 
+ 	args->fence = submit->fence->seqno;
+ 
+
+commit f0a42bb5423a1387e54a2d3451a10d4358b8cfb6
+Author: Rob Clark <robdclark@gmail.com>
+Date:   Thu Jun 16 16:08:19 2016 -0400
+
+    drm/msm: submit support for in-fences
+    
+    Signed-off-by: Rob Clark <robdclark@gmail.com>
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index 0b96d85d99f9..3a4a8ddeb1db 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -15,6 +15,8 @@
+  * this program.  If not, see <http://www.gnu.org/licenses/>.
+  */
+ 
++#include <linux/sync_file.h>
++
+ #include "msm_drv.h"
+ #include "msm_gpu.h"
+ #include "msm_gem.h"
+@@ -361,6 +363,7 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 	struct msm_file_private *ctx = file->driver_priv;
+ 	struct msm_gem_submit *submit;
+ 	struct msm_gpu *gpu = priv->gpu;
++	struct fence *in_fence = NULL;
+ 	unsigned i;
+ 	int ret;
+ 
+@@ -394,9 +397,32 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 	if (ret)
+ 		goto out;
+ 
+-	ret = submit_fence_sync(submit);
+-	if (ret)
+-		goto out;
++	if (args->flags & MSM_SUBMIT_FENCE_FD_IN) {
++		in_fence = sync_file_get_fence(args->fence_fd);
++
++		if (!in_fence) {
++			ret = -EINVAL;
++			goto out;
++		}
++
++		/* TODO if we get an array-fence due to userspace merging multiple
++		 * fences, we need a way to determine if all the backing fences
++		 * are from our own context..
++		 */
++
++		if (in_fence->context != gpu->fctx->context) {
++			ret = fence_wait(in_fence, true);
++			if (ret)
++				goto out;
++		}
++
++	}
++
++	if (!(args->fence & MSM_SUBMIT_NO_IMPLICIT)) {
++		ret = submit_fence_sync(submit);
++		if (ret)
++			goto out;
++	}
+ 
+ 	ret = submit_pin_objects(submit);
+ 	if (ret)
+@@ -467,6 +493,8 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 	args->fence = submit->fence->seqno;
+ 
+ out:
++	if (in_fence)
++		fence_put(in_fence);
+ 	submit_cleanup(submit);
+ 	if (ret)
+ 		msm_gem_submit_free(submit);
+
+commit d9c181e22a0599fa7e27c3717f56bc1b3b020e63
+Author: Rob Clark <robdclark@gmail.com>
+Date:   Sat Apr 23 10:08:59 2016 -0400
+
+    drm/msm: extend the submit ioctl to pass in flags
+    
+    We'll want to be able to pass in flags, such as asking for explicit
+    fencing, and possibly other things down the road.  Fortunately we
+    don't need a full 32b for the pipe-id.  So use the upper 16 bits
+    for flags (which could be extended or reduced later if needed, so
+    start adding flags from the high bits).
+    
+    Since anything with the upper bits set would not be a valid pipe-id,
+    an old userspace would not set any of the upper bits, and an old
+    kernel would reject it as an invalid pipe-id.
+    
+    Signed-off-by: Rob Clark <robdclark@gmail.com>
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index 9766f9ae4b7d..0b96d85d99f9 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -370,7 +370,10 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 	/* for now, we just have 3d pipe.. eventually this would need to
+ 	 * be more clever to dispatch to appropriate gpu module:
+ 	 */
+-	if (args->pipe != MSM_PIPE_3D0)
++	if (MSM_PIPE_ID(args->flags) != MSM_PIPE_3D0)
++		return -EINVAL;
++
++	if (MSM_PIPE_FLAGS(args->flags) & ~MSM_SUBMIT_FLAGS)
+ 		return -EINVAL;
+ 
+ 	ret = mutex_lock_interruptible(&dev->struct_mutex);
+
+commit d78d383ab354b0b9e1d23404ae0d9fbdeb9aa035
+Author: Rob Clark <robdclark@gmail.com>
+Date:   Mon Aug 22 15:28:38 2016 -0400
+
+    drm/msm: protect against faults from copy_from_user() in submit ioctl
+    
+    An evil userspace could try to cause deadlock by passing an unfaulted-in
+    GEM bo as submit->bos (or submit->cmds) table.  Which will trigger
+    msm_gem_fault() while we already hold struct_mutex.  See:
+    
+    https://github.com/freedreno/msmtest/blob/master/evilsubmittest.c
+    
+    Cc: stable@vger.kernel.org
+    Signed-off-by: Rob Clark <robdclark@gmail.com>
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index 408da409a216..880d6a9af7c8 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -394,6 +394,8 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 	if (ret)
+ 		return ret;
+ 
++	priv->struct_mutex_task = current;
++
+ 	submit = submit_create(dev, gpu, args->nr_bos, args->nr_cmds);
+ 	if (!submit) {
+ 		ret = -ENOMEM;
+@@ -485,6 +487,7 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 	if (ret)
+ 		msm_gem_submit_free(submit);
+ out_unlock:
++	priv->struct_mutex_task = NULL;
+ 	mutex_unlock(&dev->struct_mutex);
+ 	return ret;
+ }
+
+commit 89f82cbb0d5c0ab768c8d02914188aa2211cd2e3
+Author: Rob Clark <robdclark@gmail.com>
+Date:   Mon Aug 22 15:15:23 2016 -0400
+
+    drm/msm: fix use of copy_from_user() while holding spinlock
+    
+    Use instead __copy_from_user_inatomic() and fallback to slow-path where
+    we drop and re-aquire the lock in case of fault.
+    
+    Cc: stable@vger.kernel.org
+    Reported-by: Vaishali Thakkar <vaishali.thakkar@oracle.com>
+    Signed-off-by: Rob Clark <robdclark@gmail.com>
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index 9766f9ae4b7d..408da409a216 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -64,6 +64,14 @@ void msm_gem_submit_free(struct msm_gem_submit *submit)
+ 	kfree(submit);
+ }
+ 
++static inline unsigned long __must_check
++copy_from_user_inatomic(void *to, const void __user *from, unsigned long n)
++{
++	if (access_ok(VERIFY_READ, from, n))
++		return __copy_from_user_inatomic(to, from, n);
++	return -EFAULT;
++}
++
+ static int submit_lookup_objects(struct msm_gem_submit *submit,
+ 		struct drm_msm_gem_submit *args, struct drm_file *file)
+ {
+@@ -71,6 +79,7 @@ static int submit_lookup_objects(struct msm_gem_submit *submit,
+ 	int ret = 0;
+ 
+ 	spin_lock(&file->table_lock);
++	pagefault_disable();
+ 
+ 	for (i = 0; i < args->nr_bos; i++) {
+ 		struct drm_msm_gem_submit_bo submit_bo;
+@@ -84,10 +93,15 @@ static int submit_lookup_objects(struct msm_gem_submit *submit,
+ 		 */
+ 		submit->bos[i].flags = 0;
+ 
+-		ret = copy_from_user(&submit_bo, userptr, sizeof(submit_bo));
+-		if (ret) {
+-			ret = -EFAULT;
+-			goto out_unlock;
++		ret = copy_from_user_inatomic(&submit_bo, userptr, sizeof(submit_bo));
++		if (unlikely(ret)) {
++			pagefault_enable();
++			spin_unlock(&file->table_lock);
++			ret = copy_from_user(&submit_bo, userptr, sizeof(submit_bo));
++			if (ret)
++				goto out;
++			spin_lock(&file->table_lock);
++			pagefault_disable();
+ 		}
+ 
+ 		if (submit_bo.flags & ~MSM_SUBMIT_BO_FLAGS) {
+@@ -127,9 +141,12 @@ static int submit_lookup_objects(struct msm_gem_submit *submit,
+ 	}
+ 
+ out_unlock:
+-	submit->nr_bos = i;
++	pagefault_enable();
+ 	spin_unlock(&file->table_lock);
+ 
++out:
++	submit->nr_bos = i;
++
+ 	return ret;
+ }
+ 
+
+commit 6b597ce2f7c7a0f8116d753902db9aba6bc05cb0
+Author: Rob Clark <robdclark@gmail.com>
+Date:   Wed Jun 1 14:17:40 2016 -0400
+
+    drm/msm: deal with arbitrary # of cmd buffers
+    
+    For some optimizations coming on the userspace side, splitting larger
+    draw or gmem cmds into multiple cmdstream buffers, we need to support
+    much more than the previous small/arbitrary limit.
+    
+    Signed-off-by: Rob Clark <robdclark@gmail.com>
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index 736f15881b6a..9766f9ae4b7d 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -29,10 +29,11 @@
+ #define BO_PINNED   0x2000
+ 
+ static struct msm_gem_submit *submit_create(struct drm_device *dev,
+-		struct msm_gpu *gpu, int nr)
++		struct msm_gpu *gpu, int nr_bos, int nr_cmds)
+ {
+ 	struct msm_gem_submit *submit;
+-	int sz = sizeof(*submit) + (nr * sizeof(submit->bos[0]));
++	int sz = sizeof(*submit) + (nr_bos * sizeof(submit->bos[0])) +
++			(nr_cmds * sizeof(*submit->cmd));
+ 
+ 	submit = kmalloc(sz, GFP_TEMPORARY | __GFP_NOWARN | __GFP_NORETRY);
+ 	if (!submit)
+@@ -42,6 +43,7 @@ static struct msm_gem_submit *submit_create(struct drm_device *dev,
+ 	submit->gpu = gpu;
+ 	submit->fence = NULL;
+ 	submit->pid = get_pid(task_pid(current));
++	submit->cmd = (void *)&submit->bos[nr_bos];
+ 
+ 	/* initially, until copy_from_user() and bo lookup succeeds: */
+ 	submit->nr_bos = 0;
+@@ -371,14 +373,11 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 	if (args->pipe != MSM_PIPE_3D0)
+ 		return -EINVAL;
+ 
+-	if (args->nr_cmds > MAX_CMDS)
+-		return -EINVAL;
+-
+ 	ret = mutex_lock_interruptible(&dev->struct_mutex);
+ 	if (ret)
+ 		return ret;
+ 
+-	submit = submit_create(dev, gpu, args->nr_bos);
++	submit = submit_create(dev, gpu, args->nr_bos, args->nr_cmds);
+ 	if (!submit) {
+ 		ret = -ENOMEM;
+ 		goto out_unlock;
+
+commit 18f23049f640e2590930c34009418c66e6ebf7b6
+Author: Rob Clark <robdclark@gmail.com>
+Date:   Thu May 26 16:24:35 2016 -0400
+
+    drm/msm: change gem->vmap() to get/put
+    
+    Before we can add vmap shrinking, we really need to know which vmap'ings
+    are currently being used.  So switch to get/put interface.  Stubbed put
+    fxns for now.
+    
+    Signed-off-by: Rob Clark <robdclark@gmail.com>
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index ea5f709e2e27..736f15881b6a 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -279,7 +279,7 @@ static int submit_reloc(struct msm_gem_submit *submit, struct msm_gem_object *ob
+ 	/* For now, just map the entire thing.  Eventually we probably
+ 	 * to do it page-by-page, w/ kmap() if not vmap()d..
+ 	 */
+-	ptr = msm_gem_vaddr_locked(&obj->base);
++	ptr = msm_gem_get_vaddr_locked(&obj->base);
+ 
+ 	if (IS_ERR(ptr)) {
+ 		ret = PTR_ERR(ptr);
+@@ -332,6 +332,8 @@ static int submit_reloc(struct msm_gem_submit *submit, struct msm_gem_object *ob
+ 		last_offset = off;
+ 	}
+ 
++	msm_gem_put_vaddr_locked(&obj->base);
++
+ 	return 0;
+ }
+ 
+
+commit b5b4c264df4d270819676b290cef9a11d04c35f0
+Author: Rob Clark <robdclark@gmail.com>
+Date:   Tue May 17 15:43:35 2016 -0400
+
+    drm/msm: use mutex_lock_interruptible for submit ioctl
+    
+    Be kinder to things that do lots of signal handling (ie. Xorg)
+    
+    Signed-off-by: Rob Clark <robdclark@gmail.com>
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index eb4bb8b2f3a5..ea5f709e2e27 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -372,11 +372,15 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 	if (args->nr_cmds > MAX_CMDS)
+ 		return -EINVAL;
+ 
+-	submit = submit_create(dev, gpu, args->nr_bos);
+-	if (!submit)
+-		return -ENOMEM;
++	ret = mutex_lock_interruptible(&dev->struct_mutex);
++	if (ret)
++		return ret;
+ 
+-	mutex_lock(&dev->struct_mutex);
++	submit = submit_create(dev, gpu, args->nr_bos);
++	if (!submit) {
++		ret = -ENOMEM;
++		goto out_unlock;
++	}
+ 
+ 	ret = submit_lookup_objects(submit, args, file);
+ 	if (ret)
+@@ -462,6 +466,7 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 	submit_cleanup(submit);
+ 	if (ret)
+ 		msm_gem_submit_free(submit);
++out_unlock:
+ 	mutex_unlock(&dev->struct_mutex);
+ 	return ret;
+ }
+
+commit a9e26cab40ecfd4a0d718f22fa30db4dd1edbf60
+Author: Rob Clark <robdclark@gmail.com>
+Date:   Wed Jun 1 14:02:51 2016 -0400
+
+    drm/msm: fix potential submit error path issue
+    
+    Signed-off-by: Rob Clark <robdclark@gmail.com>
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index 635eff17c3d1..eb4bb8b2f3a5 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -77,6 +77,11 @@ static int submit_lookup_objects(struct msm_gem_submit *submit,
+ 		void __user *userptr =
+ 			u64_to_user_ptr(args->bos + (i * sizeof(submit_bo)));
+ 
++		/* make sure we don't have garbage flags, in case we hit
++		 * error path before flags is initialized:
++		 */
++		submit->bos[i].flags = 0;
++
+ 		ret = copy_from_user(&submit_bo, userptr, sizeof(submit_bo));
+ 		if (ret) {
+ 			ret = -EFAULT;
+
+commit ba344afd667a6f1c6bf7c53e08fc16bd84fa4df7
+Author: Rob Clark <robdclark@gmail.com>
+Date:   Tue May 24 18:43:26 2016 -0400
+
+    drm/msm: fix some crashes in submit fail path
+    
+    If submit fails, before fence is created or before submit is added to
+    submit-list, then unitialized fields cause problems in the clean-up
+    path.
+    
+    Signed-off-by: Rob Clark <robdclark@gmail.com>
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index b89ca5174863..635eff17c3d1 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -40,12 +40,14 @@ static struct msm_gem_submit *submit_create(struct drm_device *dev,
+ 
+ 	submit->dev = dev;
+ 	submit->gpu = gpu;
++	submit->fence = NULL;
+ 	submit->pid = get_pid(task_pid(current));
+ 
+ 	/* initially, until copy_from_user() and bo lookup succeeds: */
+ 	submit->nr_bos = 0;
+ 	submit->nr_cmds = 0;
+ 
++	INIT_LIST_HEAD(&submit->node);
+ 	INIT_LIST_HEAD(&submit->bo_list);
+ 	ww_acquire_init(&submit->ticket, &reservation_ww_class);
+ 
+
+commit 1d6da87a3241deb13d073c4125d19ed0e5a0c62c
+Merge: 1f40c49570eb a39ed680bddb
+Author: Linus Torvalds <torvalds@linux-foundation.org>
+Date:   Mon May 23 11:48:48 2016 -0700
+
+    Merge branch 'drm-next' of git://people.freedesktop.org/~airlied/linux
+    
+    Pull drm updates from Dave Airlie:
+     "Here's the main drm pull request for 4.7, it's been a busy one, and
+      I've been a bit more distracted in real life this merge window.  Lots
+      more ARM drivers, not sure if it'll ever end.  I think I've at least
+      one more coming the next merge window.
+    
+      But changes are all over the place, support for AMD Polaris GPUs is in
+      here, some missing GM108 support for nouveau (found in some Lenovos),
+      a bunch of MST and skylake fixes.
+    
+      I've also noticed a few fixes from Arnd in my inbox, that I'll try and
+      get in asap, but I didn't think they should hold this up.
+    
+      New drivers:
+       - Hisilicon kirin display driver
+       - Mediatek MT8173 display driver
+       - ARC PGU - bitstreamer on Synopsys ARC SDP boards
+       - Allwinner A13 initial RGB output driver
+       - Analogix driver for DisplayPort IP found in exynos and rockchip
+    
+      DRM Core:
+       - UAPI headers fixes and C++ safety
+       - DRM connector reference counting
+       - DisplayID mode parsing for Dell 5K monitors
+       - Removal of struct_mutex from drivers
+       - Connector registration cleanups
+       - MST robustness fixes
+       - MAINTAINERS updates
+       - Lockless GEM object freeing
+       - Generic fbdev deferred IO support
+    
+      panel:
+       - Support for a bunch of new panels
+    
+      i915:
+       - VBT refactoring
+       - PLL computation cleanups
+       - DSI support for BXT
+       - Color manager support
+       - More atomic patches
+       - GEM improvements
+       - GuC fw loading fixes
+       - DP detection fixes
+       - SKL GPU hang fixes
+       - Lots of BXT fixes
+    
+      radeon/amdgpu:
+       - Initial Polaris support
+       - GPUVM/Scheduler/Clock/Power improvements
+       - ASYNC pageflip support
+       - New mesa feature support
+    
+      nouveau:
+       - GM108 support
+       - Power sensor support improvements
+       - GR init + ucode fixes.
+       - Use GPU provided topology information
+    
+      vmwgfx:
+       - Add host messaging support
+    
+      gma500:
+       - Some cleanups and fixes
+    
+      atmel:
+       - Bridge support
+       - Async atomic commit support
+    
+      fsl-dcu:
+       - Timing controller for LCD support
+       - Pixel clock polarity support
+    
+      rcar-du:
+       - Misc fixes
+    
+      exynos:
+       - Pipeline clock support
+       - Exynoss4533 SoC support
+       - HW trigger mode support
+       - export HDMI_PHY clock
+       - DECON5433 fixes
+       - Use generic prime functions
+       - use DMA mapping APIs
+    
+      rockchip:
+       - Lots of little fixes
+    
+      vc4:
+       - Render node support
+       - Gamma ramp support
+       - DPI output support
+    
+      msm:
+       - Mostly cleanups and fixes
+       - Conversion to generic struct fence
+    
+      etnaviv:
+       - Fix for prime buffer handling
+       - Allow hangcheck to be coalesced with other wakeups
+    
+      tegra:
+       - Gamme table size fix"
+    
+    * 'drm-next' of git://people.freedesktop.org/~airlied/linux: (1050 commits)
+      drm/edid: add displayid detailed 1 timings to the modelist. (v1.1)
+      drm/edid: move displayid validation to it's own function.
+      drm/displayid: Iterate over all DisplayID blocks
+      drm/edid: move displayid tiled block parsing into separate function.
+      drm: Nuke ->vblank_disable_allowed
+      drm/vmwgfx: Report vmwgfx version to vmware.log
+      drm/vmwgfx: Add VMWare host messaging capability
+      drm/vmwgfx: Kill some lockdep warnings
+      drm/nouveau/gr/gf100-: fix race condition in fecs/gpccs ucode
+      drm/nouveau/core: recognise GM108 chipsets
+      drm/nouveau/gr/gm107-: fix touching non-existent ppcs in attrib cb setup
+      drm/nouveau/gr/gk104-: share implementation of ppc exception init
+      drm/nouveau/gr/gk104-: move rop_active_fbps init to nonctx
+      drm/nouveau/bios/pll: check BIT table version before trying to parse it
+      drm/nouveau/bios/pll: prevent oops when limits table can't be parsed
+      drm/nouveau/volt/gk104: round up in gk104_volt_set
+      drm/nouveau/fb/gm200: setup mmu debug buffer registers at init()
+      drm/nouveau/fb/gk20a,gm20b: setup mmu debug buffer registers at init()
+      drm/nouveau/fb/gf100-: allocate mmu debug buffers
+      drm/nouveau/fb: allow chipset-specific actions for oneinit()
+      ...
+
+commit 4816b6267cf078f40158ff2e6bf9d0223f0c1cf6
+Author: Rob Clark <robdclark@gmail.com>
+Date:   Tue May 3 10:10:15 2016 -0400
+
+    drm/msm: print offender task name on hangcheck recovery
+    
+    Track the pid per submit, so we can print the name of the task which
+    submitted the batch that caused the gpu to hang.
+    
+    Signed-off-by: Rob Clark <robdclark@gmail.com>
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index 711a658cf1ea..a9a001150b9e 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -45,6 +45,7 @@ static struct msm_gem_submit *submit_create(struct drm_device *dev,
+ 
+ 	submit->dev = dev;
+ 	submit->gpu = gpu;
++	submit->pid = get_pid(task_pid(current));
+ 
+ 	/* initially, until copy_from_user() and bo lookup succeeds: */
+ 	submit->nr_bos = 0;
+@@ -60,6 +61,7 @@ void msm_gem_submit_free(struct msm_gem_submit *submit)
+ {
+ 	fence_put(submit->fence);
+ 	list_del(&submit->node);
++	put_pid(submit->pid);
+ 	kfree(submit);
+ }
+ 
+
+commit 40e6815bba6e34e5560e8855b43cd3eb17b24b09
+Author: Rob Clark <robdclark@gmail.com>
+Date:   Tue May 3 09:50:26 2016 -0400
+
+    drm/msm: fix leak in failed submit path
+    
+    Signed-off-by: Rob Clark <robdclark@gmail.com>
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index 96c595c9ab93..711a658cf1ea 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -56,6 +56,13 @@ static struct msm_gem_submit *submit_create(struct drm_device *dev,
+ 	return submit;
+ }
+ 
++void msm_gem_submit_free(struct msm_gem_submit *submit)
++{
++	fence_put(submit->fence);
++	list_del(&submit->node);
++	kfree(submit);
++}
++
+ static int submit_lookup_objects(struct msm_gem_submit *submit,
+ 		struct drm_msm_gem_submit *args, struct drm_file *file)
+ {
+@@ -324,7 +331,7 @@ static int submit_reloc(struct msm_gem_submit *submit, struct msm_gem_object *ob
+ 	return 0;
+ }
+ 
+-static void submit_cleanup(struct msm_gem_submit *submit, bool fail)
++static void submit_cleanup(struct msm_gem_submit *submit)
+ {
+ 	unsigned i;
+ 
+@@ -448,7 +455,9 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 	args->fence = submit->fence->seqno;
+ 
+ out:
+-	submit_cleanup(submit, !!ret);
++	submit_cleanup(submit);
++	if (ret)
++		msm_gem_submit_free(submit);
+ 	mutex_unlock(&dev->struct_mutex);
+ 	return ret;
+ }
+
+commit 6860b56c4b84bf9dba479c3f881d45a0b09a879c
+Author: Rob Clark <robdclark@gmail.com>
+Date:   Tue May 3 09:49:40 2016 -0400
+
+    drm/msm: de-indent submit_create()
+    
+    Signed-off-by: Rob Clark <robdclark@gmail.com>
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index 2661a7cb23c8..96c595c9ab93 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -40,17 +40,18 @@ static struct msm_gem_submit *submit_create(struct drm_device *dev,
+ 	int sz = sizeof(*submit) + (nr * sizeof(submit->bos[0]));
+ 
+ 	submit = kmalloc(sz, GFP_TEMPORARY | __GFP_NOWARN | __GFP_NORETRY);
+-	if (submit) {
+-		submit->dev = dev;
+-		submit->gpu = gpu;
++	if (!submit)
++		return NULL;
+ 
+-		/* initially, until copy_from_user() and bo lookup succeeds: */
+-		submit->nr_bos = 0;
+-		submit->nr_cmds = 0;
++	submit->dev = dev;
++	submit->gpu = gpu;
+ 
+-		INIT_LIST_HEAD(&submit->bo_list);
+-		ww_acquire_init(&submit->ticket, &reservation_ww_class);
+-	}
++	/* initially, until copy_from_user() and bo lookup succeeds: */
++	submit->nr_bos = 0;
++	submit->nr_cmds = 0;
++
++	INIT_LIST_HEAD(&submit->bo_list);
++	ww_acquire_init(&submit->ticket, &reservation_ww_class);
+ 
+ 	return submit;
+ }
+
+commit b6295f9a38fc3f7d59ec0caa45aa803461c6cea5
+Author: Rob Clark <robdclark@gmail.com>
+Date:   Tue Mar 15 18:26:28 2016 -0400
+
+    drm/msm: 'struct fence' conversion
+    
+    Signed-off-by: Rob Clark <robdclark@gmail.com>
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index b231544b3f52..2661a7cb23c8 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -184,6 +184,22 @@ static int submit_lock_objects(struct msm_gem_submit *submit)
+ 	return ret;
+ }
+ 
++static int submit_fence_sync(struct msm_gem_submit *submit)
++{
++	int i, ret = 0;
++
++	for (i = 0; i < submit->nr_bos; i++) {
++		struct msm_gem_object *msm_obj = submit->bos[i].obj;
++		bool write = submit->bos[i].flags & MSM_SUBMIT_BO_WRITE;
++
++		ret = msm_gem_sync_object(&msm_obj->base, submit->gpu->fctx, write);
++		if (ret)
++			break;
++	}
++
++	return ret;
++}
++
+ static int submit_pin_objects(struct msm_gem_submit *submit)
+ {
+ 	int i, ret = 0;
+@@ -358,6 +374,10 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 	if (ret)
+ 		goto out;
+ 
++	ret = submit_fence_sync(submit);
++	if (ret)
++		goto out;
++
+ 	ret = submit_pin_objects(submit);
+ 	if (ret)
+ 		goto out;
+@@ -424,7 +444,7 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 
+ 	ret = msm_gpu_submit(gpu, submit, ctx);
+ 
+-	args->fence = submit->fence;
++	args->fence = submit->fence->seqno;
+ 
+ out:
+ 	submit_cleanup(submit, !!ret);
+
+commit 340faef2418989b2573b82e6c708ef9e24ca439b
+Author: Rob Clark <robdclark@gmail.com>
+Date:   Mon Mar 14 13:56:37 2016 -0400
+
+    drm/msm: split locking and pinning BO's
+    
+    Split up locking and pinning buffers in the submit path.  This is needed
+    because we'll want to insert fencing in between the two steps.
+    
+    This makes things end up looking more similar to etnaviv submit code
+    (which was originally modelled on the msm code but has already added
+    'struct fence' support).
+    
+    Signed-off-by: Rob Clark <robdclark@gmail.com>
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index 43d2181231c0..b231544b3f52 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -24,7 +24,7 @@
+  */
+ 
+ /* make sure these don't conflict w/ MSM_SUBMIT_BO_x */
+-#define BO_VALID    0x8000
++#define BO_VALID    0x8000   /* is current addr in cmdstream correct/valid? */
+ #define BO_LOCKED   0x4000
+ #define BO_PINNED   0x2000
+ 
+@@ -136,16 +136,13 @@ static void submit_unlock_unpin_bo(struct msm_gem_submit *submit, int i)
+ }
+ 
+ /* This is where we make sure all the bo's are reserved and pin'd: */
+-static int submit_validate_objects(struct msm_gem_submit *submit)
++static int submit_lock_objects(struct msm_gem_submit *submit)
+ {
+ 	int contended, slow_locked = -1, i, ret = 0;
+ 
+ retry:
+-	submit->valid = true;
+-
+ 	for (i = 0; i < submit->nr_bos; i++) {
+ 		struct msm_gem_object *msm_obj = submit->bos[i].obj;
+-		uint32_t iova;
+ 
+ 		if (slow_locked == i)
+ 			slow_locked = -1;
+@@ -159,30 +156,6 @@ static int submit_validate_objects(struct msm_gem_submit *submit)
+ 				goto fail;
+ 			submit->bos[i].flags |= BO_LOCKED;
+ 		}
+-
+-
+-		/* if locking succeeded, pin bo: */
+-		ret = msm_gem_get_iova_locked(&msm_obj->base,
+-				submit->gpu->id, &iova);
+-
+-		/* this would break the logic in the fail path.. there is no
+-		 * reason for this to happen, but just to be on the safe side
+-		 * let's notice if this starts happening in the future:
+-		 */
+-		WARN_ON(ret == -EDEADLK);
+-
+-		if (ret)
+-			goto fail;
+-
+-		submit->bos[i].flags |= BO_PINNED;
+-
+-		if (iova == submit->bos[i].iova) {
+-			submit->bos[i].flags |= BO_VALID;
+-		} else {
+-			submit->bos[i].iova = iova;
+-			submit->bos[i].flags &= ~BO_VALID;
+-			submit->valid = false;
+-		}
+ 	}
+ 
+ 	ww_acquire_done(&submit->ticket);
+@@ -211,6 +184,38 @@ static int submit_validate_objects(struct msm_gem_submit *submit)
+ 	return ret;
+ }
+ 
++static int submit_pin_objects(struct msm_gem_submit *submit)
++{
++	int i, ret = 0;
++
++	submit->valid = true;
++
++	for (i = 0; i < submit->nr_bos; i++) {
++		struct msm_gem_object *msm_obj = submit->bos[i].obj;
++		uint32_t iova;
++
++		/* if locking succeeded, pin bo: */
++		ret = msm_gem_get_iova_locked(&msm_obj->base,
++				submit->gpu->id, &iova);
++
++		if (ret)
++			break;
++
++		submit->bos[i].flags |= BO_PINNED;
++
++		if (iova == submit->bos[i].iova) {
++			submit->bos[i].flags |= BO_VALID;
++		} else {
++			submit->bos[i].iova = iova;
++			/* iova changed, so address in cmdstream is not valid: */
++			submit->bos[i].flags &= ~BO_VALID;
++			submit->valid = false;
++		}
++	}
++
++	return ret;
++}
++
+ static int submit_bo(struct msm_gem_submit *submit, uint32_t idx,
+ 		struct msm_gem_object **obj, uint32_t *iova, bool *valid)
+ {
+@@ -349,7 +354,11 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 	if (ret)
+ 		goto out;
+ 
+-	ret = submit_validate_objects(submit);
++	ret = submit_lock_objects(submit);
++	if (ret)
++		goto out;
++
++	ret = submit_pin_objects(submit);
+ 	if (ret)
+ 		goto out;
+ 
+
+commit 3ed605bc8a0a688d8750a1e2eff39c854418c5cf
+Author: Gustavo Padovan <gustavo.padovan@collabora.co.uk>
+Date:   Tue Apr 26 12:32:27 2016 -0300
+
+    kernel.h: add u64_to_user_ptr()
+    
+    This function had copies in 3 different files. Unify them in kernel.h.
+    
+    Cc: Joe Perches <joe@perches.com>
+    Cc: Andrew Morton <akpm@linux-foundation.org>
+    Cc: David Airlie <airlied@linux.ie>
+    Cc: Daniel Vetter <daniel.vetter@intel.com>
+    Cc: Rob Clark <robdclark@gmail.com>
+    Signed-off-by: Gustavo Padovan <gustavo.padovan@collabora.co.uk>
+    Acked-by: Daniel Vetter <daniel.vetter@intel.com>       [drm/i915/]
+    Acked-by: Rob Clark <robdclark@gmail.com>               [drm/msm/]
+    Acked-by: Lucas Stach <l.stach@pengutronix.de>          [drm/etinav/]
+    Acked-by: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index 43d2181231c0..23d25283616c 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -28,11 +28,6 @@
+ #define BO_LOCKED   0x4000
+ #define BO_PINNED   0x2000
+ 
+-static inline void __user *to_user_ptr(u64 address)
+-{
+-	return (void __user *)(uintptr_t)address;
+-}
+-
+ static struct msm_gem_submit *submit_create(struct drm_device *dev,
+ 		struct msm_gpu *gpu, int nr)
+ {
+@@ -68,7 +63,7 @@ static int submit_lookup_objects(struct msm_gem_submit *submit,
+ 		struct drm_gem_object *obj;
+ 		struct msm_gem_object *msm_obj;
+ 		void __user *userptr =
+-			to_user_ptr(args->bos + (i * sizeof(submit_bo)));
++			u64_to_user_ptr(args->bos + (i * sizeof(submit_bo)));
+ 
+ 		ret = copy_from_user(&submit_bo, userptr, sizeof(submit_bo));
+ 		if (ret) {
+@@ -257,7 +252,7 @@ static int submit_reloc(struct msm_gem_submit *submit, struct msm_gem_object *ob
+ 	for (i = 0; i < nr_relocs; i++) {
+ 		struct drm_msm_gem_submit_reloc submit_reloc;
+ 		void __user *userptr =
+-			to_user_ptr(relocs + (i * sizeof(submit_reloc)));
++			u64_to_user_ptr(relocs + (i * sizeof(submit_reloc)));
+ 		uint32_t iova, off;
+ 		bool valid;
+ 
+@@ -356,7 +351,7 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 	for (i = 0; i < args->nr_cmds; i++) {
+ 		struct drm_msm_gem_submit_cmd submit_cmd;
+ 		void __user *userptr =
+-			to_user_ptr(args->cmds + (i * sizeof(submit_cmd)));
++			u64_to_user_ptr(args->cmds + (i * sizeof(submit_cmd)));
+ 		struct msm_gem_object *msm_obj;
+ 		uint32_t iova;
+ 
+
+commit 687f084a3bd01d932bb870a21fe92496055697d6
+Author: Rob Clark <robdclark@gmail.com>
+Date:   Wed Feb 3 13:24:35 2016 -0500
+
+    drm/msm: grab struct_mutex after allocating submit
+    
+    No real need to hold the lock over allocation, and simplifies things
+    slightly if we change the order.
+    
+    Signed-off-by: Rob Clark <robdclark@gmail.com>
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index 06f6ea9ccba0..43d2181231c0 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -339,13 +339,11 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 	if (args->nr_cmds > MAX_CMDS)
+ 		return -EINVAL;
+ 
+-	mutex_lock(&dev->struct_mutex);
+-
+ 	submit = submit_create(dev, gpu, args->nr_bos);
+-	if (!submit) {
+-		ret = -ENOMEM;
+-		goto out;
+-	}
++	if (!submit)
++		return -ENOMEM;
++
++	mutex_lock(&dev->struct_mutex);
+ 
+ 	ret = submit_lookup_objects(submit, args, file);
+ 	if (ret)
+@@ -420,8 +418,7 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 	args->fence = submit->fence;
+ 
+ out:
+-	if (submit)
+-		submit_cleanup(submit, !!ret);
++	submit_cleanup(submit, !!ret);
+ 	mutex_unlock(&dev->struct_mutex);
+ 	return ret;
+ }
+
+commit c01a958eca6e7f23bc49058feb66942ebcacb277
+Author: Rob Clark <robdclark@gmail.com>
+Date:   Wed Feb 3 13:12:31 2016 -0500
+
+    drm/msm: reject submit ioctl if no gpu
+    
+    Existing userspace wouldn't get this far, since getparam ioctl would
+    have failed and it would have bailed out creating a screen/context.
+    
+    But all the same, we shouldn't let evil or confused userspace cause a
+    null ptr deref.
+    
+    Signed-off-by: Rob Clark <robdclark@gmail.com>
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index 6d7cd3fe21e7..06f6ea9ccba0 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -323,18 +323,19 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 	struct drm_msm_gem_submit *args = data;
+ 	struct msm_file_private *ctx = file->driver_priv;
+ 	struct msm_gem_submit *submit;
+-	struct msm_gpu *gpu;
++	struct msm_gpu *gpu = priv->gpu;
+ 	unsigned i;
+ 	int ret;
+ 
++	if (!gpu)
++		return -ENXIO;
++
+ 	/* for now, we just have 3d pipe.. eventually this would need to
+ 	 * be more clever to dispatch to appropriate gpu module:
+ 	 */
+ 	if (args->pipe != MSM_PIPE_3D0)
+ 		return -EINVAL;
+ 
+-	gpu = priv->gpu;
+-
+ 	if (args->nr_cmds > MAX_CMDS)
+ 		return -EINVAL;
+ 
+
+commit 1a370be9ac51129e40b0ed7fa71d2b2b92bc47e5
+Author: Rob Clark <robdclark@gmail.com>
+Date:   Sun Jun 7 13:46:04 2015 -0400
+
+    drm/msm: restart queued submits after hang
+    
+    Track the list of in-flight submits.  If the gpu hangs, retire up to an
+    including the offending submit, and then re-submit the remainder.  This
+    way, for concurrently running piglit tests (for example), one failing
+    test doesn't cause unrelated tests to fail simply because it's submit
+    was queued up after one that triggered a hang.
+    
+    Signed-off-by: Rob Clark <robdclark@gmail.com>
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index cd0554f68316..6d7cd3fe21e7 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -314,7 +314,6 @@ static void submit_cleanup(struct msm_gem_submit *submit, bool fail)
+ 	}
+ 
+ 	ww_acquire_fini(&submit->ticket);
+-	kfree(submit);
+ }
+ 
+ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+
+commit a7d3c9509b2fecf8e593f3c933ab302cbe987d2e
+Author: Rob Clark <robdclark@gmail.com>
+Date:   Fri May 30 14:47:38 2014 -0400
+
+    drm/msm: add rd logging debugfs
+    
+    To ease debugging, add debugfs file which can be cat/tail'd to log
+    submits, along with fence #.  If GPU hangs, you can look at 'gpu'
+    debugfs file to find last completed fence and current register state,
+    and compare with logged rd file to narrow down the DRAW_INDX which
+    triggered the GPU hang.
+    
+    Signed-off-by: Rob Clark <robdclark@gmail.com>
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index 1f1f4cffdaed..cd0554f68316 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -402,6 +402,7 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 		submit->cmd[i].type = submit_cmd.type;
+ 		submit->cmd[i].size = submit_cmd.size / 4;
+ 		submit->cmd[i].iova = iova + submit_cmd.submit_offset;
++		submit->cmd[i].idx  = submit_cmd.submit_idx;
+ 
+ 		if (submit->valid)
+ 			continue;
+
+commit 93ddb0d3b022dfbd963f243bd01741643cebfb28
+Author: Rob Clark <robdclark@gmail.com>
+Date:   Mon Mar 3 09:42:33 2014 -0500
+
+    drm/msm: validate flags, etc
+    
+    After reading a nice article on LWN[1], I went back and double checked
+    my handling of invalid-input checking.  Turns out there were a couple
+    places I had missed.
+    
+    Since the driver is fairly young, and the devices it supports are really
+    only just barely usable for basic stuff (serial console) with an
+    upstream kernel, I think we should fix this now and revert specific
+    parts of this patch later in the unlikely event that a regression is
+    reported.
+    
+    [1] https://lwn.net/Articles/588444/
+    
+    Signed-off-by: Rob Clark <robdclark@gmail.com>
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index 5423e914e491..1f1f4cffdaed 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -23,7 +23,6 @@
+  * Cmdstream submission:
+  */
+ 
+-#define BO_INVALID_FLAGS ~(MSM_SUBMIT_BO_READ | MSM_SUBMIT_BO_WRITE)
+ /* make sure these don't conflict w/ MSM_SUBMIT_BO_x */
+ #define BO_VALID    0x8000
+ #define BO_LOCKED   0x4000
+@@ -77,7 +76,7 @@ static int submit_lookup_objects(struct msm_gem_submit *submit,
+ 			goto out_unlock;
+ 		}
+ 
+-		if (submit_bo.flags & BO_INVALID_FLAGS) {
++		if (submit_bo.flags & ~MSM_SUBMIT_BO_FLAGS) {
+ 			DRM_ERROR("invalid flags: %x\n", submit_bo.flags);
+ 			ret = -EINVAL;
+ 			goto out_unlock;
+@@ -369,6 +368,18 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 			goto out;
+ 		}
+ 
++		/* validate input from userspace: */
++		switch (submit_cmd.type) {
++		case MSM_SUBMIT_CMD_BUF:
++		case MSM_SUBMIT_CMD_IB_TARGET_BUF:
++		case MSM_SUBMIT_CMD_CTX_RESTORE_BUF:
++			break;
++		default:
++			DRM_ERROR("invalid type: %08x\n", submit_cmd.type);
++			ret = -EINVAL;
++			goto out;
++		}
++
+ 		ret = submit_bo(submit, submit_cmd.submit_idx,
+ 				&msm_obj, &iova, NULL);
+ 		if (ret)
+
+commit c2703b13a63da335053a2f3cb560bb806bdda0ae
+Author: Rob Clark <robdclark@gmail.com>
+Date:   Thu Feb 6 19:19:20 2014 -0500
+
+    drm/msm: bigger synchronization hammer
+    
+    Because we use a list_head in the bo to track it's position in a submit,
+    we need to serialize at a higher layer.  Otherwise there are problems
+    when multiple contexts are SUBMIT'ing in parallel cmdstreams referencing
+    a shared bo.
+    
+    Signed-off-by: Rob Clark <robdclark@gmail.com>
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index 5281d4bc37f7..5423e914e491 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -163,7 +163,7 @@ static int submit_validate_objects(struct msm_gem_submit *submit)
+ 
+ 
+ 		/* if locking succeeded, pin bo: */
+-		ret = msm_gem_get_iova(&msm_obj->base,
++		ret = msm_gem_get_iova_locked(&msm_obj->base,
+ 				submit->gpu->id, &iova);
+ 
+ 		/* this would break the logic in the fail path.. there is no
+@@ -247,7 +247,7 @@ static int submit_reloc(struct msm_gem_submit *submit, struct msm_gem_object *ob
+ 	/* For now, just map the entire thing.  Eventually we probably
+ 	 * to do it page-by-page, w/ kmap() if not vmap()d..
+ 	 */
+-	ptr = msm_gem_vaddr(&obj->base);
++	ptr = msm_gem_vaddr_locked(&obj->base);
+ 
+ 	if (IS_ERR(ptr)) {
+ 		ret = PTR_ERR(ptr);
+@@ -307,14 +307,12 @@ static void submit_cleanup(struct msm_gem_submit *submit, bool fail)
+ {
+ 	unsigned i;
+ 
+-	mutex_lock(&submit->dev->struct_mutex);
+ 	for (i = 0; i < submit->nr_bos; i++) {
+ 		struct msm_gem_object *msm_obj = submit->bos[i].obj;
+ 		submit_unlock_unpin_bo(submit, i);
+ 		list_del_init(&msm_obj->submit_entry);
+ 		drm_gem_object_unreference(&msm_obj->base);
+ 	}
+-	mutex_unlock(&submit->dev->struct_mutex);
+ 
+ 	ww_acquire_fini(&submit->ticket);
+ 	kfree(submit);
+@@ -342,6 +340,8 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 	if (args->nr_cmds > MAX_CMDS)
+ 		return -EINVAL;
+ 
++	mutex_lock(&dev->struct_mutex);
++
+ 	submit = submit_create(dev, gpu, args->nr_bos);
+ 	if (!submit) {
+ 		ret = -ENOMEM;
+@@ -410,5 +410,6 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ out:
+ 	if (submit)
+ 		submit_cleanup(submit, !!ret);
++	mutex_unlock(&dev->struct_mutex);
+ 	return ret;
+ }
+
+commit 198725337ef1f73b73e7dc953c6ffb0799f26ffe
+Author: Rob Clark <robdclark@gmail.com>
+Date:   Fri Sep 6 15:36:40 2013 -0400
+
+    drm/msm: fix cmdstream size check
+    
+    Need to check size+offset against bo size (duh!).. now we have a test
+    case to make sure I've done it right:
+    
+    https://github.com/freedreno/msmtest/blob/master/submittest.c
+    
+    Also, use DRM_ERROR() for error case traces, which makes debugging
+    userspace easier when enabling debug traces is too much.
+    
+    Signed-off-by: Rob Clark <robdclark@gmail.com>
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index 3e1ef3a00f60..5281d4bc37f7 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -78,7 +78,7 @@ static int submit_lookup_objects(struct msm_gem_submit *submit,
+ 		}
+ 
+ 		if (submit_bo.flags & BO_INVALID_FLAGS) {
+-			DBG("invalid flags: %x", submit_bo.flags);
++			DRM_ERROR("invalid flags: %x\n", submit_bo.flags);
+ 			ret = -EINVAL;
+ 			goto out_unlock;
+ 		}
+@@ -92,7 +92,7 @@ static int submit_lookup_objects(struct msm_gem_submit *submit,
+ 		 */
+ 		obj = idr_find(&file->object_idr, submit_bo.handle);
+ 		if (!obj) {
+-			DBG("invalid handle %u at index %u", submit_bo.handle, i);
++			DRM_ERROR("invalid handle %u at index %u\n", submit_bo.handle, i);
+ 			ret = -EINVAL;
+ 			goto out_unlock;
+ 		}
+@@ -100,7 +100,7 @@ static int submit_lookup_objects(struct msm_gem_submit *submit,
+ 		msm_obj = to_msm_bo(obj);
+ 
+ 		if (!list_empty(&msm_obj->submit_entry)) {
+-			DBG("handle %u at index %u already on submit list",
++			DRM_ERROR("handle %u at index %u already on submit list\n",
+ 					submit_bo.handle, i);
+ 			ret = -EINVAL;
+ 			goto out_unlock;
+@@ -216,8 +216,9 @@ static int submit_bo(struct msm_gem_submit *submit, uint32_t idx,
+ 		struct msm_gem_object **obj, uint32_t *iova, bool *valid)
+ {
+ 	if (idx >= submit->nr_bos) {
+-		DBG("invalid buffer index: %u (out of %u)", idx, submit->nr_bos);
+-		return EINVAL;
++		DRM_ERROR("invalid buffer index: %u (out of %u)\n",
++				idx, submit->nr_bos);
++		return -EINVAL;
+ 	}
+ 
+ 	if (obj)
+@@ -239,7 +240,7 @@ static int submit_reloc(struct msm_gem_submit *submit, struct msm_gem_object *ob
+ 	int ret;
+ 
+ 	if (offset % 4) {
+-		DBG("non-aligned cmdstream buffer: %u", offset);
++		DRM_ERROR("non-aligned cmdstream buffer: %u\n", offset);
+ 		return -EINVAL;
+ 	}
+ 
+@@ -266,7 +267,7 @@ static int submit_reloc(struct msm_gem_submit *submit, struct msm_gem_object *ob
+ 			return -EFAULT;
+ 
+ 		if (submit_reloc.submit_offset % 4) {
+-			DBG("non-aligned reloc offset: %u",
++			DRM_ERROR("non-aligned reloc offset: %u\n",
+ 					submit_reloc.submit_offset);
+ 			return -EINVAL;
+ 		}
+@@ -276,7 +277,7 @@ static int submit_reloc(struct msm_gem_submit *submit, struct msm_gem_object *ob
+ 
+ 		if ((off >= (obj->base.size / 4)) ||
+ 				(off < last_offset)) {
+-			DBG("invalid offset %u at reloc %u", off, i);
++			DRM_ERROR("invalid offset %u at reloc %u\n", off, i);
+ 			return -EINVAL;
+ 		}
+ 
+@@ -374,14 +375,15 @@ int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
+ 			goto out;
+ 
+ 		if (submit_cmd.size % 4) {
+-			DBG("non-aligned cmdstream buffer size: %u",
++			DRM_ERROR("non-aligned cmdstream buffer size: %u\n",
+ 					submit_cmd.size);
+ 			ret = -EINVAL;
+ 			goto out;
+ 		}
+ 
+-		if (submit_cmd.size >= msm_obj->base.size) {
+-			DBG("invalid cmdstream size: %u", submit_cmd.size);
++		if ((submit_cmd.size + submit_cmd.submit_offset) >=
++				msm_obj->base.size) {
++			DRM_ERROR("invalid cmdstream size: %u\n", submit_cmd.size);
+ 			ret = -EINVAL;
+ 			goto out;
+ 		}
+
+commit 7198e6b03155f6dadecadba004eb83b81a6ffe4c
+Author: Rob Clark <robdclark@gmail.com>
+Date:   Fri Jul 19 12:59:32 2013 -0400
+
+    drm/msm: add a3xx gpu support
+    
+    Add initial support for a3xx 3d core.
+    
+    So far, with hardware that I've seen to date, we can have:
+     + zero, one, or two z180 2d cores
+     + a3xx or a2xx 3d core, which share a common CP (the firmware
+       for the CP seems to implement some different PM4 packet types
+       but the basics of cmdstream submission are the same)
+    
+    Which means that the eventual complete "class" hierarchy, once
+    support for all past and present hw is in place, becomes:
+     + msm_gpu
+       + adreno_gpu
+         + a3xx_gpu
+         + a2xx_gpu
+       + z180_gpu
+    
+    This commit splits out the parts that will eventually be common
+    between a2xx/a3xx into adreno_gpu, and the parts that are even
+    common to z180 into msm_gpu.
+    
+    Note that there is no cmdstream validation required.  All memory access
+    from the GPU is via IOMMU/MMU.  So as long as you don't map silly things
+    to the GPU, there isn't much damage that the GPU can do.
+    
+    Signed-off-by: Rob Clark <robdclark@gmail.com>
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+new file mode 100644
+index 000000000000..3e1ef3a00f60
+--- /dev/null
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -0,0 +1,412 @@
++/*
++ * Copyright (C) 2013 Red Hat
++ * Author: Rob Clark <robdclark@gmail.com>
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 as published by
++ * the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ *
++ * You should have received a copy of the GNU General Public License along with
++ * this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#include "msm_drv.h"
++#include "msm_gpu.h"
++#include "msm_gem.h"
++
++/*
++ * Cmdstream submission:
++ */
++
++#define BO_INVALID_FLAGS ~(MSM_SUBMIT_BO_READ | MSM_SUBMIT_BO_WRITE)
++/* make sure these don't conflict w/ MSM_SUBMIT_BO_x */
++#define BO_VALID    0x8000
++#define BO_LOCKED   0x4000
++#define BO_PINNED   0x2000
++
++static inline void __user *to_user_ptr(u64 address)
++{
++	return (void __user *)(uintptr_t)address;
++}
++
++static struct msm_gem_submit *submit_create(struct drm_device *dev,
++		struct msm_gpu *gpu, int nr)
++{
++	struct msm_gem_submit *submit;
++	int sz = sizeof(*submit) + (nr * sizeof(submit->bos[0]));
++
++	submit = kmalloc(sz, GFP_TEMPORARY | __GFP_NOWARN | __GFP_NORETRY);
++	if (submit) {
++		submit->dev = dev;
++		submit->gpu = gpu;
++
++		/* initially, until copy_from_user() and bo lookup succeeds: */
++		submit->nr_bos = 0;
++		submit->nr_cmds = 0;
++
++		INIT_LIST_HEAD(&submit->bo_list);
++		ww_acquire_init(&submit->ticket, &reservation_ww_class);
++	}
++
++	return submit;
++}
++
++static int submit_lookup_objects(struct msm_gem_submit *submit,
++		struct drm_msm_gem_submit *args, struct drm_file *file)
++{
++	unsigned i;
++	int ret = 0;
++
++	spin_lock(&file->table_lock);
++
++	for (i = 0; i < args->nr_bos; i++) {
++		struct drm_msm_gem_submit_bo submit_bo;
++		struct drm_gem_object *obj;
++		struct msm_gem_object *msm_obj;
++		void __user *userptr =
++			to_user_ptr(args->bos + (i * sizeof(submit_bo)));
++
++		ret = copy_from_user(&submit_bo, userptr, sizeof(submit_bo));
++		if (ret) {
++			ret = -EFAULT;
++			goto out_unlock;
++		}
++
++		if (submit_bo.flags & BO_INVALID_FLAGS) {
++			DBG("invalid flags: %x", submit_bo.flags);
++			ret = -EINVAL;
++			goto out_unlock;
++		}
++
++		submit->bos[i].flags = submit_bo.flags;
++		/* in validate_objects() we figure out if this is true: */
++		submit->bos[i].iova  = submit_bo.presumed;
++
++		/* normally use drm_gem_object_lookup(), but for bulk lookup
++		 * all under single table_lock just hit object_idr directly:
++		 */
++		obj = idr_find(&file->object_idr, submit_bo.handle);
++		if (!obj) {
++			DBG("invalid handle %u at index %u", submit_bo.handle, i);
++			ret = -EINVAL;
++			goto out_unlock;
++		}
++
++		msm_obj = to_msm_bo(obj);
++
++		if (!list_empty(&msm_obj->submit_entry)) {
++			DBG("handle %u at index %u already on submit list",
++					submit_bo.handle, i);
++			ret = -EINVAL;
++			goto out_unlock;
++		}
++
++		drm_gem_object_reference(obj);
++
++		submit->bos[i].obj = msm_obj;
++
++		list_add_tail(&msm_obj->submit_entry, &submit->bo_list);
++	}
++
++out_unlock:
++	submit->nr_bos = i;
++	spin_unlock(&file->table_lock);
++
++	return ret;
++}
++
++static void submit_unlock_unpin_bo(struct msm_gem_submit *submit, int i)
++{
++	struct msm_gem_object *msm_obj = submit->bos[i].obj;
++
++	if (submit->bos[i].flags & BO_PINNED)
++		msm_gem_put_iova(&msm_obj->base, submit->gpu->id);
++
++	if (submit->bos[i].flags & BO_LOCKED)
++		ww_mutex_unlock(&msm_obj->resv->lock);
++
++	if (!(submit->bos[i].flags & BO_VALID))
++		submit->bos[i].iova = 0;
++
++	submit->bos[i].flags &= ~(BO_LOCKED | BO_PINNED);
++}
++
++/* This is where we make sure all the bo's are reserved and pin'd: */
++static int submit_validate_objects(struct msm_gem_submit *submit)
++{
++	int contended, slow_locked = -1, i, ret = 0;
++
++retry:
++	submit->valid = true;
++
++	for (i = 0; i < submit->nr_bos; i++) {
++		struct msm_gem_object *msm_obj = submit->bos[i].obj;
++		uint32_t iova;
++
++		if (slow_locked == i)
++			slow_locked = -1;
++
++		contended = i;
++
++		if (!(submit->bos[i].flags & BO_LOCKED)) {
++			ret = ww_mutex_lock_interruptible(&msm_obj->resv->lock,
++					&submit->ticket);
++			if (ret)
++				goto fail;
++			submit->bos[i].flags |= BO_LOCKED;
++		}
++
++
++		/* if locking succeeded, pin bo: */
++		ret = msm_gem_get_iova(&msm_obj->base,
++				submit->gpu->id, &iova);
++
++		/* this would break the logic in the fail path.. there is no
++		 * reason for this to happen, but just to be on the safe side
++		 * let's notice if this starts happening in the future:
++		 */
++		WARN_ON(ret == -EDEADLK);
++
++		if (ret)
++			goto fail;
++
++		submit->bos[i].flags |= BO_PINNED;
++
++		if (iova == submit->bos[i].iova) {
++			submit->bos[i].flags |= BO_VALID;
++		} else {
++			submit->bos[i].iova = iova;
++			submit->bos[i].flags &= ~BO_VALID;
++			submit->valid = false;
++		}
++	}
++
++	ww_acquire_done(&submit->ticket);
++
++	return 0;
++
++fail:
++	for (; i >= 0; i--)
++		submit_unlock_unpin_bo(submit, i);
++
++	if (slow_locked > 0)
++		submit_unlock_unpin_bo(submit, slow_locked);
++
++	if (ret == -EDEADLK) {
++		struct msm_gem_object *msm_obj = submit->bos[contended].obj;
++		/* we lost out in a seqno race, lock and retry.. */
++		ret = ww_mutex_lock_slow_interruptible(&msm_obj->resv->lock,
++				&submit->ticket);
++		if (!ret) {
++			submit->bos[contended].flags |= BO_LOCKED;
++			slow_locked = contended;
++			goto retry;
++		}
++	}
++
++	return ret;
++}
++
++static int submit_bo(struct msm_gem_submit *submit, uint32_t idx,
++		struct msm_gem_object **obj, uint32_t *iova, bool *valid)
++{
++	if (idx >= submit->nr_bos) {
++		DBG("invalid buffer index: %u (out of %u)", idx, submit->nr_bos);
++		return EINVAL;
++	}
++
++	if (obj)
++		*obj = submit->bos[idx].obj;
++	if (iova)
++		*iova = submit->bos[idx].iova;
++	if (valid)
++		*valid = !!(submit->bos[idx].flags & BO_VALID);
++
++	return 0;
++}
++
++/* process the reloc's and patch up the cmdstream as needed: */
++static int submit_reloc(struct msm_gem_submit *submit, struct msm_gem_object *obj,
++		uint32_t offset, uint32_t nr_relocs, uint64_t relocs)
++{
++	uint32_t i, last_offset = 0;
++	uint32_t *ptr;
++	int ret;
++
++	if (offset % 4) {
++		DBG("non-aligned cmdstream buffer: %u", offset);
++		return -EINVAL;
++	}
++
++	/* For now, just map the entire thing.  Eventually we probably
++	 * to do it page-by-page, w/ kmap() if not vmap()d..
++	 */
++	ptr = msm_gem_vaddr(&obj->base);
++
++	if (IS_ERR(ptr)) {
++		ret = PTR_ERR(ptr);
++		DBG("failed to map: %d", ret);
++		return ret;
++	}
++
++	for (i = 0; i < nr_relocs; i++) {
++		struct drm_msm_gem_submit_reloc submit_reloc;
++		void __user *userptr =
++			to_user_ptr(relocs + (i * sizeof(submit_reloc)));
++		uint32_t iova, off;
++		bool valid;
++
++		ret = copy_from_user(&submit_reloc, userptr, sizeof(submit_reloc));
++		if (ret)
++			return -EFAULT;
++
++		if (submit_reloc.submit_offset % 4) {
++			DBG("non-aligned reloc offset: %u",
++					submit_reloc.submit_offset);
++			return -EINVAL;
++		}
++
++		/* offset in dwords: */
++		off = submit_reloc.submit_offset / 4;
++
++		if ((off >= (obj->base.size / 4)) ||
++				(off < last_offset)) {
++			DBG("invalid offset %u at reloc %u", off, i);
++			return -EINVAL;
++		}
++
++		ret = submit_bo(submit, submit_reloc.reloc_idx, NULL, &iova, &valid);
++		if (ret)
++			return ret;
++
++		if (valid)
++			continue;
++
++		iova += submit_reloc.reloc_offset;
++
++		if (submit_reloc.shift < 0)
++			iova >>= -submit_reloc.shift;
++		else
++			iova <<= submit_reloc.shift;
++
++		ptr[off] = iova | submit_reloc.or;
++
++		last_offset = off;
++	}
++
++	return 0;
++}
++
++static void submit_cleanup(struct msm_gem_submit *submit, bool fail)
++{
++	unsigned i;
++
++	mutex_lock(&submit->dev->struct_mutex);
++	for (i = 0; i < submit->nr_bos; i++) {
++		struct msm_gem_object *msm_obj = submit->bos[i].obj;
++		submit_unlock_unpin_bo(submit, i);
++		list_del_init(&msm_obj->submit_entry);
++		drm_gem_object_unreference(&msm_obj->base);
++	}
++	mutex_unlock(&submit->dev->struct_mutex);
++
++	ww_acquire_fini(&submit->ticket);
++	kfree(submit);
++}
++
++int msm_ioctl_gem_submit(struct drm_device *dev, void *data,
++		struct drm_file *file)
++{
++	struct msm_drm_private *priv = dev->dev_private;
++	struct drm_msm_gem_submit *args = data;
++	struct msm_file_private *ctx = file->driver_priv;
++	struct msm_gem_submit *submit;
++	struct msm_gpu *gpu;
++	unsigned i;
++	int ret;
++
++	/* for now, we just have 3d pipe.. eventually this would need to
++	 * be more clever to dispatch to appropriate gpu module:
++	 */
++	if (args->pipe != MSM_PIPE_3D0)
++		return -EINVAL;
++
++	gpu = priv->gpu;
++
++	if (args->nr_cmds > MAX_CMDS)
++		return -EINVAL;
++
++	submit = submit_create(dev, gpu, args->nr_bos);
++	if (!submit) {
++		ret = -ENOMEM;
++		goto out;
++	}
++
++	ret = submit_lookup_objects(submit, args, file);
++	if (ret)
++		goto out;
++
++	ret = submit_validate_objects(submit);
++	if (ret)
++		goto out;
++
++	for (i = 0; i < args->nr_cmds; i++) {
++		struct drm_msm_gem_submit_cmd submit_cmd;
++		void __user *userptr =
++			to_user_ptr(args->cmds + (i * sizeof(submit_cmd)));
++		struct msm_gem_object *msm_obj;
++		uint32_t iova;
++
++		ret = copy_from_user(&submit_cmd, userptr, sizeof(submit_cmd));
++		if (ret) {
++			ret = -EFAULT;
++			goto out;
++		}
++
++		ret = submit_bo(submit, submit_cmd.submit_idx,
++				&msm_obj, &iova, NULL);
++		if (ret)
++			goto out;
++
++		if (submit_cmd.size % 4) {
++			DBG("non-aligned cmdstream buffer size: %u",
++					submit_cmd.size);
++			ret = -EINVAL;
++			goto out;
++		}
++
++		if (submit_cmd.size >= msm_obj->base.size) {
++			DBG("invalid cmdstream size: %u", submit_cmd.size);
++			ret = -EINVAL;
++			goto out;
++		}
++
++		submit->cmd[i].type = submit_cmd.type;
++		submit->cmd[i].size = submit_cmd.size / 4;
++		submit->cmd[i].iova = iova + submit_cmd.submit_offset;
++
++		if (submit->valid)
++			continue;
++
++		ret = submit_reloc(submit, msm_obj, submit_cmd.submit_offset,
++				submit_cmd.nr_relocs, submit_cmd.relocs);
++		if (ret)
++			goto out;
++	}
++
++	submit->nr_cmds = i;
++
++	ret = msm_gpu_submit(gpu, submit, ctx);
++
++	args->fence = submit->fence;
++
++out:
++	if (submit)
++		submit_cleanup(submit, !!ret);
++	return ret;
++}

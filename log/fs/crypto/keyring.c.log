@@ -1,0 +1,2386 @@
+commit e3b1078bedd323df343894a27eb3b3c34944dfd1
+Author: Eric Biggers <ebiggers@google.com>
+Date:   Fri May 15 13:41:41 2020 -0700
+
+    fscrypt: add support for IV_INO_LBLK_32 policies
+    
+    The eMMC inline crypto standard will only specify 32 DUN bits (a.k.a. IV
+    bits), unlike UFS's 64.  IV_INO_LBLK_64 is therefore not applicable, but
+    an encryption format which uses one key per policy and permits the
+    moving of encrypted file contents (as f2fs's garbage collector requires)
+    is still desirable.
+    
+    To support such hardware, add a new encryption format IV_INO_LBLK_32
+    that makes the best use of the 32 bits: the IV is set to
+    'SipHash-2-4(inode_number) + file_logical_block_number mod 2^32', where
+    the SipHash key is derived from the fscrypt master key.  We hash only
+    the inode number and not also the block number, because we need to
+    maintain contiguity of DUNs to merge bios.
+    
+    Unlike with IV_INO_LBLK_64, with this format IV reuse is possible; this
+    is unavoidable given the size of the DUN.  This means this format should
+    only be used where the requirements of the first paragraph apply.
+    However, the hash spreads out the IVs in the whole usable range, and the
+    use of a keyed hash makes it difficult for an attacker to determine
+    which files use which IVs.
+    
+    Besides the above differences, this flag works like IV_INO_LBLK_64 in
+    that on ext4 it is only allowed if the stable_inodes feature has been
+    enabled to prevent inode numbers and the filesystem UUID from changing.
+    
+    Link: https://lore.kernel.org/r/20200515204141.251098-1-ebiggers@kernel.org
+    Reviewed-by: Theodore Ts'o <tytso@mit.edu>
+    Reviewed-by: Paul Crowley <paulcrowley@google.com>
+    Signed-off-by: Eric Biggers <ebiggers@google.com>
+
+diff --git a/fs/crypto/keyring.c b/fs/crypto/keyring.c
+index c983ddfde8ad..e24eb48bfbe1 100644
+--- a/fs/crypto/keyring.c
++++ b/fs/crypto/keyring.c
+@@ -45,8 +45,9 @@ static void free_master_key(struct fscrypt_master_key *mk)
+ 	wipe_master_key_secret(&mk->mk_secret);
+ 
+ 	for (i = 0; i <= __FSCRYPT_MODE_MAX; i++) {
+-		crypto_free_skcipher(mk->mk_direct_tfms[i]);
+-		crypto_free_skcipher(mk->mk_iv_ino_lblk_64_tfms[i]);
++		crypto_free_skcipher(mk->mk_direct_keys[i]);
++		crypto_free_skcipher(mk->mk_iv_ino_lblk_64_keys[i]);
++		crypto_free_skcipher(mk->mk_iv_ino_lblk_32_keys[i]);
+ 	}
+ 
+ 	key_put(mk->mk_users);
+
+commit cdeb21da1783afe26a827eb62d61084f93720be9
+Author: Eric Biggers <ebiggers@google.com>
+Date:   Tue May 12 16:32:49 2020 -0700
+
+    fscrypt: add fscrypt_add_test_dummy_key()
+    
+    Currently, the test_dummy_encryption mount option (which is used for
+    encryption I/O testing with xfstests) uses v1 encryption policies, and
+    it relies on userspace inserting a test key into the session keyring.
+    
+    We need test_dummy_encryption to support v2 encryption policies too.
+    Requiring userspace to add the test key doesn't work well with v2
+    policies, since v2 policies only support the filesystem keyring (not the
+    session keyring), and keys in the filesystem keyring are lost when the
+    filesystem is unmounted.  Hooking all test code that unmounts and
+    re-mounts the filesystem would be difficult.
+    
+    Instead, let's make the filesystem automatically add the test key to its
+    keyring when test_dummy_encryption is enabled.
+    
+    That puts the responsibility for choosing the test key on the kernel.
+    We could just hard-code a key.  But out of paranoia, let's first try
+    using a per-boot random key, to prevent this code from being misused.
+    A per-boot key will work as long as no one expects dummy-encrypted files
+    to remain accessible after a reboot.  (gce-xfstests doesn't.)
+    
+    Therefore, this patch adds a function fscrypt_add_test_dummy_key() which
+    implements the above.  The next patch will use it.
+    
+    Link: https://lore.kernel.org/r/20200512233251.118314-3-ebiggers@kernel.org
+    Reviewed-by: Theodore Ts'o <tytso@mit.edu>
+    Reviewed-by: Jaegeuk Kim <jaegeuk@kernel.org>
+    Signed-off-by: Eric Biggers <ebiggers@google.com>
+
+diff --git a/fs/crypto/keyring.c b/fs/crypto/keyring.c
+index ab41b25d4fa1..c983ddfde8ad 100644
+--- a/fs/crypto/keyring.c
++++ b/fs/crypto/keyring.c
+@@ -20,6 +20,7 @@
+ 
+ #include <crypto/skcipher.h>
+ #include <linux/key-type.h>
++#include <linux/random.h>
+ #include <linux/seq_file.h>
+ 
+ #include "fscrypt_private.h"
+@@ -424,9 +425,9 @@ static int add_existing_master_key(struct fscrypt_master_key *mk,
+ 	return 0;
+ }
+ 
+-static int add_master_key(struct super_block *sb,
+-			  struct fscrypt_master_key_secret *secret,
+-			  const struct fscrypt_key_specifier *mk_spec)
++static int do_add_master_key(struct super_block *sb,
++			     struct fscrypt_master_key_secret *secret,
++			     const struct fscrypt_key_specifier *mk_spec)
+ {
+ 	static DEFINE_MUTEX(fscrypt_add_key_mutex);
+ 	struct key *key;
+@@ -465,6 +466,35 @@ static int add_master_key(struct super_block *sb,
+ 	return err;
+ }
+ 
++static int add_master_key(struct super_block *sb,
++			  struct fscrypt_master_key_secret *secret,
++			  struct fscrypt_key_specifier *key_spec)
++{
++	int err;
++
++	if (key_spec->type == FSCRYPT_KEY_SPEC_TYPE_IDENTIFIER) {
++		err = fscrypt_init_hkdf(&secret->hkdf, secret->raw,
++					secret->size);
++		if (err)
++			return err;
++
++		/*
++		 * Now that the HKDF context is initialized, the raw key is no
++		 * longer needed.
++		 */
++		memzero_explicit(secret->raw, secret->size);
++
++		/* Calculate the key identifier */
++		err = fscrypt_hkdf_expand(&secret->hkdf,
++					  HKDF_CONTEXT_KEY_IDENTIFIER, NULL, 0,
++					  key_spec->u.identifier,
++					  FSCRYPT_KEY_IDENTIFIER_SIZE);
++		if (err)
++			return err;
++	}
++	return do_add_master_key(sb, secret, key_spec);
++}
++
+ static int fscrypt_provisioning_key_preparse(struct key_preparsed_payload *prep)
+ {
+ 	const struct fscrypt_provisioning_key_payload *payload = prep->data;
+@@ -609,6 +639,15 @@ int fscrypt_ioctl_add_key(struct file *filp, void __user *_uarg)
+ 	if (memchr_inv(arg.__reserved, 0, sizeof(arg.__reserved)))
+ 		return -EINVAL;
+ 
++	/*
++	 * Only root can add keys that are identified by an arbitrary descriptor
++	 * rather than by a cryptographic hash --- since otherwise a malicious
++	 * user could add the wrong key.
++	 */
++	if (arg.key_spec.type == FSCRYPT_KEY_SPEC_TYPE_DESCRIPTOR &&
++	    !capable(CAP_SYS_ADMIN))
++		return -EACCES;
++
+ 	memset(&secret, 0, sizeof(secret));
+ 	if (arg.key_id) {
+ 		if (arg.raw_size != 0)
+@@ -626,54 +665,46 @@ int fscrypt_ioctl_add_key(struct file *filp, void __user *_uarg)
+ 			goto out_wipe_secret;
+ 	}
+ 
+-	switch (arg.key_spec.type) {
+-	case FSCRYPT_KEY_SPEC_TYPE_DESCRIPTOR:
+-		/*
+-		 * Only root can add keys that are identified by an arbitrary
+-		 * descriptor rather than by a cryptographic hash --- since
+-		 * otherwise a malicious user could add the wrong key.
+-		 */
+-		err = -EACCES;
+-		if (!capable(CAP_SYS_ADMIN))
+-			goto out_wipe_secret;
+-		break;
+-	case FSCRYPT_KEY_SPEC_TYPE_IDENTIFIER:
+-		err = fscrypt_init_hkdf(&secret.hkdf, secret.raw, secret.size);
+-		if (err)
+-			goto out_wipe_secret;
+-
+-		/*
+-		 * Now that the HKDF context is initialized, the raw key is no
+-		 * longer needed.
+-		 */
+-		memzero_explicit(secret.raw, secret.size);
+-
+-		/* Calculate the key identifier and return it to userspace. */
+-		err = fscrypt_hkdf_expand(&secret.hkdf,
+-					  HKDF_CONTEXT_KEY_IDENTIFIER,
+-					  NULL, 0, arg.key_spec.u.identifier,
+-					  FSCRYPT_KEY_IDENTIFIER_SIZE);
+-		if (err)
+-			goto out_wipe_secret;
+-		err = -EFAULT;
+-		if (copy_to_user(uarg->key_spec.u.identifier,
+-				 arg.key_spec.u.identifier,
+-				 FSCRYPT_KEY_IDENTIFIER_SIZE))
+-			goto out_wipe_secret;
+-		break;
+-	default:
+-		WARN_ON(1);
+-		err = -EINVAL;
++	err = add_master_key(sb, &secret, &arg.key_spec);
++	if (err)
+ 		goto out_wipe_secret;
+-	}
+ 
+-	err = add_master_key(sb, &secret, &arg.key_spec);
++	/* Return the key identifier to userspace, if applicable */
++	err = -EFAULT;
++	if (arg.key_spec.type == FSCRYPT_KEY_SPEC_TYPE_IDENTIFIER &&
++	    copy_to_user(uarg->key_spec.u.identifier, arg.key_spec.u.identifier,
++			 FSCRYPT_KEY_IDENTIFIER_SIZE))
++		goto out_wipe_secret;
++	err = 0;
+ out_wipe_secret:
+ 	wipe_master_key_secret(&secret);
+ 	return err;
+ }
+ EXPORT_SYMBOL_GPL(fscrypt_ioctl_add_key);
+ 
++/*
++ * Add the key for '-o test_dummy_encryption' to the filesystem keyring.
++ *
++ * Use a per-boot random key to prevent people from misusing this option.
++ */
++int fscrypt_add_test_dummy_key(struct super_block *sb,
++			       struct fscrypt_key_specifier *key_spec)
++{
++	static u8 test_key[FSCRYPT_MAX_KEY_SIZE];
++	struct fscrypt_master_key_secret secret;
++	int err;
++
++	get_random_once(test_key, FSCRYPT_MAX_KEY_SIZE);
++
++	memset(&secret, 0, sizeof(secret));
++	secret.size = FSCRYPT_MAX_KEY_SIZE;
++	memcpy(secret.raw, test_key, FSCRYPT_MAX_KEY_SIZE);
++
++	err = add_master_key(sb, &secret, key_spec);
++	wipe_master_key_secret(&secret);
++	return err;
++}
++
+ /*
+  * Verify that the current user has added a master key with the given identifier
+  * (returns -ENOKEY if not).  This is needed to prevent a user from encrypting
+
+commit 13a10da94615d81087e718517794f2868a8b3fab
+Author: Eric Biggers <ebiggers@google.com>
+Date:   Sun Jan 19 22:07:32 2020 -0800
+
+    fscrypt: don't print name of busy file when removing key
+    
+    When an encryption key can't be fully removed due to file(s) protected
+    by it still being in-use, we shouldn't really print the path to one of
+    these files to the kernel log, since parts of this path are likely to be
+    encrypted on-disk, and (depending on how the system is set up) the
+    confidentiality of this path might be lost by printing it to the log.
+    
+    This is a trade-off: a single file path often doesn't matter at all,
+    especially if it's a directory; the kernel log might still be protected
+    in some way; and I had originally hoped that any "inode(s) still busy"
+    bugs (which are security weaknesses in their own right) would be quickly
+    fixed and that to do so it would be super helpful to always know the
+    file path and not have to run 'find dir -inum $inum' after the fact.
+    
+    But in practice, these bugs can be hard to fix (e.g. due to asynchronous
+    process killing that is difficult to eliminate, for performance
+    reasons), and also not tied to specific files, so knowing a file path
+    doesn't necessarily help.
+    
+    So to be safe, for now let's just show the inode number, not the path.
+    If someone really wants to know a path they can use 'find -inum'.
+    
+    Fixes: b1c0ec3599f4 ("fscrypt: add FS_IOC_REMOVE_ENCRYPTION_KEY ioctl")
+    Cc: <stable@vger.kernel.org> # v5.4+
+    Link: https://lore.kernel.org/r/20200120060732.390362-1-ebiggers@kernel.org
+    Signed-off-by: Eric Biggers <ebiggers@google.com>
+
+diff --git a/fs/crypto/keyring.c b/fs/crypto/keyring.c
+index 098ff2e0f0bb..ab41b25d4fa1 100644
+--- a/fs/crypto/keyring.c
++++ b/fs/crypto/keyring.c
+@@ -776,9 +776,6 @@ static int check_for_busy_inodes(struct super_block *sb,
+ 	struct list_head *pos;
+ 	size_t busy_count = 0;
+ 	unsigned long ino;
+-	struct dentry *dentry;
+-	char _path[256];
+-	char *path = NULL;
+ 
+ 	spin_lock(&mk->mk_decrypted_inodes_lock);
+ 
+@@ -797,22 +794,14 @@ static int check_for_busy_inodes(struct super_block *sb,
+ 					 struct fscrypt_info,
+ 					 ci_master_key_link)->ci_inode;
+ 		ino = inode->i_ino;
+-		dentry = d_find_alias(inode);
+ 	}
+ 	spin_unlock(&mk->mk_decrypted_inodes_lock);
+ 
+-	if (dentry) {
+-		path = dentry_path(dentry, _path, sizeof(_path));
+-		dput(dentry);
+-	}
+-	if (IS_ERR_OR_NULL(path))
+-		path = "(unknown)";
+-
+ 	fscrypt_warn(NULL,
+-		     "%s: %zu inode(s) still busy after removing key with %s %*phN, including ino %lu (%s)",
++		     "%s: %zu inode(s) still busy after removing key with %s %*phN, including ino %lu",
+ 		     sb->s_id, busy_count, master_key_spec_type(&mk->mk_spec),
+ 		     master_key_spec_len(&mk->mk_spec), (u8 *)&mk->mk_spec.u,
+-		     ino, path);
++		     ino);
+ 	return -EBUSY;
+ }
+ 
+
+commit 93edd392cad7485097c2e9068c764ae30083bb05
+Author: Eric Biggers <ebiggers@google.com>
+Date:   Tue Nov 19 14:24:47 2019 -0800
+
+    fscrypt: support passing a keyring key to FS_IOC_ADD_ENCRYPTION_KEY
+    
+    Extend the FS_IOC_ADD_ENCRYPTION_KEY ioctl to allow the raw key to be
+    specified by a Linux keyring key, rather than specified directly.
+    
+    This is useful because fscrypt keys belong to a particular filesystem
+    instance, so they are destroyed when that filesystem is unmounted.
+    Usually this is desired.  But in some cases, userspace may need to
+    unmount and re-mount the filesystem while keeping the keys, e.g. during
+    a system update.  This requires keeping the keys somewhere else too.
+    
+    The keys could be kept in memory in a userspace daemon.  But depending
+    on the security architecture and assumptions, it can be preferable to
+    keep them only in kernel memory, where they are unreadable by userspace.
+    
+    We also can't solve this by going back to the original fscrypt API
+    (where for each file, the master key was looked up in the process's
+    keyring hierarchy) because that caused lots of problems of its own.
+    
+    Therefore, add the ability for FS_IOC_ADD_ENCRYPTION_KEY to accept a
+    Linux keyring key.  This solves the problem by allowing userspace to (if
+    needed) save the keys securely in a Linux keyring for re-provisioning,
+    while still using the new fscrypt key management ioctls.
+    
+    This is analogous to how dm-crypt accepts a Linux keyring key, but the
+    key is then stored internally in the dm-crypt data structures rather
+    than being looked up again each time the dm-crypt device is accessed.
+    
+    Use a custom key type "fscrypt-provisioning" rather than one of the
+    existing key types such as "logon".  This is strongly desired because it
+    enforces that these keys are only usable for a particular purpose: for
+    fscrypt as input to a particular KDF.  Otherwise, the keys could also be
+    passed to any kernel API that accepts a "logon" key with any service
+    prefix, e.g. dm-crypt, UBIFS, or (recently proposed) AF_ALG.  This would
+    risk leaking information about the raw key despite it ostensibly being
+    unreadable.  Of course, this mistake has already been made for multiple
+    kernel APIs; but since this is a new API, let's do it right.
+    
+    This patch has been tested using an xfstest which I wrote to test it.
+    
+    Link: https://lore.kernel.org/r/20191119222447.226853-1-ebiggers@kernel.org
+    Signed-off-by: Eric Biggers <ebiggers@google.com>
+
+diff --git a/fs/crypto/keyring.c b/fs/crypto/keyring.c
+index 40cca351273f..098ff2e0f0bb 100644
+--- a/fs/crypto/keyring.c
++++ b/fs/crypto/keyring.c
+@@ -465,6 +465,109 @@ static int add_master_key(struct super_block *sb,
+ 	return err;
+ }
+ 
++static int fscrypt_provisioning_key_preparse(struct key_preparsed_payload *prep)
++{
++	const struct fscrypt_provisioning_key_payload *payload = prep->data;
++
++	if (prep->datalen < sizeof(*payload) + FSCRYPT_MIN_KEY_SIZE ||
++	    prep->datalen > sizeof(*payload) + FSCRYPT_MAX_KEY_SIZE)
++		return -EINVAL;
++
++	if (payload->type != FSCRYPT_KEY_SPEC_TYPE_DESCRIPTOR &&
++	    payload->type != FSCRYPT_KEY_SPEC_TYPE_IDENTIFIER)
++		return -EINVAL;
++
++	if (payload->__reserved)
++		return -EINVAL;
++
++	prep->payload.data[0] = kmemdup(payload, prep->datalen, GFP_KERNEL);
++	if (!prep->payload.data[0])
++		return -ENOMEM;
++
++	prep->quotalen = prep->datalen;
++	return 0;
++}
++
++static void fscrypt_provisioning_key_free_preparse(
++					struct key_preparsed_payload *prep)
++{
++	kzfree(prep->payload.data[0]);
++}
++
++static void fscrypt_provisioning_key_describe(const struct key *key,
++					      struct seq_file *m)
++{
++	seq_puts(m, key->description);
++	if (key_is_positive(key)) {
++		const struct fscrypt_provisioning_key_payload *payload =
++			key->payload.data[0];
++
++		seq_printf(m, ": %u [%u]", key->datalen, payload->type);
++	}
++}
++
++static void fscrypt_provisioning_key_destroy(struct key *key)
++{
++	kzfree(key->payload.data[0]);
++}
++
++static struct key_type key_type_fscrypt_provisioning = {
++	.name			= "fscrypt-provisioning",
++	.preparse		= fscrypt_provisioning_key_preparse,
++	.free_preparse		= fscrypt_provisioning_key_free_preparse,
++	.instantiate		= generic_key_instantiate,
++	.describe		= fscrypt_provisioning_key_describe,
++	.destroy		= fscrypt_provisioning_key_destroy,
++};
++
++/*
++ * Retrieve the raw key from the Linux keyring key specified by 'key_id', and
++ * store it into 'secret'.
++ *
++ * The key must be of type "fscrypt-provisioning" and must have the field
++ * fscrypt_provisioning_key_payload::type set to 'type', indicating that it's
++ * only usable with fscrypt with the particular KDF version identified by
++ * 'type'.  We don't use the "logon" key type because there's no way to
++ * completely restrict the use of such keys; they can be used by any kernel API
++ * that accepts "logon" keys and doesn't require a specific service prefix.
++ *
++ * The ability to specify the key via Linux keyring key is intended for cases
++ * where userspace needs to re-add keys after the filesystem is unmounted and
++ * re-mounted.  Most users should just provide the raw key directly instead.
++ */
++static int get_keyring_key(u32 key_id, u32 type,
++			   struct fscrypt_master_key_secret *secret)
++{
++	key_ref_t ref;
++	struct key *key;
++	const struct fscrypt_provisioning_key_payload *payload;
++	int err;
++
++	ref = lookup_user_key(key_id, 0, KEY_NEED_SEARCH);
++	if (IS_ERR(ref))
++		return PTR_ERR(ref);
++	key = key_ref_to_ptr(ref);
++
++	if (key->type != &key_type_fscrypt_provisioning)
++		goto bad_key;
++	payload = key->payload.data[0];
++
++	/* Don't allow fscrypt v1 keys to be used as v2 keys and vice versa. */
++	if (payload->type != type)
++		goto bad_key;
++
++	secret->size = key->datalen - sizeof(*payload);
++	memcpy(secret->raw, payload->raw, secret->size);
++	err = 0;
++	goto out_put;
++
++bad_key:
++	err = -EKEYREJECTED;
++out_put:
++	key_ref_put(ref);
++	return err;
++}
++
+ /*
+  * Add a master encryption key to the filesystem, causing all files which were
+  * encrypted with it to appear "unlocked" (decrypted) when accessed.
+@@ -503,18 +606,25 @@ int fscrypt_ioctl_add_key(struct file *filp, void __user *_uarg)
+ 	if (!valid_key_spec(&arg.key_spec))
+ 		return -EINVAL;
+ 
+-	if (arg.raw_size < FSCRYPT_MIN_KEY_SIZE ||
+-	    arg.raw_size > FSCRYPT_MAX_KEY_SIZE)
+-		return -EINVAL;
+-
+ 	if (memchr_inv(arg.__reserved, 0, sizeof(arg.__reserved)))
+ 		return -EINVAL;
+ 
+ 	memset(&secret, 0, sizeof(secret));
+-	secret.size = arg.raw_size;
+-	err = -EFAULT;
+-	if (copy_from_user(secret.raw, uarg->raw, secret.size))
+-		goto out_wipe_secret;
++	if (arg.key_id) {
++		if (arg.raw_size != 0)
++			return -EINVAL;
++		err = get_keyring_key(arg.key_id, arg.key_spec.type, &secret);
++		if (err)
++			goto out_wipe_secret;
++	} else {
++		if (arg.raw_size < FSCRYPT_MIN_KEY_SIZE ||
++		    arg.raw_size > FSCRYPT_MAX_KEY_SIZE)
++			return -EINVAL;
++		secret.size = arg.raw_size;
++		err = -EFAULT;
++		if (copy_from_user(secret.raw, uarg->raw, secret.size))
++			goto out_wipe_secret;
++	}
+ 
+ 	switch (arg.key_spec.type) {
+ 	case FSCRYPT_KEY_SPEC_TYPE_DESCRIPTOR:
+@@ -978,8 +1088,14 @@ int __init fscrypt_init_keyring(void)
+ 	if (err)
+ 		goto err_unregister_fscrypt;
+ 
++	err = register_key_type(&key_type_fscrypt_provisioning);
++	if (err)
++		goto err_unregister_fscrypt_user;
++
+ 	return 0;
+ 
++err_unregister_fscrypt_user:
++	unregister_key_type(&key_type_fscrypt_user);
+ err_unregister_fscrypt:
+ 	unregister_key_type(&key_type_fscrypt);
+ 	return err;
+
+commit c593642c8be046915ca3a4a300243a68077cd207
+Author: Pankaj Bharadiya <pankaj.laxminarayan.bharadiya@intel.com>
+Date:   Mon Dec 9 10:31:43 2019 -0800
+
+    treewide: Use sizeof_field() macro
+    
+    Replace all the occurrences of FIELD_SIZEOF() with sizeof_field() except
+    at places where these are defined. Later patches will remove the unused
+    definition of FIELD_SIZEOF().
+    
+    This patch is generated using following script:
+    
+    EXCLUDE_FILES="include/linux/stddef.h|include/linux/kernel.h"
+    
+    git grep -l -e "\bFIELD_SIZEOF\b" | while read file;
+    do
+    
+            if [[ "$file" =~ $EXCLUDE_FILES ]]; then
+                    continue
+            fi
+            sed -i  -e 's/\bFIELD_SIZEOF\b/sizeof_field/g' $file;
+    done
+    
+    Signed-off-by: Pankaj Bharadiya <pankaj.laxminarayan.bharadiya@intel.com>
+    Link: https://lore.kernel.org/r/20190924105839.110713-3-pankaj.laxminarayan.bharadiya@intel.com
+    Co-developed-by: Kees Cook <keescook@chromium.org>
+    Signed-off-by: Kees Cook <keescook@chromium.org>
+    Acked-by: David Miller <davem@davemloft.net> # for net
+
+diff --git a/fs/crypto/keyring.c b/fs/crypto/keyring.c
+index 040df1f5e1c8..40cca351273f 100644
+--- a/fs/crypto/keyring.c
++++ b/fs/crypto/keyring.c
+@@ -151,7 +151,7 @@ static struct key *search_fscrypt_keyring(struct key *keyring,
+ }
+ 
+ #define FSCRYPT_FS_KEYRING_DESCRIPTION_SIZE	\
+-	(CONST_STRLEN("fscrypt-") + FIELD_SIZEOF(struct super_block, s_id))
++	(CONST_STRLEN("fscrypt-") + sizeof_field(struct super_block, s_id))
+ 
+ #define FSCRYPT_MK_DESCRIPTION_SIZE	(2 * FSCRYPT_KEY_IDENTIFIER_SIZE + 1)
+ 
+
+commit b103fb7653fff09e7a6fb6ba9398a41584e7ae36
+Author: Eric Biggers <ebiggers@google.com>
+Date:   Thu Oct 24 14:54:36 2019 -0700
+
+    fscrypt: add support for IV_INO_LBLK_64 policies
+    
+    Inline encryption hardware compliant with the UFS v2.1 standard or with
+    the upcoming version of the eMMC standard has the following properties:
+    
+    (1) Per I/O request, the encryption key is specified by a previously
+        loaded keyslot.  There might be only a small number of keyslots.
+    
+    (2) Per I/O request, the starting IV is specified by a 64-bit "data unit
+        number" (DUN).  IV bits 64-127 are assumed to be 0.  The hardware
+        automatically increments the DUN for each "data unit" of
+        configurable size in the request, e.g. for each filesystem block.
+    
+    Property (1) makes it inefficient to use the traditional fscrypt
+    per-file keys.  Property (2) precludes the use of the existing
+    DIRECT_KEY fscrypt policy flag, which needs at least 192 IV bits.
+    
+    Therefore, add a new fscrypt policy flag IV_INO_LBLK_64 which causes the
+    encryption to modified as follows:
+    
+    - The encryption keys are derived from the master key, encryption mode
+      number, and filesystem UUID.
+    
+    - The IVs are chosen as (inode_number << 32) | file_logical_block_num.
+      For filenames encryption, file_logical_block_num is 0.
+    
+    Since the file nonces aren't used in the key derivation, many files may
+    share the same encryption key.  This is much more efficient on the
+    target hardware.  Including the inode number in the IVs and mixing the
+    filesystem UUID into the keys ensures that data in different files is
+    nevertheless still encrypted differently.
+    
+    Additionally, limiting the inode and block numbers to 32 bits and
+    placing the block number in the low bits maintains compatibility with
+    the 64-bit DUN convention (property (2) above).
+    
+    Since this scheme assumes that inode numbers are stable (which may
+    preclude filesystem shrinking) and that inode and file logical block
+    numbers are at most 32-bit, IV_INO_LBLK_64 will only be allowed on
+    filesystems that meet these constraints.  These are acceptable
+    limitations for the cases where this format would actually be used.
+    
+    Note that IV_INO_LBLK_64 is an on-disk format, not an implementation.
+    This patch just adds support for it using the existing filesystem layer
+    encryption.  A later patch will add support for inline encryption.
+    
+    Reviewed-by: Paul Crowley <paulcrowley@google.com>
+    Co-developed-by: Satya Tangirala <satyat@google.com>
+    Signed-off-by: Satya Tangirala <satyat@google.com>
+    Signed-off-by: Eric Biggers <ebiggers@google.com>
+
+diff --git a/fs/crypto/keyring.c b/fs/crypto/keyring.c
+index c34fa7c61b43..040df1f5e1c8 100644
+--- a/fs/crypto/keyring.c
++++ b/fs/crypto/keyring.c
+@@ -43,8 +43,10 @@ static void free_master_key(struct fscrypt_master_key *mk)
+ 
+ 	wipe_master_key_secret(&mk->mk_secret);
+ 
+-	for (i = 0; i < ARRAY_SIZE(mk->mk_mode_keys); i++)
+-		crypto_free_skcipher(mk->mk_mode_keys[i]);
++	for (i = 0; i <= __FSCRYPT_MODE_MAX; i++) {
++		crypto_free_skcipher(mk->mk_direct_tfms[i]);
++		crypto_free_skcipher(mk->mk_iv_ino_lblk_64_tfms[i]);
++	}
+ 
+ 	key_put(mk->mk_users);
+ 	kzfree(mk);
+
+commit 5ab7189a31bad40e4b44020cae6e56c8074721a1
+Author: Eric Biggers <ebiggers@google.com>
+Date:   Sun Aug 4 19:35:48 2019 -0700
+
+    fscrypt: require that key be added when setting a v2 encryption policy
+    
+    By looking up the master keys in a filesystem-level keyring rather than
+    in the calling processes' key hierarchy, it becomes possible for a user
+    to set an encryption policy which refers to some key they don't actually
+    know, then encrypt their files using that key.  Cryptographically this
+    isn't much of a problem, but the semantics of this would be a bit weird.
+    Thus, enforce that a v2 encryption policy can only be set if the user
+    has previously added the key, or has capable(CAP_FOWNER).
+    
+    We tolerate that this problem will continue to exist for v1 encryption
+    policies, however; there is no way around that.
+    
+    Reviewed-by: Theodore Ts'o <tytso@mit.edu>
+    Signed-off-by: Eric Biggers <ebiggers@google.com>
+
+diff --git a/fs/crypto/keyring.c b/fs/crypto/keyring.c
+index 8c600ead0e2e..c34fa7c61b43 100644
+--- a/fs/crypto/keyring.c
++++ b/fs/crypto/keyring.c
+@@ -562,6 +562,53 @@ int fscrypt_ioctl_add_key(struct file *filp, void __user *_uarg)
+ }
+ EXPORT_SYMBOL_GPL(fscrypt_ioctl_add_key);
+ 
++/*
++ * Verify that the current user has added a master key with the given identifier
++ * (returns -ENOKEY if not).  This is needed to prevent a user from encrypting
++ * their files using some other user's key which they don't actually know.
++ * Cryptographically this isn't much of a problem, but the semantics of this
++ * would be a bit weird, so it's best to just forbid it.
++ *
++ * The system administrator (CAP_FOWNER) can override this, which should be
++ * enough for any use cases where encryption policies are being set using keys
++ * that were chosen ahead of time but aren't available at the moment.
++ *
++ * Note that the key may have already removed by the time this returns, but
++ * that's okay; we just care whether the key was there at some point.
++ *
++ * Return: 0 if the key is added, -ENOKEY if it isn't, or another -errno code
++ */
++int fscrypt_verify_key_added(struct super_block *sb,
++			     const u8 identifier[FSCRYPT_KEY_IDENTIFIER_SIZE])
++{
++	struct fscrypt_key_specifier mk_spec;
++	struct key *key, *mk_user;
++	struct fscrypt_master_key *mk;
++	int err;
++
++	mk_spec.type = FSCRYPT_KEY_SPEC_TYPE_IDENTIFIER;
++	memcpy(mk_spec.u.identifier, identifier, FSCRYPT_KEY_IDENTIFIER_SIZE);
++
++	key = fscrypt_find_master_key(sb, &mk_spec);
++	if (IS_ERR(key)) {
++		err = PTR_ERR(key);
++		goto out;
++	}
++	mk = key->payload.data[0];
++	mk_user = find_master_key_user(mk);
++	if (IS_ERR(mk_user)) {
++		err = PTR_ERR(mk_user);
++	} else {
++		key_put(mk_user);
++		err = 0;
++	}
++	key_put(key);
++out:
++	if (err == -ENOKEY && capable(CAP_FOWNER))
++		err = 0;
++	return err;
++}
++
+ /*
+  * Try to evict the inode's dentries from the dentry cache.  If the inode is a
+  * directory, then it can have at most one dentry; however, that dentry may be
+
+commit 78a1b96bcf7a0721c7852bb1475218c3cbef884a
+Author: Eric Biggers <ebiggers@google.com>
+Date:   Sun Aug 4 19:35:47 2019 -0700
+
+    fscrypt: add FS_IOC_REMOVE_ENCRYPTION_KEY_ALL_USERS ioctl
+    
+    Add a root-only variant of the FS_IOC_REMOVE_ENCRYPTION_KEY ioctl which
+    removes all users' claims of the key, not just the current user's claim.
+    I.e., it always removes the key itself, no matter how many users have
+    added it.
+    
+    This is useful for forcing a directory to be locked, without having to
+    figure out which user ID(s) the key was added under.  This is planned to
+    be used by a command like 'sudo fscrypt lock DIR --all-users' in the
+    fscrypt userspace tool (http://github.com/google/fscrypt).
+    
+    Reviewed-by: Theodore Ts'o <tytso@mit.edu>
+    Signed-off-by: Eric Biggers <ebiggers@google.com>
+
+diff --git a/fs/crypto/keyring.c b/fs/crypto/keyring.c
+index c654effb83f5..8c600ead0e2e 100644
+--- a/fs/crypto/keyring.c
++++ b/fs/crypto/keyring.c
+@@ -11,6 +11,7 @@
+  *
+  * - FS_IOC_ADD_ENCRYPTION_KEY
+  * - FS_IOC_REMOVE_ENCRYPTION_KEY
++ * - FS_IOC_REMOVE_ENCRYPTION_KEY_ALL_USERS
+  * - FS_IOC_GET_ENCRYPTION_KEY_STATUS
+  *
+  * See the "User API" section of Documentation/filesystems/fscrypt.rst for more
+@@ -699,8 +700,10 @@ static int try_to_lock_encrypted_files(struct super_block *sb,
+ /*
+  * Try to remove an fscrypt master encryption key.
+  *
+- * This removes the current user's claim to the key, then removes the key itself
+- * if no other users have claims.
++ * FS_IOC_REMOVE_ENCRYPTION_KEY (all_users=false) removes the current user's
++ * claim to the key, then removes the key itself if no other users have claims.
++ * FS_IOC_REMOVE_ENCRYPTION_KEY_ALL_USERS (all_users=true) always removes the
++ * key itself.
+  *
+  * To "remove the key itself", first we wipe the actual master key secret, so
+  * that no more inodes can be unlocked with it.  Then we try to evict all cached
+@@ -715,7 +718,7 @@ static int try_to_lock_encrypted_files(struct super_block *sb,
+  * For more details, see the "Removing keys" section of
+  * Documentation/filesystems/fscrypt.rst.
+  */
+-int fscrypt_ioctl_remove_key(struct file *filp, void __user *_uarg)
++static int do_remove_key(struct file *filp, void __user *_uarg, bool all_users)
+ {
+ 	struct super_block *sb = file_inode(filp)->i_sb;
+ 	struct fscrypt_remove_key_arg __user *uarg = _uarg;
+@@ -751,9 +754,12 @@ int fscrypt_ioctl_remove_key(struct file *filp, void __user *_uarg)
+ 
+ 	down_write(&key->sem);
+ 
+-	/* If relevant, remove current user's claim to the key */
++	/* If relevant, remove current user's (or all users) claim to the key */
+ 	if (mk->mk_users && mk->mk_users->keys.nr_leaves_on_tree != 0) {
+-		err = remove_master_key_user(mk);
++		if (all_users)
++			err = keyring_clear(mk->mk_users);
++		else
++			err = remove_master_key_user(mk);
+ 		if (err) {
+ 			up_write(&key->sem);
+ 			goto out_put_key;
+@@ -809,8 +815,21 @@ int fscrypt_ioctl_remove_key(struct file *filp, void __user *_uarg)
+ 		err = put_user(status_flags, &uarg->removal_status_flags);
+ 	return err;
+ }
++
++int fscrypt_ioctl_remove_key(struct file *filp, void __user *uarg)
++{
++	return do_remove_key(filp, uarg, false);
++}
+ EXPORT_SYMBOL_GPL(fscrypt_ioctl_remove_key);
+ 
++int fscrypt_ioctl_remove_key_all_users(struct file *filp, void __user *uarg)
++{
++	if (!capable(CAP_SYS_ADMIN))
++		return -EACCES;
++	return do_remove_key(filp, uarg, true);
++}
++EXPORT_SYMBOL_GPL(fscrypt_ioctl_remove_key_all_users);
++
+ /*
+  * Retrieve the status of an fscrypt master encryption key.
+  *
+
+commit 23c688b54016eed15d39f4387ca9da241e165922
+Author: Eric Biggers <ebiggers@google.com>
+Date:   Sun Aug 4 19:35:47 2019 -0700
+
+    fscrypt: allow unprivileged users to add/remove keys for v2 policies
+    
+    Allow the FS_IOC_ADD_ENCRYPTION_KEY and FS_IOC_REMOVE_ENCRYPTION_KEY
+    ioctls to be used by non-root users to add and remove encryption keys
+    from the filesystem-level crypto keyrings, subject to limitations.
+    
+    Motivation: while privileged fscrypt key management is sufficient for
+    some users (e.g. Android and Chromium OS, where a privileged process
+    manages all keys), the old API by design also allows non-root users to
+    set up and use encrypted directories, and we don't want to regress on
+    that.  Especially, we don't want to force users to continue using the
+    old API, running into the visibility mismatch between files and keyrings
+    and being unable to "lock" encrypted directories.
+    
+    Intuitively, the ioctls have to be privileged since they manipulate
+    filesystem-level state.  However, it's actually safe to make them
+    unprivileged if we very carefully enforce some specific limitations.
+    
+    First, each key must be identified by a cryptographic hash so that a
+    user can't add the wrong key for another user's files.  For v2
+    encryption policies, we use the key_identifier for this.  v1 policies
+    don't have this, so managing keys for them remains privileged.
+    
+    Second, each key a user adds is charged to their quota for the keyrings
+    service.  Thus, a user can't exhaust memory by adding a huge number of
+    keys.  By default each non-root user is allowed up to 200 keys; this can
+    be changed using the existing sysctl 'kernel.keys.maxkeys'.
+    
+    Third, if multiple users add the same key, we keep track of those users
+    of the key (of which there remains a single copy), and won't really
+    remove the key, i.e. "lock" the encrypted files, until all those users
+    have removed it.  This prevents denial of service attacks that would be
+    possible under simpler schemes, such allowing the first user who added a
+    key to remove it -- since that could be a malicious user who has
+    compromised the key.  Of course, encryption keys should be kept secret,
+    but the idea is that using encryption should never be *less* secure than
+    not using encryption, even if your key was compromised.
+    
+    We tolerate that a user will be unable to really remove a key, i.e.
+    unable to "lock" their encrypted files, if another user has added the
+    same key.  But in a sense, this is actually a good thing because it will
+    avoid providing a false notion of security where a key appears to have
+    been removed when actually it's still in memory, available to any
+    attacker who compromises the operating system kernel.
+    
+    Reviewed-by: Theodore Ts'o <tytso@mit.edu>
+    Signed-off-by: Eric Biggers <ebiggers@google.com>
+
+diff --git a/fs/crypto/keyring.c b/fs/crypto/keyring.c
+index fca3bdf01e7c..c654effb83f5 100644
+--- a/fs/crypto/keyring.c
++++ b/fs/crypto/keyring.c
+@@ -45,6 +45,7 @@ static void free_master_key(struct fscrypt_master_key *mk)
+ 	for (i = 0; i < ARRAY_SIZE(mk->mk_mode_keys); i++)
+ 		crypto_free_skcipher(mk->mk_mode_keys[i]);
+ 
++	key_put(mk->mk_users);
+ 	kzfree(mk);
+ }
+ 
+@@ -93,7 +94,39 @@ static struct key_type key_type_fscrypt = {
+ 	.describe		= fscrypt_key_describe,
+ };
+ 
+-/* Search ->s_master_keys */
++static int fscrypt_user_key_instantiate(struct key *key,
++					struct key_preparsed_payload *prep)
++{
++	/*
++	 * We just charge FSCRYPT_MAX_KEY_SIZE bytes to the user's key quota for
++	 * each key, regardless of the exact key size.  The amount of memory
++	 * actually used is greater than the size of the raw key anyway.
++	 */
++	return key_payload_reserve(key, FSCRYPT_MAX_KEY_SIZE);
++}
++
++static void fscrypt_user_key_describe(const struct key *key, struct seq_file *m)
++{
++	seq_puts(m, key->description);
++}
++
++/*
++ * Type of key in ->mk_users.  Each key of this type represents a particular
++ * user who has added a particular master key.
++ *
++ * Note that the name of this key type really should be something like
++ * ".fscrypt-user" instead of simply ".fscrypt".  But the shorter name is chosen
++ * mainly for simplicity of presentation in /proc/keys when read by a non-root
++ * user.  And it is expected to be rare that a key is actually added by multiple
++ * users, since users should keep their encryption keys confidential.
++ */
++static struct key_type key_type_fscrypt_user = {
++	.name			= ".fscrypt",
++	.instantiate		= fscrypt_user_key_instantiate,
++	.describe		= fscrypt_user_key_describe,
++};
++
++/* Search ->s_master_keys or ->mk_users */
+ static struct key *search_fscrypt_keyring(struct key *keyring,
+ 					  struct key_type *type,
+ 					  const char *description)
+@@ -119,6 +152,13 @@ static struct key *search_fscrypt_keyring(struct key *keyring,
+ 
+ #define FSCRYPT_MK_DESCRIPTION_SIZE	(2 * FSCRYPT_KEY_IDENTIFIER_SIZE + 1)
+ 
++#define FSCRYPT_MK_USERS_DESCRIPTION_SIZE	\
++	(CONST_STRLEN("fscrypt-") + 2 * FSCRYPT_KEY_IDENTIFIER_SIZE + \
++	 CONST_STRLEN("-users") + 1)
++
++#define FSCRYPT_MK_USER_DESCRIPTION_SIZE	\
++	(2 * FSCRYPT_KEY_IDENTIFIER_SIZE + CONST_STRLEN(".uid.") + 10 + 1)
++
+ static void format_fs_keyring_description(
+ 			char description[FSCRYPT_FS_KEYRING_DESCRIPTION_SIZE],
+ 			const struct super_block *sb)
+@@ -134,6 +174,23 @@ static void format_mk_description(
+ 		master_key_spec_len(mk_spec), (u8 *)&mk_spec->u);
+ }
+ 
++static void format_mk_users_keyring_description(
++			char description[FSCRYPT_MK_USERS_DESCRIPTION_SIZE],
++			const u8 mk_identifier[FSCRYPT_KEY_IDENTIFIER_SIZE])
++{
++	sprintf(description, "fscrypt-%*phN-users",
++		FSCRYPT_KEY_IDENTIFIER_SIZE, mk_identifier);
++}
++
++static void format_mk_user_description(
++			char description[FSCRYPT_MK_USER_DESCRIPTION_SIZE],
++			const u8 mk_identifier[FSCRYPT_KEY_IDENTIFIER_SIZE])
++{
++
++	sprintf(description, "%*phN.uid.%u", FSCRYPT_KEY_IDENTIFIER_SIZE,
++		mk_identifier, __kuid_val(current_fsuid()));
++}
++
+ /* Create ->s_master_keys if needed.  Synchronized by fscrypt_add_key_mutex. */
+ static int allocate_filesystem_keyring(struct super_block *sb)
+ {
+@@ -181,6 +238,80 @@ struct key *fscrypt_find_master_key(struct super_block *sb,
+ 	return search_fscrypt_keyring(keyring, &key_type_fscrypt, description);
+ }
+ 
++static int allocate_master_key_users_keyring(struct fscrypt_master_key *mk)
++{
++	char description[FSCRYPT_MK_USERS_DESCRIPTION_SIZE];
++	struct key *keyring;
++
++	format_mk_users_keyring_description(description,
++					    mk->mk_spec.u.identifier);
++	keyring = keyring_alloc(description, GLOBAL_ROOT_UID, GLOBAL_ROOT_GID,
++				current_cred(), KEY_POS_SEARCH |
++				  KEY_USR_SEARCH | KEY_USR_READ | KEY_USR_VIEW,
++				KEY_ALLOC_NOT_IN_QUOTA, NULL, NULL);
++	if (IS_ERR(keyring))
++		return PTR_ERR(keyring);
++
++	mk->mk_users = keyring;
++	return 0;
++}
++
++/*
++ * Find the current user's "key" in the master key's ->mk_users.
++ * Returns ERR_PTR(-ENOKEY) if not found.
++ */
++static struct key *find_master_key_user(struct fscrypt_master_key *mk)
++{
++	char description[FSCRYPT_MK_USER_DESCRIPTION_SIZE];
++
++	format_mk_user_description(description, mk->mk_spec.u.identifier);
++	return search_fscrypt_keyring(mk->mk_users, &key_type_fscrypt_user,
++				      description);
++}
++
++/*
++ * Give the current user a "key" in ->mk_users.  This charges the user's quota
++ * and marks the master key as added by the current user, so that it cannot be
++ * removed by another user with the key.  Either the master key's key->sem must
++ * be held for write, or the master key must be still undergoing initialization.
++ */
++static int add_master_key_user(struct fscrypt_master_key *mk)
++{
++	char description[FSCRYPT_MK_USER_DESCRIPTION_SIZE];
++	struct key *mk_user;
++	int err;
++
++	format_mk_user_description(description, mk->mk_spec.u.identifier);
++	mk_user = key_alloc(&key_type_fscrypt_user, description,
++			    current_fsuid(), current_gid(), current_cred(),
++			    KEY_POS_SEARCH | KEY_USR_VIEW, 0, NULL);
++	if (IS_ERR(mk_user))
++		return PTR_ERR(mk_user);
++
++	err = key_instantiate_and_link(mk_user, NULL, 0, mk->mk_users, NULL);
++	key_put(mk_user);
++	return err;
++}
++
++/*
++ * Remove the current user's "key" from ->mk_users.
++ * The master key's key->sem must be held for write.
++ *
++ * Returns 0 if removed, -ENOKEY if not found, or another -errno code.
++ */
++static int remove_master_key_user(struct fscrypt_master_key *mk)
++{
++	struct key *mk_user;
++	int err;
++
++	mk_user = find_master_key_user(mk);
++	if (IS_ERR(mk_user))
++		return PTR_ERR(mk_user);
++	err = key_unlink(mk->mk_users, mk_user);
++	key_put(mk_user);
++	return err;
++}
++
+ /*
+  * Allocate a new fscrypt_master_key which contains the given secret, set it as
+  * the payload of a new 'struct key' of type fscrypt, and link the 'struct key'
+@@ -202,11 +333,26 @@ static int add_new_master_key(struct fscrypt_master_key_secret *secret,
+ 	mk->mk_spec = *mk_spec;
+ 
+ 	move_master_key_secret(&mk->mk_secret, secret);
++	init_rwsem(&mk->mk_secret_sem);
+ 
+ 	refcount_set(&mk->mk_refcount, 1); /* secret is present */
+ 	INIT_LIST_HEAD(&mk->mk_decrypted_inodes);
+ 	spin_lock_init(&mk->mk_decrypted_inodes_lock);
+ 
++	if (mk_spec->type == FSCRYPT_KEY_SPEC_TYPE_IDENTIFIER) {
++		err = allocate_master_key_users_keyring(mk);
++		if (err)
++			goto out_free_mk;
++		err = add_master_key_user(mk);
++		if (err)
++			goto out_free_mk;
++	}
++
++	/*
++	 * Note that we don't charge this key to anyone's quota, since when
++	 * ->mk_users is in use those keys are charged instead, and otherwise
++	 * (when ->mk_users isn't in use) only root can add these keys.
++	 */
+ 	format_mk_description(description, mk_spec);
+ 	key = key_alloc(&key_type_fscrypt, description,
+ 			GLOBAL_ROOT_UID, GLOBAL_ROOT_GID, current_cred(),
+@@ -233,13 +379,45 @@ static int add_new_master_key(struct fscrypt_master_key_secret *secret,
+ static int add_existing_master_key(struct fscrypt_master_key *mk,
+ 				   struct fscrypt_master_key_secret *secret)
+ {
+-	if (is_master_key_secret_present(&mk->mk_secret))
+-		return 0;
++	struct key *mk_user;
++	bool rekey;
++	int err;
+ 
+-	if (!refcount_inc_not_zero(&mk->mk_refcount))
++	/*
++	 * If the current user is already in ->mk_users, then there's nothing to
++	 * do.  (Not applicable for v1 policy keys, which have NULL ->mk_users.)
++	 */
++	if (mk->mk_users) {
++		mk_user = find_master_key_user(mk);
++		if (mk_user != ERR_PTR(-ENOKEY)) {
++			if (IS_ERR(mk_user))
++				return PTR_ERR(mk_user);
++			key_put(mk_user);
++			return 0;
++		}
++	}
++
++	/* If we'll be re-adding ->mk_secret, try to take the reference. */
++	rekey = !is_master_key_secret_present(&mk->mk_secret);
++	if (rekey && !refcount_inc_not_zero(&mk->mk_refcount))
+ 		return KEY_DEAD;
+ 
+-	move_master_key_secret(&mk->mk_secret, secret);
++	/* Add the current user to ->mk_users, if applicable. */
++	if (mk->mk_users) {
++		err = add_master_key_user(mk);
++		if (err) {
++			if (rekey && refcount_dec_and_test(&mk->mk_refcount))
++				return KEY_DEAD;
++			return err;
++		}
++	}
++
++	/* Re-add the secret if needed. */
++	if (rekey) {
++		down_write(&mk->mk_secret_sem);
++		move_master_key_secret(&mk->mk_secret, secret);
++		up_write(&mk->mk_secret_sem);
++	}
+ 	return 0;
+ }
+ 
+@@ -266,7 +444,7 @@ static int add_master_key(struct super_block *sb,
+ 	} else {
+ 		/*
+ 		 * Found the key in ->s_master_keys.  Re-add the secret if
+-		 * needed.
++		 * needed, and add the user to ->mk_users if needed.
+ 		 */
+ 		down_write(&key->sem);
+ 		err = add_existing_master_key(key->payload.data[0], secret);
+@@ -288,6 +466,23 @@ static int add_master_key(struct super_block *sb,
+  * Add a master encryption key to the filesystem, causing all files which were
+  * encrypted with it to appear "unlocked" (decrypted) when accessed.
+  *
++ * When adding a key for use by v1 encryption policies, this ioctl is
++ * privileged, and userspace must provide the 'key_descriptor'.
++ *
++ * When adding a key for use by v2+ encryption policies, this ioctl is
++ * unprivileged.  This is needed, in general, to allow non-root users to use
++ * encryption without encountering the visibility problems of process-subscribed
++ * keyrings and the inability to properly remove keys.  This works by having
++ * each key identified by its cryptographically secure hash --- the
++ * 'key_identifier'.  The cryptographic hash ensures that a malicious user
++ * cannot add the wrong key for a given identifier.  Furthermore, each added key
++ * is charged to the appropriate user's quota for the keyrings service, which
++ * prevents a malicious user from adding too many keys.  Finally, we forbid a
++ * user from removing a key while other users have added it too, which prevents
++ * a user who knows another user's key from causing a denial-of-service by
++ * removing it at an inopportune time.  (We tolerate that a user who knows a key
++ * can prevent other users from removing it.)
++ *
+  * For more details, see the "FS_IOC_ADD_ENCRYPTION_KEY" section of
+  * Documentation/filesystems/fscrypt.rst.
+  */
+@@ -318,11 +513,18 @@ int fscrypt_ioctl_add_key(struct file *filp, void __user *_uarg)
+ 	if (copy_from_user(secret.raw, uarg->raw, secret.size))
+ 		goto out_wipe_secret;
+ 
+-	err = -EACCES;
+-	if (!capable(CAP_SYS_ADMIN))
+-		goto out_wipe_secret;
+-
+-	if (arg.key_spec.type == FSCRYPT_KEY_SPEC_TYPE_IDENTIFIER) {
++	switch (arg.key_spec.type) {
++	case FSCRYPT_KEY_SPEC_TYPE_DESCRIPTOR:
++		/*
++		 * Only root can add keys that are identified by an arbitrary
++		 * descriptor rather than by a cryptographic hash --- since
++		 * otherwise a malicious user could add the wrong key.
++		 */
++		err = -EACCES;
++		if (!capable(CAP_SYS_ADMIN))
++			goto out_wipe_secret;
++		break;
++	case FSCRYPT_KEY_SPEC_TYPE_IDENTIFIER:
+ 		err = fscrypt_init_hkdf(&secret.hkdf, secret.raw, secret.size);
+ 		if (err)
+ 			goto out_wipe_secret;
+@@ -345,6 +547,11 @@ int fscrypt_ioctl_add_key(struct file *filp, void __user *_uarg)
+ 				 arg.key_spec.u.identifier,
+ 				 FSCRYPT_KEY_IDENTIFIER_SIZE))
+ 			goto out_wipe_secret;
++		break;
++	default:
++		WARN_ON(1);
++		err = -EINVAL;
++		goto out_wipe_secret;
+ 	}
+ 
+ 	err = add_master_key(sb, &secret, &arg.key_spec);
+@@ -492,9 +699,12 @@ static int try_to_lock_encrypted_files(struct super_block *sb,
+ /*
+  * Try to remove an fscrypt master encryption key.
+  *
+- * First we wipe the actual master key secret, so that no more inodes can be
+- * unlocked with it.  Then we try to evict all cached inodes that had been
+- * unlocked with the key.
++ * This removes the current user's claim to the key, then removes the key itself
++ * if no other users have claims.
++ *
++ * To "remove the key itself", first we wipe the actual master key secret, so
++ * that no more inodes can be unlocked with it.  Then we try to evict all cached
++ * inodes that had been unlocked with the key.
+  *
+  * If all inodes were evicted, then we unlink the fscrypt_master_key from the
+  * keyring.  Otherwise it remains in the keyring in the "incompletely removed"
+@@ -525,7 +735,12 @@ int fscrypt_ioctl_remove_key(struct file *filp, void __user *_uarg)
+ 	if (memchr_inv(arg.__reserved, 0, sizeof(arg.__reserved)))
+ 		return -EINVAL;
+ 
+-	if (!capable(CAP_SYS_ADMIN))
++	/*
++	 * Only root can add and remove keys that are identified by an arbitrary
++	 * descriptor rather than by a cryptographic hash.
++	 */
++	if (arg.key_spec.type == FSCRYPT_KEY_SPEC_TYPE_DESCRIPTOR &&
++	    !capable(CAP_SYS_ADMIN))
+ 		return -EACCES;
+ 
+ 	/* Find the key being removed. */
+@@ -536,11 +751,34 @@ int fscrypt_ioctl_remove_key(struct file *filp, void __user *_uarg)
+ 
+ 	down_write(&key->sem);
+ 
+-	/* Wipe the secret. */
++	/* If relevant, remove current user's claim to the key */
++	if (mk->mk_users && mk->mk_users->keys.nr_leaves_on_tree != 0) {
++		err = remove_master_key_user(mk);
++		if (err) {
++			up_write(&key->sem);
++			goto out_put_key;
++		}
++		if (mk->mk_users->keys.nr_leaves_on_tree != 0) {
++			/*
++			 * Other users have still added the key too.  We removed
++			 * the current user's claim to the key, but we still
++			 * can't remove the key itself.
++			 */
++			status_flags |=
++				FSCRYPT_KEY_REMOVAL_STATUS_FLAG_OTHER_USERS;
++			err = 0;
++			up_write(&key->sem);
++			goto out_put_key;
++		}
++	}
++
++	/* No user claims remaining.  Go ahead and wipe the secret. */
+ 	dead = false;
+ 	if (is_master_key_secret_present(&mk->mk_secret)) {
++		down_write(&mk->mk_secret_sem);
+ 		wipe_master_key_secret(&mk->mk_secret);
+ 		dead = refcount_dec_and_test(&mk->mk_refcount);
++		up_write(&mk->mk_secret_sem);
+ 	}
+ 	up_write(&key->sem);
+ 	if (dead) {
+@@ -560,11 +798,12 @@ int fscrypt_ioctl_remove_key(struct file *filp, void __user *_uarg)
+ 		}
+ 	}
+ 	/*
+-	 * We return 0 if we successfully did something: wiped the secret, or
+-	 * tried locking the files again.  Users need to check the informational
+-	 * status flags if they care whether the key has been fully removed
+-	 * including all files locked.
++	 * We return 0 if we successfully did something: removed a claim to the
++	 * key, wiped the secret, or tried locking the files again.  Users need
++	 * to check the informational status flags if they care whether the key
++	 * has been fully removed including all files locked.
+ 	 */
++out_put_key:
+ 	key_put(key);
+ 	if (err == 0)
+ 		err = put_user(status_flags, &uarg->removal_status_flags);
+@@ -583,6 +822,15 @@ EXPORT_SYMBOL_GPL(fscrypt_ioctl_remove_key);
+  * regular file in it (which can confuse the "incompletely removed" state with
+  * absent or present).
+  *
++ * In addition, for v2 policy keys we allow applications to determine, via
++ * ->status_flags and ->user_count, whether the key has been added by the
++ * current user, by other users, or by both.  Most applications should not need
++ * this, since ordinarily only one user should know a given key.  However, if a
++ * secret key is shared by multiple users, applications may wish to add an
++ * already-present key to prevent other users from removing it.  This ioctl can
++ * be used to check whether that really is the case before the work is done to
++ * add the key --- which might e.g. require prompting the user for a passphrase.
++ *
+  * For more details, see the "FS_IOC_GET_ENCRYPTION_KEY_STATUS" section of
+  * Documentation/filesystems/fscrypt.rst.
+  */
+@@ -603,6 +851,8 @@ int fscrypt_ioctl_get_key_status(struct file *filp, void __user *uarg)
+ 	if (memchr_inv(arg.__reserved, 0, sizeof(arg.__reserved)))
+ 		return -EINVAL;
+ 
++	arg.status_flags = 0;
++	arg.user_count = 0;
+ 	memset(arg.__out_reserved, 0, sizeof(arg.__out_reserved));
+ 
+ 	key = fscrypt_find_master_key(sb, &arg.key_spec);
+@@ -623,6 +873,20 @@ int fscrypt_ioctl_get_key_status(struct file *filp, void __user *uarg)
+ 	}
+ 
+ 	arg.status = FSCRYPT_KEY_STATUS_PRESENT;
++	if (mk->mk_users) {
++		struct key *mk_user;
++
++		arg.user_count = mk->mk_users->keys.nr_leaves_on_tree;
++		mk_user = find_master_key_user(mk);
++		if (!IS_ERR(mk_user)) {
++			arg.status_flags |=
++				FSCRYPT_KEY_STATUS_FLAG_ADDED_BY_SELF;
++			key_put(mk_user);
++		} else if (mk_user != ERR_PTR(-ENOKEY)) {
++			err = PTR_ERR(mk_user);
++			goto out_release_key;
++		}
++	}
+ 	err = 0;
+ out_release_key:
+ 	up_read(&key->sem);
+@@ -636,5 +900,19 @@ EXPORT_SYMBOL_GPL(fscrypt_ioctl_get_key_status);
+ 
+ int __init fscrypt_init_keyring(void)
+ {
+-	return register_key_type(&key_type_fscrypt);
++	int err;
++
++	err = register_key_type(&key_type_fscrypt);
++	if (err)
++		return err;
++
++	err = register_key_type(&key_type_fscrypt_user);
++	if (err)
++		goto err_unregister_fscrypt;
++
++	return 0;
++
++err_unregister_fscrypt:
++	unregister_key_type(&key_type_fscrypt);
++	return err;
+ }
+
+commit 5dae460c2292dbbdac3a7a982cd566f470d957a2
+Author: Eric Biggers <ebiggers@google.com>
+Date:   Sun Aug 4 19:35:47 2019 -0700
+
+    fscrypt: v2 encryption policy support
+    
+    Add a new fscrypt policy version, "v2".  It has the following changes
+    from the original policy version, which we call "v1" (*):
+    
+    - Master keys (the user-provided encryption keys) are only ever used as
+      input to HKDF-SHA512.  This is more flexible and less error-prone, and
+      it avoids the quirks and limitations of the AES-128-ECB based KDF.
+      Three classes of cryptographically isolated subkeys are defined:
+    
+        - Per-file keys, like used in v1 policies except for the new KDF.
+    
+        - Per-mode keys.  These implement the semantics of the DIRECT_KEY
+          flag, which for v1 policies made the master key be used directly.
+          These are also planned to be used for inline encryption when
+          support for it is added.
+    
+        - Key identifiers (see below).
+    
+    - Each master key is identified by a 16-byte master_key_identifier,
+      which is derived from the key itself using HKDF-SHA512.  This prevents
+      users from associating the wrong key with an encrypted file or
+      directory.  This was easily possible with v1 policies, which
+      identified the key by an arbitrary 8-byte master_key_descriptor.
+    
+    - The key must be provided in the filesystem-level keyring, not in a
+      process-subscribed keyring.
+    
+    The following UAPI additions are made:
+    
+    - The existing ioctl FS_IOC_SET_ENCRYPTION_POLICY can now be passed a
+      fscrypt_policy_v2 to set a v2 encryption policy.  It's disambiguated
+      from fscrypt_policy/fscrypt_policy_v1 by the version code prefix.
+    
+    - A new ioctl FS_IOC_GET_ENCRYPTION_POLICY_EX is added.  It allows
+      getting the v1 or v2 encryption policy of an encrypted file or
+      directory.  The existing FS_IOC_GET_ENCRYPTION_POLICY ioctl could not
+      be used because it did not have a way for userspace to indicate which
+      policy structure is expected.  The new ioctl includes a size field, so
+      it is extensible to future fscrypt policy versions.
+    
+    - The ioctls FS_IOC_ADD_ENCRYPTION_KEY, FS_IOC_REMOVE_ENCRYPTION_KEY,
+      and FS_IOC_GET_ENCRYPTION_KEY_STATUS now support managing keys for v2
+      encryption policies.  Such keys are kept logically separate from keys
+      for v1 encryption policies, and are identified by 'identifier' rather
+      than by 'descriptor'.  The 'identifier' need not be provided when
+      adding a key, since the kernel will calculate it anyway.
+    
+    This patch temporarily keeps adding/removing v2 policy keys behind the
+    same permission check done for adding/removing v1 policy keys:
+    capable(CAP_SYS_ADMIN).  However, the next patch will carefully take
+    advantage of the cryptographically secure master_key_identifier to allow
+    non-root users to add/remove v2 policy keys, thus providing a full
+    replacement for v1 policies.
+    
+    (*) Actually, in the API fscrypt_policy::version is 0 while on-disk
+        fscrypt_context::format is 1.  But I believe it makes the most sense
+        to advance both to '2' to have them be in sync, and to consider the
+        numbering to start at 1 except for the API quirk.
+    
+    Reviewed-by: Paul Crowley <paulcrowley@google.com>
+    Reviewed-by: Theodore Ts'o <tytso@mit.edu>
+    Signed-off-by: Eric Biggers <ebiggers@google.com>
+
+diff --git a/fs/crypto/keyring.c b/fs/crypto/keyring.c
+index 8c94c2fa0c13..fca3bdf01e7c 100644
+--- a/fs/crypto/keyring.c
++++ b/fs/crypto/keyring.c
+@@ -17,6 +17,7 @@
+  * information about these ioctls.
+  */
+ 
++#include <crypto/skcipher.h>
+ #include <linux/key-type.h>
+ #include <linux/seq_file.h>
+ 
+@@ -24,6 +25,7 @@
+ 
+ static void wipe_master_key_secret(struct fscrypt_master_key_secret *secret)
+ {
++	fscrypt_destroy_hkdf(&secret->hkdf);
+ 	memzero_explicit(secret, sizeof(*secret));
+ }
+ 
+@@ -36,7 +38,13 @@ static void move_master_key_secret(struct fscrypt_master_key_secret *dst,
+ 
+ static void free_master_key(struct fscrypt_master_key *mk)
+ {
++	size_t i;
++
+ 	wipe_master_key_secret(&mk->mk_secret);
++
++	for (i = 0; i < ARRAY_SIZE(mk->mk_mode_keys); i++)
++		crypto_free_skcipher(mk->mk_mode_keys[i]);
++
+ 	kzfree(mk);
+ }
+ 
+@@ -109,7 +117,7 @@ static struct key *search_fscrypt_keyring(struct key *keyring,
+ #define FSCRYPT_FS_KEYRING_DESCRIPTION_SIZE	\
+ 	(CONST_STRLEN("fscrypt-") + FIELD_SIZEOF(struct super_block, s_id))
+ 
+-#define FSCRYPT_MK_DESCRIPTION_SIZE	(2 * FSCRYPT_KEY_DESCRIPTOR_SIZE + 1)
++#define FSCRYPT_MK_DESCRIPTION_SIZE	(2 * FSCRYPT_KEY_IDENTIFIER_SIZE + 1)
+ 
+ static void format_fs_keyring_description(
+ 			char description[FSCRYPT_FS_KEYRING_DESCRIPTION_SIZE],
+@@ -314,6 +322,31 @@ int fscrypt_ioctl_add_key(struct file *filp, void __user *_uarg)
+ 	if (!capable(CAP_SYS_ADMIN))
+ 		goto out_wipe_secret;
+ 
++	if (arg.key_spec.type == FSCRYPT_KEY_SPEC_TYPE_IDENTIFIER) {
++		err = fscrypt_init_hkdf(&secret.hkdf, secret.raw, secret.size);
++		if (err)
++			goto out_wipe_secret;
++
++		/*
++		 * Now that the HKDF context is initialized, the raw key is no
++		 * longer needed.
++		 */
++		memzero_explicit(secret.raw, secret.size);
++
++		/* Calculate the key identifier and return it to userspace. */
++		err = fscrypt_hkdf_expand(&secret.hkdf,
++					  HKDF_CONTEXT_KEY_IDENTIFIER,
++					  NULL, 0, arg.key_spec.u.identifier,
++					  FSCRYPT_KEY_IDENTIFIER_SIZE);
++		if (err)
++			goto out_wipe_secret;
++		err = -EFAULT;
++		if (copy_to_user(uarg->key_spec.u.identifier,
++				 arg.key_spec.u.identifier,
++				 FSCRYPT_KEY_IDENTIFIER_SIZE))
++			goto out_wipe_secret;
++	}
++
+ 	err = add_master_key(sb, &secret, &arg.key_spec);
+ out_wipe_secret:
+ 	wipe_master_key_secret(&secret);
+
+commit 5a7e29924dac34f0690b06906aad9d70d3c022a5
+Author: Eric Biggers <ebiggers@google.com>
+Date:   Sun Aug 4 19:35:46 2019 -0700
+
+    fscrypt: add FS_IOC_GET_ENCRYPTION_KEY_STATUS ioctl
+    
+    Add a new fscrypt ioctl, FS_IOC_GET_ENCRYPTION_KEY_STATUS.  Given a key
+    specified by 'struct fscrypt_key_specifier' (the same way a key is
+    specified for the other fscrypt key management ioctls), it returns
+    status information in a 'struct fscrypt_get_key_status_arg'.
+    
+    The main motivation for this is that applications need to be able to
+    check whether an encrypted directory is "unlocked" or not, so that they
+    can add the key if it is not, and avoid adding the key (which may
+    involve prompting the user for a passphrase) if it already is.
+    
+    It's possible to use some workarounds such as checking whether opening a
+    regular file fails with ENOKEY, or checking whether the filenames "look
+    like gibberish" or not.  However, no workaround is usable in all cases.
+    
+    Like the other key management ioctls, the keyrings syscalls may seem at
+    first to be a good fit for this.  Unfortunately, they are not.  Even if
+    we exposed the keyring ID of the ->s_master_keys keyring and gave
+    everyone Search permission on it (note: currently the keyrings
+    permission system would also allow everyone to "invalidate" the keyring
+    too), the fscrypt keys have an additional state that doesn't map cleanly
+    to the keyrings API: the secret can be removed, but we can be still
+    tracking the files that were using the key, and the removal can be
+    re-attempted or the secret added again.
+    
+    After later patches, some applications will also need a way to determine
+    whether a key was added by the current user vs. by some other user.
+    Reserved fields are included in fscrypt_get_key_status_arg for this and
+    other future extensions.
+    
+    Reviewed-by: Theodore Ts'o <tytso@mit.edu>
+    Signed-off-by: Eric Biggers <ebiggers@google.com>
+
+diff --git a/fs/crypto/keyring.c b/fs/crypto/keyring.c
+index c3423f0edc70..8c94c2fa0c13 100644
+--- a/fs/crypto/keyring.c
++++ b/fs/crypto/keyring.c
+@@ -11,6 +11,7 @@
+  *
+  * - FS_IOC_ADD_ENCRYPTION_KEY
+  * - FS_IOC_REMOVE_ENCRYPTION_KEY
++ * - FS_IOC_GET_ENCRYPTION_KEY_STATUS
+  *
+  * See the "User API" section of Documentation/filesystems/fscrypt.rst for more
+  * information about these ioctls.
+@@ -538,6 +539,68 @@ int fscrypt_ioctl_remove_key(struct file *filp, void __user *_uarg)
+ }
+ EXPORT_SYMBOL_GPL(fscrypt_ioctl_remove_key);
+ 
++/*
++ * Retrieve the status of an fscrypt master encryption key.
++ *
++ * We set ->status to indicate whether the key is absent, present, or
++ * incompletely removed.  "Incompletely removed" means that the master key
++ * secret has been removed, but some files which had been unlocked with it are
++ * still in use.  This field allows applications to easily determine the state
++ * of an encrypted directory without using a hack such as trying to open a
++ * regular file in it (which can confuse the "incompletely removed" state with
++ * absent or present).
++ *
++ * For more details, see the "FS_IOC_GET_ENCRYPTION_KEY_STATUS" section of
++ * Documentation/filesystems/fscrypt.rst.
++ */
++int fscrypt_ioctl_get_key_status(struct file *filp, void __user *uarg)
++{
++	struct super_block *sb = file_inode(filp)->i_sb;
++	struct fscrypt_get_key_status_arg arg;
++	struct key *key;
++	struct fscrypt_master_key *mk;
++	int err;
++
++	if (copy_from_user(&arg, uarg, sizeof(arg)))
++		return -EFAULT;
++
++	if (!valid_key_spec(&arg.key_spec))
++		return -EINVAL;
++
++	if (memchr_inv(arg.__reserved, 0, sizeof(arg.__reserved)))
++		return -EINVAL;
++
++	memset(arg.__out_reserved, 0, sizeof(arg.__out_reserved));
++
++	key = fscrypt_find_master_key(sb, &arg.key_spec);
++	if (IS_ERR(key)) {
++		if (key != ERR_PTR(-ENOKEY))
++			return PTR_ERR(key);
++		arg.status = FSCRYPT_KEY_STATUS_ABSENT;
++		err = 0;
++		goto out;
++	}
++	mk = key->payload.data[0];
++	down_read(&key->sem);
++
++	if (!is_master_key_secret_present(&mk->mk_secret)) {
++		arg.status = FSCRYPT_KEY_STATUS_INCOMPLETELY_REMOVED;
++		err = 0;
++		goto out_release_key;
++	}
++
++	arg.status = FSCRYPT_KEY_STATUS_PRESENT;
++	err = 0;
++out_release_key:
++	up_read(&key->sem);
++	key_put(key);
++out:
++	if (!err && copy_to_user(uarg, &arg, sizeof(arg)))
++		err = -EFAULT;
++	return err;
++}
++EXPORT_SYMBOL_GPL(fscrypt_ioctl_get_key_status);
++
+ int __init fscrypt_init_keyring(void)
+ {
+ 	return register_key_type(&key_type_fscrypt);
+
+commit b1c0ec3599f42ad372063b0235a3c33f65eb1e30
+Author: Eric Biggers <ebiggers@google.com>
+Date:   Sun Aug 4 19:35:46 2019 -0700
+
+    fscrypt: add FS_IOC_REMOVE_ENCRYPTION_KEY ioctl
+    
+    Add a new fscrypt ioctl, FS_IOC_REMOVE_ENCRYPTION_KEY.  This ioctl
+    removes an encryption key that was added by FS_IOC_ADD_ENCRYPTION_KEY.
+    It wipes the secret key itself, then "locks" the encrypted files and
+    directories that had been unlocked using that key -- implemented by
+    evicting the relevant dentries and inodes from the VFS caches.
+    
+    The problem this solves is that many fscrypt users want the ability to
+    remove encryption keys, causing the corresponding encrypted directories
+    to appear "locked" (presented in ciphertext form) again.  Moreover,
+    users want removing an encryption key to *really* remove it, in the
+    sense that the removed keys cannot be recovered even if kernel memory is
+    compromised, e.g. by the exploit of a kernel security vulnerability or
+    by a physical attack.  This is desirable after a user logs out of the
+    system, for example.  In many cases users even already assume this to be
+    the case and are surprised to hear when it's not.
+    
+    It is not sufficient to simply unlink the master key from the keyring
+    (or to revoke or invalidate it), since the actual encryption transform
+    objects are still pinned in memory by their inodes.  Therefore, to
+    really remove a key we must also evict the relevant inodes.
+    
+    Currently one workaround is to run 'sync && echo 2 >
+    /proc/sys/vm/drop_caches'.  But, that evicts all unused inodes in the
+    system rather than just the inodes associated with the key being
+    removed, causing severe performance problems.  Moreover, it requires
+    root privileges, so regular users can't "lock" their encrypted files.
+    
+    Another workaround, used in Chromium OS kernels, is to add a new
+    VFS-level ioctl FS_IOC_DROP_CACHE which is a more restricted version of
+    drop_caches that operates on a single super_block.  It does:
+    
+            shrink_dcache_sb(sb);
+            invalidate_inodes(sb, false);
+    
+    But it's still a hack.  Yet, the major users of filesystem encryption
+    want this feature badly enough that they are actually using these hacks.
+    
+    To properly solve the problem, start maintaining a list of the inodes
+    which have been "unlocked" using each master key.  Originally this
+    wasn't possible because the kernel didn't keep track of in-use master
+    keys at all.  But, with the ->s_master_keys keyring it is now possible.
+    
+    Then, add an ioctl FS_IOC_REMOVE_ENCRYPTION_KEY.  It finds the specified
+    master key in ->s_master_keys, then wipes the secret key itself, which
+    prevents any additional inodes from being unlocked with the key.  Then,
+    it syncs the filesystem and evicts the inodes in the key's list.  The
+    normal inode eviction code will free and wipe the per-file keys (in
+    ->i_crypt_info).  Note that freeing ->i_crypt_info without evicting the
+    inodes was also considered, but would have been racy.
+    
+    Some inodes may still be in use when a master key is removed, and we
+    can't simply revoke random file descriptors, mmap's, etc.  Thus, the
+    ioctl simply skips in-use inodes, and returns -EBUSY to indicate that
+    some inodes weren't evicted.  The master key *secret* is still removed,
+    but the fscrypt_master_key struct remains to keep track of the remaining
+    inodes.  Userspace can then retry the ioctl to evict the remaining
+    inodes.  Alternatively, if userspace adds the key again, the refreshed
+    secret will be associated with the existing list of inodes so they
+    remain correctly tracked for future key removals.
+    
+    The ioctl doesn't wipe pagecache pages.  Thus, we tolerate that after a
+    kernel compromise some portions of plaintext file contents may still be
+    recoverable from memory.  This can be solved by enabling page poisoning
+    system-wide, which security conscious users may choose to do.  But it's
+    very difficult to solve otherwise, e.g. note that plaintext file
+    contents may have been read in other places than pagecache pages.
+    
+    Like FS_IOC_ADD_ENCRYPTION_KEY, FS_IOC_REMOVE_ENCRYPTION_KEY is
+    initially restricted to privileged users only.  This is sufficient for
+    some use cases, but not all.  A later patch will relax this restriction,
+    but it will require introducing key hashes, among other changes.
+    
+    Reviewed-by: Theodore Ts'o <tytso@mit.edu>
+    Signed-off-by: Eric Biggers <ebiggers@google.com>
+
+diff --git a/fs/crypto/keyring.c b/fs/crypto/keyring.c
+index bcd7d2836e1e..c3423f0edc70 100644
+--- a/fs/crypto/keyring.c
++++ b/fs/crypto/keyring.c
+@@ -10,6 +10,7 @@
+  * filesystem-level keyring, including the ioctls:
+  *
+  * - FS_IOC_ADD_ENCRYPTION_KEY
++ * - FS_IOC_REMOVE_ENCRYPTION_KEY
+  *
+  * See the "User API" section of Documentation/filesystems/fscrypt.rst for more
+  * information about these ioctls.
+@@ -60,6 +61,13 @@ static void fscrypt_key_destroy(struct key *key)
+ static void fscrypt_key_describe(const struct key *key, struct seq_file *m)
+ {
+ 	seq_puts(m, key->description);
++
++	if (key_is_positive(key)) {
++		const struct fscrypt_master_key *mk = key->payload.data[0];
++
++		if (!is_master_key_secret_present(&mk->mk_secret))
++			seq_puts(m, ": secret removed");
++	}
+ }
+ 
+ /*
+@@ -186,6 +194,10 @@ static int add_new_master_key(struct fscrypt_master_key_secret *secret,
+ 
+ 	move_master_key_secret(&mk->mk_secret, secret);
+ 
++	refcount_set(&mk->mk_refcount, 1); /* secret is present */
++	INIT_LIST_HEAD(&mk->mk_decrypted_inodes);
++	spin_lock_init(&mk->mk_decrypted_inodes_lock);
++
+ 	format_mk_description(description, mk_spec);
+ 	key = key_alloc(&key_type_fscrypt, description,
+ 			GLOBAL_ROOT_UID, GLOBAL_ROOT_GID, current_cred(),
+@@ -207,6 +219,21 @@ static int add_new_master_key(struct fscrypt_master_key_secret *secret,
+ 	return err;
+ }
+ 
++#define KEY_DEAD	1
++
++static int add_existing_master_key(struct fscrypt_master_key *mk,
++				   struct fscrypt_master_key_secret *secret)
++{
++	if (is_master_key_secret_present(&mk->mk_secret))
++		return 0;
++
++	if (!refcount_inc_not_zero(&mk->mk_refcount))
++		return KEY_DEAD;
++
++	move_master_key_secret(&mk->mk_secret, secret);
++	return 0;
++}
++
+ static int add_master_key(struct super_block *sb,
+ 			  struct fscrypt_master_key_secret *secret,
+ 			  const struct fscrypt_key_specifier *mk_spec)
+@@ -216,6 +243,7 @@ static int add_master_key(struct super_block *sb,
+ 	int err;
+ 
+ 	mutex_lock(&fscrypt_add_key_mutex); /* serialize find + link */
++retry:
+ 	key = fscrypt_find_master_key(sb, mk_spec);
+ 	if (IS_ERR(key)) {
+ 		err = PTR_ERR(key);
+@@ -227,8 +255,20 @@ static int add_master_key(struct super_block *sb,
+ 			goto out_unlock;
+ 		err = add_new_master_key(secret, mk_spec, sb->s_master_keys);
+ 	} else {
++		/*
++		 * Found the key in ->s_master_keys.  Re-add the secret if
++		 * needed.
++		 */
++		down_write(&key->sem);
++		err = add_existing_master_key(key->payload.data[0], secret);
++		up_write(&key->sem);
++		if (err == KEY_DEAD) {
++			/* Key being removed or needs to be removed */
++			key_invalidate(key);
++			key_put(key);
++			goto retry;
++		}
+ 		key_put(key);
+-		err = 0;
+ 	}
+ out_unlock:
+ 	mutex_unlock(&fscrypt_add_key_mutex);
+@@ -280,6 +320,224 @@ int fscrypt_ioctl_add_key(struct file *filp, void __user *_uarg)
+ }
+ EXPORT_SYMBOL_GPL(fscrypt_ioctl_add_key);
+ 
++/*
++ * Try to evict the inode's dentries from the dentry cache.  If the inode is a
++ * directory, then it can have at most one dentry; however, that dentry may be
++ * pinned by child dentries, so first try to evict the children too.
++ */
++static void shrink_dcache_inode(struct inode *inode)
++{
++	struct dentry *dentry;
++
++	if (S_ISDIR(inode->i_mode)) {
++		dentry = d_find_any_alias(inode);
++		if (dentry) {
++			shrink_dcache_parent(dentry);
++			dput(dentry);
++		}
++	}
++	d_prune_aliases(inode);
++}
++
++static void evict_dentries_for_decrypted_inodes(struct fscrypt_master_key *mk)
++{
++	struct fscrypt_info *ci;
++	struct inode *inode;
++	struct inode *toput_inode = NULL;
++
++	spin_lock(&mk->mk_decrypted_inodes_lock);
++
++	list_for_each_entry(ci, &mk->mk_decrypted_inodes, ci_master_key_link) {
++		inode = ci->ci_inode;
++		spin_lock(&inode->i_lock);
++		if (inode->i_state & (I_FREEING | I_WILL_FREE | I_NEW)) {
++			spin_unlock(&inode->i_lock);
++			continue;
++		}
++		__iget(inode);
++		spin_unlock(&inode->i_lock);
++		spin_unlock(&mk->mk_decrypted_inodes_lock);
++
++		shrink_dcache_inode(inode);
++		iput(toput_inode);
++		toput_inode = inode;
++
++		spin_lock(&mk->mk_decrypted_inodes_lock);
++	}
++
++	spin_unlock(&mk->mk_decrypted_inodes_lock);
++	iput(toput_inode);
++}
++
++static int check_for_busy_inodes(struct super_block *sb,
++				 struct fscrypt_master_key *mk)
++{
++	struct list_head *pos;
++	size_t busy_count = 0;
++	unsigned long ino;
++	struct dentry *dentry;
++	char _path[256];
++	char *path = NULL;
++
++	spin_lock(&mk->mk_decrypted_inodes_lock);
++
++	list_for_each(pos, &mk->mk_decrypted_inodes)
++		busy_count++;
++
++	if (busy_count == 0) {
++		spin_unlock(&mk->mk_decrypted_inodes_lock);
++		return 0;
++	}
++
++	{
++		/* select an example file to show for debugging purposes */
++		struct inode *inode =
++			list_first_entry(&mk->mk_decrypted_inodes,
++					 struct fscrypt_info,
++					 ci_master_key_link)->ci_inode;
++		ino = inode->i_ino;
++		dentry = d_find_alias(inode);
++	}
++	spin_unlock(&mk->mk_decrypted_inodes_lock);
++
++	if (dentry) {
++		path = dentry_path(dentry, _path, sizeof(_path));
++		dput(dentry);
++	}
++	if (IS_ERR_OR_NULL(path))
++		path = "(unknown)";
++
++	fscrypt_warn(NULL,
++		     "%s: %zu inode(s) still busy after removing key with %s %*phN, including ino %lu (%s)",
++		     sb->s_id, busy_count, master_key_spec_type(&mk->mk_spec),
++		     master_key_spec_len(&mk->mk_spec), (u8 *)&mk->mk_spec.u,
++		     ino, path);
++	return -EBUSY;
++}
++
++static int try_to_lock_encrypted_files(struct super_block *sb,
++				       struct fscrypt_master_key *mk)
++{
++	int err1;
++	int err2;
++
++	/*
++	 * An inode can't be evicted while it is dirty or has dirty pages.
++	 * Thus, we first have to clean the inodes in ->mk_decrypted_inodes.
++	 *
++	 * Just do it the easy way: call sync_filesystem().  It's overkill, but
++	 * it works, and it's more important to minimize the amount of caches we
++	 * drop than the amount of data we sync.  Also, unprivileged users can
++	 * already call sync_filesystem() via sys_syncfs() or sys_sync().
++	 */
++	down_read(&sb->s_umount);
++	err1 = sync_filesystem(sb);
++	up_read(&sb->s_umount);
++	/* If a sync error occurs, still try to evict as much as possible. */
++
++	/*
++	 * Inodes are pinned by their dentries, so we have to evict their
++	 * dentries.  shrink_dcache_sb() would suffice, but would be overkill
++	 * and inappropriate for use by unprivileged users.  So instead go
++	 * through the inodes' alias lists and try to evict each dentry.
++	 */
++	evict_dentries_for_decrypted_inodes(mk);
++
++	/*
++	 * evict_dentries_for_decrypted_inodes() already iput() each inode in
++	 * the list; any inodes for which that dropped the last reference will
++	 * have been evicted due to fscrypt_drop_inode() detecting the key
++	 * removal and telling the VFS to evict the inode.  So to finish, we
++	 * just need to check whether any inodes couldn't be evicted.
++	 */
++	err2 = check_for_busy_inodes(sb, mk);
++
++	return err1 ?: err2;
++}
++
++/*
++ * Try to remove an fscrypt master encryption key.
++ *
++ * First we wipe the actual master key secret, so that no more inodes can be
++ * unlocked with it.  Then we try to evict all cached inodes that had been
++ * unlocked with the key.
++ *
++ * If all inodes were evicted, then we unlink the fscrypt_master_key from the
++ * keyring.  Otherwise it remains in the keyring in the "incompletely removed"
++ * state (without the actual secret key) where it tracks the list of remaining
++ * inodes.  Userspace can execute the ioctl again later to retry eviction, or
++ * alternatively can re-add the secret key again.
++ *
++ * For more details, see the "Removing keys" section of
++ * Documentation/filesystems/fscrypt.rst.
++ */
++int fscrypt_ioctl_remove_key(struct file *filp, void __user *_uarg)
++{
++	struct super_block *sb = file_inode(filp)->i_sb;
++	struct fscrypt_remove_key_arg __user *uarg = _uarg;
++	struct fscrypt_remove_key_arg arg;
++	struct key *key;
++	struct fscrypt_master_key *mk;
++	u32 status_flags = 0;
++	int err;
++	bool dead;
++
++	if (copy_from_user(&arg, uarg, sizeof(arg)))
++		return -EFAULT;
++
++	if (!valid_key_spec(&arg.key_spec))
++		return -EINVAL;
++
++	if (memchr_inv(arg.__reserved, 0, sizeof(arg.__reserved)))
++		return -EINVAL;
++
++	if (!capable(CAP_SYS_ADMIN))
++		return -EACCES;
++
++	/* Find the key being removed. */
++	key = fscrypt_find_master_key(sb, &arg.key_spec);
++	if (IS_ERR(key))
++		return PTR_ERR(key);
++	mk = key->payload.data[0];
++
++	down_write(&key->sem);
++
++	/* Wipe the secret. */
++	dead = false;
++	if (is_master_key_secret_present(&mk->mk_secret)) {
++		wipe_master_key_secret(&mk->mk_secret);
++		dead = refcount_dec_and_test(&mk->mk_refcount);
++	}
++	up_write(&key->sem);
++	if (dead) {
++		/*
++		 * No inodes reference the key, and we wiped the secret, so the
++		 * key object is free to be removed from the keyring.
++		 */
++		key_invalidate(key);
++		err = 0;
++	} else {
++		/* Some inodes still reference this key; try to evict them. */
++		err = try_to_lock_encrypted_files(sb, mk);
++		if (err == -EBUSY) {
++			status_flags |=
++				FSCRYPT_KEY_REMOVAL_STATUS_FLAG_FILES_BUSY;
++			err = 0;
++		}
++	}
++	/*
++	 * We return 0 if we successfully did something: wiped the secret, or
++	 * tried locking the files again.  Users need to check the informational
++	 * status flags if they care whether the key has been fully removed
++	 * including all files locked.
++	 */
++	key_put(key);
++	if (err == 0)
++		err = put_user(status_flags, &uarg->removal_status_flags);
++	return err;
++}
++EXPORT_SYMBOL_GPL(fscrypt_ioctl_remove_key);
++
+ int __init fscrypt_init_keyring(void)
+ {
+ 	return register_key_type(&key_type_fscrypt);
+
+commit 22d94f493bfb408fdd764f7b1d0363af2122fba5
+Author: Eric Biggers <ebiggers@google.com>
+Date:   Sun Aug 4 19:35:46 2019 -0700
+
+    fscrypt: add FS_IOC_ADD_ENCRYPTION_KEY ioctl
+    
+    Add a new fscrypt ioctl, FS_IOC_ADD_ENCRYPTION_KEY.  This ioctl adds an
+    encryption key to the filesystem's fscrypt keyring ->s_master_keys,
+    making any files encrypted with that key appear "unlocked".
+    
+    Why we need this
+    ~~~~~~~~~~~~~~~~
+    
+    The main problem is that the "locked/unlocked" (ciphertext/plaintext)
+    status of encrypted files is global, but the fscrypt keys are not.
+    fscrypt only looks for keys in the keyring(s) the process accessing the
+    filesystem is subscribed to: the thread keyring, process keyring, and
+    session keyring, where the session keyring may contain the user keyring.
+    
+    Therefore, userspace has to put fscrypt keys in the keyrings for
+    individual users or sessions.  But this means that when a process with a
+    different keyring tries to access encrypted files, whether they appear
+    "unlocked" or not is nondeterministic.  This is because it depends on
+    whether the files are currently present in the inode cache.
+    
+    Fixing this by consistently providing each process its own view of the
+    filesystem depending on whether it has the key or not isn't feasible due
+    to how the VFS caches work.  Furthermore, while sometimes users expect
+    this behavior, it is misguided for two reasons.  First, it would be an
+    OS-level access control mechanism largely redundant with existing access
+    control mechanisms such as UNIX file permissions, ACLs, LSMs, etc.
+    Encryption is actually for protecting the data at rest.
+    
+    Second, almost all users of fscrypt actually do need the keys to be
+    global.  The largest users of fscrypt, Android and Chromium OS, achieve
+    this by having PID 1 create a "session keyring" that is inherited by
+    every process.  This works, but it isn't scalable because it prevents
+    session keyrings from being used for any other purpose.
+    
+    On general-purpose Linux distros, the 'fscrypt' userspace tool [1] can't
+    similarly abuse the session keyring, so to make 'sudo' work on all
+    systems it has to link all the user keyrings into root's user keyring
+    [2].  This is ugly and raises security concerns.  Moreover it can't make
+    the keys available to system services, such as sshd trying to access the
+    user's '~/.ssh' directory (see [3], [4]) or NetworkManager trying to
+    read certificates from the user's home directory (see [5]); or to Docker
+    containers (see [6], [7]).
+    
+    By having an API to add a key to the *filesystem* we'll be able to fix
+    the above bugs, remove userspace workarounds, and clearly express the
+    intended semantics: the locked/unlocked status of an encrypted directory
+    is global, and encryption is orthogonal to OS-level access control.
+    
+    Why not use the add_key() syscall
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    
+    We use an ioctl for this API rather than the existing add_key() system
+    call because the ioctl gives us the flexibility needed to implement
+    fscrypt-specific semantics that will be introduced in later patches:
+    
+    - Supporting key removal with the semantics such that the secret is
+      removed immediately and any unused inodes using the key are evicted;
+      also, the eviction of any in-use inodes can be retried.
+    
+    - Calculating a key-dependent cryptographic identifier and returning it
+      to userspace.
+    
+    - Allowing keys to be added and removed by non-root users, but only keys
+      for v2 encryption policies; and to prevent denial-of-service attacks,
+      users can only remove keys they themselves have added, and a key is
+      only really removed after all users who added it have removed it.
+    
+    Trying to shoehorn these semantics into the keyrings syscalls would be
+    very difficult, whereas the ioctls make things much easier.
+    
+    However, to reuse code the implementation still uses the keyrings
+    service internally.  Thus we get lockless RCU-mode key lookups without
+    having to re-implement it, and the keys automatically show up in
+    /proc/keys for debugging purposes.
+    
+    References:
+    
+        [1] https://github.com/google/fscrypt
+        [2] https://goo.gl/55cCrI#heading=h.vf09isp98isb
+        [3] https://github.com/google/fscrypt/issues/111#issuecomment-444347939
+        [4] https://github.com/google/fscrypt/issues/116
+        [5] https://bugs.launchpad.net/ubuntu/+source/fscrypt/+bug/1770715
+        [6] https://github.com/google/fscrypt/issues/128
+        [7] https://askubuntu.com/questions/1130306/cannot-run-docker-on-an-encrypted-filesystem
+    
+    Reviewed-by: Theodore Ts'o <tytso@mit.edu>
+    Signed-off-by: Eric Biggers <ebiggers@google.com>
+
+diff --git a/fs/crypto/keyring.c b/fs/crypto/keyring.c
+new file mode 100644
+index 000000000000..bcd7d2836e1e
+--- /dev/null
++++ b/fs/crypto/keyring.c
+@@ -0,0 +1,286 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Filesystem-level keyring for fscrypt
++ *
++ * Copyright 2019 Google LLC
++ */
++
++/*
++ * This file implements management of fscrypt master keys in the
++ * filesystem-level keyring, including the ioctls:
++ *
++ * - FS_IOC_ADD_ENCRYPTION_KEY
++ *
++ * See the "User API" section of Documentation/filesystems/fscrypt.rst for more
++ * information about these ioctls.
++ */
++
++#include <linux/key-type.h>
++#include <linux/seq_file.h>
++
++#include "fscrypt_private.h"
++
++static void wipe_master_key_secret(struct fscrypt_master_key_secret *secret)
++{
++	memzero_explicit(secret, sizeof(*secret));
++}
++
++static void move_master_key_secret(struct fscrypt_master_key_secret *dst,
++				   struct fscrypt_master_key_secret *src)
++{
++	memcpy(dst, src, sizeof(*dst));
++	memzero_explicit(src, sizeof(*src));
++}
++
++static void free_master_key(struct fscrypt_master_key *mk)
++{
++	wipe_master_key_secret(&mk->mk_secret);
++	kzfree(mk);
++}
++
++static inline bool valid_key_spec(const struct fscrypt_key_specifier *spec)
++{
++	if (spec->__reserved)
++		return false;
++	return master_key_spec_len(spec) != 0;
++}
++
++static int fscrypt_key_instantiate(struct key *key,
++				   struct key_preparsed_payload *prep)
++{
++	key->payload.data[0] = (struct fscrypt_master_key *)prep->data;
++	return 0;
++}
++
++static void fscrypt_key_destroy(struct key *key)
++{
++	free_master_key(key->payload.data[0]);
++}
++
++static void fscrypt_key_describe(const struct key *key, struct seq_file *m)
++{
++	seq_puts(m, key->description);
++}
++
++/*
++ * Type of key in ->s_master_keys.  Each key of this type represents a master
++ * key which has been added to the filesystem.  Its payload is a
++ * 'struct fscrypt_master_key'.  The "." prefix in the key type name prevents
++ * users from adding keys of this type via the keyrings syscalls rather than via
++ * the intended method of FS_IOC_ADD_ENCRYPTION_KEY.
++ */
++static struct key_type key_type_fscrypt = {
++	.name			= "._fscrypt",
++	.instantiate		= fscrypt_key_instantiate,
++	.destroy		= fscrypt_key_destroy,
++	.describe		= fscrypt_key_describe,
++};
++
++/* Search ->s_master_keys */
++static struct key *search_fscrypt_keyring(struct key *keyring,
++					  struct key_type *type,
++					  const char *description)
++{
++	/*
++	 * We need to mark the keyring reference as "possessed" so that we
++	 * acquire permission to search it, via the KEY_POS_SEARCH permission.
++	 */
++	key_ref_t keyref = make_key_ref(keyring, true /* possessed */);
++
++	keyref = keyring_search(keyref, type, description, false);
++	if (IS_ERR(keyref)) {
++		if (PTR_ERR(keyref) == -EAGAIN || /* not found */
++		    PTR_ERR(keyref) == -EKEYREVOKED) /* recently invalidated */
++			keyref = ERR_PTR(-ENOKEY);
++		return ERR_CAST(keyref);
++	}
++	return key_ref_to_ptr(keyref);
++}
++
++#define FSCRYPT_FS_KEYRING_DESCRIPTION_SIZE	\
++	(CONST_STRLEN("fscrypt-") + FIELD_SIZEOF(struct super_block, s_id))
++
++#define FSCRYPT_MK_DESCRIPTION_SIZE	(2 * FSCRYPT_KEY_DESCRIPTOR_SIZE + 1)
++
++static void format_fs_keyring_description(
++			char description[FSCRYPT_FS_KEYRING_DESCRIPTION_SIZE],
++			const struct super_block *sb)
++{
++	sprintf(description, "fscrypt-%s", sb->s_id);
++}
++
++static void format_mk_description(
++			char description[FSCRYPT_MK_DESCRIPTION_SIZE],
++			const struct fscrypt_key_specifier *mk_spec)
++{
++	sprintf(description, "%*phN",
++		master_key_spec_len(mk_spec), (u8 *)&mk_spec->u);
++}
++
++/* Create ->s_master_keys if needed.  Synchronized by fscrypt_add_key_mutex. */
++static int allocate_filesystem_keyring(struct super_block *sb)
++{
++	char description[FSCRYPT_FS_KEYRING_DESCRIPTION_SIZE];
++	struct key *keyring;
++
++	if (sb->s_master_keys)
++		return 0;
++
++	format_fs_keyring_description(description, sb);
++	keyring = keyring_alloc(description, GLOBAL_ROOT_UID, GLOBAL_ROOT_GID,
++				current_cred(), KEY_POS_SEARCH |
++				  KEY_USR_SEARCH | KEY_USR_READ | KEY_USR_VIEW,
++				KEY_ALLOC_NOT_IN_QUOTA, NULL, NULL);
++	if (IS_ERR(keyring))
++		return PTR_ERR(keyring);
++
++	/* Pairs with READ_ONCE() in fscrypt_find_master_key() */
++	smp_store_release(&sb->s_master_keys, keyring);
++	return 0;
++}
++
++void fscrypt_sb_free(struct super_block *sb)
++{
++	key_put(sb->s_master_keys);
++	sb->s_master_keys = NULL;
++}
++
++/*
++ * Find the specified master key in ->s_master_keys.
++ * Returns ERR_PTR(-ENOKEY) if not found.
++ */
++struct key *fscrypt_find_master_key(struct super_block *sb,
++				    const struct fscrypt_key_specifier *mk_spec)
++{
++	struct key *keyring;
++	char description[FSCRYPT_MK_DESCRIPTION_SIZE];
++
++	/* pairs with smp_store_release() in allocate_filesystem_keyring() */
++	keyring = READ_ONCE(sb->s_master_keys);
++	if (keyring == NULL)
++		return ERR_PTR(-ENOKEY); /* No keyring yet, so no keys yet. */
++
++	format_mk_description(description, mk_spec);
++	return search_fscrypt_keyring(keyring, &key_type_fscrypt, description);
++}
++
++/*
++ * Allocate a new fscrypt_master_key which contains the given secret, set it as
++ * the payload of a new 'struct key' of type fscrypt, and link the 'struct key'
++ * into the given keyring.  Synchronized by fscrypt_add_key_mutex.
++ */
++static int add_new_master_key(struct fscrypt_master_key_secret *secret,
++			      const struct fscrypt_key_specifier *mk_spec,
++			      struct key *keyring)
++{
++	struct fscrypt_master_key *mk;
++	char description[FSCRYPT_MK_DESCRIPTION_SIZE];
++	struct key *key;
++	int err;
++
++	mk = kzalloc(sizeof(*mk), GFP_KERNEL);
++	if (!mk)
++		return -ENOMEM;
++
++	mk->mk_spec = *mk_spec;
++
++	move_master_key_secret(&mk->mk_secret, secret);
++
++	format_mk_description(description, mk_spec);
++	key = key_alloc(&key_type_fscrypt, description,
++			GLOBAL_ROOT_UID, GLOBAL_ROOT_GID, current_cred(),
++			KEY_POS_SEARCH | KEY_USR_SEARCH | KEY_USR_VIEW,
++			KEY_ALLOC_NOT_IN_QUOTA, NULL);
++	if (IS_ERR(key)) {
++		err = PTR_ERR(key);
++		goto out_free_mk;
++	}
++	err = key_instantiate_and_link(key, mk, sizeof(*mk), keyring, NULL);
++	key_put(key);
++	if (err)
++		goto out_free_mk;
++
++	return 0;
++
++out_free_mk:
++	free_master_key(mk);
++	return err;
++}
++
++static int add_master_key(struct super_block *sb,
++			  struct fscrypt_master_key_secret *secret,
++			  const struct fscrypt_key_specifier *mk_spec)
++{
++	static DEFINE_MUTEX(fscrypt_add_key_mutex);
++	struct key *key;
++	int err;
++
++	mutex_lock(&fscrypt_add_key_mutex); /* serialize find + link */
++	key = fscrypt_find_master_key(sb, mk_spec);
++	if (IS_ERR(key)) {
++		err = PTR_ERR(key);
++		if (err != -ENOKEY)
++			goto out_unlock;
++		/* Didn't find the key in ->s_master_keys.  Add it. */
++		err = allocate_filesystem_keyring(sb);
++		if (err)
++			goto out_unlock;
++		err = add_new_master_key(secret, mk_spec, sb->s_master_keys);
++	} else {
++		key_put(key);
++		err = 0;
++	}
++out_unlock:
++	mutex_unlock(&fscrypt_add_key_mutex);
++	return err;
++}
++
++/*
++ * Add a master encryption key to the filesystem, causing all files which were
++ * encrypted with it to appear "unlocked" (decrypted) when accessed.
++ *
++ * For more details, see the "FS_IOC_ADD_ENCRYPTION_KEY" section of
++ * Documentation/filesystems/fscrypt.rst.
++ */
++int fscrypt_ioctl_add_key(struct file *filp, void __user *_uarg)
++{
++	struct super_block *sb = file_inode(filp)->i_sb;
++	struct fscrypt_add_key_arg __user *uarg = _uarg;
++	struct fscrypt_add_key_arg arg;
++	struct fscrypt_master_key_secret secret;
++	int err;
++
++	if (copy_from_user(&arg, uarg, sizeof(arg)))
++		return -EFAULT;
++
++	if (!valid_key_spec(&arg.key_spec))
++		return -EINVAL;
++
++	if (arg.raw_size < FSCRYPT_MIN_KEY_SIZE ||
++	    arg.raw_size > FSCRYPT_MAX_KEY_SIZE)
++		return -EINVAL;
++
++	if (memchr_inv(arg.__reserved, 0, sizeof(arg.__reserved)))
++		return -EINVAL;
++
++	memset(&secret, 0, sizeof(secret));
++	secret.size = arg.raw_size;
++	err = -EFAULT;
++	if (copy_from_user(secret.raw, uarg->raw, secret.size))
++		goto out_wipe_secret;
++
++	err = -EACCES;
++	if (!capable(CAP_SYS_ADMIN))
++		goto out_wipe_secret;
++
++	err = add_master_key(sb, &secret, &arg.key_spec);
++out_wipe_secret:
++	wipe_master_key_secret(&secret);
++	return err;
++}
++EXPORT_SYMBOL_GPL(fscrypt_ioctl_add_key);
++
++int __init fscrypt_init_keyring(void)
++{
++	return register_key_type(&key_type_fscrypt);
++}

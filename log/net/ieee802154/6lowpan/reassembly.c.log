@@ -1,0 +1,3019 @@
+commit 891584f48a9084ba462f10da4c6bb28b6181b543
+Author: Guillaume Nault <gnault@redhat.com>
+Date:   Fri Aug 2 17:15:03 2019 +0200
+
+    inet: frags: re-introduce skb coalescing for local delivery
+    
+    Before commit d4289fcc9b16 ("net: IP6 defrag: use rbtrees for IPv6
+    defrag"), a netperf UDP_STREAM test[0] using big IPv6 datagrams (thus
+    generating many fragments) and running over an IPsec tunnel, reported
+    more than 6Gbps throughput. After that patch, the same test gets only
+    9Mbps when receiving on a be2net nic (driver can make a big difference
+    here, for example, ixgbe doesn't seem to be affected).
+    
+    By reusing the IPv4 defragmentation code, IPv6 lost fragment coalescing
+    (IPv4 fragment coalescing was dropped by commit 14fe22e33462 ("Revert
+    "ipv4: use skb coalescing in defragmentation"")).
+    
+    Without fragment coalescing, be2net runs out of Rx ring entries and
+    starts to drop frames (ethtool reports rx_drops_no_frags errors). Since
+    the netperf traffic is only composed of UDP fragments, any lost packet
+    prevents reassembly of the full datagram. Therefore, fragments which
+    have no possibility to ever get reassembled pile up in the reassembly
+    queue, until the memory accounting exeeds the threshold. At that point
+    no fragment is accepted anymore, which effectively discards all
+    netperf traffic.
+    
+    When reassembly timeout expires, some stale fragments are removed from
+    the reassembly queue, so a few packets can be received, reassembled
+    and delivered to the netperf receiver. But the nic still drops frames
+    and soon the reassembly queue gets filled again with stale fragments.
+    These long time frames where no datagram can be received explain why
+    the performance drop is so significant.
+    
+    Re-introducing fragment coalescing is enough to get the initial
+    performances again (6.6Gbps with be2net): driver doesn't drop frames
+    anymore (no more rx_drops_no_frags errors) and the reassembly engine
+    works at full speed.
+    
+    This patch is quite conservative and only coalesces skbs for local
+    IPv4 and IPv6 delivery (in order to avoid changing skb geometry when
+    forwarding). Coalescing could be extended in the future if need be, as
+    more scenarios would probably benefit from it.
+    
+    [0]: Test configuration
+    Sender:
+    ip xfrm policy flush
+    ip xfrm state flush
+    ip xfrm state add src fc00:1::1 dst fc00:2::1 proto esp spi 0x1000 aead 'rfc4106(gcm(aes))' 0x0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b 96 mode transport sel src fc00:1::1 dst fc00:2::1
+    ip xfrm policy add src fc00:1::1 dst fc00:2::1 dir in tmpl src fc00:1::1 dst fc00:2::1 proto esp mode transport action allow
+    ip xfrm state add src fc00:2::1 dst fc00:1::1 proto esp spi 0x1001 aead 'rfc4106(gcm(aes))' 0x0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b 96 mode transport sel src fc00:2::1 dst fc00:1::1
+    ip xfrm policy add src fc00:2::1 dst fc00:1::1 dir out tmpl src fc00:2::1 dst fc00:1::1 proto esp mode transport action allow
+    netserver -D -L fc00:2::1
+    
+    Receiver:
+    ip xfrm policy flush
+    ip xfrm state flush
+    ip xfrm state add src fc00:2::1 dst fc00:1::1 proto esp spi 0x1001 aead 'rfc4106(gcm(aes))' 0x0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b 96 mode transport sel src fc00:2::1 dst fc00:1::1
+    ip xfrm policy add src fc00:2::1 dst fc00:1::1 dir in tmpl src fc00:2::1 dst fc00:1::1 proto esp mode transport action allow
+    ip xfrm state add src fc00:1::1 dst fc00:2::1 proto esp spi 0x1000 aead 'rfc4106(gcm(aes))' 0x0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b 96 mode transport sel src fc00:1::1 dst fc00:2::1
+    ip xfrm policy add src fc00:1::1 dst fc00:2::1 dir out tmpl src fc00:1::1 dst fc00:2::1 proto esp mode transport action allow
+    netperf -H fc00:2::1 -f k -P 0 -L fc00:1::1 -l 60 -t UDP_STREAM -I 99,5 -i 5,5 -T5,5 -6
+    
+    Signed-off-by: Guillaume Nault <gnault@redhat.com>
+    Acked-by: Florian Westphal <fw@strlen.de>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ieee802154/6lowpan/reassembly.c b/net/ieee802154/6lowpan/reassembly.c
+index e4aba5d485be..bbe9b3b2d395 100644
+--- a/net/ieee802154/6lowpan/reassembly.c
++++ b/net/ieee802154/6lowpan/reassembly.c
+@@ -170,7 +170,7 @@ static int lowpan_frag_reasm(struct lowpan_frag_queue *fq, struct sk_buff *skb,
+ 	reasm_data = inet_frag_reasm_prepare(&fq->q, skb, prev_tail);
+ 	if (!reasm_data)
+ 		goto out_oom;
+-	inet_frag_reasm_finish(&fq->q, skb, reasm_data);
++	inet_frag_reasm_finish(&fq->q, skb, reasm_data, false);
+ 
+ 	skb->dev = ldev;
+ 	skb->tstamp = fq->q.stamp;
+
+commit d5dd88794a13c2f24cce31abad7a0a6c5e0ed2db
+Author: Eric Dumazet <edumazet@google.com>
+Date:   Tue Jun 18 11:09:00 2019 -0700
+
+    inet: fix various use-after-free in defrags units
+    
+    syzbot reported another issue caused by my recent patches. [1]
+    
+    The issue here is that fqdir_exit() is initiating a work queue
+    and immediately returns. A bit later cleanup_net() was able
+    to free the MIB (percpu data) and the whole struct net was freed,
+    but we had active frag timers that fired and triggered use-after-free.
+    
+    We need to make sure that timers can catch fqdir->dead being set,
+    to bailout.
+    
+    Since RCU is used for the reader side, this means
+    we want to respect an RCU grace period between these operations :
+    
+    1) qfdir->dead = 1;
+    
+    2) netns dismantle (freeing of various data structure)
+    
+    This patch uses new new (struct pernet_operations)->pre_exit
+    infrastructure to ensures a full RCU grace period
+    happens between fqdir_pre_exit() and fqdir_exit()
+    
+    This also means we can use a regular work queue, we no
+    longer need rcu_work.
+    
+    Tested:
+    
+    $ time for i in {1..1000}; do unshare -n /bin/false;done
+    
+    real    0m2.585s
+    user    0m0.160s
+    sys     0m2.214s
+    
+    [1]
+    
+    BUG: KASAN: use-after-free in ip_expire+0x73e/0x800 net/ipv4/ip_fragment.c:152
+    Read of size 8 at addr ffff88808b9fe330 by task syz-executor.4/11860
+    
+    CPU: 1 PID: 11860 Comm: syz-executor.4 Not tainted 5.2.0-rc2+ #22
+    Hardware name: Google Google Compute Engine/Google Compute Engine, BIOS Google 01/01/2011
+    Call Trace:
+     <IRQ>
+     __dump_stack lib/dump_stack.c:77 [inline]
+     dump_stack+0x172/0x1f0 lib/dump_stack.c:113
+     print_address_description.cold+0x7c/0x20d mm/kasan/report.c:188
+     __kasan_report.cold+0x1b/0x40 mm/kasan/report.c:317
+     kasan_report+0x12/0x20 mm/kasan/common.c:614
+     __asan_report_load8_noabort+0x14/0x20 mm/kasan/generic_report.c:132
+     ip_expire+0x73e/0x800 net/ipv4/ip_fragment.c:152
+     call_timer_fn+0x193/0x720 kernel/time/timer.c:1322
+     expire_timers kernel/time/timer.c:1366 [inline]
+     __run_timers kernel/time/timer.c:1685 [inline]
+     __run_timers kernel/time/timer.c:1653 [inline]
+     run_timer_softirq+0x66f/0x1740 kernel/time/timer.c:1698
+     __do_softirq+0x25c/0x94c kernel/softirq.c:293
+     invoke_softirq kernel/softirq.c:374 [inline]
+     irq_exit+0x180/0x1d0 kernel/softirq.c:414
+     exiting_irq arch/x86/include/asm/apic.h:536 [inline]
+     smp_apic_timer_interrupt+0x13b/0x550 arch/x86/kernel/apic/apic.c:1068
+     apic_timer_interrupt+0xf/0x20 arch/x86/entry/entry_64.S:806
+     </IRQ>
+    RIP: 0010:tomoyo_domain_quota_is_ok+0x131/0x540 security/tomoyo/util.c:1035
+    Code: 24 4c 3b 65 d0 0f 84 9c 00 00 00 e8 19 1d 73 fe 49 8d 7c 24 18 48 ba 00 00 00 00 00 fc ff df 48 89 f8 48 c1 e8 03 0f b6 04 10 <48> 89 fa 83 e2 07 38 d0 7f 08 84 c0 0f 85 69 03 00 00 41 0f b6 5c
+    RSP: 0018:ffff88806ae079c0 EFLAGS: 00000a02 ORIG_RAX: ffffffffffffff13
+    RAX: 0000000000000000 RBX: 0000000000000010 RCX: ffffc9000e655000
+    RDX: dffffc0000000000 RSI: ffffffff82fd88a7 RDI: ffff888086202398
+    RBP: ffff88806ae07a00 R08: ffff88808b6c8700 R09: ffffed100d5c0f4d
+    R10: ffffed100d5c0f4c R11: 0000000000000000 R12: ffff888086202380
+    R13: 0000000000000030 R14: 00000000000000d3 R15: 0000000000000000
+     tomoyo_supervisor+0x2e8/0xef0 security/tomoyo/common.c:2087
+     tomoyo_audit_path_number_log security/tomoyo/file.c:235 [inline]
+     tomoyo_path_number_perm+0x42f/0x520 security/tomoyo/file.c:734
+     tomoyo_file_ioctl+0x23/0x30 security/tomoyo/tomoyo.c:335
+     security_file_ioctl+0x77/0xc0 security/security.c:1370
+     ksys_ioctl+0x57/0xd0 fs/ioctl.c:711
+     __do_sys_ioctl fs/ioctl.c:720 [inline]
+     __se_sys_ioctl fs/ioctl.c:718 [inline]
+     __x64_sys_ioctl+0x73/0xb0 fs/ioctl.c:718
+     do_syscall_64+0xfd/0x680 arch/x86/entry/common.c:301
+     entry_SYSCALL_64_after_hwframe+0x49/0xbe
+    RIP: 0033:0x4592c9
+    Code: fd b7 fb ff c3 66 2e 0f 1f 84 00 00 00 00 00 66 90 48 89 f8 48 89 f7 48 89 d6 48 89 ca 4d 89 c2 4d 89 c8 4c 8b 4c 24 08 0f 05 <48> 3d 01 f0 ff ff 0f 83 cb b7 fb ff c3 66 2e 0f 1f 84 00 00 00 00
+    RSP: 002b:00007f8db5e44c78 EFLAGS: 00000246 ORIG_RAX: 0000000000000010
+    RAX: ffffffffffffffda RBX: 0000000000000003 RCX: 00000000004592c9
+    RDX: 0000000020000080 RSI: 00000000000089f1 RDI: 0000000000000006
+    RBP: 000000000075bf20 R08: 0000000000000000 R09: 0000000000000000
+    R10: 0000000000000000 R11: 0000000000000246 R12: 00007f8db5e456d4
+    R13: 00000000004cc770 R14: 00000000004d5cd8 R15: 00000000ffffffff
+    
+    Allocated by task 9047:
+     save_stack+0x23/0x90 mm/kasan/common.c:71
+     set_track mm/kasan/common.c:79 [inline]
+     __kasan_kmalloc mm/kasan/common.c:489 [inline]
+     __kasan_kmalloc.constprop.0+0xcf/0xe0 mm/kasan/common.c:462
+     kasan_slab_alloc+0xf/0x20 mm/kasan/common.c:497
+     slab_post_alloc_hook mm/slab.h:437 [inline]
+     slab_alloc mm/slab.c:3326 [inline]
+     kmem_cache_alloc+0x11a/0x6f0 mm/slab.c:3488
+     kmem_cache_zalloc include/linux/slab.h:732 [inline]
+     net_alloc net/core/net_namespace.c:386 [inline]
+     copy_net_ns+0xed/0x340 net/core/net_namespace.c:426
+     create_new_namespaces+0x400/0x7b0 kernel/nsproxy.c:107
+     unshare_nsproxy_namespaces+0xc2/0x200 kernel/nsproxy.c:206
+     ksys_unshare+0x440/0x980 kernel/fork.c:2692
+     __do_sys_unshare kernel/fork.c:2760 [inline]
+     __se_sys_unshare kernel/fork.c:2758 [inline]
+     __x64_sys_unshare+0x31/0x40 kernel/fork.c:2758
+     do_syscall_64+0xfd/0x680 arch/x86/entry/common.c:301
+     entry_SYSCALL_64_after_hwframe+0x49/0xbe
+    
+    Freed by task 2541:
+     save_stack+0x23/0x90 mm/kasan/common.c:71
+     set_track mm/kasan/common.c:79 [inline]
+     __kasan_slab_free+0x102/0x150 mm/kasan/common.c:451
+     kasan_slab_free+0xe/0x10 mm/kasan/common.c:459
+     __cache_free mm/slab.c:3432 [inline]
+     kmem_cache_free+0x86/0x260 mm/slab.c:3698
+     net_free net/core/net_namespace.c:402 [inline]
+     net_drop_ns.part.0+0x70/0x90 net/core/net_namespace.c:409
+     net_drop_ns net/core/net_namespace.c:408 [inline]
+     cleanup_net+0x538/0x960 net/core/net_namespace.c:571
+     process_one_work+0x989/0x1790 kernel/workqueue.c:2269
+     worker_thread+0x98/0xe40 kernel/workqueue.c:2415
+     kthread+0x354/0x420 kernel/kthread.c:255
+     ret_from_fork+0x24/0x30 arch/x86/entry/entry_64.S:352
+    
+    The buggy address belongs to the object at ffff88808b9fe100
+     which belongs to the cache net_namespace of size 6784
+    The buggy address is located 560 bytes inside of
+     6784-byte region [ffff88808b9fe100, ffff88808b9ffb80)
+    The buggy address belongs to the page:
+    page:ffffea00022e7f80 refcount:1 mapcount:0 mapping:ffff88821b6f60c0 index:0x0 compound_mapcount: 0
+    flags: 0x1fffc0000010200(slab|head)
+    raw: 01fffc0000010200 ffffea000256f288 ffffea0001bbef08 ffff88821b6f60c0
+    raw: 0000000000000000 ffff88808b9fe100 0000000100000001 0000000000000000
+    page dumped because: kasan: bad access detected
+    
+    Memory state around the buggy address:
+     ffff88808b9fe200: fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb
+     ffff88808b9fe280: fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb
+    >ffff88808b9fe300: fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb
+                                         ^
+     ffff88808b9fe380: fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb
+     ffff88808b9fe400: fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb
+    
+    Fixes: 3c8fc8782044 ("inet: frags: rework rhashtable dismantle")
+    Signed-off-by: Eric Dumazet <edumazet@google.com>
+    Reported-by: syzbot <syzkaller@googlegroups.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ieee802154/6lowpan/reassembly.c b/net/ieee802154/6lowpan/reassembly.c
+index a0ed13cd120e..e4aba5d485be 100644
+--- a/net/ieee802154/6lowpan/reassembly.c
++++ b/net/ieee802154/6lowpan/reassembly.c
+@@ -459,6 +459,14 @@ static int __net_init lowpan_frags_init_net(struct net *net)
+ 	return res;
+ }
+ 
++static void __net_exit lowpan_frags_pre_exit_net(struct net *net)
++{
++	struct netns_ieee802154_lowpan *ieee802154_lowpan =
++		net_ieee802154_lowpan(net);
++
++	fqdir_pre_exit(ieee802154_lowpan->fqdir);
++}
++
+ static void __net_exit lowpan_frags_exit_net(struct net *net)
+ {
+ 	struct netns_ieee802154_lowpan *ieee802154_lowpan =
+@@ -469,8 +477,9 @@ static void __net_exit lowpan_frags_exit_net(struct net *net)
+ }
+ 
+ static struct pernet_operations lowpan_frags_ops = {
+-	.init = lowpan_frags_init_net,
+-	.exit = lowpan_frags_exit_net,
++	.init		= lowpan_frags_init_net,
++	.pre_exit	= lowpan_frags_pre_exit_net,
++	.exit		= lowpan_frags_exit_net,
+ };
+ 
+ static u32 lowpan_key_hashfn(const void *data, u32 len, u32 seed)
+
+commit a6cdeeb16bff89c8486324f53577db058cbe81ba
+Merge: 96524ea4be04 1e1d92636954
+Author: David S. Miller <davem@davemloft.net>
+Date:   Fri Jun 7 11:00:14 2019 -0700
+
+    Merge git://git.kernel.org/pub/scm/linux/kernel/git/davem/net
+    
+    Some ISDN files that got removed in net-next had some changes
+    done in mainline, take the removals.
+    
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+commit 2874c5fd284268364ece81a7bd936f3c8168e567
+Author: Thomas Gleixner <tglx@linutronix.de>
+Date:   Mon May 27 08:55:01 2019 +0200
+
+    treewide: Replace GPLv2 boilerplate/reference with SPDX - rule 152
+    
+    Based on 1 normalized pattern(s):
+    
+      this program is free software you can redistribute it and or modify
+      it under the terms of the gnu general public license as published by
+      the free software foundation either version 2 of the license or at
+      your option any later version
+    
+    extracted by the scancode license scanner the SPDX license identifier
+    
+      GPL-2.0-or-later
+    
+    has been chosen to replace the boilerplate/reference in 3029 file(s).
+    
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Reviewed-by: Allison Randal <allison@lohutok.net>
+    Cc: linux-spdx@vger.kernel.org
+    Link: https://lkml.kernel.org/r/20190527070032.746973796@linutronix.de
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/net/ieee802154/6lowpan/reassembly.c b/net/ieee802154/6lowpan/reassembly.c
+index 4196bcd4105a..9133e3cede77 100644
+--- a/net/ieee802154/6lowpan/reassembly.c
++++ b/net/ieee802154/6lowpan/reassembly.c
+@@ -1,15 +1,10 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
+ /*	6LoWPAN fragment reassembly
+- *
+  *
+  *	Authors:
+  *	Alexander Aring		<aar@pengutronix.de>
+  *
+  *	Based on: net/ipv6/reassembly.c
+- *
+- *	This program is free software; you can redistribute it and/or
+- *	modify it under the terms of the GNU General Public License
+- *	as published by the Free Software Foundation; either version
+- *	2 of the License, or (at your option) any later version.
+  */
+ 
+ #define pr_fmt(fmt) "6LoWPAN: " fmt
+
+commit ae7352d384a552d8c799c242e74a934809990a71
+Author: Eric Dumazet <edumazet@google.com>
+Date:   Mon May 27 16:56:48 2019 -0700
+
+    inet: frags: call inet_frags_fini() after unregister_pernet_subsys()
+    
+    Both IPv6 and 6lowpan are calling inet_frags_fini() too soon.
+    
+    inet_frags_fini() is dismantling a kmem_cache, that might be needed
+    later when unregister_pernet_subsys() eventually has to remove
+    frags queues from hash tables and free them.
+    
+    This fixes potential use-after-free, and is a prereq for the following patch.
+    
+    Fixes: d4ad4d22e7ac ("inet: frags: use kmem_cache for inet_frag_queue")
+    Signed-off-by: Eric Dumazet <edumazet@google.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ieee802154/6lowpan/reassembly.c b/net/ieee802154/6lowpan/reassembly.c
+index e59c3b708969..5b56f16ed86b 100644
+--- a/net/ieee802154/6lowpan/reassembly.c
++++ b/net/ieee802154/6lowpan/reassembly.c
+@@ -540,7 +540,7 @@ int __init lowpan_net_frag_init(void)
+ 
+ void lowpan_net_frag_exit(void)
+ {
+-	inet_frags_fini(&lowpan_frags);
+ 	lowpan_frags_sysctl_unregister();
+ 	unregister_pernet_subsys(&lowpan_frags_ops);
++	inet_frags_fini(&lowpan_frags);
+ }
+
+commit 4907abc605e328d61bee56e4e89db4f56ade2090
+Author: Eric Dumazet <edumazet@google.com>
+Date:   Fri May 24 09:03:39 2019 -0700
+
+    net: dynamically allocate fqdir structures
+    
+    Following patch will add rcu grace period before fqdir
+    rhashtable destruction, so we need to dynamically allocate
+    fqdir structures to not force expensive synchronize_rcu() calls
+    in netns dismantle path.
+    
+    Signed-off-by: Eric Dumazet <edumazet@google.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ieee802154/6lowpan/reassembly.c b/net/ieee802154/6lowpan/reassembly.c
+index 03a444c9e191..e59c3b708969 100644
+--- a/net/ieee802154/6lowpan/reassembly.c
++++ b/net/ieee802154/6lowpan/reassembly.c
+@@ -79,7 +79,7 @@ fq_find(struct net *net, const struct lowpan_802154_cb *cb,
+ 	key.src = *src;
+ 	key.dst = *dst;
+ 
+-	q = inet_frag_find(&ieee802154_lowpan->fqdir, &key);
++	q = inet_frag_find(ieee802154_lowpan->fqdir, &key);
+ 	if (!q)
+ 		return NULL;
+ 
+@@ -377,11 +377,11 @@ static int __net_init lowpan_frags_ns_sysctl_register(struct net *net)
+ 			table[0].procname = NULL;
+ 	}
+ 
+-	table[0].data	= &ieee802154_lowpan->fqdir.high_thresh;
+-	table[0].extra1	= &ieee802154_lowpan->fqdir.low_thresh;
+-	table[1].data	= &ieee802154_lowpan->fqdir.low_thresh;
+-	table[1].extra2	= &ieee802154_lowpan->fqdir.high_thresh;
+-	table[2].data	= &ieee802154_lowpan->fqdir.timeout;
++	table[0].data	= &ieee802154_lowpan->fqdir->high_thresh;
++	table[0].extra1	= &ieee802154_lowpan->fqdir->low_thresh;
++	table[1].data	= &ieee802154_lowpan->fqdir->low_thresh;
++	table[1].extra2	= &ieee802154_lowpan->fqdir->high_thresh;
++	table[2].data	= &ieee802154_lowpan->fqdir->timeout;
+ 
+ 	hdr = register_net_sysctl(net, "net/ieee802154/6lowpan", table);
+ 	if (hdr == NULL)
+@@ -449,16 +449,18 @@ static int __net_init lowpan_frags_init_net(struct net *net)
+ 		net_ieee802154_lowpan(net);
+ 	int res;
+ 
+-	ieee802154_lowpan->fqdir.high_thresh = IPV6_FRAG_HIGH_THRESH;
+-	ieee802154_lowpan->fqdir.low_thresh = IPV6_FRAG_LOW_THRESH;
+-	ieee802154_lowpan->fqdir.timeout = IPV6_FRAG_TIMEOUT;
+ 
+ 	res = fqdir_init(&ieee802154_lowpan->fqdir, &lowpan_frags, net);
+ 	if (res < 0)
+ 		return res;
++
++	ieee802154_lowpan->fqdir->high_thresh = IPV6_FRAG_HIGH_THRESH;
++	ieee802154_lowpan->fqdir->low_thresh = IPV6_FRAG_LOW_THRESH;
++	ieee802154_lowpan->fqdir->timeout = IPV6_FRAG_TIMEOUT;
++
+ 	res = lowpan_frags_ns_sysctl_register(net);
+ 	if (res < 0)
+-		fqdir_exit(&ieee802154_lowpan->fqdir);
++		fqdir_exit(ieee802154_lowpan->fqdir);
+ 	return res;
+ }
+ 
+@@ -468,7 +470,7 @@ static void __net_exit lowpan_frags_exit_net(struct net *net)
+ 		net_ieee802154_lowpan(net);
+ 
+ 	lowpan_frags_ns_sysctl_unregister(net);
+-	fqdir_exit(&ieee802154_lowpan->fqdir);
++	fqdir_exit(ieee802154_lowpan->fqdir);
+ }
+ 
+ static struct pernet_operations lowpan_frags_ops = {
+
+commit a39aca678a0626941aa99c18c1c452ca758e7865
+Author: Eric Dumazet <edumazet@google.com>
+Date:   Fri May 24 09:03:38 2019 -0700
+
+    net: add a net pointer to struct fqdir
+    
+    fqdir will soon be dynamically allocated.
+    
+    We need to reach the struct net pointer from fqdir,
+    so add it, and replace the various container_of() constructs
+    by direct access to the new field.
+    
+    Signed-off-by: Eric Dumazet <edumazet@google.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ieee802154/6lowpan/reassembly.c b/net/ieee802154/6lowpan/reassembly.c
+index 82db76ce0e61..03a444c9e191 100644
+--- a/net/ieee802154/6lowpan/reassembly.c
++++ b/net/ieee802154/6lowpan/reassembly.c
+@@ -453,7 +453,7 @@ static int __net_init lowpan_frags_init_net(struct net *net)
+ 	ieee802154_lowpan->fqdir.low_thresh = IPV6_FRAG_LOW_THRESH;
+ 	ieee802154_lowpan->fqdir.timeout = IPV6_FRAG_TIMEOUT;
+ 
+-	res = fqdir_init(&ieee802154_lowpan->fqdir, &lowpan_frags);
++	res = fqdir_init(&ieee802154_lowpan->fqdir, &lowpan_frags, net);
+ 	if (res < 0)
+ 		return res;
+ 	res = lowpan_frags_ns_sysctl_register(net);
+
+commit 9cce45f22ceedf639cbb5fb5dfe612a278d36b58
+Author: Eric Dumazet <edumazet@google.com>
+Date:   Fri May 24 09:03:37 2019 -0700
+
+    net: rename inet_frags_init_net() to fdir_init()
+    
+    And pass an extra parameter, since we will soon
+    dynamically allocate fqdir structures.
+    
+    Signed-off-by: Eric Dumazet <edumazet@google.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ieee802154/6lowpan/reassembly.c b/net/ieee802154/6lowpan/reassembly.c
+index 4bbd6999c58f..82db76ce0e61 100644
+--- a/net/ieee802154/6lowpan/reassembly.c
++++ b/net/ieee802154/6lowpan/reassembly.c
+@@ -452,9 +452,8 @@ static int __net_init lowpan_frags_init_net(struct net *net)
+ 	ieee802154_lowpan->fqdir.high_thresh = IPV6_FRAG_HIGH_THRESH;
+ 	ieee802154_lowpan->fqdir.low_thresh = IPV6_FRAG_LOW_THRESH;
+ 	ieee802154_lowpan->fqdir.timeout = IPV6_FRAG_TIMEOUT;
+-	ieee802154_lowpan->fqdir.f = &lowpan_frags;
+ 
+-	res = inet_frags_init_net(&ieee802154_lowpan->fqdir);
++	res = fqdir_init(&ieee802154_lowpan->fqdir, &lowpan_frags);
+ 	if (res < 0)
+ 		return res;
+ 	res = lowpan_frags_ns_sysctl_register(net);
+
+commit d2dfd43598f3ce5441daabc7b352cdfea811e021
+Author: Eric Dumazet <edumazet@google.com>
+Date:   Fri May 24 09:03:36 2019 -0700
+
+    ieee820154: 6lowpan: no longer reference init_net in lowpan_frags_ns_ctl_table
+    
+    (struct net *)->ieee802154_lowpan.fqdir will soon be a pointer, so make
+    sure lowpan_frags_ns_ctl_table[] does not reference init_net.
+    
+    lowpan_frags_ns_sysctl_register() can perform the needed initialization
+    for all netns.
+    
+    Signed-off-by: Eric Dumazet <edumazet@google.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ieee802154/6lowpan/reassembly.c b/net/ieee802154/6lowpan/reassembly.c
+index 955047fe797a..4bbd6999c58f 100644
+--- a/net/ieee802154/6lowpan/reassembly.c
++++ b/net/ieee802154/6lowpan/reassembly.c
+@@ -326,23 +326,18 @@ int lowpan_frag_rcv(struct sk_buff *skb, u8 frag_type)
+ static struct ctl_table lowpan_frags_ns_ctl_table[] = {
+ 	{
+ 		.procname	= "6lowpanfrag_high_thresh",
+-		.data		= &init_net.ieee802154_lowpan.fqdir.high_thresh,
+ 		.maxlen		= sizeof(unsigned long),
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_doulongvec_minmax,
+-		.extra1		= &init_net.ieee802154_lowpan.fqdir.low_thresh
+ 	},
+ 	{
+ 		.procname	= "6lowpanfrag_low_thresh",
+-		.data		= &init_net.ieee802154_lowpan.fqdir.low_thresh,
+ 		.maxlen		= sizeof(unsigned long),
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_doulongvec_minmax,
+-		.extra2		= &init_net.ieee802154_lowpan.fqdir.high_thresh
+ 	},
+ 	{
+ 		.procname	= "6lowpanfrag_time",
+-		.data		= &init_net.ieee802154_lowpan.fqdir.timeout,
+ 		.maxlen		= sizeof(int),
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_dointvec_jiffies,
+@@ -377,17 +372,17 @@ static int __net_init lowpan_frags_ns_sysctl_register(struct net *net)
+ 		if (table == NULL)
+ 			goto err_alloc;
+ 
+-		table[0].data = &ieee802154_lowpan->fqdir.high_thresh;
+-		table[0].extra1 = &ieee802154_lowpan->fqdir.low_thresh;
+-		table[1].data = &ieee802154_lowpan->fqdir.low_thresh;
+-		table[1].extra2 = &ieee802154_lowpan->fqdir.high_thresh;
+-		table[2].data = &ieee802154_lowpan->fqdir.timeout;
+-
+ 		/* Don't export sysctls to unprivileged users */
+ 		if (net->user_ns != &init_user_ns)
+ 			table[0].procname = NULL;
+ 	}
+ 
++	table[0].data	= &ieee802154_lowpan->fqdir.high_thresh;
++	table[0].extra1	= &ieee802154_lowpan->fqdir.low_thresh;
++	table[1].data	= &ieee802154_lowpan->fqdir.low_thresh;
++	table[1].extra2	= &ieee802154_lowpan->fqdir.high_thresh;
++	table[2].data	= &ieee802154_lowpan->fqdir.timeout;
++
+ 	hdr = register_net_sysctl(net, "net/ieee802154/6lowpan", table);
+ 	if (hdr == NULL)
+ 		goto err_reg;
+
+commit 803fdd99684714b3cdcbed4364473d41abbd6afe
+Author: Eric Dumazet <edumazet@google.com>
+Date:   Fri May 24 09:03:32 2019 -0700
+
+    net: rename struct fqdir fields
+    
+    Rename the @frags fields from structs netns_ipv4, netns_ipv6,
+    netns_nf_frag and netns_ieee802154_lowpan to @fqdir
+    
+    Signed-off-by: Eric Dumazet <edumazet@google.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ieee802154/6lowpan/reassembly.c b/net/ieee802154/6lowpan/reassembly.c
+index dc73452d3224..955047fe797a 100644
+--- a/net/ieee802154/6lowpan/reassembly.c
++++ b/net/ieee802154/6lowpan/reassembly.c
+@@ -79,7 +79,7 @@ fq_find(struct net *net, const struct lowpan_802154_cb *cb,
+ 	key.src = *src;
+ 	key.dst = *dst;
+ 
+-	q = inet_frag_find(&ieee802154_lowpan->frags, &key);
++	q = inet_frag_find(&ieee802154_lowpan->fqdir, &key);
+ 	if (!q)
+ 		return NULL;
+ 
+@@ -326,23 +326,23 @@ int lowpan_frag_rcv(struct sk_buff *skb, u8 frag_type)
+ static struct ctl_table lowpan_frags_ns_ctl_table[] = {
+ 	{
+ 		.procname	= "6lowpanfrag_high_thresh",
+-		.data		= &init_net.ieee802154_lowpan.frags.high_thresh,
++		.data		= &init_net.ieee802154_lowpan.fqdir.high_thresh,
+ 		.maxlen		= sizeof(unsigned long),
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_doulongvec_minmax,
+-		.extra1		= &init_net.ieee802154_lowpan.frags.low_thresh
++		.extra1		= &init_net.ieee802154_lowpan.fqdir.low_thresh
+ 	},
+ 	{
+ 		.procname	= "6lowpanfrag_low_thresh",
+-		.data		= &init_net.ieee802154_lowpan.frags.low_thresh,
++		.data		= &init_net.ieee802154_lowpan.fqdir.low_thresh,
+ 		.maxlen		= sizeof(unsigned long),
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_doulongvec_minmax,
+-		.extra2		= &init_net.ieee802154_lowpan.frags.high_thresh
++		.extra2		= &init_net.ieee802154_lowpan.fqdir.high_thresh
+ 	},
+ 	{
+ 		.procname	= "6lowpanfrag_time",
+-		.data		= &init_net.ieee802154_lowpan.frags.timeout,
++		.data		= &init_net.ieee802154_lowpan.fqdir.timeout,
+ 		.maxlen		= sizeof(int),
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_dointvec_jiffies,
+@@ -377,11 +377,11 @@ static int __net_init lowpan_frags_ns_sysctl_register(struct net *net)
+ 		if (table == NULL)
+ 			goto err_alloc;
+ 
+-		table[0].data = &ieee802154_lowpan->frags.high_thresh;
+-		table[0].extra1 = &ieee802154_lowpan->frags.low_thresh;
+-		table[1].data = &ieee802154_lowpan->frags.low_thresh;
+-		table[1].extra2 = &ieee802154_lowpan->frags.high_thresh;
+-		table[2].data = &ieee802154_lowpan->frags.timeout;
++		table[0].data = &ieee802154_lowpan->fqdir.high_thresh;
++		table[0].extra1 = &ieee802154_lowpan->fqdir.low_thresh;
++		table[1].data = &ieee802154_lowpan->fqdir.low_thresh;
++		table[1].extra2 = &ieee802154_lowpan->fqdir.high_thresh;
++		table[2].data = &ieee802154_lowpan->fqdir.timeout;
+ 
+ 		/* Don't export sysctls to unprivileged users */
+ 		if (net->user_ns != &init_user_ns)
+@@ -454,17 +454,17 @@ static int __net_init lowpan_frags_init_net(struct net *net)
+ 		net_ieee802154_lowpan(net);
+ 	int res;
+ 
+-	ieee802154_lowpan->frags.high_thresh = IPV6_FRAG_HIGH_THRESH;
+-	ieee802154_lowpan->frags.low_thresh = IPV6_FRAG_LOW_THRESH;
+-	ieee802154_lowpan->frags.timeout = IPV6_FRAG_TIMEOUT;
+-	ieee802154_lowpan->frags.f = &lowpan_frags;
++	ieee802154_lowpan->fqdir.high_thresh = IPV6_FRAG_HIGH_THRESH;
++	ieee802154_lowpan->fqdir.low_thresh = IPV6_FRAG_LOW_THRESH;
++	ieee802154_lowpan->fqdir.timeout = IPV6_FRAG_TIMEOUT;
++	ieee802154_lowpan->fqdir.f = &lowpan_frags;
+ 
+-	res = inet_frags_init_net(&ieee802154_lowpan->frags);
++	res = inet_frags_init_net(&ieee802154_lowpan->fqdir);
+ 	if (res < 0)
+ 		return res;
+ 	res = lowpan_frags_ns_sysctl_register(net);
+ 	if (res < 0)
+-		fqdir_exit(&ieee802154_lowpan->frags);
++		fqdir_exit(&ieee802154_lowpan->fqdir);
+ 	return res;
+ }
+ 
+@@ -474,7 +474,7 @@ static void __net_exit lowpan_frags_exit_net(struct net *net)
+ 		net_ieee802154_lowpan(net);
+ 
+ 	lowpan_frags_ns_sysctl_unregister(net);
+-	fqdir_exit(&ieee802154_lowpan->frags);
++	fqdir_exit(&ieee802154_lowpan->fqdir);
+ }
+ 
+ static struct pernet_operations lowpan_frags_ops = {
+
+commit 89fb900514d1623cf6019848f39d0557a3d31890
+Author: Eric Dumazet <edumazet@google.com>
+Date:   Fri May 24 09:03:31 2019 -0700
+
+    net: rename inet_frags_exit_net() to fqdir_exit()
+    
+    Signed-off-by: Eric Dumazet <edumazet@google.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ieee802154/6lowpan/reassembly.c b/net/ieee802154/6lowpan/reassembly.c
+index 8551d307f214..dc73452d3224 100644
+--- a/net/ieee802154/6lowpan/reassembly.c
++++ b/net/ieee802154/6lowpan/reassembly.c
+@@ -464,7 +464,7 @@ static int __net_init lowpan_frags_init_net(struct net *net)
+ 		return res;
+ 	res = lowpan_frags_ns_sysctl_register(net);
+ 	if (res < 0)
+-		inet_frags_exit_net(&ieee802154_lowpan->frags);
++		fqdir_exit(&ieee802154_lowpan->frags);
+ 	return res;
+ }
+ 
+@@ -474,7 +474,7 @@ static void __net_exit lowpan_frags_exit_net(struct net *net)
+ 		net_ieee802154_lowpan(net);
+ 
+ 	lowpan_frags_ns_sysctl_unregister(net);
+-	inet_frags_exit_net(&ieee802154_lowpan->frags);
++	fqdir_exit(&ieee802154_lowpan->frags);
+ }
+ 
+ static struct pernet_operations lowpan_frags_ops = {
+
+commit 6ce3b4dcee4f96a5000d3f790403eb6997e3d553
+Author: Eric Dumazet <edumazet@google.com>
+Date:   Fri May 24 09:03:30 2019 -0700
+
+    inet: rename netns_frags to fqdir
+    
+    1) struct netns_frags is renamed to struct fqdir
+      This structure is really holding many frag queues in a hash table.
+    
+    2) (struct inet_frag_queue)->net field is renamed to fqdir
+      since net is generally associated to a 'struct net' pointer
+      in networking stack.
+    
+    Signed-off-by: Eric Dumazet <edumazet@google.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ieee802154/6lowpan/reassembly.c b/net/ieee802154/6lowpan/reassembly.c
+index 4196bcd4105a..8551d307f214 100644
+--- a/net/ieee802154/6lowpan/reassembly.c
++++ b/net/ieee802154/6lowpan/reassembly.c
+@@ -139,7 +139,7 @@ static int lowpan_frag_queue(struct lowpan_frag_queue *fq,
+ 		fq->q.flags |= INET_FRAG_FIRST_IN;
+ 
+ 	fq->q.meat += skb->len;
+-	add_frag_mem_limit(fq->q.net, skb->truesize);
++	add_frag_mem_limit(fq->q.fqdir, skb->truesize);
+ 
+ 	if (fq->q.flags == (INET_FRAG_FIRST_IN | INET_FRAG_LAST_IN) &&
+ 	    fq->q.meat == fq->q.len) {
+
+commit d8cf757fbd3ee96a449f656707e773c91ca805b8
+Author: Peter Oskolkov <posk@google.com>
+Date:   Mon Feb 25 17:43:46 2019 -0800
+
+    net: remove unused struct inet_frag_queue.fragments field
+    
+    Now that all users of struct inet_frag_queue have been converted
+    to use 'rb_fragments', remove the unused 'fragments' field.
+    
+    Build with `make allyesconfig` succeeded. ip_defrag selftest passed.
+    
+    Signed-off-by: Peter Oskolkov <posk@google.com>
+    Acked-by: Stefan Schmidt <stefan@datenfreihafen.org>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ieee802154/6lowpan/reassembly.c b/net/ieee802154/6lowpan/reassembly.c
+index bd61633d2c32..4196bcd4105a 100644
+--- a/net/ieee802154/6lowpan/reassembly.c
++++ b/net/ieee802154/6lowpan/reassembly.c
+@@ -179,7 +179,6 @@ static int lowpan_frag_reasm(struct lowpan_frag_queue *fq, struct sk_buff *skb,
+ 
+ 	skb->dev = ldev;
+ 	skb->tstamp = fq->q.stamp;
+-	fq->q.fragments = NULL;
+ 	fq->q.rb_fragments = RB_ROOT;
+ 	fq->q.fragments_tail = NULL;
+ 	fq->q.last_run_head = NULL;
+
+commit 254c5dbe15d44c9d76a3ccd3724eb1befb7adf99
+Author: Peter Oskolkov <posk@google.com>
+Date:   Thu Feb 14 18:29:53 2019 -0800
+
+    6lowpan: use rbtree for IP frag queue
+    
+    This patch aligns IP defragmenation logic in 6lowpan with that
+    of IPv4 and IPv6: see
+    commit d4289fcc9b16 ("net: IP6 defrag: use rbtrees for IPv6 defrag")
+    
+    Modifying ip_defrag selftest seemed like an overkill, as I suspect
+    most kernel test setups do not have 6lowpan hwsim enabled. So I ran
+    the following code/script manually:
+    
+            insmod ./mac802154_hwsim.ko
+    
+            iwpan dev wpan0 set pan_id 0xbeef
+            ip link add link wpan0 name lowpan0 type lowpan
+            ip link set wpan0 up
+            ip link set lowpan0 up
+    
+            iwpan dev wpan1 set pan_id 0xbeef
+            ip netns add foo
+            iwpan phy1 set netns name foo
+            ip netns exec foo ip link add link wpan1 name lowpan1 type lowpan
+            ip netns exec foo ip link set wpan1 up
+            ip netns exec foo ip link set lowpan1 up
+    
+            ip -6 addr add "fb01::1/128" nodad dev lowpan0
+            ip -netns foo -6 addr add "fb02::1/128" nodad dev lowpan1
+    
+            ip -6 route add "fb02::1/128" dev lowpan0
+            ip -netns foo -6 route add "fb01::1/128" dev lowpan1
+    
+            # then in term1:
+               ip netns exec foo bash
+               ./udp_stream -6
+    
+            # in term2:
+                ./udp_stream -c -6 -H fb02::1
+    
+            # pr_warn_once showed that the code changed by this patch
+            # was invoked.
+    
+    Signed-off-by: Peter Oskolkov <posk@google.com>
+    Acked-by: Alexander Aring <aring@mojatatu.com>
+    Signed-off-by: Stefan Schmidt <stefan@datenfreihafen.org>
+
+diff --git a/net/ieee802154/6lowpan/reassembly.c b/net/ieee802154/6lowpan/reassembly.c
+index d14226ecfde4..bd61633d2c32 100644
+--- a/net/ieee802154/6lowpan/reassembly.c
++++ b/net/ieee802154/6lowpan/reassembly.c
+@@ -27,6 +27,7 @@
+ #include <net/6lowpan.h>
+ #include <net/ipv6_frag.h>
+ #include <net/inet_frag.h>
++#include <net/ip.h>
+ 
+ #include "6lowpan_i.h"
+ 
+@@ -34,8 +35,8 @@ static const char lowpan_frags_cache_name[] = "lowpan-frags";
+ 
+ static struct inet_frags lowpan_frags;
+ 
+-static int lowpan_frag_reasm(struct lowpan_frag_queue *fq,
+-			     struct sk_buff *prev, struct net_device *ldev);
++static int lowpan_frag_reasm(struct lowpan_frag_queue *fq, struct sk_buff *skb,
++			     struct sk_buff *prev,  struct net_device *ldev);
+ 
+ static void lowpan_frag_init(struct inet_frag_queue *q, const void *a)
+ {
+@@ -88,9 +89,15 @@ fq_find(struct net *net, const struct lowpan_802154_cb *cb,
+ static int lowpan_frag_queue(struct lowpan_frag_queue *fq,
+ 			     struct sk_buff *skb, u8 frag_type)
+ {
+-	struct sk_buff *prev, *next;
++	struct sk_buff *prev_tail;
+ 	struct net_device *ldev;
+-	int end, offset;
++	int end, offset, err;
++
++	/* inet_frag_queue_* functions use skb->cb; see struct ipfrag_skb_cb
++	 * in inet_fragment.c
++	 */
++	BUILD_BUG_ON(sizeof(struct lowpan_802154_cb) > sizeof(struct inet_skb_parm));
++	BUILD_BUG_ON(sizeof(struct lowpan_802154_cb) > sizeof(struct inet6_skb_parm));
+ 
+ 	if (fq->q.flags & INET_FRAG_COMPLETE)
+ 		goto err;
+@@ -117,38 +124,15 @@ static int lowpan_frag_queue(struct lowpan_frag_queue *fq,
+ 		}
+ 	}
+ 
+-	/* Find out which fragments are in front and at the back of us
+-	 * in the chain of fragments so far.  We must know where to put
+-	 * this fragment, right?
+-	 */
+-	prev = fq->q.fragments_tail;
+-	if (!prev ||
+-	    lowpan_802154_cb(prev)->d_offset <
+-	    lowpan_802154_cb(skb)->d_offset) {
+-		next = NULL;
+-		goto found;
+-	}
+-	prev = NULL;
+-	for (next = fq->q.fragments; next != NULL; next = next->next) {
+-		if (lowpan_802154_cb(next)->d_offset >=
+-		    lowpan_802154_cb(skb)->d_offset)
+-			break;	/* bingo! */
+-		prev = next;
+-	}
+-
+-found:
+-	/* Insert this fragment in the chain of fragments. */
+-	skb->next = next;
+-	if (!next)
+-		fq->q.fragments_tail = skb;
+-	if (prev)
+-		prev->next = skb;
+-	else
+-		fq->q.fragments = skb;
+-
+ 	ldev = skb->dev;
+ 	if (ldev)
+ 		skb->dev = NULL;
++	barrier();
++
++	prev_tail = fq->q.fragments_tail;
++	err = inet_frag_queue_insert(&fq->q, skb, offset, end);
++	if (err)
++		goto err;
+ 
+ 	fq->q.stamp = skb->tstamp;
+ 	if (frag_type == LOWPAN_DISPATCH_FRAG1)
+@@ -163,10 +147,11 @@ static int lowpan_frag_queue(struct lowpan_frag_queue *fq,
+ 		unsigned long orefdst = skb->_skb_refdst;
+ 
+ 		skb->_skb_refdst = 0UL;
+-		res = lowpan_frag_reasm(fq, prev, ldev);
++		res = lowpan_frag_reasm(fq, skb, prev_tail, ldev);
+ 		skb->_skb_refdst = orefdst;
+ 		return res;
+ 	}
++	skb_dst_drop(skb);
+ 
+ 	return -1;
+ err:
+@@ -175,97 +160,29 @@ static int lowpan_frag_queue(struct lowpan_frag_queue *fq,
+ }
+ 
+ /*	Check if this packet is complete.
+- *	Returns NULL on failure by any reason, and pointer
+- *	to current nexthdr field in reassembled frame.
+  *
+  *	It is called with locked fq, and caller must check that
+  *	queue is eligible for reassembly i.e. it is not COMPLETE,
+  *	the last and the first frames arrived and all the bits are here.
+  */
+-static int lowpan_frag_reasm(struct lowpan_frag_queue *fq, struct sk_buff *prev,
+-			     struct net_device *ldev)
++static int lowpan_frag_reasm(struct lowpan_frag_queue *fq, struct sk_buff *skb,
++			     struct sk_buff *prev_tail, struct net_device *ldev)
+ {
+-	struct sk_buff *fp, *head = fq->q.fragments;
+-	int sum_truesize;
++	void *reasm_data;
+ 
+ 	inet_frag_kill(&fq->q);
+ 
+-	/* Make the one we just received the head. */
+-	if (prev) {
+-		head = prev->next;
+-		fp = skb_clone(head, GFP_ATOMIC);
+-
+-		if (!fp)
+-			goto out_oom;
+-
+-		fp->next = head->next;
+-		if (!fp->next)
+-			fq->q.fragments_tail = fp;
+-		prev->next = fp;
+-
+-		skb_morph(head, fq->q.fragments);
+-		head->next = fq->q.fragments->next;
+-
+-		consume_skb(fq->q.fragments);
+-		fq->q.fragments = head;
+-	}
+-
+-	/* Head of list must not be cloned. */
+-	if (skb_unclone(head, GFP_ATOMIC))
++	reasm_data = inet_frag_reasm_prepare(&fq->q, skb, prev_tail);
++	if (!reasm_data)
+ 		goto out_oom;
++	inet_frag_reasm_finish(&fq->q, skb, reasm_data);
+ 
+-	/* If the first fragment is fragmented itself, we split
+-	 * it to two chunks: the first with data and paged part
+-	 * and the second, holding only fragments.
+-	 */
+-	if (skb_has_frag_list(head)) {
+-		struct sk_buff *clone;
+-		int i, plen = 0;
+-
+-		clone = alloc_skb(0, GFP_ATOMIC);
+-		if (!clone)
+-			goto out_oom;
+-		clone->next = head->next;
+-		head->next = clone;
+-		skb_shinfo(clone)->frag_list = skb_shinfo(head)->frag_list;
+-		skb_frag_list_init(head);
+-		for (i = 0; i < skb_shinfo(head)->nr_frags; i++)
+-			plen += skb_frag_size(&skb_shinfo(head)->frags[i]);
+-		clone->len = head->data_len - plen;
+-		clone->data_len = clone->len;
+-		head->data_len -= clone->len;
+-		head->len -= clone->len;
+-		add_frag_mem_limit(fq->q.net, clone->truesize);
+-	}
+-
+-	WARN_ON(head == NULL);
+-
+-	sum_truesize = head->truesize;
+-	for (fp = head->next; fp;) {
+-		bool headstolen;
+-		int delta;
+-		struct sk_buff *next = fp->next;
+-
+-		sum_truesize += fp->truesize;
+-		if (skb_try_coalesce(head, fp, &headstolen, &delta)) {
+-			kfree_skb_partial(fp, headstolen);
+-		} else {
+-			if (!skb_shinfo(head)->frag_list)
+-				skb_shinfo(head)->frag_list = fp;
+-			head->data_len += fp->len;
+-			head->len += fp->len;
+-			head->truesize += fp->truesize;
+-		}
+-		fp = next;
+-	}
+-	sub_frag_mem_limit(fq->q.net, sum_truesize);
+-
+-	skb_mark_not_on_list(head);
+-	head->dev = ldev;
+-	head->tstamp = fq->q.stamp;
+-
++	skb->dev = ldev;
++	skb->tstamp = fq->q.stamp;
+ 	fq->q.fragments = NULL;
++	fq->q.rb_fragments = RB_ROOT;
+ 	fq->q.fragments_tail = NULL;
++	fq->q.last_run_head = NULL;
+ 
+ 	return 1;
+ out_oom:
+
+commit 83619623929815a76fa7af49309d2cdfcf024fd3
+Author: Peter Oskolkov <posk@google.com>
+Date:   Fri Sep 21 11:17:16 2018 -0700
+
+    net/ipfrag: let ip[6]frag_high_thresh in ns be higher than in init_net
+    
+    Currently, ip[6]frag_high_thresh sysctl values in new namespaces are
+    hard-limited to those of the root/init ns.
+    
+    There are at least two use cases when it would be desirable to
+    set the high_thresh values higher in a child namespace vs the global hard
+    limit:
+    
+    - a security/ddos protection policy may lower the thresholds in the
+      root/init ns but allow for a special exception in a child namespace
+    - testing: a test running in a namespace may want to set these
+      thresholds higher in its namespace than what is in the root/init ns
+    
+    The new behavior:
+    
+     # ip netns add testns
+     # ip netns exec testns bash
+    
+     # sysctl -w net.ipv4.ipfrag_high_thresh=9000000
+     net.ipv4.ipfrag_high_thresh = 9000000
+    
+     # sysctl net.ipv4.ipfrag_high_thresh
+     net.ipv4.ipfrag_high_thresh = 9000000
+    
+     # sysctl -w net.ipv6.ip6frag_high_thresh=9000000
+     net.ipv6.ip6frag_high_thresh = 9000000
+    
+     # sysctl net.ipv6.ip6frag_high_thresh
+     net.ipv6.ip6frag_high_thresh = 9000000
+    
+    The old behavior:
+    
+     # ip netns add testns
+     # ip netns exec testns bash
+    
+     # sysctl -w net.ipv4.ipfrag_high_thresh=9000000
+     net.ipv4.ipfrag_high_thresh = 9000000
+    
+     # sysctl net.ipv4.ipfrag_high_thresh
+     net.ipv4.ipfrag_high_thresh = 4194304
+    
+     # sysctl -w net.ipv6.ip6frag_high_thresh=9000000
+     net.ipv6.ip6frag_high_thresh = 9000000
+    
+     # sysctl net.ipv6.ip6frag_high_thresh
+     net.ipv6.ip6frag_high_thresh = 4194304
+    
+    Signed-off-by: Peter Oskolkov <posk@google.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ieee802154/6lowpan/reassembly.c b/net/ieee802154/6lowpan/reassembly.c
+index 09ffbf5ce8fa..d14226ecfde4 100644
+--- a/net/ieee802154/6lowpan/reassembly.c
++++ b/net/ieee802154/6lowpan/reassembly.c
+@@ -463,7 +463,6 @@ static int __net_init lowpan_frags_ns_sysctl_register(struct net *net)
+ 
+ 		table[0].data = &ieee802154_lowpan->frags.high_thresh;
+ 		table[0].extra1 = &ieee802154_lowpan->frags.low_thresh;
+-		table[0].extra2 = &init_net.ieee802154_lowpan.frags.high_thresh;
+ 		table[1].data = &ieee802154_lowpan->frags.low_thresh;
+ 		table[1].extra2 = &ieee802154_lowpan->frags.high_thresh;
+ 		table[2].data = &ieee802154_lowpan->frags.timeout;
+
+commit a8305bff685252e80b7c60f4f5e7dd2e63e38218
+Author: David S. Miller <davem@davemloft.net>
+Date:   Sun Jul 29 20:42:53 2018 -0700
+
+    net: Add and use skb_mark_not_on_list().
+    
+    An SKB is not on a list if skb->next is NULL.
+    
+    Codify this convention into a helper function and use it
+    where we are dequeueing an SKB and need to mark it as such.
+    
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ieee802154/6lowpan/reassembly.c b/net/ieee802154/6lowpan/reassembly.c
+index e7857a8ac86d..09ffbf5ce8fa 100644
+--- a/net/ieee802154/6lowpan/reassembly.c
++++ b/net/ieee802154/6lowpan/reassembly.c
+@@ -260,7 +260,7 @@ static int lowpan_frag_reasm(struct lowpan_frag_queue *fq, struct sk_buff *prev,
+ 	}
+ 	sub_frag_mem_limit(fq->q.net, sum_truesize);
+ 
+-	head->next = NULL;
++	skb_mark_not_on_list(head);
+ 	head->dev = ldev;
+ 	head->tstamp = fq->q.stamp;
+ 
+
+commit 4e54acb2022099e41231271b5a8ec58ca8ac2d86
+Author: Colin Ian King <colin.king@canonical.com>
+Date:   Tue Jul 31 16:45:07 2018 +0100
+
+    net: ieee802154: 6lowpan: remove redundant pointers 'fq' and 'net'
+    
+    Pointers fq and net are being assigned but are never used hence they
+    are redundant and can be removed.
+    
+    Cleans up clang warnings:
+    warning: variable 'fq' set but not used [-Wunused-but-set-variable]
+    warning: variable 'net' set but not used [-Wunused-but-set-variable]
+    
+    Signed-off-by: Colin Ian King <colin.king@canonical.com>
+    Signed-off-by: Stefan Schmidt <stefan@datenfreihafen.org>
+
+diff --git a/net/ieee802154/6lowpan/reassembly.c b/net/ieee802154/6lowpan/reassembly.c
+index ec7a5da56129..e7857a8ac86d 100644
+--- a/net/ieee802154/6lowpan/reassembly.c
++++ b/net/ieee802154/6lowpan/reassembly.c
+@@ -40,9 +40,6 @@ static int lowpan_frag_reasm(struct lowpan_frag_queue *fq,
+ static void lowpan_frag_init(struct inet_frag_queue *q, const void *a)
+ {
+ 	const struct frag_lowpan_compare_key *key = a;
+-	struct lowpan_frag_queue *fq;
+-
+-	fq = container_of(q, struct lowpan_frag_queue, q);
+ 
+ 	BUILD_BUG_ON(sizeof(*key) > sizeof(q->key));
+ 	memcpy(&q->key, key, sizeof(*key));
+@@ -52,10 +49,8 @@ static void lowpan_frag_expire(struct timer_list *t)
+ {
+ 	struct inet_frag_queue *frag = from_timer(frag, t, timer);
+ 	struct frag_queue *fq;
+-	struct net *net;
+ 
+ 	fq = container_of(frag, struct frag_queue, q);
+-	net = container_of(fq->q.net, struct net, ieee802154_lowpan.frags);
+ 
+ 	spin_lock(&fq->q.lock);
+ 
+
+commit 70b095c84326640eeacfd69a411db8fc36e8ab1a
+Author: Florian Westphal <fw@strlen.de>
+Date:   Sat Jul 14 01:14:01 2018 +0200
+
+    ipv6: remove dependency of nf_defrag_ipv6 on ipv6 module
+    
+    IPV6=m
+    DEFRAG_IPV6=m
+    CONNTRACK=y yields:
+    
+    net/netfilter/nf_conntrack_proto.o: In function `nf_ct_netns_do_get':
+    net/netfilter/nf_conntrack_proto.c:802: undefined reference to `nf_defrag_ipv6_enable'
+    net/netfilter/nf_conntrack_proto.o:(.rodata+0x640): undefined reference to `nf_conntrack_l4proto_icmpv6'
+    
+    Setting DEFRAG_IPV6=y causes undefined references to ip6_rhash_params
+    ip6_frag_init and ip6_expire_frag_queue so it would be needed to force
+    IPV6=y too.
+    
+    This patch gets rid of the 'followup linker error' by removing
+    the dependency of ipv6.ko symbols from netfilter ipv6 defrag.
+    
+    Shared code is placed into a header, then used from both.
+    
+    Signed-off-by: Florian Westphal <fw@strlen.de>
+    Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+
+diff --git a/net/ieee802154/6lowpan/reassembly.c b/net/ieee802154/6lowpan/reassembly.c
+index 2cc224106b69..ec7a5da56129 100644
+--- a/net/ieee802154/6lowpan/reassembly.c
++++ b/net/ieee802154/6lowpan/reassembly.c
+@@ -25,7 +25,7 @@
+ 
+ #include <net/ieee802154_netdev.h>
+ #include <net/6lowpan.h>
+-#include <net/ipv6.h>
++#include <net/ipv6_frag.h>
+ #include <net/inet_frag.h>
+ 
+ #include "6lowpan_i.h"
+
+commit f18fa5de5ba7f1d6650951502bb96a6e4715a948
+Author: Alexander Aring <aring@mojatatu.com>
+Date:   Fri Apr 20 14:54:13 2018 -0400
+
+    net: ieee802154: 6lowpan: fix frag reassembly
+    
+    This patch initialize stack variables which are used in
+    frag_lowpan_compare_key to zero. In my case there are padding bytes in the
+    structures ieee802154_addr as well in frag_lowpan_compare_key. Otherwise
+    the key variable contains random bytes. The result is that a compare of
+    two keys by memcmp works incorrect.
+    
+    Fixes: 648700f76b03 ("inet: frags: use rhashtables for reassembly units")
+    Signed-off-by: Alexander Aring <aring@mojatatu.com>
+    Reported-by: Stefan Schmidt <stefan@osg.samsung.com>
+    Signed-off-by: Stefan Schmidt <stefan@osg.samsung.com>
+
+diff --git a/net/ieee802154/6lowpan/reassembly.c b/net/ieee802154/6lowpan/reassembly.c
+index 1790b65944b3..2cc224106b69 100644
+--- a/net/ieee802154/6lowpan/reassembly.c
++++ b/net/ieee802154/6lowpan/reassembly.c
+@@ -75,14 +75,14 @@ fq_find(struct net *net, const struct lowpan_802154_cb *cb,
+ {
+ 	struct netns_ieee802154_lowpan *ieee802154_lowpan =
+ 		net_ieee802154_lowpan(net);
+-	struct frag_lowpan_compare_key key = {
+-		.tag = cb->d_tag,
+-		.d_size = cb->d_size,
+-		.src = *src,
+-		.dst = *dst,
+-	};
++	struct frag_lowpan_compare_key key = {};
+ 	struct inet_frag_queue *q;
+ 
++	key.tag = cb->d_tag;
++	key.d_size = cb->d_size;
++	key.src = *src;
++	key.dst = *dst;
++
+ 	q = inet_frag_find(&ieee802154_lowpan->frags, &key);
+ 	if (!q)
+ 		return NULL;
+@@ -372,7 +372,7 @@ int lowpan_frag_rcv(struct sk_buff *skb, u8 frag_type)
+ 	struct lowpan_frag_queue *fq;
+ 	struct net *net = dev_net(skb->dev);
+ 	struct lowpan_802154_cb *cb = lowpan_802154_cb(skb);
+-	struct ieee802154_hdr hdr;
++	struct ieee802154_hdr hdr = {};
+ 	int err;
+ 
+ 	if (ieee802154_hdr_peek_addrs(skb, &hdr) < 0)
+
+commit 3d23401283e80ceb03f765842787e0e79ff598b7
+Author: Eric Dumazet <edumazet@google.com>
+Date:   Wed Apr 4 08:35:10 2018 -0700
+
+    inet: frags: fix ip6frag_low_thresh boundary
+    
+    Giving an integer to proc_doulongvec_minmax() is dangerous on 64bit arches,
+    since linker might place next to it a non zero value preventing a change
+    to ip6frag_low_thresh.
+    
+    ip6frag_low_thresh is not used anymore in the kernel, but we do not
+    want to prematuraly break user scripts wanting to change it.
+    
+    Since specifying a minimal value of 0 for proc_doulongvec_minmax()
+    is moot, let's remove these zero values in all defrag units.
+    
+    Fixes: 6e00f7dd5e4e ("ipv6: frags: fix /proc/sys/net/ipv6/ip6frag_low_thresh")
+    Signed-off-by: Eric Dumazet <edumazet@google.com>
+    Reported-by: Maciej Żenczykowski <maze@google.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ieee802154/6lowpan/reassembly.c b/net/ieee802154/6lowpan/reassembly.c
+index 44f148a6bb57..1790b65944b3 100644
+--- a/net/ieee802154/6lowpan/reassembly.c
++++ b/net/ieee802154/6lowpan/reassembly.c
+@@ -411,7 +411,6 @@ int lowpan_frag_rcv(struct sk_buff *skb, u8 frag_type)
+ }
+ 
+ #ifdef CONFIG_SYSCTL
+-static long zero;
+ 
+ static struct ctl_table lowpan_frags_ns_ctl_table[] = {
+ 	{
+@@ -428,7 +427,6 @@ static struct ctl_table lowpan_frags_ns_ctl_table[] = {
+ 		.maxlen		= sizeof(unsigned long),
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_doulongvec_minmax,
+-		.extra1		= &zero,
+ 		.extra2		= &init_net.ieee802154_lowpan.frags.high_thresh
+ 	},
+ 	{
+
+commit 3e67f106f619dcfaf6f4e2039599bdb69848c714
+Author: Eric Dumazet <edumazet@google.com>
+Date:   Sat Mar 31 12:58:53 2018 -0700
+
+    inet: frags: break the 2GB limit for frags storage
+    
+    Some users are willing to provision huge amounts of memory to be able
+    to perform reassembly reasonnably well under pressure.
+    
+    Current memory tracking is using one atomic_t and integers.
+    
+    Switch to atomic_long_t so that 64bit arches can use more than 2GB,
+    without any cost for 32bit arches.
+    
+    Note that this patch avoids an overflow error, if high_thresh was set
+    to ~2GB, since this test in inet_frag_alloc() was never true :
+    
+    if (... || frag_mem_limit(nf) > nf->high_thresh)
+    
+    Tested:
+    
+    $ echo 16000000000 >/proc/sys/net/ipv4/ipfrag_high_thresh
+    
+    <frag DDOS>
+    
+    $ grep FRAG /proc/net/sockstat
+    FRAG: inuse 14705885 memory 16000002880
+    
+    $ nstat -n ; sleep 1 ; nstat | grep Reas
+    IpReasmReqds                    3317150            0.0
+    IpReasmFails                    3317112            0.0
+    
+    Signed-off-by: Eric Dumazet <edumazet@google.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ieee802154/6lowpan/reassembly.c b/net/ieee802154/6lowpan/reassembly.c
+index 1aec71a3f904..44f148a6bb57 100644
+--- a/net/ieee802154/6lowpan/reassembly.c
++++ b/net/ieee802154/6lowpan/reassembly.c
+@@ -411,23 +411,23 @@ int lowpan_frag_rcv(struct sk_buff *skb, u8 frag_type)
+ }
+ 
+ #ifdef CONFIG_SYSCTL
+-static int zero;
++static long zero;
+ 
+ static struct ctl_table lowpan_frags_ns_ctl_table[] = {
+ 	{
+ 		.procname	= "6lowpanfrag_high_thresh",
+ 		.data		= &init_net.ieee802154_lowpan.frags.high_thresh,
+-		.maxlen		= sizeof(int),
++		.maxlen		= sizeof(unsigned long),
+ 		.mode		= 0644,
+-		.proc_handler	= proc_dointvec_minmax,
++		.proc_handler	= proc_doulongvec_minmax,
+ 		.extra1		= &init_net.ieee802154_lowpan.frags.low_thresh
+ 	},
+ 	{
+ 		.procname	= "6lowpanfrag_low_thresh",
+ 		.data		= &init_net.ieee802154_lowpan.frags.low_thresh,
+-		.maxlen		= sizeof(int),
++		.maxlen		= sizeof(unsigned long),
+ 		.mode		= 0644,
+-		.proc_handler	= proc_dointvec_minmax,
++		.proc_handler	= proc_doulongvec_minmax,
+ 		.extra1		= &zero,
+ 		.extra2		= &init_net.ieee802154_lowpan.frags.high_thresh
+ 	},
+
+commit 2d44ed22e607f9a285b049de2263e3840673a260
+Author: Eric Dumazet <edumazet@google.com>
+Date:   Sat Mar 31 12:58:52 2018 -0700
+
+    inet: frags: remove inet_frag_maybe_warn_overflow()
+    
+    This function is obsolete, after rhashtable addition to inet defrag.
+    
+    Signed-off-by: Eric Dumazet <edumazet@google.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ieee802154/6lowpan/reassembly.c b/net/ieee802154/6lowpan/reassembly.c
+index 0fa0121f85d4..1aec71a3f904 100644
+--- a/net/ieee802154/6lowpan/reassembly.c
++++ b/net/ieee802154/6lowpan/reassembly.c
+@@ -84,10 +84,9 @@ fq_find(struct net *net, const struct lowpan_802154_cb *cb,
+ 	struct inet_frag_queue *q;
+ 
+ 	q = inet_frag_find(&ieee802154_lowpan->frags, &key);
+-	if (IS_ERR_OR_NULL(q)) {
+-		inet_frag_maybe_warn_overflow(q, pr_fmt());
++	if (!q)
+ 		return NULL;
+-	}
++
+ 	return container_of(q, struct lowpan_frag_queue, q);
+ }
+ 
+
+commit 648700f76b03b7e8149d13cc2bdb3355035258a9
+Author: Eric Dumazet <edumazet@google.com>
+Date:   Sat Mar 31 12:58:49 2018 -0700
+
+    inet: frags: use rhashtables for reassembly units
+    
+    Some applications still rely on IP fragmentation, and to be fair linux
+    reassembly unit is not working under any serious load.
+    
+    It uses static hash tables of 1024 buckets, and up to 128 items per bucket (!!!)
+    
+    A work queue is supposed to garbage collect items when host is under memory
+    pressure, and doing a hash rebuild, changing seed used in hash computations.
+    
+    This work queue blocks softirqs for up to 25 ms when doing a hash rebuild,
+    occurring every 5 seconds if host is under fire.
+    
+    Then there is the problem of sharing this hash table for all netns.
+    
+    It is time to switch to rhashtables, and allocate one of them per netns
+    to speedup netns dismantle, since this is a critical metric these days.
+    
+    Lookup is now using RCU. A followup patch will even remove
+    the refcount hold/release left from prior implementation and save
+    a couple of atomic operations.
+    
+    Before this patch, 16 cpus (16 RX queue NIC) could not handle more
+    than 1 Mpps frags DDOS.
+    
+    After the patch, I reach 9 Mpps without any tuning, and can use up to 2GB
+    of storage for the fragments (exact number depends on frags being evicted
+    after timeout)
+    
+    $ grep FRAG /proc/net/sockstat
+    FRAG: inuse 1966916 memory 2140004608
+    
+    A followup patch will change the limits for 64bit arches.
+    
+    Signed-off-by: Eric Dumazet <edumazet@google.com>
+    Cc: Kirill Tkhai <ktkhai@virtuozzo.com>
+    Cc: Herbert Xu <herbert@gondor.apana.org.au>
+    Cc: Florian Westphal <fw@strlen.de>
+    Cc: Jesper Dangaard Brouer <brouer@redhat.com>
+    Cc: Alexander Aring <alex.aring@gmail.com>
+    Cc: Stefan Schmidt <stefan@osg.samsung.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ieee802154/6lowpan/reassembly.c b/net/ieee802154/6lowpan/reassembly.c
+index ddada12a044d..0fa0121f85d4 100644
+--- a/net/ieee802154/6lowpan/reassembly.c
++++ b/net/ieee802154/6lowpan/reassembly.c
+@@ -37,47 +37,15 @@ static struct inet_frags lowpan_frags;
+ static int lowpan_frag_reasm(struct lowpan_frag_queue *fq,
+ 			     struct sk_buff *prev, struct net_device *ldev);
+ 
+-static unsigned int lowpan_hash_frag(u16 tag, u16 d_size,
+-				     const struct ieee802154_addr *saddr,
+-				     const struct ieee802154_addr *daddr)
+-{
+-	net_get_random_once(&lowpan_frags.rnd, sizeof(lowpan_frags.rnd));
+-	return jhash_3words(ieee802154_addr_hash(saddr),
+-			    ieee802154_addr_hash(daddr),
+-			    (__force u32)(tag + (d_size << 16)),
+-			    lowpan_frags.rnd);
+-}
+-
+-static unsigned int lowpan_hashfn(const struct inet_frag_queue *q)
+-{
+-	const struct lowpan_frag_queue *fq;
+-
+-	fq = container_of(q, struct lowpan_frag_queue, q);
+-	return lowpan_hash_frag(fq->tag, fq->d_size, &fq->saddr, &fq->daddr);
+-}
+-
+-static bool lowpan_frag_match(const struct inet_frag_queue *q, const void *a)
+-{
+-	const struct lowpan_frag_queue *fq;
+-	const struct lowpan_create_arg *arg = a;
+-
+-	fq = container_of(q, struct lowpan_frag_queue, q);
+-	return	fq->tag == arg->tag && fq->d_size == arg->d_size &&
+-		ieee802154_addr_equal(&fq->saddr, arg->src) &&
+-		ieee802154_addr_equal(&fq->daddr, arg->dst);
+-}
+-
+ static void lowpan_frag_init(struct inet_frag_queue *q, const void *a)
+ {
+-	const struct lowpan_create_arg *arg = a;
++	const struct frag_lowpan_compare_key *key = a;
+ 	struct lowpan_frag_queue *fq;
+ 
+ 	fq = container_of(q, struct lowpan_frag_queue, q);
+ 
+-	fq->tag = arg->tag;
+-	fq->d_size = arg->d_size;
+-	fq->saddr = *arg->src;
+-	fq->daddr = *arg->dst;
++	BUILD_BUG_ON(sizeof(*key) > sizeof(q->key));
++	memcpy(&q->key, key, sizeof(*key));
+ }
+ 
+ static void lowpan_frag_expire(struct timer_list *t)
+@@ -105,21 +73,17 @@ fq_find(struct net *net, const struct lowpan_802154_cb *cb,
+ 	const struct ieee802154_addr *src,
+ 	const struct ieee802154_addr *dst)
+ {
+-	struct inet_frag_queue *q;
+-	struct lowpan_create_arg arg;
+-	unsigned int hash;
+ 	struct netns_ieee802154_lowpan *ieee802154_lowpan =
+ 		net_ieee802154_lowpan(net);
++	struct frag_lowpan_compare_key key = {
++		.tag = cb->d_tag,
++		.d_size = cb->d_size,
++		.src = *src,
++		.dst = *dst,
++	};
++	struct inet_frag_queue *q;
+ 
+-	arg.tag = cb->d_tag;
+-	arg.d_size = cb->d_size;
+-	arg.src = src;
+-	arg.dst = dst;
+-
+-	hash = lowpan_hash_frag(cb->d_tag, cb->d_size, src, dst);
+-
+-	q = inet_frag_find(&ieee802154_lowpan->frags,
+-			   &lowpan_frags, &arg, hash);
++	q = inet_frag_find(&ieee802154_lowpan->frags, &key);
+ 	if (IS_ERR_OR_NULL(q)) {
+ 		inet_frag_maybe_warn_overflow(q, pr_fmt());
+ 		return NULL;
+@@ -611,17 +575,46 @@ static struct pernet_operations lowpan_frags_ops = {
+ 	.exit = lowpan_frags_exit_net,
+ };
+ 
++static u32 lowpan_key_hashfn(const void *data, u32 len, u32 seed)
++{
++	return jhash2(data,
++		      sizeof(struct frag_lowpan_compare_key) / sizeof(u32), seed);
++}
++
++static u32 lowpan_obj_hashfn(const void *data, u32 len, u32 seed)
++{
++	const struct inet_frag_queue *fq = data;
++
++	return jhash2((const u32 *)&fq->key,
++		      sizeof(struct frag_lowpan_compare_key) / sizeof(u32), seed);
++}
++
++static int lowpan_obj_cmpfn(struct rhashtable_compare_arg *arg, const void *ptr)
++{
++	const struct frag_lowpan_compare_key *key = arg->key;
++	const struct inet_frag_queue *fq = ptr;
++
++	return !!memcmp(&fq->key, key, sizeof(*key));
++}
++
++static const struct rhashtable_params lowpan_rhash_params = {
++	.head_offset		= offsetof(struct inet_frag_queue, node),
++	.hashfn			= lowpan_key_hashfn,
++	.obj_hashfn		= lowpan_obj_hashfn,
++	.obj_cmpfn		= lowpan_obj_cmpfn,
++	.automatic_shrinking	= true,
++};
++
+ int __init lowpan_net_frag_init(void)
+ {
+ 	int ret;
+ 
+-	lowpan_frags.hashfn = lowpan_hashfn;
+ 	lowpan_frags.constructor = lowpan_frag_init;
+ 	lowpan_frags.destructor = NULL;
+ 	lowpan_frags.qsize = sizeof(struct frag_queue);
+-	lowpan_frags.match = lowpan_frag_match;
+ 	lowpan_frags.frag_expire = lowpan_frag_expire;
+ 	lowpan_frags.frags_cache_name = lowpan_frags_cache_name;
++	lowpan_frags.rhash_params = lowpan_rhash_params;
+ 	ret = inet_frags_init(&lowpan_frags);
+ 	if (ret)
+ 		goto out;
+
+commit 807f1844df4ac23594268fa9f41902d0549e92aa
+Author: Eric Dumazet <edumazet@google.com>
+Date:   Sat Mar 31 12:58:46 2018 -0700
+
+    inet: frags: refactor lowpan_net_frag_init()
+    
+    We want to call lowpan_net_frag_init() earlier.
+    Similar to commit "inet: frags: refactor ipv6_frag_init()"
+    
+    This is a prereq to "inet: frags: use rhashtables for reassembly units"
+    
+    Signed-off-by: Eric Dumazet <edumazet@google.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ieee802154/6lowpan/reassembly.c b/net/ieee802154/6lowpan/reassembly.c
+index 6badc055555b..ddada12a044d 100644
+--- a/net/ieee802154/6lowpan/reassembly.c
++++ b/net/ieee802154/6lowpan/reassembly.c
+@@ -615,14 +615,6 @@ int __init lowpan_net_frag_init(void)
+ {
+ 	int ret;
+ 
+-	ret = lowpan_frags_sysctl_register();
+-	if (ret)
+-		return ret;
+-
+-	ret = register_pernet_subsys(&lowpan_frags_ops);
+-	if (ret)
+-		goto err_pernet;
+-
+ 	lowpan_frags.hashfn = lowpan_hashfn;
+ 	lowpan_frags.constructor = lowpan_frag_init;
+ 	lowpan_frags.destructor = NULL;
+@@ -632,11 +624,21 @@ int __init lowpan_net_frag_init(void)
+ 	lowpan_frags.frags_cache_name = lowpan_frags_cache_name;
+ 	ret = inet_frags_init(&lowpan_frags);
+ 	if (ret)
+-		goto err_pernet;
++		goto out;
+ 
++	ret = lowpan_frags_sysctl_register();
++	if (ret)
++		goto err_sysctl;
++
++	ret = register_pernet_subsys(&lowpan_frags_ops);
++	if (ret)
++		goto err_pernet;
++out:
+ 	return ret;
+ err_pernet:
+ 	lowpan_frags_sysctl_unregister();
++err_sysctl:
++	inet_frags_fini(&lowpan_frags);
+ 	return ret;
+ }
+ 
+
+commit 093ba72914b696521e4885756a68a3332782c8de
+Author: Eric Dumazet <edumazet@google.com>
+Date:   Sat Mar 31 12:58:44 2018 -0700
+
+    inet: frags: add a pointer to struct netns_frags
+    
+    In order to simplify the API, add a pointer to struct inet_frags.
+    This will allow us to make things less complex.
+    
+    These functions no longer have a struct inet_frags parameter :
+    
+    inet_frag_destroy(struct inet_frag_queue *q  /*, struct inet_frags *f */)
+    inet_frag_put(struct inet_frag_queue *q /*, struct inet_frags *f */)
+    inet_frag_kill(struct inet_frag_queue *q /*, struct inet_frags *f */)
+    inet_frags_exit_net(struct netns_frags *nf /*, struct inet_frags *f */)
+    ip6_expire_frag_queue(struct net *net, struct frag_queue *fq)
+    
+    Signed-off-by: Eric Dumazet <edumazet@google.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ieee802154/6lowpan/reassembly.c b/net/ieee802154/6lowpan/reassembly.c
+index 2aaab4bba429..6badc055555b 100644
+--- a/net/ieee802154/6lowpan/reassembly.c
++++ b/net/ieee802154/6lowpan/reassembly.c
+@@ -94,10 +94,10 @@ static void lowpan_frag_expire(struct timer_list *t)
+ 	if (fq->q.flags & INET_FRAG_COMPLETE)
+ 		goto out;
+ 
+-	inet_frag_kill(&fq->q, &lowpan_frags);
++	inet_frag_kill(&fq->q);
+ out:
+ 	spin_unlock(&fq->q.lock);
+-	inet_frag_put(&fq->q, &lowpan_frags);
++	inet_frag_put(&fq->q);
+ }
+ 
+ static inline struct lowpan_frag_queue *
+@@ -230,7 +230,7 @@ static int lowpan_frag_reasm(struct lowpan_frag_queue *fq, struct sk_buff *prev,
+ 	struct sk_buff *fp, *head = fq->q.fragments;
+ 	int sum_truesize;
+ 
+-	inet_frag_kill(&fq->q, &lowpan_frags);
++	inet_frag_kill(&fq->q);
+ 
+ 	/* Make the one we just received the head. */
+ 	if (prev) {
+@@ -438,7 +438,7 @@ int lowpan_frag_rcv(struct sk_buff *skb, u8 frag_type)
+ 		ret = lowpan_frag_queue(fq, skb, frag_type);
+ 		spin_unlock(&fq->q.lock);
+ 
+-		inet_frag_put(&fq->q, &lowpan_frags);
++		inet_frag_put(&fq->q);
+ 		return ret;
+ 	}
+ 
+@@ -586,13 +586,14 @@ static int __net_init lowpan_frags_init_net(struct net *net)
+ 	ieee802154_lowpan->frags.high_thresh = IPV6_FRAG_HIGH_THRESH;
+ 	ieee802154_lowpan->frags.low_thresh = IPV6_FRAG_LOW_THRESH;
+ 	ieee802154_lowpan->frags.timeout = IPV6_FRAG_TIMEOUT;
++	ieee802154_lowpan->frags.f = &lowpan_frags;
+ 
+ 	res = inet_frags_init_net(&ieee802154_lowpan->frags);
+ 	if (res < 0)
+ 		return res;
+ 	res = lowpan_frags_ns_sysctl_register(net);
+ 	if (res < 0)
+-		inet_frags_exit_net(&ieee802154_lowpan->frags, &lowpan_frags);
++		inet_frags_exit_net(&ieee802154_lowpan->frags);
+ 	return res;
+ }
+ 
+@@ -602,7 +603,7 @@ static void __net_exit lowpan_frags_exit_net(struct net *net)
+ 		net_ieee802154_lowpan(net);
+ 
+ 	lowpan_frags_ns_sysctl_unregister(net);
+-	inet_frags_exit_net(&ieee802154_lowpan->frags, &lowpan_frags);
++	inet_frags_exit_net(&ieee802154_lowpan->frags);
+ }
+ 
+ static struct pernet_operations lowpan_frags_ops = {
+
+commit 787bea7748a76130566f881c2342a0be4127d182
+Author: Eric Dumazet <edumazet@google.com>
+Date:   Sat Mar 31 12:58:43 2018 -0700
+
+    inet: frags: change inet_frags_init_net() return value
+    
+    We will soon initialize one rhashtable per struct netns_frags
+    in inet_frags_init_net().
+    
+    This patch changes the return value to eventually propagate an
+    error.
+    
+    Signed-off-by: Eric Dumazet <edumazet@google.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ieee802154/6lowpan/reassembly.c b/net/ieee802154/6lowpan/reassembly.c
+index 85bf86ad6b18..2aaab4bba429 100644
+--- a/net/ieee802154/6lowpan/reassembly.c
++++ b/net/ieee802154/6lowpan/reassembly.c
+@@ -581,14 +581,19 @@ static int __net_init lowpan_frags_init_net(struct net *net)
+ {
+ 	struct netns_ieee802154_lowpan *ieee802154_lowpan =
+ 		net_ieee802154_lowpan(net);
++	int res;
+ 
+ 	ieee802154_lowpan->frags.high_thresh = IPV6_FRAG_HIGH_THRESH;
+ 	ieee802154_lowpan->frags.low_thresh = IPV6_FRAG_LOW_THRESH;
+ 	ieee802154_lowpan->frags.timeout = IPV6_FRAG_TIMEOUT;
+ 
+-	inet_frags_init_net(&ieee802154_lowpan->frags);
+-
+-	return lowpan_frags_ns_sysctl_register(net);
++	res = inet_frags_init_net(&ieee802154_lowpan->frags);
++	if (res < 0)
++		return res;
++	res = lowpan_frags_ns_sysctl_register(net);
++	if (res < 0)
++		inet_frags_exit_net(&ieee802154_lowpan->frags, &lowpan_frags);
++	return res;
+ }
+ 
+ static void __net_exit lowpan_frags_exit_net(struct net *net)
+
+commit 2f635ceeb22ba13c307236d69795fbb29cfa3e7c
+Author: Kirill Tkhai <ktkhai@virtuozzo.com>
+Date:   Tue Mar 27 18:02:13 2018 +0300
+
+    net: Drop pernet_operations::async
+    
+    Synchronous pernet_operations are not allowed anymore.
+    All are asynchronous. So, drop the structure member.
+    
+    Signed-off-by: Kirill Tkhai <ktkhai@virtuozzo.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ieee802154/6lowpan/reassembly.c b/net/ieee802154/6lowpan/reassembly.c
+index a9ccb1322f69..85bf86ad6b18 100644
+--- a/net/ieee802154/6lowpan/reassembly.c
++++ b/net/ieee802154/6lowpan/reassembly.c
+@@ -603,7 +603,6 @@ static void __net_exit lowpan_frags_exit_net(struct net *net)
+ static struct pernet_operations lowpan_frags_ops = {
+ 	.init = lowpan_frags_init_net,
+ 	.exit = lowpan_frags_exit_net,
+-	.async = true,
+ };
+ 
+ int __init lowpan_net_frag_init(void)
+
+commit 08012631d6277cebe388971cd84fe14d1cc49a00
+Author: Kirill Tkhai <ktkhai@virtuozzo.com>
+Date:   Mon Mar 19 14:45:37 2018 +0300
+
+    net: Convert lowpan_frags_ops
+    
+    These pernet_operations register and unregister sysctl.
+    Also, there is inet_frags_exit_net() called in exit method,
+    which has to be safe after a560002437d3 "net: Fix hlist
+    corruptions in inet_evict_bucket()".
+    
+    Signed-off-by: Kirill Tkhai <ktkhai@virtuozzo.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ieee802154/6lowpan/reassembly.c b/net/ieee802154/6lowpan/reassembly.c
+index 85bf86ad6b18..a9ccb1322f69 100644
+--- a/net/ieee802154/6lowpan/reassembly.c
++++ b/net/ieee802154/6lowpan/reassembly.c
+@@ -603,6 +603,7 @@ static void __net_exit lowpan_frags_exit_net(struct net *net)
+ static struct pernet_operations lowpan_frags_ops = {
+ 	.init = lowpan_frags_init_net,
+ 	.exit = lowpan_frags_exit_net,
++	.async = true,
+ };
+ 
+ int __init lowpan_net_frag_init(void)
+
+commit 78802011fbe34331bdef6f2dfb1634011f0e4c32
+Author: Kees Cook <keescook@chromium.org>
+Date:   Mon Oct 16 17:29:20 2017 -0700
+
+    inet: frags: Convert timers to use timer_setup()
+    
+    In preparation for unconditionally passing the struct timer_list pointer to
+    all timer callbacks, switch to using the new timer_setup() and from_timer()
+    to pass the timer pointer explicitly.
+    
+    Cc: Alexander Aring <alex.aring@gmail.com>
+    Cc: Stefan Schmidt <stefan@osg.samsung.com>
+    Cc: "David S. Miller" <davem@davemloft.net>
+    Cc: Alexey Kuznetsov <kuznet@ms2.inr.ac.ru>
+    Cc: Hideaki YOSHIFUJI <yoshfuji@linux-ipv6.org>
+    Cc: Pablo Neira Ayuso <pablo@netfilter.org>
+    Cc: Jozsef Kadlecsik <kadlec@blackhole.kfki.hu>
+    Cc: Florian Westphal <fw@strlen.de>
+    Cc: linux-wpan@vger.kernel.org
+    Cc: netdev@vger.kernel.org
+    Cc: netfilter-devel@vger.kernel.org
+    Cc: coreteam@netfilter.org
+    Signed-off-by: Kees Cook <keescook@chromium.org>
+    Acked-by: Stefan Schmidt <stefan@osg.samsung.com> # for ieee802154
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ieee802154/6lowpan/reassembly.c b/net/ieee802154/6lowpan/reassembly.c
+index f85b08baff16..85bf86ad6b18 100644
+--- a/net/ieee802154/6lowpan/reassembly.c
++++ b/net/ieee802154/6lowpan/reassembly.c
+@@ -80,12 +80,13 @@ static void lowpan_frag_init(struct inet_frag_queue *q, const void *a)
+ 	fq->daddr = *arg->dst;
+ }
+ 
+-static void lowpan_frag_expire(unsigned long data)
++static void lowpan_frag_expire(struct timer_list *t)
+ {
++	struct inet_frag_queue *frag = from_timer(frag, t, timer);
+ 	struct frag_queue *fq;
+ 	struct net *net;
+ 
+-	fq = container_of((struct inet_frag_queue *)data, struct frag_queue, q);
++	fq = container_of(frag, struct frag_queue, q);
+ 	net = container_of(fq->q.net, struct net, ieee802154_lowpan.frags);
+ 
+ 	spin_lock(&fq->q.lock);
+
+commit 5a63643e583b6a9789d7a225ae076fb4e603991c
+Author: Jesper Dangaard Brouer <brouer@redhat.com>
+Date:   Fri Sep 1 11:26:13 2017 +0200
+
+    Revert "net: fix percpu memory leaks"
+    
+    This reverts commit 1d6119baf0610f813eb9d9580eb4fd16de5b4ceb.
+    
+    After reverting commit 6d7b857d541e ("net: use lib/percpu_counter API
+    for fragmentation mem accounting") then here is no need for this
+    fix-up patch.  As percpu_counter is no longer used, it cannot
+    memory leak it any-longer.
+    
+    Fixes: 6d7b857d541e ("net: use lib/percpu_counter API for fragmentation mem accounting")
+    Fixes: 1d6119baf061 ("net: fix percpu memory leaks")
+    Signed-off-by: Jesper Dangaard Brouer <brouer@redhat.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ieee802154/6lowpan/reassembly.c b/net/ieee802154/6lowpan/reassembly.c
+index 30d875dff6b5..f85b08baff16 100644
+--- a/net/ieee802154/6lowpan/reassembly.c
++++ b/net/ieee802154/6lowpan/reassembly.c
+@@ -580,19 +580,14 @@ static int __net_init lowpan_frags_init_net(struct net *net)
+ {
+ 	struct netns_ieee802154_lowpan *ieee802154_lowpan =
+ 		net_ieee802154_lowpan(net);
+-	int res;
+ 
+ 	ieee802154_lowpan->frags.high_thresh = IPV6_FRAG_HIGH_THRESH;
+ 	ieee802154_lowpan->frags.low_thresh = IPV6_FRAG_LOW_THRESH;
+ 	ieee802154_lowpan->frags.timeout = IPV6_FRAG_TIMEOUT;
+ 
+-	res = inet_frags_init_net(&ieee802154_lowpan->frags);
+-	if (res)
+-		return res;
+-	res = lowpan_frags_ns_sysctl_register(net);
+-	if (res)
+-		inet_frags_uninit_net(&ieee802154_lowpan->frags);
+-	return res;
++	inet_frags_init_net(&ieee802154_lowpan->frags);
++
++	return lowpan_frags_ns_sysctl_register(net);
+ }
+ 
+ static void __net_exit lowpan_frags_exit_net(struct net *net)
+
+commit a72a5e2d34ec2921c0d9a7545093087e4cb90d0a
+Author: Florian Westphal <fw@strlen.de>
+Date:   Tue Jan 5 22:17:55 2016 +0100
+
+    inet: kill unused skb_free op
+    
+    The only user was removed in commit
+    029f7f3b8701cc7a ("netfilter: ipv6: nf_defrag: avoid/free clone operations").
+    
+    Signed-off-by: Florian Westphal <fw@strlen.de>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ieee802154/6lowpan/reassembly.c b/net/ieee802154/6lowpan/reassembly.c
+index 6b437e8760d3..30d875dff6b5 100644
+--- a/net/ieee802154/6lowpan/reassembly.c
++++ b/net/ieee802154/6lowpan/reassembly.c
+@@ -624,7 +624,6 @@ int __init lowpan_net_frag_init(void)
+ 	lowpan_frags.hashfn = lowpan_hashfn;
+ 	lowpan_frags.constructor = lowpan_frag_init;
+ 	lowpan_frags.destructor = NULL;
+-	lowpan_frags.skb_free = NULL;
+ 	lowpan_frags.qsize = sizeof(struct frag_queue);
+ 	lowpan_frags.match = lowpan_frag_match;
+ 	lowpan_frags.frag_expire = lowpan_frag_expire;
+
+commit 1d6119baf0610f813eb9d9580eb4fd16de5b4ceb
+Author: Eric Dumazet <edumazet@google.com>
+Date:   Mon Nov 2 09:03:11 2015 -0800
+
+    net: fix percpu memory leaks
+    
+    This patch fixes following problems :
+    
+    1) percpu_counter_init() can return an error, therefore
+      init_frag_mem_limit() must propagate this error so that
+      inet_frags_init_net() can do the same up to its callers.
+    
+    2) If ip[46]_frags_ns_ctl_register() fail, we must unwind
+       properly and free the percpu_counter.
+    
+    Without this fix, we leave freed object in percpu_counters
+    global list (if CONFIG_HOTPLUG_CPU) leading to crashes.
+    
+    This bug was detected by KASAN and syzkaller tool
+    (http://github.com/google/syzkaller)
+    
+    Fixes: 6d7b857d541e ("net: use lib/percpu_counter API for fragmentation mem accounting")
+    Signed-off-by: Eric Dumazet <edumazet@google.com>
+    Reported-by: Dmitry Vyukov <dvyukov@google.com>
+    Cc: Hannes Frederic Sowa <hannes@stressinduktion.org>
+    Cc: Jesper Dangaard Brouer <brouer@redhat.com>
+    Acked-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ieee802154/6lowpan/reassembly.c b/net/ieee802154/6lowpan/reassembly.c
+index 12e8cf4bda9f..6b437e8760d3 100644
+--- a/net/ieee802154/6lowpan/reassembly.c
++++ b/net/ieee802154/6lowpan/reassembly.c
+@@ -580,14 +580,19 @@ static int __net_init lowpan_frags_init_net(struct net *net)
+ {
+ 	struct netns_ieee802154_lowpan *ieee802154_lowpan =
+ 		net_ieee802154_lowpan(net);
++	int res;
+ 
+ 	ieee802154_lowpan->frags.high_thresh = IPV6_FRAG_HIGH_THRESH;
+ 	ieee802154_lowpan->frags.low_thresh = IPV6_FRAG_LOW_THRESH;
+ 	ieee802154_lowpan->frags.timeout = IPV6_FRAG_TIMEOUT;
+ 
+-	inet_frags_init_net(&ieee802154_lowpan->frags);
+-
+-	return lowpan_frags_ns_sysctl_register(net);
++	res = inet_frags_init_net(&ieee802154_lowpan->frags);
++	if (res)
++		return res;
++	res = lowpan_frags_ns_sysctl_register(net);
++	if (res)
++		inet_frags_uninit_net(&ieee802154_lowpan->frags);
++	return res;
+ }
+ 
+ static void __net_exit lowpan_frags_exit_net(struct net *net)
+
+commit 72a5e6bb5120d6464c9e7855c5a22555ede819dc
+Author: Alexander Aring <alex.aring@gmail.com>
+Date:   Wed Sep 2 14:21:25 2015 +0200
+
+    ieee820154: 6lowpan: dispatch evaluation rework
+    
+    This patch complete reworks the evaluation of 6lowpan dispatch value by
+    introducing a receive handler mechanism for each dispatch value.
+    
+    A list of changes:
+    
+     - Doing uncompression on-the-fly when FRAG1 is received, this require
+       some special handling for 802.15.4 lltype in generic 6lowpan branch
+       for setting the payload length correct.
+     - Fix dispatch mask for fragmentation.
+     - Add IPv6 dispatch evaluation for FRAG1.
+     - Add skb_unshare for dispatch which might manipulate the skb data
+       buffer.
+    
+    Cc: Jukka Rissanen <jukka.rissanen@linux.intel.com>
+    Reviewed-by: Stefan Schmidt <stefan@osg.samsung.com>
+    Signed-off-by: Alexander Aring <alex.aring@gmail.com>
+    Signed-off-by: Marcel Holtmann <marcel@holtmann.org>
+
+diff --git a/net/ieee802154/6lowpan/reassembly.c b/net/ieee802154/6lowpan/reassembly.c
+index 0fc3350ace5a..12e8cf4bda9f 100644
+--- a/net/ieee802154/6lowpan/reassembly.c
++++ b/net/ieee802154/6lowpan/reassembly.c
+@@ -32,17 +32,6 @@
+ 
+ static const char lowpan_frags_cache_name[] = "lowpan-frags";
+ 
+-struct lowpan_frag_info {
+-	u16 d_tag;
+-	u16 d_size;
+-	u8 d_offset;
+-};
+-
+-static struct lowpan_frag_info *lowpan_cb(struct sk_buff *skb)
+-{
+-	return (struct lowpan_frag_info *)skb->cb;
+-}
+-
+ static struct inet_frags lowpan_frags;
+ 
+ static int lowpan_frag_reasm(struct lowpan_frag_queue *fq,
+@@ -111,7 +100,7 @@ static void lowpan_frag_expire(unsigned long data)
+ }
+ 
+ static inline struct lowpan_frag_queue *
+-fq_find(struct net *net, const struct lowpan_frag_info *frag_info,
++fq_find(struct net *net, const struct lowpan_802154_cb *cb,
+ 	const struct ieee802154_addr *src,
+ 	const struct ieee802154_addr *dst)
+ {
+@@ -121,12 +110,12 @@ fq_find(struct net *net, const struct lowpan_frag_info *frag_info,
+ 	struct netns_ieee802154_lowpan *ieee802154_lowpan =
+ 		net_ieee802154_lowpan(net);
+ 
+-	arg.tag = frag_info->d_tag;
+-	arg.d_size = frag_info->d_size;
++	arg.tag = cb->d_tag;
++	arg.d_size = cb->d_size;
+ 	arg.src = src;
+ 	arg.dst = dst;
+ 
+-	hash = lowpan_hash_frag(frag_info->d_tag, frag_info->d_size, src, dst);
++	hash = lowpan_hash_frag(cb->d_tag, cb->d_size, src, dst);
+ 
+ 	q = inet_frag_find(&ieee802154_lowpan->frags,
+ 			   &lowpan_frags, &arg, hash);
+@@ -138,7 +127,7 @@ fq_find(struct net *net, const struct lowpan_frag_info *frag_info,
+ }
+ 
+ static int lowpan_frag_queue(struct lowpan_frag_queue *fq,
+-			     struct sk_buff *skb, const u8 frag_type)
++			     struct sk_buff *skb, u8 frag_type)
+ {
+ 	struct sk_buff *prev, *next;
+ 	struct net_device *ldev;
+@@ -147,8 +136,8 @@ static int lowpan_frag_queue(struct lowpan_frag_queue *fq,
+ 	if (fq->q.flags & INET_FRAG_COMPLETE)
+ 		goto err;
+ 
+-	offset = lowpan_cb(skb)->d_offset << 3;
+-	end = lowpan_cb(skb)->d_size;
++	offset = lowpan_802154_cb(skb)->d_offset << 3;
++	end = lowpan_802154_cb(skb)->d_size;
+ 
+ 	/* Is this the final fragment? */
+ 	if (offset + skb->len == end) {
+@@ -174,13 +163,16 @@ static int lowpan_frag_queue(struct lowpan_frag_queue *fq,
+ 	 * this fragment, right?
+ 	 */
+ 	prev = fq->q.fragments_tail;
+-	if (!prev || lowpan_cb(prev)->d_offset < lowpan_cb(skb)->d_offset) {
++	if (!prev ||
++	    lowpan_802154_cb(prev)->d_offset <
++	    lowpan_802154_cb(skb)->d_offset) {
+ 		next = NULL;
+ 		goto found;
+ 	}
+ 	prev = NULL;
+ 	for (next = fq->q.fragments; next != NULL; next = next->next) {
+-		if (lowpan_cb(next)->d_offset >= lowpan_cb(skb)->d_offset)
++		if (lowpan_802154_cb(next)->d_offset >=
++		    lowpan_802154_cb(skb)->d_offset)
+ 			break;	/* bingo! */
+ 		prev = next;
+ 	}
+@@ -200,13 +192,10 @@ static int lowpan_frag_queue(struct lowpan_frag_queue *fq,
+ 		skb->dev = NULL;
+ 
+ 	fq->q.stamp = skb->tstamp;
+-	if (frag_type == LOWPAN_DISPATCH_FRAG1) {
+-		/* Calculate uncomp. 6lowpan header to estimate full size */
+-		fq->q.meat += lowpan_uncompress_size(skb, NULL);
++	if (frag_type == LOWPAN_DISPATCH_FRAG1)
+ 		fq->q.flags |= INET_FRAG_FIRST_IN;
+-	} else {
+-		fq->q.meat += skb->len;
+-	}
++
++	fq->q.meat += skb->len;
+ 	add_frag_mem_limit(fq->q.net, skb->truesize);
+ 
+ 	if (fq->q.flags == (INET_FRAG_FIRST_IN | INET_FRAG_LAST_IN) &&
+@@ -325,24 +314,87 @@ static int lowpan_frag_reasm(struct lowpan_frag_queue *fq, struct sk_buff *prev,
+ 	return -1;
+ }
+ 
+-static int lowpan_get_frag_info(struct sk_buff *skb, const u8 frag_type,
+-				struct lowpan_frag_info *frag_info)
++static int lowpan_frag_rx_handlers_result(struct sk_buff *skb,
++					  lowpan_rx_result res)
++{
++	switch (res) {
++	case RX_QUEUED:
++		return NET_RX_SUCCESS;
++	case RX_CONTINUE:
++		/* nobody cared about this packet */
++		net_warn_ratelimited("%s: received unknown dispatch\n",
++				     __func__);
++
++		/* fall-through */
++	default:
++		/* all others failure */
++		return NET_RX_DROP;
++	}
++}
++
++static lowpan_rx_result lowpan_frag_rx_h_iphc(struct sk_buff *skb)
++{
++	int ret;
++
++	if (!lowpan_is_iphc(*skb_network_header(skb)))
++		return RX_CONTINUE;
++
++	ret = lowpan_iphc_decompress(skb);
++	if (ret < 0)
++		return RX_DROP;
++
++	return RX_QUEUED;
++}
++
++static int lowpan_invoke_frag_rx_handlers(struct sk_buff *skb)
++{
++	lowpan_rx_result res;
++
++#define CALL_RXH(rxh)			\
++	do {				\
++		res = rxh(skb);	\
++		if (res != RX_CONTINUE)	\
++			goto rxh_next;	\
++	} while (0)
++
++	/* likely at first */
++	CALL_RXH(lowpan_frag_rx_h_iphc);
++	CALL_RXH(lowpan_rx_h_ipv6);
++
++rxh_next:
++	return lowpan_frag_rx_handlers_result(skb, res);
++#undef CALL_RXH
++}
++
++#define LOWPAN_FRAG_DGRAM_SIZE_HIGH_MASK	0x07
++#define LOWPAN_FRAG_DGRAM_SIZE_HIGH_SHIFT	8
++
++static int lowpan_get_cb(struct sk_buff *skb, u8 frag_type,
++			 struct lowpan_802154_cb *cb)
+ {
+ 	bool fail;
+-	u8 pattern = 0, low = 0;
++	u8 high = 0, low = 0;
+ 	__be16 d_tag = 0;
+ 
+-	fail = lowpan_fetch_skb(skb, &pattern, 1);
++	fail = lowpan_fetch_skb(skb, &high, 1);
+ 	fail |= lowpan_fetch_skb(skb, &low, 1);
+-	frag_info->d_size = (pattern & 7) << 8 | low;
++	/* remove the dispatch value and use first three bits as high value
++	 * for the datagram size
++	 */
++	cb->d_size = (high & LOWPAN_FRAG_DGRAM_SIZE_HIGH_MASK) <<
++		LOWPAN_FRAG_DGRAM_SIZE_HIGH_SHIFT | low;
+ 	fail |= lowpan_fetch_skb(skb, &d_tag, 2);
+-	frag_info->d_tag = ntohs(d_tag);
++	cb->d_tag = ntohs(d_tag);
+ 
+ 	if (frag_type == LOWPAN_DISPATCH_FRAGN) {
+-		fail |= lowpan_fetch_skb(skb, &frag_info->d_offset, 1);
++		fail |= lowpan_fetch_skb(skb, &cb->d_offset, 1);
+ 	} else {
+ 		skb_reset_network_header(skb);
+-		frag_info->d_offset = 0;
++		cb->d_offset = 0;
++		/* check if datagram_size has ipv6hdr on FRAG1 */
++		fail |= cb->d_size < sizeof(struct ipv6hdr);
++		/* check if we can dereference the dispatch value */
++		fail |= !skb->len;
+ 	}
+ 
+ 	if (unlikely(fail))
+@@ -351,27 +403,33 @@ static int lowpan_get_frag_info(struct sk_buff *skb, const u8 frag_type,
+ 	return 0;
+ }
+ 
+-int lowpan_frag_rcv(struct sk_buff *skb, const u8 frag_type)
++int lowpan_frag_rcv(struct sk_buff *skb, u8 frag_type)
+ {
+ 	struct lowpan_frag_queue *fq;
+ 	struct net *net = dev_net(skb->dev);
+-	struct lowpan_frag_info *frag_info = lowpan_cb(skb);
+-	struct ieee802154_addr source, dest;
++	struct lowpan_802154_cb *cb = lowpan_802154_cb(skb);
++	struct ieee802154_hdr hdr;
+ 	int err;
+ 
+-	source = mac_cb(skb)->source;
+-	dest = mac_cb(skb)->dest;
++	if (ieee802154_hdr_peek_addrs(skb, &hdr) < 0)
++		goto err;
+ 
+-	err = lowpan_get_frag_info(skb, frag_type, frag_info);
++	err = lowpan_get_cb(skb, frag_type, cb);
+ 	if (err < 0)
+ 		goto err;
+ 
+-	if (frag_info->d_size > IPV6_MIN_MTU) {
++	if (frag_type == LOWPAN_DISPATCH_FRAG1) {
++		err = lowpan_invoke_frag_rx_handlers(skb);
++		if (err == NET_RX_DROP)
++			goto err;
++	}
++
++	if (cb->d_size > IPV6_MIN_MTU) {
+ 		net_warn_ratelimited("lowpan_frag_rcv: datagram size exceeds MTU\n");
+ 		goto err;
+ 	}
+ 
+-	fq = fq_find(net, frag_info, &source, &dest);
++	fq = fq_find(net, cb, &hdr.source, &hdr.dest);
+ 	if (fq != NULL) {
+ 		int ret;
+ 
+
+commit 348a882ea745039295e721ef00f1b46307fb1c88
+Author: Alexander Aring <alex.aring@gmail.com>
+Date:   Wed Sep 2 14:21:20 2015 +0200
+
+    ieee802154: 6lowpan: remove EXPORT_SYMBOL
+    
+    This function is used internally inside of ieee802154 6lowpan module
+    only and not outside of any other module. We don't need to export this
+    function then.
+    
+    Reviewed-by: Stefan Schmidt <stefan@osg.samsung.com>
+    Signed-off-by: Alexander Aring <alex.aring@gmail.com>
+    Signed-off-by: Marcel Holtmann <marcel@holtmann.org>
+
+diff --git a/net/ieee802154/6lowpan/reassembly.c b/net/ieee802154/6lowpan/reassembly.c
+index 60d6df75aee9..0fc3350ace5a 100644
+--- a/net/ieee802154/6lowpan/reassembly.c
++++ b/net/ieee802154/6lowpan/reassembly.c
+@@ -387,7 +387,6 @@ int lowpan_frag_rcv(struct sk_buff *skb, const u8 frag_type)
+ 	kfree_skb(skb);
+ 	return -1;
+ }
+-EXPORT_SYMBOL(lowpan_frag_rcv);
+ 
+ #ifdef CONFIG_SYSCTL
+ static int zero;
+
+commit f4606583fd8dcf15a07060dbd45a3e369144a934
+Author: Alexander Aring <alex.aring@gmail.com>
+Date:   Wed Sep 2 14:21:16 2015 +0200
+
+    ieee802154: 6lowpan: change dev vars to wdev and ldev
+    
+    Inside the IEEE 802.15.4 6LoWPAN subsystem we use two interfaces which
+    are wpan and lowpan interfaces. Instead of using always the variable
+    name "dev" for both we rename the "dev" variable to wdev which means the
+    wpan net_device and ldev which means a lowpan net_device. This avoids
+    confusing and always looking back to see which net_device is meant by
+    the variable name "dev".
+    
+    Reviewed-by: Stefan Schmidt <stefan@osg.samsung.com>
+    Signed-off-by: Alexander Aring <alex.aring@gmail.com>
+    Signed-off-by: Marcel Holtmann <marcel@holtmann.org>
+
+diff --git a/net/ieee802154/6lowpan/reassembly.c b/net/ieee802154/6lowpan/reassembly.c
+index 214d44aef35b..60d6df75aee9 100644
+--- a/net/ieee802154/6lowpan/reassembly.c
++++ b/net/ieee802154/6lowpan/reassembly.c
+@@ -46,7 +46,7 @@ static struct lowpan_frag_info *lowpan_cb(struct sk_buff *skb)
+ static struct inet_frags lowpan_frags;
+ 
+ static int lowpan_frag_reasm(struct lowpan_frag_queue *fq,
+-			     struct sk_buff *prev, struct net_device *dev);
++			     struct sk_buff *prev, struct net_device *ldev);
+ 
+ static unsigned int lowpan_hash_frag(u16 tag, u16 d_size,
+ 				     const struct ieee802154_addr *saddr,
+@@ -141,7 +141,7 @@ static int lowpan_frag_queue(struct lowpan_frag_queue *fq,
+ 			     struct sk_buff *skb, const u8 frag_type)
+ {
+ 	struct sk_buff *prev, *next;
+-	struct net_device *dev;
++	struct net_device *ldev;
+ 	int end, offset;
+ 
+ 	if (fq->q.flags & INET_FRAG_COMPLETE)
+@@ -195,8 +195,8 @@ static int lowpan_frag_queue(struct lowpan_frag_queue *fq,
+ 	else
+ 		fq->q.fragments = skb;
+ 
+-	dev = skb->dev;
+-	if (dev)
++	ldev = skb->dev;
++	if (ldev)
+ 		skb->dev = NULL;
+ 
+ 	fq->q.stamp = skb->tstamp;
+@@ -215,7 +215,7 @@ static int lowpan_frag_queue(struct lowpan_frag_queue *fq,
+ 		unsigned long orefdst = skb->_skb_refdst;
+ 
+ 		skb->_skb_refdst = 0UL;
+-		res = lowpan_frag_reasm(fq, prev, dev);
++		res = lowpan_frag_reasm(fq, prev, ldev);
+ 		skb->_skb_refdst = orefdst;
+ 		return res;
+ 	}
+@@ -235,7 +235,7 @@ static int lowpan_frag_queue(struct lowpan_frag_queue *fq,
+  *	the last and the first frames arrived and all the bits are here.
+  */
+ static int lowpan_frag_reasm(struct lowpan_frag_queue *fq, struct sk_buff *prev,
+-			     struct net_device *dev)
++			     struct net_device *ldev)
+ {
+ 	struct sk_buff *fp, *head = fq->q.fragments;
+ 	int sum_truesize;
+@@ -313,7 +313,7 @@ static int lowpan_frag_reasm(struct lowpan_frag_queue *fq, struct sk_buff *prev,
+ 	sub_frag_mem_limit(fq->q.net, sum_truesize);
+ 
+ 	head->next = NULL;
+-	head->dev = dev;
++	head->dev = ldev;
+ 	head->tstamp = fq->q.stamp;
+ 
+ 	fq->q.fragments = NULL;
+
+commit 0e60d245a0be7fdbb723607f1d6621007916b252
+Author: Florian Westphal <fw@strlen.de>
+Date:   Thu Jul 23 12:05:38 2015 +0200
+
+    inet: frag: change *_frag_mem_limit functions to take netns_frags as argument
+    
+    Followup patch will call it after inet_frag_queue was freed, so q->net
+    doesn't work anymore (but netf = q->net; free(q); mem_limit(netf) would).
+    
+    Tested-by: Frank Schreuder <fschreuder@transip.nl>
+    Signed-off-by: Florian Westphal <fw@strlen.de>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ieee802154/6lowpan/reassembly.c b/net/ieee802154/6lowpan/reassembly.c
+index f46e4d1306f2..214d44aef35b 100644
+--- a/net/ieee802154/6lowpan/reassembly.c
++++ b/net/ieee802154/6lowpan/reassembly.c
+@@ -207,7 +207,7 @@ static int lowpan_frag_queue(struct lowpan_frag_queue *fq,
+ 	} else {
+ 		fq->q.meat += skb->len;
+ 	}
+-	add_frag_mem_limit(&fq->q, skb->truesize);
++	add_frag_mem_limit(fq->q.net, skb->truesize);
+ 
+ 	if (fq->q.flags == (INET_FRAG_FIRST_IN | INET_FRAG_LAST_IN) &&
+ 	    fq->q.meat == fq->q.len) {
+@@ -287,7 +287,7 @@ static int lowpan_frag_reasm(struct lowpan_frag_queue *fq, struct sk_buff *prev,
+ 		clone->data_len = clone->len;
+ 		head->data_len -= clone->len;
+ 		head->len -= clone->len;
+-		add_frag_mem_limit(&fq->q, clone->truesize);
++		add_frag_mem_limit(fq->q.net, clone->truesize);
+ 	}
+ 
+ 	WARN_ON(head == NULL);
+@@ -310,7 +310,7 @@ static int lowpan_frag_reasm(struct lowpan_frag_queue *fq, struct sk_buff *prev,
+ 		}
+ 		fp = next;
+ 	}
+-	sub_frag_mem_limit(&fq->q, sum_truesize);
++	sub_frag_mem_limit(fq->q.net, sum_truesize);
+ 
+ 	head->next = NULL;
+ 	head->dev = dev;
+
+commit 8691ee592c9299847b28350692eda1d5d6990581
+Author: Alexander Aring <alex.aring@gmail.com>
+Date:   Sun Jan 4 17:10:54 2015 +0100
+
+    ieee802154: 6lowpan: rename internal header
+    
+    This patch renames the internal header for af802154. This naming
+    convention is like ieee802154_i.h in mac802154 and avoids naming
+    confusing with the global af802154 header. Furthermore this header
+    contains more ieee802154 specific definitions.
+    
+    Signed-off-by: Alexander Aring <alex.aring@gmail.com>
+    Signed-off-by: Marcel Holtmann <marcel@holtmann.org>
+
+diff --git a/net/ieee802154/6lowpan/reassembly.c b/net/ieee802154/6lowpan/reassembly.c
+index 9d980ed3ffe2..f46e4d1306f2 100644
+--- a/net/ieee802154/6lowpan/reassembly.c
++++ b/net/ieee802154/6lowpan/reassembly.c
+@@ -28,7 +28,7 @@
+ #include <net/ipv6.h>
+ #include <net/inet_frag.h>
+ 
+-#include "reassembly.h"
++#include "6lowpan_i.h"
+ 
+ static const char lowpan_frags_cache_name[] = "lowpan-frags";
+ 
+
+commit ea81ac2e7050798109356150ea16e71622a5c329
+Author: Alexander Aring <alex.aring@gmail.com>
+Date:   Sun Jan 4 17:10:53 2015 +0100
+
+    ieee802154: create 6lowpan sub-directory
+    
+    This patch creates an 6lowpan sub-directory inside ieee802154.
+    Additional we move all ieee802154 6lowpan relevant files into
+    this sub-directory instead of placing the 6lowpan related files
+    inside ieee802154.
+    
+    Signed-off-by: Alexander Aring <alex.aring@gmail.com>
+    Signed-off-by: Marcel Holtmann <marcel@holtmann.org>
+
+diff --git a/net/ieee802154/6lowpan/reassembly.c b/net/ieee802154/6lowpan/reassembly.c
+new file mode 100644
+index 000000000000..9d980ed3ffe2
+--- /dev/null
++++ b/net/ieee802154/6lowpan/reassembly.c
+@@ -0,0 +1,585 @@
++/*	6LoWPAN fragment reassembly
++ *
++ *
++ *	Authors:
++ *	Alexander Aring		<aar@pengutronix.de>
++ *
++ *	Based on: net/ipv6/reassembly.c
++ *
++ *	This program is free software; you can redistribute it and/or
++ *	modify it under the terms of the GNU General Public License
++ *	as published by the Free Software Foundation; either version
++ *	2 of the License, or (at your option) any later version.
++ */
++
++#define pr_fmt(fmt) "6LoWPAN: " fmt
++
++#include <linux/net.h>
++#include <linux/list.h>
++#include <linux/netdevice.h>
++#include <linux/random.h>
++#include <linux/jhash.h>
++#include <linux/skbuff.h>
++#include <linux/slab.h>
++#include <linux/export.h>
++
++#include <net/ieee802154_netdev.h>
++#include <net/6lowpan.h>
++#include <net/ipv6.h>
++#include <net/inet_frag.h>
++
++#include "reassembly.h"
++
++static const char lowpan_frags_cache_name[] = "lowpan-frags";
++
++struct lowpan_frag_info {
++	u16 d_tag;
++	u16 d_size;
++	u8 d_offset;
++};
++
++static struct lowpan_frag_info *lowpan_cb(struct sk_buff *skb)
++{
++	return (struct lowpan_frag_info *)skb->cb;
++}
++
++static struct inet_frags lowpan_frags;
++
++static int lowpan_frag_reasm(struct lowpan_frag_queue *fq,
++			     struct sk_buff *prev, struct net_device *dev);
++
++static unsigned int lowpan_hash_frag(u16 tag, u16 d_size,
++				     const struct ieee802154_addr *saddr,
++				     const struct ieee802154_addr *daddr)
++{
++	net_get_random_once(&lowpan_frags.rnd, sizeof(lowpan_frags.rnd));
++	return jhash_3words(ieee802154_addr_hash(saddr),
++			    ieee802154_addr_hash(daddr),
++			    (__force u32)(tag + (d_size << 16)),
++			    lowpan_frags.rnd);
++}
++
++static unsigned int lowpan_hashfn(const struct inet_frag_queue *q)
++{
++	const struct lowpan_frag_queue *fq;
++
++	fq = container_of(q, struct lowpan_frag_queue, q);
++	return lowpan_hash_frag(fq->tag, fq->d_size, &fq->saddr, &fq->daddr);
++}
++
++static bool lowpan_frag_match(const struct inet_frag_queue *q, const void *a)
++{
++	const struct lowpan_frag_queue *fq;
++	const struct lowpan_create_arg *arg = a;
++
++	fq = container_of(q, struct lowpan_frag_queue, q);
++	return	fq->tag == arg->tag && fq->d_size == arg->d_size &&
++		ieee802154_addr_equal(&fq->saddr, arg->src) &&
++		ieee802154_addr_equal(&fq->daddr, arg->dst);
++}
++
++static void lowpan_frag_init(struct inet_frag_queue *q, const void *a)
++{
++	const struct lowpan_create_arg *arg = a;
++	struct lowpan_frag_queue *fq;
++
++	fq = container_of(q, struct lowpan_frag_queue, q);
++
++	fq->tag = arg->tag;
++	fq->d_size = arg->d_size;
++	fq->saddr = *arg->src;
++	fq->daddr = *arg->dst;
++}
++
++static void lowpan_frag_expire(unsigned long data)
++{
++	struct frag_queue *fq;
++	struct net *net;
++
++	fq = container_of((struct inet_frag_queue *)data, struct frag_queue, q);
++	net = container_of(fq->q.net, struct net, ieee802154_lowpan.frags);
++
++	spin_lock(&fq->q.lock);
++
++	if (fq->q.flags & INET_FRAG_COMPLETE)
++		goto out;
++
++	inet_frag_kill(&fq->q, &lowpan_frags);
++out:
++	spin_unlock(&fq->q.lock);
++	inet_frag_put(&fq->q, &lowpan_frags);
++}
++
++static inline struct lowpan_frag_queue *
++fq_find(struct net *net, const struct lowpan_frag_info *frag_info,
++	const struct ieee802154_addr *src,
++	const struct ieee802154_addr *dst)
++{
++	struct inet_frag_queue *q;
++	struct lowpan_create_arg arg;
++	unsigned int hash;
++	struct netns_ieee802154_lowpan *ieee802154_lowpan =
++		net_ieee802154_lowpan(net);
++
++	arg.tag = frag_info->d_tag;
++	arg.d_size = frag_info->d_size;
++	arg.src = src;
++	arg.dst = dst;
++
++	hash = lowpan_hash_frag(frag_info->d_tag, frag_info->d_size, src, dst);
++
++	q = inet_frag_find(&ieee802154_lowpan->frags,
++			   &lowpan_frags, &arg, hash);
++	if (IS_ERR_OR_NULL(q)) {
++		inet_frag_maybe_warn_overflow(q, pr_fmt());
++		return NULL;
++	}
++	return container_of(q, struct lowpan_frag_queue, q);
++}
++
++static int lowpan_frag_queue(struct lowpan_frag_queue *fq,
++			     struct sk_buff *skb, const u8 frag_type)
++{
++	struct sk_buff *prev, *next;
++	struct net_device *dev;
++	int end, offset;
++
++	if (fq->q.flags & INET_FRAG_COMPLETE)
++		goto err;
++
++	offset = lowpan_cb(skb)->d_offset << 3;
++	end = lowpan_cb(skb)->d_size;
++
++	/* Is this the final fragment? */
++	if (offset + skb->len == end) {
++		/* If we already have some bits beyond end
++		 * or have different end, the segment is corrupted.
++		 */
++		if (end < fq->q.len ||
++		    ((fq->q.flags & INET_FRAG_LAST_IN) && end != fq->q.len))
++			goto err;
++		fq->q.flags |= INET_FRAG_LAST_IN;
++		fq->q.len = end;
++	} else {
++		if (end > fq->q.len) {
++			/* Some bits beyond end -> corruption. */
++			if (fq->q.flags & INET_FRAG_LAST_IN)
++				goto err;
++			fq->q.len = end;
++		}
++	}
++
++	/* Find out which fragments are in front and at the back of us
++	 * in the chain of fragments so far.  We must know where to put
++	 * this fragment, right?
++	 */
++	prev = fq->q.fragments_tail;
++	if (!prev || lowpan_cb(prev)->d_offset < lowpan_cb(skb)->d_offset) {
++		next = NULL;
++		goto found;
++	}
++	prev = NULL;
++	for (next = fq->q.fragments; next != NULL; next = next->next) {
++		if (lowpan_cb(next)->d_offset >= lowpan_cb(skb)->d_offset)
++			break;	/* bingo! */
++		prev = next;
++	}
++
++found:
++	/* Insert this fragment in the chain of fragments. */
++	skb->next = next;
++	if (!next)
++		fq->q.fragments_tail = skb;
++	if (prev)
++		prev->next = skb;
++	else
++		fq->q.fragments = skb;
++
++	dev = skb->dev;
++	if (dev)
++		skb->dev = NULL;
++
++	fq->q.stamp = skb->tstamp;
++	if (frag_type == LOWPAN_DISPATCH_FRAG1) {
++		/* Calculate uncomp. 6lowpan header to estimate full size */
++		fq->q.meat += lowpan_uncompress_size(skb, NULL);
++		fq->q.flags |= INET_FRAG_FIRST_IN;
++	} else {
++		fq->q.meat += skb->len;
++	}
++	add_frag_mem_limit(&fq->q, skb->truesize);
++
++	if (fq->q.flags == (INET_FRAG_FIRST_IN | INET_FRAG_LAST_IN) &&
++	    fq->q.meat == fq->q.len) {
++		int res;
++		unsigned long orefdst = skb->_skb_refdst;
++
++		skb->_skb_refdst = 0UL;
++		res = lowpan_frag_reasm(fq, prev, dev);
++		skb->_skb_refdst = orefdst;
++		return res;
++	}
++
++	return -1;
++err:
++	kfree_skb(skb);
++	return -1;
++}
++
++/*	Check if this packet is complete.
++ *	Returns NULL on failure by any reason, and pointer
++ *	to current nexthdr field in reassembled frame.
++ *
++ *	It is called with locked fq, and caller must check that
++ *	queue is eligible for reassembly i.e. it is not COMPLETE,
++ *	the last and the first frames arrived and all the bits are here.
++ */
++static int lowpan_frag_reasm(struct lowpan_frag_queue *fq, struct sk_buff *prev,
++			     struct net_device *dev)
++{
++	struct sk_buff *fp, *head = fq->q.fragments;
++	int sum_truesize;
++
++	inet_frag_kill(&fq->q, &lowpan_frags);
++
++	/* Make the one we just received the head. */
++	if (prev) {
++		head = prev->next;
++		fp = skb_clone(head, GFP_ATOMIC);
++
++		if (!fp)
++			goto out_oom;
++
++		fp->next = head->next;
++		if (!fp->next)
++			fq->q.fragments_tail = fp;
++		prev->next = fp;
++
++		skb_morph(head, fq->q.fragments);
++		head->next = fq->q.fragments->next;
++
++		consume_skb(fq->q.fragments);
++		fq->q.fragments = head;
++	}
++
++	/* Head of list must not be cloned. */
++	if (skb_unclone(head, GFP_ATOMIC))
++		goto out_oom;
++
++	/* If the first fragment is fragmented itself, we split
++	 * it to two chunks: the first with data and paged part
++	 * and the second, holding only fragments.
++	 */
++	if (skb_has_frag_list(head)) {
++		struct sk_buff *clone;
++		int i, plen = 0;
++
++		clone = alloc_skb(0, GFP_ATOMIC);
++		if (!clone)
++			goto out_oom;
++		clone->next = head->next;
++		head->next = clone;
++		skb_shinfo(clone)->frag_list = skb_shinfo(head)->frag_list;
++		skb_frag_list_init(head);
++		for (i = 0; i < skb_shinfo(head)->nr_frags; i++)
++			plen += skb_frag_size(&skb_shinfo(head)->frags[i]);
++		clone->len = head->data_len - plen;
++		clone->data_len = clone->len;
++		head->data_len -= clone->len;
++		head->len -= clone->len;
++		add_frag_mem_limit(&fq->q, clone->truesize);
++	}
++
++	WARN_ON(head == NULL);
++
++	sum_truesize = head->truesize;
++	for (fp = head->next; fp;) {
++		bool headstolen;
++		int delta;
++		struct sk_buff *next = fp->next;
++
++		sum_truesize += fp->truesize;
++		if (skb_try_coalesce(head, fp, &headstolen, &delta)) {
++			kfree_skb_partial(fp, headstolen);
++		} else {
++			if (!skb_shinfo(head)->frag_list)
++				skb_shinfo(head)->frag_list = fp;
++			head->data_len += fp->len;
++			head->len += fp->len;
++			head->truesize += fp->truesize;
++		}
++		fp = next;
++	}
++	sub_frag_mem_limit(&fq->q, sum_truesize);
++
++	head->next = NULL;
++	head->dev = dev;
++	head->tstamp = fq->q.stamp;
++
++	fq->q.fragments = NULL;
++	fq->q.fragments_tail = NULL;
++
++	return 1;
++out_oom:
++	net_dbg_ratelimited("lowpan_frag_reasm: no memory for reassembly\n");
++	return -1;
++}
++
++static int lowpan_get_frag_info(struct sk_buff *skb, const u8 frag_type,
++				struct lowpan_frag_info *frag_info)
++{
++	bool fail;
++	u8 pattern = 0, low = 0;
++	__be16 d_tag = 0;
++
++	fail = lowpan_fetch_skb(skb, &pattern, 1);
++	fail |= lowpan_fetch_skb(skb, &low, 1);
++	frag_info->d_size = (pattern & 7) << 8 | low;
++	fail |= lowpan_fetch_skb(skb, &d_tag, 2);
++	frag_info->d_tag = ntohs(d_tag);
++
++	if (frag_type == LOWPAN_DISPATCH_FRAGN) {
++		fail |= lowpan_fetch_skb(skb, &frag_info->d_offset, 1);
++	} else {
++		skb_reset_network_header(skb);
++		frag_info->d_offset = 0;
++	}
++
++	if (unlikely(fail))
++		return -EIO;
++
++	return 0;
++}
++
++int lowpan_frag_rcv(struct sk_buff *skb, const u8 frag_type)
++{
++	struct lowpan_frag_queue *fq;
++	struct net *net = dev_net(skb->dev);
++	struct lowpan_frag_info *frag_info = lowpan_cb(skb);
++	struct ieee802154_addr source, dest;
++	int err;
++
++	source = mac_cb(skb)->source;
++	dest = mac_cb(skb)->dest;
++
++	err = lowpan_get_frag_info(skb, frag_type, frag_info);
++	if (err < 0)
++		goto err;
++
++	if (frag_info->d_size > IPV6_MIN_MTU) {
++		net_warn_ratelimited("lowpan_frag_rcv: datagram size exceeds MTU\n");
++		goto err;
++	}
++
++	fq = fq_find(net, frag_info, &source, &dest);
++	if (fq != NULL) {
++		int ret;
++
++		spin_lock(&fq->q.lock);
++		ret = lowpan_frag_queue(fq, skb, frag_type);
++		spin_unlock(&fq->q.lock);
++
++		inet_frag_put(&fq->q, &lowpan_frags);
++		return ret;
++	}
++
++err:
++	kfree_skb(skb);
++	return -1;
++}
++EXPORT_SYMBOL(lowpan_frag_rcv);
++
++#ifdef CONFIG_SYSCTL
++static int zero;
++
++static struct ctl_table lowpan_frags_ns_ctl_table[] = {
++	{
++		.procname	= "6lowpanfrag_high_thresh",
++		.data		= &init_net.ieee802154_lowpan.frags.high_thresh,
++		.maxlen		= sizeof(int),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec_minmax,
++		.extra1		= &init_net.ieee802154_lowpan.frags.low_thresh
++	},
++	{
++		.procname	= "6lowpanfrag_low_thresh",
++		.data		= &init_net.ieee802154_lowpan.frags.low_thresh,
++		.maxlen		= sizeof(int),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec_minmax,
++		.extra1		= &zero,
++		.extra2		= &init_net.ieee802154_lowpan.frags.high_thresh
++	},
++	{
++		.procname	= "6lowpanfrag_time",
++		.data		= &init_net.ieee802154_lowpan.frags.timeout,
++		.maxlen		= sizeof(int),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec_jiffies,
++	},
++	{ }
++};
++
++/* secret interval has been deprecated */
++static int lowpan_frags_secret_interval_unused;
++static struct ctl_table lowpan_frags_ctl_table[] = {
++	{
++		.procname	= "6lowpanfrag_secret_interval",
++		.data		= &lowpan_frags_secret_interval_unused,
++		.maxlen		= sizeof(int),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec_jiffies,
++	},
++	{ }
++};
++
++static int __net_init lowpan_frags_ns_sysctl_register(struct net *net)
++{
++	struct ctl_table *table;
++	struct ctl_table_header *hdr;
++	struct netns_ieee802154_lowpan *ieee802154_lowpan =
++		net_ieee802154_lowpan(net);
++
++	table = lowpan_frags_ns_ctl_table;
++	if (!net_eq(net, &init_net)) {
++		table = kmemdup(table, sizeof(lowpan_frags_ns_ctl_table),
++				GFP_KERNEL);
++		if (table == NULL)
++			goto err_alloc;
++
++		table[0].data = &ieee802154_lowpan->frags.high_thresh;
++		table[0].extra1 = &ieee802154_lowpan->frags.low_thresh;
++		table[0].extra2 = &init_net.ieee802154_lowpan.frags.high_thresh;
++		table[1].data = &ieee802154_lowpan->frags.low_thresh;
++		table[1].extra2 = &ieee802154_lowpan->frags.high_thresh;
++		table[2].data = &ieee802154_lowpan->frags.timeout;
++
++		/* Don't export sysctls to unprivileged users */
++		if (net->user_ns != &init_user_ns)
++			table[0].procname = NULL;
++	}
++
++	hdr = register_net_sysctl(net, "net/ieee802154/6lowpan", table);
++	if (hdr == NULL)
++		goto err_reg;
++
++	ieee802154_lowpan->sysctl.frags_hdr = hdr;
++	return 0;
++
++err_reg:
++	if (!net_eq(net, &init_net))
++		kfree(table);
++err_alloc:
++	return -ENOMEM;
++}
++
++static void __net_exit lowpan_frags_ns_sysctl_unregister(struct net *net)
++{
++	struct ctl_table *table;
++	struct netns_ieee802154_lowpan *ieee802154_lowpan =
++		net_ieee802154_lowpan(net);
++
++	table = ieee802154_lowpan->sysctl.frags_hdr->ctl_table_arg;
++	unregister_net_sysctl_table(ieee802154_lowpan->sysctl.frags_hdr);
++	if (!net_eq(net, &init_net))
++		kfree(table);
++}
++
++static struct ctl_table_header *lowpan_ctl_header;
++
++static int __init lowpan_frags_sysctl_register(void)
++{
++	lowpan_ctl_header = register_net_sysctl(&init_net,
++						"net/ieee802154/6lowpan",
++						lowpan_frags_ctl_table);
++	return lowpan_ctl_header == NULL ? -ENOMEM : 0;
++}
++
++static void lowpan_frags_sysctl_unregister(void)
++{
++	unregister_net_sysctl_table(lowpan_ctl_header);
++}
++#else
++static inline int lowpan_frags_ns_sysctl_register(struct net *net)
++{
++	return 0;
++}
++
++static inline void lowpan_frags_ns_sysctl_unregister(struct net *net)
++{
++}
++
++static inline int __init lowpan_frags_sysctl_register(void)
++{
++	return 0;
++}
++
++static inline void lowpan_frags_sysctl_unregister(void)
++{
++}
++#endif
++
++static int __net_init lowpan_frags_init_net(struct net *net)
++{
++	struct netns_ieee802154_lowpan *ieee802154_lowpan =
++		net_ieee802154_lowpan(net);
++
++	ieee802154_lowpan->frags.high_thresh = IPV6_FRAG_HIGH_THRESH;
++	ieee802154_lowpan->frags.low_thresh = IPV6_FRAG_LOW_THRESH;
++	ieee802154_lowpan->frags.timeout = IPV6_FRAG_TIMEOUT;
++
++	inet_frags_init_net(&ieee802154_lowpan->frags);
++
++	return lowpan_frags_ns_sysctl_register(net);
++}
++
++static void __net_exit lowpan_frags_exit_net(struct net *net)
++{
++	struct netns_ieee802154_lowpan *ieee802154_lowpan =
++		net_ieee802154_lowpan(net);
++
++	lowpan_frags_ns_sysctl_unregister(net);
++	inet_frags_exit_net(&ieee802154_lowpan->frags, &lowpan_frags);
++}
++
++static struct pernet_operations lowpan_frags_ops = {
++	.init = lowpan_frags_init_net,
++	.exit = lowpan_frags_exit_net,
++};
++
++int __init lowpan_net_frag_init(void)
++{
++	int ret;
++
++	ret = lowpan_frags_sysctl_register();
++	if (ret)
++		return ret;
++
++	ret = register_pernet_subsys(&lowpan_frags_ops);
++	if (ret)
++		goto err_pernet;
++
++	lowpan_frags.hashfn = lowpan_hashfn;
++	lowpan_frags.constructor = lowpan_frag_init;
++	lowpan_frags.destructor = NULL;
++	lowpan_frags.skb_free = NULL;
++	lowpan_frags.qsize = sizeof(struct frag_queue);
++	lowpan_frags.match = lowpan_frag_match;
++	lowpan_frags.frag_expire = lowpan_frag_expire;
++	lowpan_frags.frags_cache_name = lowpan_frags_cache_name;
++	ret = inet_frags_init(&lowpan_frags);
++	if (ret)
++		goto err_pernet;
++
++	return ret;
++err_pernet:
++	lowpan_frags_sysctl_unregister();
++	return ret;
++}
++
++void lowpan_net_frag_exit(void)
++{
++	inet_frags_fini(&lowpan_frags);
++	lowpan_frags_sysctl_unregister();
++	unregister_pernet_subsys(&lowpan_frags_ops);
++}

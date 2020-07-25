@@ -1,0 +1,2998 @@
+commit 20325960f8750165964a6891a733e4cc15d19076
+Author: David Howells <dhowells@redhat.com>
+Date:   Thu Apr 30 01:03:49 2020 +0100
+
+    afs: Reorganise volume and server trees to be rooted on the cell
+    
+    Reorganise afs_volume objects such that they're in a tree keyed on volume
+    ID, rooted at on an afs_cell object rather than being in multiple trees,
+    each of which is rooted on an afs_server object.
+    
+    afs_server structs become per-cell and acquire a pointer to the cell.
+    
+    The process of breaking a callback then starts with finding the server by
+    its network address, following that to the cell and then looking up each
+    volume ID in the volume tree.
+    
+    This is simpler than the afs_vol_interest/afs_cb_interest N:M mapping web
+    and allows those structs and the code for maintaining them to be simplified
+    or removed.
+    
+    It does make a couple of things a bit more tricky, though:
+    
+     (1) Operations now start with a volume, not a server, so there can be more
+         than one answer as to whether or not the server we'll end up using
+         supports the FS.InlineBulkStatus RPC.
+    
+     (2) CB RPC operations that specify the server UUID.  There's still a tree
+         of servers by UUID on the afs_net struct, but the UUIDs in it aren't
+         guaranteed unique.
+    
+    Signed-off-by: David Howells <dhowells@redhat.com>
+
+diff --git a/fs/afs/security.c b/fs/afs/security.c
+index ce9de1e6742b..90d852704328 100644
+--- a/fs/afs/security.c
++++ b/fs/afs/security.c
+@@ -170,8 +170,7 @@ void afs_cache_permit(struct afs_vnode *vnode, struct key *key,
+ 					break;
+ 				}
+ 
+-				if (afs_cb_is_broken(cb_break, vnode,
+-						     rcu_dereference(vnode->cb_interest))) {
++				if (afs_cb_is_broken(cb_break, vnode)) {
+ 					changed = true;
+ 					break;
+ 				}
+@@ -201,7 +200,7 @@ void afs_cache_permit(struct afs_vnode *vnode, struct key *key,
+ 		}
+ 	}
+ 
+-	if (afs_cb_is_broken(cb_break, vnode, rcu_dereference(vnode->cb_interest)))
++	if (afs_cb_is_broken(cb_break, vnode))
+ 		goto someone_else_changed_it;
+ 
+ 	/* We need a ref on any permits list we want to copy as we'll have to
+@@ -281,8 +280,7 @@ void afs_cache_permit(struct afs_vnode *vnode, struct key *key,
+ 	rcu_read_lock();
+ 	spin_lock(&vnode->lock);
+ 	zap = rcu_access_pointer(vnode->permit_cache);
+-	if (!afs_cb_is_broken(cb_break, vnode, rcu_dereference(vnode->cb_interest)) &&
+-	    zap == permits)
++	if (!afs_cb_is_broken(cb_break, vnode) && zap == permits)
+ 		rcu_assign_pointer(vnode->permit_cache, replacement);
+ 	else
+ 		zap = replacement;
+
+commit a0753c29004f4983e303abce019f29e183b1ee48
+Author: David Howells <dhowells@redhat.com>
+Date:   Mon May 20 08:48:46 2019 +0100
+
+    afs: Support RCU pathwalk
+    
+    Make afs_permission() and afs_d_revalidate() do initial checks in RCU-mode
+    pathwalk to reduce latency in pathwalk elements that get done multiple
+    times.  We don't need to query the server unless we've received a
+    notification from it that something has changed or the callback has
+    expired.
+    
+    This requires that we can request a key and check permits under RCU
+    conditions if we need to.
+    
+    Signed-off-by: David Howells <dhowells@redhat.com>
+
+diff --git a/fs/afs/security.c b/fs/afs/security.c
+index ef2fd34ba282..ce9de1e6742b 100644
+--- a/fs/afs/security.c
++++ b/fs/afs/security.c
+@@ -303,6 +303,40 @@ void afs_cache_permit(struct afs_vnode *vnode, struct key *key,
+ 	return;
+ }
+ 
++static bool afs_check_permit_rcu(struct afs_vnode *vnode, struct key *key,
++				 afs_access_t *_access)
++{
++	const struct afs_permits *permits;
++	int i;
++
++	_enter("{%llx:%llu},%x",
++	       vnode->fid.vid, vnode->fid.vnode, key_serial(key));
++
++	/* check the permits to see if we've got one yet */
++	if (key == vnode->volume->cell->anonymous_key) {
++		*_access = vnode->status.anon_access;
++		_leave(" = t [anon %x]", *_access);
++		return true;
++	}
++
++	permits = rcu_dereference(vnode->permit_cache);
++	if (permits) {
++		for (i = 0; i < permits->nr_permits; i++) {
++			if (permits->permits[i].key < key)
++				continue;
++			if (permits->permits[i].key > key)
++				break;
++
++			*_access = permits->permits[i].access;
++			_leave(" = %u [perm %x]", !permits->invalidated, *_access);
++			return !permits->invalidated;
++		}
++	}
++
++	_leave(" = f");
++	return false;
++}
++
+ /*
+  * check with the fileserver to see if the directory or parent directory is
+  * permitted to be accessed with this authorisation, and if so, what access it
+@@ -369,33 +403,42 @@ int afs_permission(struct inode *inode, int mask)
+ 	struct afs_vnode *vnode = AFS_FS_I(inode);
+ 	afs_access_t uninitialized_var(access);
+ 	struct key *key;
+-	int ret;
+-
+-	if (mask & MAY_NOT_BLOCK)
+-		return -ECHILD;
++	int ret = 0;
+ 
+ 	_enter("{{%llx:%llu},%lx},%x,",
+ 	       vnode->fid.vid, vnode->fid.vnode, vnode->flags, mask);
+ 
+-	key = afs_request_key(vnode->volume->cell);
+-	if (IS_ERR(key)) {
+-		_leave(" = %ld [key]", PTR_ERR(key));
+-		return PTR_ERR(key);
+-	}
++	if (mask & MAY_NOT_BLOCK) {
++		key = afs_request_key_rcu(vnode->volume->cell);
++		if (IS_ERR(key))
++			return -ECHILD;
+ 
+-	ret = afs_validate(vnode, key);
+-	if (ret < 0)
+-		goto error;
++		ret = -ECHILD;
++		if (!afs_check_validity(vnode) ||
++		    !afs_check_permit_rcu(vnode, key, &access))
++			goto error;
++	} else {
++		key = afs_request_key(vnode->volume->cell);
++		if (IS_ERR(key)) {
++			_leave(" = %ld [key]", PTR_ERR(key));
++			return PTR_ERR(key);
++		}
+ 
+-	/* check the permits to see if we've got one yet */
+-	ret = afs_check_permit(vnode, key, &access);
+-	if (ret < 0)
+-		goto error;
++		ret = afs_validate(vnode, key);
++		if (ret < 0)
++			goto error;
++
++		/* check the permits to see if we've got one yet */
++		ret = afs_check_permit(vnode, key, &access);
++		if (ret < 0)
++			goto error;
++	}
+ 
+ 	/* interpret the access mask */
+ 	_debug("REQ %x ACC %x on %s",
+ 	       mask, access, S_ISDIR(inode->i_mode) ? "dir" : "file");
+ 
++	ret = 0;
+ 	if (S_ISDIR(inode->i_mode)) {
+ 		if (mask & (MAY_EXEC | MAY_READ | MAY_CHDIR)) {
+ 			if (!(access & AFS_ACE_LOOKUP))
+
+commit 8b6a666a97544bf307190a05947742b8357aa962
+Author: David Howells <dhowells@redhat.com>
+Date:   Mon May 20 08:48:46 2019 +0100
+
+    afs: Provide an RCU-capable key lookup
+    
+    Provide an RCU-capable key lookup function.  We don't want to call
+    afs_request_key() in RCU-mode pathwalk as request_key() might sleep, even if
+    we don't ask it to construct anything as it might find a key that is currently
+    undergoing construction.
+    
+    Signed-off-by: David Howells <dhowells@redhat.com>
+
+diff --git a/fs/afs/security.c b/fs/afs/security.c
+index 71e71c07568f..ef2fd34ba282 100644
+--- a/fs/afs/security.c
++++ b/fs/afs/security.c
+@@ -27,8 +27,37 @@ struct key *afs_request_key(struct afs_cell *cell)
+ 	_enter("{%x}", key_serial(cell->anonymous_key));
+ 
+ 	_debug("key %s", cell->anonymous_key->description);
+-	key = request_key(&key_type_rxrpc, cell->anonymous_key->description,
+-			  NULL);
++	key = request_key_net(&key_type_rxrpc, cell->anonymous_key->description,
++			      cell->net->net, NULL);
++	if (IS_ERR(key)) {
++		if (PTR_ERR(key) != -ENOKEY) {
++			_leave(" = %ld", PTR_ERR(key));
++			return key;
++		}
++
++		/* act as anonymous user */
++		_leave(" = {%x} [anon]", key_serial(cell->anonymous_key));
++		return key_get(cell->anonymous_key);
++	} else {
++		/* act as authorised user */
++		_leave(" = {%x} [auth]", key_serial(key));
++		return key;
++	}
++}
++
++/*
++ * Get a key when pathwalk is in rcuwalk mode.
++ */
++struct key *afs_request_key_rcu(struct afs_cell *cell)
++{
++	struct key *key;
++
++	_enter("{%x}", key_serial(cell->anonymous_key));
++
++	_debug("key %s", cell->anonymous_key->description);
++	key = request_key_net_rcu(&key_type_rxrpc,
++				  cell->anonymous_key->description,
++				  cell->net->net);
+ 	if (IS_ERR(key)) {
+ 		if (PTR_ERR(key) != -ENOKEY) {
+ 			_leave(" = %ld", PTR_ERR(key));
+
+commit 028db3e290f15ac509084c0fc3b9d021f668f877
+Author: Linus Torvalds <torvalds@linux-foundation.org>
+Date:   Wed Jul 10 18:43:43 2019 -0700
+
+    Revert "Merge tag 'keys-acl-20190703' of git://git.kernel.org/pub/scm/linux/kernel/git/dhowells/linux-fs"
+    
+    This reverts merge 0f75ef6a9cff49ff612f7ce0578bced9d0b38325 (and thus
+    effectively commits
+    
+       7a1ade847596 ("keys: Provide KEYCTL_GRANT_PERMISSION")
+       2e12256b9a76 ("keys: Replace uid/gid/perm permissions checking with an ACL")
+    
+    that the merge brought in).
+    
+    It turns out that it breaks booting with an encrypted volume, and Eric
+    biggers reports that it also breaks the fscrypt tests [1] and loading of
+    in-kernel X.509 certificates [2].
+    
+    The root cause of all the breakage is likely the same, but David Howells
+    is off email so rather than try to work it out it's getting reverted in
+    order to not impact the rest of the merge window.
+    
+     [1] https://lore.kernel.org/lkml/20190710011559.GA7973@sol.localdomain/
+     [2] https://lore.kernel.org/lkml/20190710013225.GB7973@sol.localdomain/
+    
+    Link: https://lore.kernel.org/lkml/CAHk-=wjxoeMJfeBahnWH=9zShKp2bsVy527vo3_y8HfOdhwAAw@mail.gmail.com/
+    Reported-by: Eric Biggers <ebiggers@kernel.org>
+    Cc: David Howells <dhowells@redhat.com>
+    Cc: James Morris <jmorris@namei.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/fs/afs/security.c b/fs/afs/security.c
+index 8866703b2e6c..71e71c07568f 100644
+--- a/fs/afs/security.c
++++ b/fs/afs/security.c
+@@ -28,7 +28,7 @@ struct key *afs_request_key(struct afs_cell *cell)
+ 
+ 	_debug("key %s", cell->anonymous_key->description);
+ 	key = request_key(&key_type_rxrpc, cell->anonymous_key->description,
+-			  NULL, NULL);
++			  NULL);
+ 	if (IS_ERR(key)) {
+ 		if (PTR_ERR(key) != -ENOKEY) {
+ 			_leave(" = %ld", PTR_ERR(key));
+
+commit 0f75ef6a9cff49ff612f7ce0578bced9d0b38325
+Merge: c84ca912b079 7a1ade847596
+Author: Linus Torvalds <torvalds@linux-foundation.org>
+Date:   Mon Jul 8 19:56:57 2019 -0700
+
+    Merge tag 'keys-acl-20190703' of git://git.kernel.org/pub/scm/linux/kernel/git/dhowells/linux-fs
+    
+    Pull keyring ACL support from David Howells:
+     "This changes the permissions model used by keys and keyrings to be
+      based on an internal ACL by the following means:
+    
+       - Replace the permissions mask internally with an ACL that contains a
+         list of ACEs, each with a specific subject with a permissions mask.
+         Potted default ACLs are available for new keys and keyrings.
+    
+         ACE subjects can be macroised to indicate the UID and GID specified
+         on the key (which remain). Future commits will be able to add
+         additional subject types, such as specific UIDs or domain
+         tags/namespaces.
+    
+         Also split a number of permissions to give finer control. Examples
+         include splitting the revocation permit from the change-attributes
+         permit, thereby allowing someone to be granted permission to revoke
+         a key without allowing them to change the owner; also the ability
+         to join a keyring is split from the ability to link to it, thereby
+         stopping a process accessing a keyring by joining it and thus
+         acquiring use of possessor permits.
+    
+       - Provide a keyctl to allow the granting or denial of one or more
+         permits to a specific subject. Direct access to the ACL is not
+         granted, and the ACL cannot be viewed"
+    
+    * tag 'keys-acl-20190703' of git://git.kernel.org/pub/scm/linux/kernel/git/dhowells/linux-fs:
+      keys: Provide KEYCTL_GRANT_PERMISSION
+      keys: Replace uid/gid/perm permissions checking with an ACL
+
+commit 2e12256b9a76584fa3a6da19210509d4775aee36
+Author: David Howells <dhowells@redhat.com>
+Date:   Thu Jun 27 23:03:07 2019 +0100
+
+    keys: Replace uid/gid/perm permissions checking with an ACL
+    
+    Replace the uid/gid/perm permissions checking on a key with an ACL to allow
+    the SETATTR and SEARCH permissions to be split.  This will also allow a
+    greater range of subjects to represented.
+    
+    ============
+    WHY DO THIS?
+    ============
+    
+    The problem is that SETATTR and SEARCH cover a slew of actions, not all of
+    which should be grouped together.
+    
+    For SETATTR, this includes actions that are about controlling access to a
+    key:
+    
+     (1) Changing a key's ownership.
+    
+     (2) Changing a key's security information.
+    
+     (3) Setting a keyring's restriction.
+    
+    And actions that are about managing a key's lifetime:
+    
+     (4) Setting an expiry time.
+    
+     (5) Revoking a key.
+    
+    and (proposed) managing a key as part of a cache:
+    
+     (6) Invalidating a key.
+    
+    Managing a key's lifetime doesn't really have anything to do with
+    controlling access to that key.
+    
+    Expiry time is awkward since it's more about the lifetime of the content
+    and so, in some ways goes better with WRITE permission.  It can, however,
+    be set unconditionally by a process with an appropriate authorisation token
+    for instantiating a key, and can also be set by the key type driver when a
+    key is instantiated, so lumping it with the access-controlling actions is
+    probably okay.
+    
+    As for SEARCH permission, that currently covers:
+    
+     (1) Finding keys in a keyring tree during a search.
+    
+     (2) Permitting keyrings to be joined.
+    
+     (3) Invalidation.
+    
+    But these don't really belong together either, since these actions really
+    need to be controlled separately.
+    
+    Finally, there are number of special cases to do with granting the
+    administrator special rights to invalidate or clear keys that I would like
+    to handle with the ACL rather than key flags and special checks.
+    
+    
+    ===============
+    WHAT IS CHANGED
+    ===============
+    
+    The SETATTR permission is split to create two new permissions:
+    
+     (1) SET_SECURITY - which allows the key's owner, group and ACL to be
+         changed and a restriction to be placed on a keyring.
+    
+     (2) REVOKE - which allows a key to be revoked.
+    
+    The SEARCH permission is split to create:
+    
+     (1) SEARCH - which allows a keyring to be search and a key to be found.
+    
+     (2) JOIN - which allows a keyring to be joined as a session keyring.
+    
+     (3) INVAL - which allows a key to be invalidated.
+    
+    The WRITE permission is also split to create:
+    
+     (1) WRITE - which allows a key's content to be altered and links to be
+         added, removed and replaced in a keyring.
+    
+     (2) CLEAR - which allows a keyring to be cleared completely.  This is
+         split out to make it possible to give just this to an administrator.
+    
+     (3) REVOKE - see above.
+    
+    
+    Keys acquire ACLs which consist of a series of ACEs, and all that apply are
+    unioned together.  An ACE specifies a subject, such as:
+    
+     (*) Possessor - permitted to anyone who 'possesses' a key
+     (*) Owner - permitted to the key owner
+     (*) Group - permitted to the key group
+     (*) Everyone - permitted to everyone
+    
+    Note that 'Other' has been replaced with 'Everyone' on the assumption that
+    you wouldn't grant a permit to 'Other' that you wouldn't also grant to
+    everyone else.
+    
+    Further subjects may be made available by later patches.
+    
+    The ACE also specifies a permissions mask.  The set of permissions is now:
+    
+            VIEW            Can view the key metadata
+            READ            Can read the key content
+            WRITE           Can update/modify the key content
+            SEARCH          Can find the key by searching/requesting
+            LINK            Can make a link to the key
+            SET_SECURITY    Can change owner, ACL, expiry
+            INVAL           Can invalidate
+            REVOKE          Can revoke
+            JOIN            Can join this keyring
+            CLEAR           Can clear this keyring
+    
+    
+    The KEYCTL_SETPERM function is then deprecated.
+    
+    The KEYCTL_SET_TIMEOUT function then is permitted if SET_SECURITY is set,
+    or if the caller has a valid instantiation auth token.
+    
+    The KEYCTL_INVALIDATE function then requires INVAL.
+    
+    The KEYCTL_REVOKE function then requires REVOKE.
+    
+    The KEYCTL_JOIN_SESSION_KEYRING function then requires JOIN to join an
+    existing keyring.
+    
+    The JOIN permission is enabled by default for session keyrings and manually
+    created keyrings only.
+    
+    
+    ======================
+    BACKWARD COMPATIBILITY
+    ======================
+    
+    To maintain backward compatibility, KEYCTL_SETPERM will translate the
+    permissions mask it is given into a new ACL for a key - unless
+    KEYCTL_SET_ACL has been called on that key, in which case an error will be
+    returned.
+    
+    It will convert possessor, owner, group and other permissions into separate
+    ACEs, if each portion of the mask is non-zero.
+    
+    SETATTR permission turns on all of INVAL, REVOKE and SET_SECURITY.  WRITE
+    permission turns on WRITE, REVOKE and, if a keyring, CLEAR.  JOIN is turned
+    on if a keyring is being altered.
+    
+    The KEYCTL_DESCRIBE function translates the ACL back into a permissions
+    mask to return depending on possessor, owner, group and everyone ACEs.
+    
+    It will make the following mappings:
+    
+     (1) INVAL, JOIN -> SEARCH
+    
+     (2) SET_SECURITY -> SETATTR
+    
+     (3) REVOKE -> WRITE if SETATTR isn't already set
+    
+     (4) CLEAR -> WRITE
+    
+    Note that the value subsequently returned by KEYCTL_DESCRIBE may not match
+    the value set with KEYCTL_SETATTR.
+    
+    
+    =======
+    TESTING
+    =======
+    
+    This passes the keyutils testsuite for all but a couple of tests:
+    
+     (1) tests/keyctl/dh_compute/badargs: The first wrong-key-type test now
+         returns EOPNOTSUPP rather than ENOKEY as READ permission isn't removed
+         if the type doesn't have ->read().  You still can't actually read the
+         key.
+    
+     (2) tests/keyctl/permitting/valid: The view-other-permissions test doesn't
+         work as Other has been replaced with Everyone in the ACL.
+    
+    Signed-off-by: David Howells <dhowells@redhat.com>
+
+diff --git a/fs/afs/security.c b/fs/afs/security.c
+index 5d8ece98561e..3185898237b2 100644
+--- a/fs/afs/security.c
++++ b/fs/afs/security.c
+@@ -32,7 +32,7 @@ struct key *afs_request_key(struct afs_cell *cell)
+ 
+ 	_debug("key %s", cell->anonymous_key->description);
+ 	key = request_key(&key_type_rxrpc, cell->anonymous_key->description,
+-			  NULL);
++			  NULL, NULL);
+ 	if (IS_ERR(key)) {
+ 		if (PTR_ERR(key) != -ENOKEY) {
+ 			_leave(" = %ld", PTR_ERR(key));
+
+commit 2874c5fd284268364ece81a7bd936f3c8168e567
+Author: Thomas Gleixner <tglx@linutronix.de>
+Date:   Mon May 27 08:55:01 2019 +0200
+
+    treewide: Replace GPLv2 boilerplate/reference with SPDX - rule 152
+    
+    Based on 1 normalized pattern(s):
+    
+      this program is free software you can redistribute it and or modify
+      it under the terms of the gnu general public license as published by
+      the free software foundation either version 2 of the license or at
+      your option any later version
+    
+    extracted by the scancode license scanner the SPDX license identifier
+    
+      GPL-2.0-or-later
+    
+    has been chosen to replace the boilerplate/reference in 3029 file(s).
+    
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Reviewed-by: Allison Randal <allison@lohutok.net>
+    Cc: linux-spdx@vger.kernel.org
+    Link: https://lkml.kernel.org/r/20190527070032.746973796@linutronix.de
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/fs/afs/security.c b/fs/afs/security.c
+index 5d8ece98561e..71e71c07568f 100644
+--- a/fs/afs/security.c
++++ b/fs/afs/security.c
+@@ -1,12 +1,8 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
+ /* AFS security handling
+  *
+  * Copyright (C) 2007, 2017 Red Hat, Inc. All Rights Reserved.
+  * Written by David Howells (dhowells@redhat.com)
+- *
+- * This program is free software; you can redistribute it and/or
+- * modify it under the terms of the GNU General Public License
+- * as published by the Free Software Foundation; either version
+- * 2 of the License, or (at your option) any later version.
+  */
+ 
+ #include <linux/init.h>
+
+commit f642404a0436a50912c218009ccc7856d48d784c
+Author: David Howells <dhowells@redhat.com>
+Date:   Mon May 13 16:14:32 2019 +0100
+
+    afs: Make vnode->cb_interest RCU safe
+    
+    Use RCU-based freeing for afs_cb_interest struct objects and use RCU on
+    vnode->cb_interest.  Use that change to allow afs_check_validity() to use
+    read_seqbegin_or_lock() instead of read_seqlock_excl().
+    
+    This also requires the caller of afs_check_validity() to hold the RCU read
+    lock across the call.
+    
+    Signed-off-by: David Howells <dhowells@redhat.com>
+
+diff --git a/fs/afs/security.c b/fs/afs/security.c
+index 857f09d09ee9..5d8ece98561e 100644
+--- a/fs/afs/security.c
++++ b/fs/afs/security.c
+@@ -146,7 +146,7 @@ void afs_cache_permit(struct afs_vnode *vnode, struct key *key,
+ 				}
+ 
+ 				if (afs_cb_is_broken(cb_break, vnode,
+-						     vnode->cb_interest)) {
++						     rcu_dereference(vnode->cb_interest))) {
+ 					changed = true;
+ 					break;
+ 				}
+@@ -176,7 +176,7 @@ void afs_cache_permit(struct afs_vnode *vnode, struct key *key,
+ 		}
+ 	}
+ 
+-	if (afs_cb_is_broken(cb_break, vnode, vnode->cb_interest))
++	if (afs_cb_is_broken(cb_break, vnode, rcu_dereference(vnode->cb_interest)))
+ 		goto someone_else_changed_it;
+ 
+ 	/* We need a ref on any permits list we want to copy as we'll have to
+@@ -253,14 +253,16 @@ void afs_cache_permit(struct afs_vnode *vnode, struct key *key,
+ 
+ 	kfree(new);
+ 
++	rcu_read_lock();
+ 	spin_lock(&vnode->lock);
+ 	zap = rcu_access_pointer(vnode->permit_cache);
+-	if (!afs_cb_is_broken(cb_break, vnode, vnode->cb_interest) &&
++	if (!afs_cb_is_broken(cb_break, vnode, rcu_dereference(vnode->cb_interest)) &&
+ 	    zap == permits)
+ 		rcu_assign_pointer(vnode->permit_cache, replacement);
+ 	else
+ 		zap = replacement;
+ 	spin_unlock(&vnode->lock);
++	rcu_read_unlock();
+ 	afs_put_permits(zap);
+ out_put:
+ 	afs_put_permits(permits);
+
+commit a58823ac458968f9fb3dbf97ee2749a62be12807
+Author: David Howells <dhowells@redhat.com>
+Date:   Thu May 9 15:16:10 2019 +0100
+
+    afs: Fix application of status and callback to be under same lock
+    
+    When applying the status and callback in the response of an operation,
+    apply them in the same critical section so that there's no race between
+    checking the callback state and checking status-dependent state (such as
+    the data version).
+    
+    Fix this by:
+    
+     (1) Allocating a joint {status,callback} record (afs_status_cb) before
+         calling the RPC function for each vnode for which the RPC reply
+         contains a status or a status plus a callback.  A flag is set in the
+         record to indicate if a callback was actually received.
+    
+     (2) These records are passed into the RPC functions to be filled in.  The
+         afs_decode_status() and yfs_decode_status() functions are removed and
+         the cb_lock is no longer taken.
+    
+     (3) xdr_decode_AFSFetchStatus() and xdr_decode_YFSFetchStatus() no longer
+         update the vnode.
+    
+     (4) xdr_decode_AFSCallBack() and xdr_decode_YFSCallBack() no longer update
+         the vnode.
+    
+     (5) vnodes, expected data-version numbers and callback break counters
+         (cb_break) no longer need to be passed to the reply delivery
+         functions.
+    
+         Note that, for the moment, the file locking functions still need
+         access to both the call and the vnode at the same time.
+    
+     (6) afs_vnode_commit_status() is now given the cb_break value and the
+         expected data_version and the task of applying the status and the
+         callback to the vnode are now done here.
+    
+         This is done under a single taking of vnode->cb_lock.
+    
+     (7) afs_pages_written_back() is now called by afs_store_data() rather than
+         by the reply delivery function.
+    
+         afs_pages_written_back() has been moved to before the call point and
+         is now given the first and last page numbers rather than a pointer to
+         the call.
+    
+     (8) The indicator from YFS.RemoveFile2 as to whether the target file
+         actually got removed (status.abort_code == VNOVNODE) rather than
+         merely dropping a link is now checked in afs_unlink rather than in
+         xdr_decode_YFSFetchStatus().
+    
+    Supplementary fixes:
+    
+     (*) afs_cache_permit() now gets the caller_access mask from the
+         afs_status_cb object rather than picking it out of the vnode's status
+         record.  afs_fetch_status() returns caller_access through its argument
+         list for this purpose also.
+    
+     (*) afs_inode_init_from_status() now uses a write lock on cb_lock rather
+         than a read lock and now sets the callback inside the same critical
+         section.
+    
+    Fixes: c435ee34551e ("afs: Overhaul the callback handling")
+    Signed-off-by: David Howells <dhowells@redhat.com>
+
+diff --git a/fs/afs/security.c b/fs/afs/security.c
+index db5529e47eb8..857f09d09ee9 100644
+--- a/fs/afs/security.c
++++ b/fs/afs/security.c
+@@ -116,10 +116,10 @@ static void afs_hash_permits(struct afs_permits *permits)
+  * as the ACL *may* have changed.
+  */
+ void afs_cache_permit(struct afs_vnode *vnode, struct key *key,
+-		      unsigned int cb_break)
++		      unsigned int cb_break, struct afs_status_cb *scb)
+ {
+ 	struct afs_permits *permits, *xpermits, *replacement, *zap, *new = NULL;
+-	afs_access_t caller_access = READ_ONCE(vnode->status.caller_access);
++	afs_access_t caller_access = scb->status.caller_access;
+ 	size_t size = 0;
+ 	bool changed = false;
+ 	int i, j;
+@@ -320,13 +320,12 @@ int afs_check_permit(struct afs_vnode *vnode, struct key *key,
+ 		 */
+ 		_debug("no valid permit");
+ 
+-		ret = afs_fetch_status(vnode, key, false);
++		ret = afs_fetch_status(vnode, key, false, _access);
+ 		if (ret < 0) {
+ 			*_access = 0;
+ 			_leave(" = %d", ret);
+ 			return ret;
+ 		}
+-		*_access = vnode->status.caller_access;
+ 	}
+ 
+ 	_leave(" = 0 [access %x]", *_access);
+
+commit fd711586bb7d63f257da5eff234e68c446ac35ea
+Author: David Howells <dhowells@redhat.com>
+Date:   Fri May 10 23:14:41 2019 +0100
+
+    afs: Fix double inc of vnode->cb_break
+    
+    When __afs_break_callback() clears the CB_PROMISED flag, it increments
+    vnode->cb_break to trigger a future refetch of the status and callback -
+    however it also calls afs_clear_permits(), which also increments
+    vnode->cb_break.
+    
+    Fix this by removing the increment from afs_clear_permits().
+    
+    Whilst we're at it, fix the conditional call to afs_put_permits() as the
+    function checks to see if the argument is NULL, so the check is redundant.
+    
+    Fixes: be080a6f43c4 ("afs: Overhaul permit caching");
+    Signed-off-by: David Howells <dhowells@redhat.com>
+
+diff --git a/fs/afs/security.c b/fs/afs/security.c
+index 5f58a9a17e69..db5529e47eb8 100644
+--- a/fs/afs/security.c
++++ b/fs/afs/security.c
+@@ -87,11 +87,9 @@ void afs_clear_permits(struct afs_vnode *vnode)
+ 	permits = rcu_dereference_protected(vnode->permit_cache,
+ 					    lockdep_is_held(&vnode->lock));
+ 	RCU_INIT_POINTER(vnode->permit_cache, NULL);
+-	vnode->cb_break++;
+ 	spin_unlock(&vnode->lock);
+ 
+-	if (permits)
+-		afs_put_permits(permits);
++	afs_put_permits(permits);
+ }
+ 
+ /*
+
+commit 18ac61853cc4e44eb30e125fc8344a3b25c7b6fe
+Author: David Howells <dhowells@redhat.com>
+Date:   Sat Oct 20 00:57:59 2018 +0100
+
+    afs: Fix callback handling
+    
+    In some circumstances, the callback interest pointer is NULL, so in such a
+    case we can't dereference it when checking to see if the callback is
+    broken.  This causes an oops in some circumstances.
+    
+    Fix this by replacing the function that worked out the aggregate break
+    counter with one that actually does the comparison, and then make that
+    return true (ie. broken) if there is no callback interest as yet (ie. the
+    pointer is NULL).
+    
+    Fixes: 68251f0a6818 ("afs: Fix whole-volume callback handling")
+    Signed-off-by: David Howells <dhowells@redhat.com>
+
+diff --git a/fs/afs/security.c b/fs/afs/security.c
+index d1ae53fd3739..5f58a9a17e69 100644
+--- a/fs/afs/security.c
++++ b/fs/afs/security.c
+@@ -147,7 +147,8 @@ void afs_cache_permit(struct afs_vnode *vnode, struct key *key,
+ 					break;
+ 				}
+ 
+-				if (cb_break != afs_cb_break_sum(vnode, vnode->cb_interest)) {
++				if (afs_cb_is_broken(cb_break, vnode,
++						     vnode->cb_interest)) {
+ 					changed = true;
+ 					break;
+ 				}
+@@ -177,7 +178,7 @@ void afs_cache_permit(struct afs_vnode *vnode, struct key *key,
+ 		}
+ 	}
+ 
+-	if (cb_break != afs_cb_break_sum(vnode, vnode->cb_interest))
++	if (afs_cb_is_broken(cb_break, vnode, vnode->cb_interest))
+ 		goto someone_else_changed_it;
+ 
+ 	/* We need a ref on any permits list we want to copy as we'll have to
+@@ -256,7 +257,7 @@ void afs_cache_permit(struct afs_vnode *vnode, struct key *key,
+ 
+ 	spin_lock(&vnode->lock);
+ 	zap = rcu_access_pointer(vnode->permit_cache);
+-	if (cb_break == afs_cb_break_sum(vnode, vnode->cb_interest) &&
++	if (!afs_cb_is_broken(cb_break, vnode, vnode->cb_interest) &&
+ 	    zap == permits)
+ 		rcu_assign_pointer(vnode->permit_cache, replacement);
+ 	else
+
+commit 3b6492df4153b8550d347dfc581856138678a231
+Author: David Howells <dhowells@redhat.com>
+Date:   Sat Oct 20 00:57:57 2018 +0100
+
+    afs: Increase to 64-bit volume ID and 96-bit vnode ID for YFS
+    
+    Increase the sizes of the volume ID to 64 bits and the vnode ID (inode
+    number equivalent) to 96 bits to allow the support of YFS.
+    
+    This requires the iget comparator to check the vnode->fid rather than i_ino
+    and i_generation as i_ino is not sufficiently capacious.  It also requires
+    this data to be placed into the vnode cache key for fscache.
+    
+    For the moment, just discard the top 32 bits of the vnode ID when returning
+    it though stat.
+    
+    Signed-off-by: David Howells <dhowells@redhat.com>
+
+diff --git a/fs/afs/security.c b/fs/afs/security.c
+index 81dfedb7879f..d1ae53fd3739 100644
+--- a/fs/afs/security.c
++++ b/fs/afs/security.c
+@@ -126,7 +126,7 @@ void afs_cache_permit(struct afs_vnode *vnode, struct key *key,
+ 	bool changed = false;
+ 	int i, j;
+ 
+-	_enter("{%x:%u},%x,%x",
++	_enter("{%llx:%llu},%x,%x",
+ 	       vnode->fid.vid, vnode->fid.vnode, key_serial(key), caller_access);
+ 
+ 	rcu_read_lock();
+@@ -289,7 +289,7 @@ int afs_check_permit(struct afs_vnode *vnode, struct key *key,
+ 	bool valid = false;
+ 	int i, ret;
+ 
+-	_enter("{%x:%u},%x",
++	_enter("{%llx:%llu},%x",
+ 	       vnode->fid.vid, vnode->fid.vnode, key_serial(key));
+ 
+ 	/* check the permits to see if we've got one yet */
+@@ -349,7 +349,7 @@ int afs_permission(struct inode *inode, int mask)
+ 	if (mask & MAY_NOT_BLOCK)
+ 		return -ECHILD;
+ 
+-	_enter("{{%x:%u},%lx},%x,",
++	_enter("{{%llx:%llu},%lx},%x,",
+ 	       vnode->fid.vid, vnode->fid.vnode, vnode->flags, mask);
+ 
+ 	key = afs_request_key(vnode->volume->cell);
+
+commit 378831e4daec75fbba6d3612bcf3b4dd00ddbf08
+Author: David Howells <dhowells@redhat.com>
+Date:   Wed May 16 21:25:46 2018 +0100
+
+    afs: Fix directory permissions check
+    
+    Doing faccessat("/afs/some/directory", 0) triggers a BUG in the permissions
+    check code.
+    
+    Fix this by just removing the BUG section.  If no permissions are asked
+    for, just return okay if the file exists.
+    
+    Also:
+    
+     (1) Split up the directory check so that it has separate if-statements
+         rather than if-else-if (e.g. checking for MAY_EXEC shouldn't skip the
+         check for MAY_READ and MAY_WRITE).
+    
+     (2) Check for MAY_CHDIR as MAY_EXEC.
+    
+    Without the main fix, the following BUG may occur:
+    
+     kernel BUG at fs/afs/security.c:386!
+     invalid opcode: 0000 [#1] SMP PTI
+     ...
+     RIP: 0010:afs_permission+0x19d/0x1a0 [kafs]
+     ...
+     Call Trace:
+      ? inode_permission+0xbe/0x180
+      ? do_faccessat+0xdc/0x270
+      ? do_syscall_64+0x60/0x1f0
+      ? entry_SYSCALL_64_after_hwframe+0x49/0xbe
+    
+    Fixes: 00d3b7a4533e ("[AFS]: Add security support.")
+    Reported-by: Jonathan Billings <jsbillings@jsbillings.org>
+    Signed-off-by: David Howells <dhowells@redhat.com>
+
+diff --git a/fs/afs/security.c b/fs/afs/security.c
+index 1992b0ffa543..81dfedb7879f 100644
+--- a/fs/afs/security.c
++++ b/fs/afs/security.c
+@@ -372,18 +372,14 @@ int afs_permission(struct inode *inode, int mask)
+ 	       mask, access, S_ISDIR(inode->i_mode) ? "dir" : "file");
+ 
+ 	if (S_ISDIR(inode->i_mode)) {
+-		if (mask & MAY_EXEC) {
++		if (mask & (MAY_EXEC | MAY_READ | MAY_CHDIR)) {
+ 			if (!(access & AFS_ACE_LOOKUP))
+ 				goto permission_denied;
+-		} else if (mask & MAY_READ) {
+-			if (!(access & AFS_ACE_LOOKUP))
+-				goto permission_denied;
+-		} else if (mask & MAY_WRITE) {
++		}
++		if (mask & MAY_WRITE) {
+ 			if (!(access & (AFS_ACE_DELETE | /* rmdir, unlink, rename from */
+ 					AFS_ACE_INSERT))) /* create, mkdir, symlink, rename to */
+ 				goto permission_denied;
+-		} else {
+-			BUG();
+ 		}
+ 	} else {
+ 		if (!(access & AFS_ACE_LOOKUP))
+
+commit 68251f0a6818f3be19b1471f36c956ca97c1427d
+Author: David Howells <dhowells@redhat.com>
+Date:   Sat May 12 22:31:33 2018 +0100
+
+    afs: Fix whole-volume callback handling
+    
+    It's possible for an AFS file server to issue a whole-volume notification
+    that callbacks on all the vnodes in the file have been broken.  This is
+    done for R/O and backup volumes (which don't have per-file callbacks) and
+    for things like a volume being taken offline.
+    
+    Fix callback handling to detect whole-volume notifications, to track it
+    across operations and to check it during inode validation.
+    
+    Fixes: c435ee34551e ("afs: Overhaul the callback handling")
+    Signed-off-by: David Howells <dhowells@redhat.com>
+
+diff --git a/fs/afs/security.c b/fs/afs/security.c
+index cea2fff313dc..1992b0ffa543 100644
+--- a/fs/afs/security.c
++++ b/fs/afs/security.c
+@@ -147,8 +147,7 @@ void afs_cache_permit(struct afs_vnode *vnode, struct key *key,
+ 					break;
+ 				}
+ 
+-				if (cb_break != (vnode->cb_break +
+-						 vnode->cb_interest->server->cb_s_break)) {
++				if (cb_break != afs_cb_break_sum(vnode, vnode->cb_interest)) {
+ 					changed = true;
+ 					break;
+ 				}
+@@ -178,7 +177,7 @@ void afs_cache_permit(struct afs_vnode *vnode, struct key *key,
+ 		}
+ 	}
+ 
+-	if (cb_break != (vnode->cb_break + vnode->cb_interest->server->cb_s_break))
++	if (cb_break != afs_cb_break_sum(vnode, vnode->cb_interest))
+ 		goto someone_else_changed_it;
+ 
+ 	/* We need a ref on any permits list we want to copy as we'll have to
+@@ -257,7 +256,7 @@ void afs_cache_permit(struct afs_vnode *vnode, struct key *key,
+ 
+ 	spin_lock(&vnode->lock);
+ 	zap = rcu_access_pointer(vnode->permit_cache);
+-	if (cb_break == (vnode->cb_break + vnode->cb_interest->server->cb_s_break) &&
++	if (cb_break == afs_cb_break_sum(vnode, vnode->cb_interest) &&
+ 	    zap == permits)
+ 		rcu_assign_pointer(vnode->permit_cache, replacement);
+ 	else
+
+commit 0c3a5ac28115f45ee1d56717d9a9526bc6d63b05
+Author: David Howells <dhowells@redhat.com>
+Date:   Fri Apr 6 14:17:24 2018 +0100
+
+    afs: Make it possible to get the data version in readpage
+    
+    Store the data version number indicated by an FS.FetchData op into the read
+    request structure so that it's accessible by the page reader.
+    
+    Signed-off-by: David Howells <dhowells@redhat.com>
+
+diff --git a/fs/afs/security.c b/fs/afs/security.c
+index bd82c5bf4a6a..cea2fff313dc 100644
+--- a/fs/afs/security.c
++++ b/fs/afs/security.c
+@@ -322,7 +322,7 @@ int afs_check_permit(struct afs_vnode *vnode, struct key *key,
+ 		 */
+ 		_debug("no valid permit");
+ 
+-		ret = afs_fetch_status(vnode, key);
++		ret = afs_fetch_status(vnode, key, false);
+ 		if (ret < 0) {
+ 			*_access = 0;
+ 			_leave(" = %d", ret);
+
+commit fe342cf77bc3c3ba89e8bb1e4eddbe614df4efa4
+Author: David Howells <dhowells@redhat.com>
+Date:   Mon Apr 9 21:12:31 2018 +0100
+
+    afs: Fix checker warnings
+    
+    Fix warnings raised by checker, including:
+    
+     (*) Warnings raised by unequal comparison for the purposes of sorting,
+         where the endianness doesn't matter:
+    
+    fs/afs/addr_list.c:246:21: warning: restricted __be16 degrades to integer
+    fs/afs/addr_list.c:246:30: warning: restricted __be16 degrades to integer
+    fs/afs/addr_list.c:248:21: warning: restricted __be32 degrades to integer
+    fs/afs/addr_list.c:248:49: warning: restricted __be32 degrades to integer
+    fs/afs/addr_list.c:283:21: warning: restricted __be16 degrades to integer
+    fs/afs/addr_list.c:283:30: warning: restricted __be16 degrades to integer
+    
+     (*) afs_set_cb_interest() is not actually used and can be removed.
+    
+     (*) afs_cell_gc_delay() should be provided with a sysctl.
+    
+     (*) afs_cell_destroy() needs to use rcu_access_pointer() to read
+         cell->vl_addrs.
+    
+     (*) afs_init_fs_cursor() should be static.
+    
+     (*) struct afs_vnode::permit_cache needs to be marked __rcu.
+    
+     (*) afs_server_rcu() needs to use rcu_access_pointer().
+    
+     (*) afs_destroy_server() should use rcu_access_pointer() on
+         server->addresses as the server object is no longer accessible.
+    
+     (*) afs_find_server() casts __be16/__be32 values to int in order to
+         directly compare them for the purpose of finding a match in a list,
+         but is should also annotate the cast with __force to avoid checker
+         warnings.
+    
+     (*) afs_check_permit() accesses vnode->permit_cache outside of the RCU
+         readlock, though it doesn't then access the value; the extraneous
+         access is deleted.
+    
+    False positives:
+    
+     (*) Conditional locking around the code in xdr_decode_AFSFetchStatus.  This
+         can be dealt with in a separate patch.
+    
+    fs/afs/fsclient.c:148:9: warning: context imbalance in 'xdr_decode_AFSFetchStatus' - different lock contexts for basic block
+    
+     (*) Incorrect handling of seq-retry lock context balance:
+    
+    fs/afs/inode.c:455:38: warning: context imbalance in 'afs_getattr' - different
+    lock contexts for basic block
+    fs/afs/server.c:52:17: warning: context imbalance in 'afs_find_server' - different lock contexts for basic block
+    fs/afs/server.c:128:17: warning: context imbalance in 'afs_find_server_by_uuid' - different lock contexts for basic block
+    
+    Errors:
+    
+     (*) afs_lookup_cell_rcu() needs to break out of the seq-retry loop, not go
+         round again if it successfully found the workstation cell.
+    
+     (*) Fix UUID decode in afs_deliver_cb_probe_uuid().
+    
+     (*) afs_cache_permit() has a missing rcu_read_unlock() before one of the
+         jumps to the someone_else_changed_it label.  Move the unlock to after
+         the label.
+    
+     (*) afs_vl_get_addrs_u() is using ntohl() rather than htonl() when
+         encoding to XDR.
+    
+     (*) afs_deliver_yfsvl_get_endpoints() is using htonl() rather than ntohl()
+         when decoding from XDR.
+    
+    Signed-off-by: David Howells <dhowells@redhat.com>
+
+diff --git a/fs/afs/security.c b/fs/afs/security.c
+index b88b7d45fdaa..bd82c5bf4a6a 100644
+--- a/fs/afs/security.c
++++ b/fs/afs/security.c
+@@ -178,18 +178,14 @@ void afs_cache_permit(struct afs_vnode *vnode, struct key *key,
+ 		}
+ 	}
+ 
+-	if (cb_break != (vnode->cb_break + vnode->cb_interest->server->cb_s_break)) {
+-		rcu_read_unlock();
++	if (cb_break != (vnode->cb_break + vnode->cb_interest->server->cb_s_break))
+ 		goto someone_else_changed_it;
+-	}
+ 
+ 	/* We need a ref on any permits list we want to copy as we'll have to
+ 	 * drop the lock to do memory allocation.
+ 	 */
+-	if (permits && !refcount_inc_not_zero(&permits->usage)) {
+-		rcu_read_unlock();
++	if (permits && !refcount_inc_not_zero(&permits->usage))
+ 		goto someone_else_changed_it;
+-	}
+ 
+ 	rcu_read_unlock();
+ 
+@@ -278,6 +274,7 @@ void afs_cache_permit(struct afs_vnode *vnode, struct key *key,
+ 	/* Someone else changed the cache under us - don't recheck at this
+ 	 * time.
+ 	 */
++	rcu_read_unlock();
+ 	return;
+ }
+ 
+@@ -296,8 +293,6 @@ int afs_check_permit(struct afs_vnode *vnode, struct key *key,
+ 	_enter("{%x:%u},%x",
+ 	       vnode->fid.vid, vnode->fid.vnode, key_serial(key));
+ 
+-	permits = vnode->permit_cache;
+-
+ 	/* check the permits to see if we've got one yet */
+ 	if (key == vnode->volume->cell->anonymous_key) {
+ 		_debug("anon");
+
+commit 1bcab12521d9b23dbaa22ac71184778dcc43e2f6
+Author: David Howells <dhowells@redhat.com>
+Date:   Fri Dec 1 11:40:43 2017 +0000
+
+    afs: Fix permit refcounting
+    
+    Fix four refcount bugs in afs_cache_permit():
+    
+     (1) When checking the result of the kzalloc(), we can't just return, but
+         must put 'permits'.
+    
+     (2) We shouldn't put permits immediately after hashing a new permit as we
+         need to keep the pointer stable so that we can check to see if
+         vnode->permit_cache has changed before we decide whether to assign to
+         it.
+    
+     (3) 'permits' is being put twice.
+    
+     (4) We need to put either the replacement or the thing replaced after the
+         assignment to vnode->permit_cache.
+    
+    Without this, lots of the following are seen:
+    
+      Kernel BUG at ffffffffa039857b [verbose debug info unavailable]
+      ------------[ cut here ]------------
+      Kernel BUG at ffffffffa039858a [verbose debug info unavailable]
+      ------------[ cut here ]------------
+    
+    The addresses are in the .text..refcount section of the kafs.ko module.
+    Following the relocation records for the __ex_table section shows one to be
+    due to the decrement in afs_put_permits() and the other to be key_get() in
+    afs_cache_permit().
+    
+    Occasionally, the following is seen:
+    
+      refcount_t overflow at afs_cache_permit+0x57d/0x5c0 [kafs] in cc1[562], uid/euid: 0/0
+      WARNING: CPU: 0 PID: 562 at kernel/panic.c:657 refcount_error_report+0x9c/0xac
+      ...
+    
+    Reported-by: Marc Dionne <marc.dionne@auristor.com>
+    Signed-off-by: David Howells <dhowells@redhat.com>
+    Tested-by: Marc Dionne <marc.dionne@auristor.com>
+
+diff --git a/fs/afs/security.c b/fs/afs/security.c
+index 2b00097101b3..b88b7d45fdaa 100644
+--- a/fs/afs/security.c
++++ b/fs/afs/security.c
+@@ -120,7 +120,7 @@ static void afs_hash_permits(struct afs_permits *permits)
+ void afs_cache_permit(struct afs_vnode *vnode, struct key *key,
+ 		      unsigned int cb_break)
+ {
+-	struct afs_permits *permits, *xpermits, *replacement, *new = NULL;
++	struct afs_permits *permits, *xpermits, *replacement, *zap, *new = NULL;
+ 	afs_access_t caller_access = READ_ONCE(vnode->status.caller_access);
+ 	size_t size = 0;
+ 	bool changed = false;
+@@ -204,7 +204,7 @@ void afs_cache_permit(struct afs_vnode *vnode, struct key *key,
+ 	new = kzalloc(sizeof(struct afs_permits) +
+ 		      sizeof(struct afs_permit) * size, GFP_NOFS);
+ 	if (!new)
+-		return;
++		goto out_put;
+ 
+ 	refcount_set(&new->usage, 1);
+ 	new->nr_permits = size;
+@@ -229,8 +229,6 @@ void afs_cache_permit(struct afs_vnode *vnode, struct key *key,
+ 
+ 	afs_hash_permits(new);
+ 
+-	afs_put_permits(permits);
+-
+ 	/* Now see if the permit list we want is actually already available */
+ 	spin_lock(&afs_permits_lock);
+ 
+@@ -262,11 +260,15 @@ void afs_cache_permit(struct afs_vnode *vnode, struct key *key,
+ 	kfree(new);
+ 
+ 	spin_lock(&vnode->lock);
+-	if (cb_break != (vnode->cb_break + vnode->cb_interest->server->cb_s_break) ||
+-	    permits != rcu_access_pointer(vnode->permit_cache))
+-		goto someone_else_changed_it_unlock;
+-	rcu_assign_pointer(vnode->permit_cache, replacement);
++	zap = rcu_access_pointer(vnode->permit_cache);
++	if (cb_break == (vnode->cb_break + vnode->cb_interest->server->cb_s_break) &&
++	    zap == permits)
++		rcu_assign_pointer(vnode->permit_cache, replacement);
++	else
++		zap = replacement;
+ 	spin_unlock(&vnode->lock);
++	afs_put_permits(zap);
++out_put:
+ 	afs_put_permits(permits);
+ 	return;
+ 
+
+commit 0fafdc9f888b42499001b7ca9d9f371c0b2932f4
+Author: David Howells <dhowells@redhat.com>
+Date:   Mon Nov 13 16:59:50 2017 +0000
+
+    afs: Fix file locking
+    
+    Fix the AFS file locking whereby the use of the big kernel lock (which
+    could be slept with) was replaced by a spinlock (which couldn't).  The
+    problem is that the AFS code was doing stuff inside the critical section
+    that might call schedule(), so this is a broken transformation.
+    
+    Fix this by the following means:
+    
+     (1) Use a state machine with a proper state that can only be changed under
+         the spinlock rather than using a collection of bit flags.
+    
+     (2) Cache the key used for the lock and the lock type in the afs_vnode
+         struct so that the manager work function doesn't have to refer to a
+         file_lock struct that's been dequeued.  This makes signal handling
+         safer.
+    
+     (4) Move the unlock from afs_do_unlk() to afs_fl_release_private() which
+         means that unlock is achieved in other circumstances too.
+    
+     (5) Unlock the file on the server before taking the next conflicting lock.
+    
+    Also change:
+    
+     (1) Check the permits on a file before actually trying the lock.
+    
+     (2) fsync the file before effecting an explicit unlock operation.  We
+         don't fsync if the lock is erased otherwise as we might not be in a
+         context where we can actually do that.
+    
+    Further fixes:
+    
+     (1) Fixed-fileserver address rotation is made to work.  It's only used by
+         the locking functions, so couldn't be tested before.
+    
+    Fixes: 72f98e72551f ("locks: turn lock_flocks into a spinlock")
+    Signed-off-by: David Howells <dhowells@redhat.com>
+    cc: jlayton@redhat.com
+
+diff --git a/fs/afs/security.c b/fs/afs/security.c
+index 46a881a4d08f..2b00097101b3 100644
+--- a/fs/afs/security.c
++++ b/fs/afs/security.c
+@@ -284,8 +284,8 @@ void afs_cache_permit(struct afs_vnode *vnode, struct key *key,
+  * permitted to be accessed with this authorisation, and if so, what access it
+  * is granted
+  */
+-static int afs_check_permit(struct afs_vnode *vnode, struct key *key,
+-			    afs_access_t *_access)
++int afs_check_permit(struct afs_vnode *vnode, struct key *key,
++		     afs_access_t *_access)
+ {
+ 	struct afs_permits *permits;
+ 	bool valid = false;
+
+commit d2ddc776a4581d900fc3bdc7803b403daae64d88
+Author: David Howells <dhowells@redhat.com>
+Date:   Thu Nov 2 15:27:50 2017 +0000
+
+    afs: Overhaul volume and server record caching and fileserver rotation
+    
+    The current code assumes that volumes and servers are per-cell and are
+    never shared, but this is not enforced, and, indeed, public cells do exist
+    that are aliases of each other.  Further, an organisation can, say, set up
+    a public cell and a private cell with overlapping, but not identical, sets
+    of servers.  The difference is purely in the database attached to the VL
+    servers.
+    
+    The current code will malfunction if it sees a server in two cells as it
+    assumes global address -> server record mappings and that each server is in
+    just one cell.
+    
+    Further, each server may have multiple addresses - and may have addresses
+    of different families (IPv4 and IPv6, say).
+    
+    To this end, the following structural changes are made:
+    
+     (1) Server record management is overhauled:
+    
+         (a) Server records are made independent of cell.  The namespace keeps
+             track of them, volume records have lists of them and each vnode
+             has a server on which its callback interest currently resides.
+    
+         (b) The cell record no longer keeps a list of servers known to be in
+             that cell.
+    
+         (c) The server records are now kept in a flat list because there's no
+             single address to sort on.
+    
+         (d) Server records are now keyed by their UUID within the namespace.
+    
+         (e) The addresses for a server are obtained with the VL.GetAddrsU
+             rather than with VL.GetEntryByName, using the server's UUID as a
+             parameter.
+    
+         (f) Cached server records are garbage collected after a period of
+             non-use and are counted out of existence before purging is allowed
+             to complete.  This protects the work functions against rmmod.
+    
+         (g) The servers list is now in /proc/fs/afs/servers.
+    
+     (2) Volume record management is overhauled:
+    
+         (a) An RCU-replaceable server list is introduced.  This tracks both
+             servers and their coresponding callback interests.
+    
+         (b) The superblock is now keyed on cell record and numeric volume ID.
+    
+         (c) The volume record is now tied to the superblock which mounts it,
+             and is activated when mounted and deactivated when unmounted.
+             This makes it easier to handle the cache cookie without causing a
+             double-use in fscache.
+    
+         (d) The volume record is loaded from the VLDB using VL.GetEntryByNameU
+             to get the server UUID list.
+    
+         (e) The volume name is updated if it is seen to have changed when the
+             volume is updated (the update is keyed on the volume ID).
+    
+     (3) The vlocation record is got rid of and VLDB records are no longer
+         cached.  Sufficient information is stored in the volume record, though
+         an update to a volume record is now no longer shared between related
+         volumes (volumes come in bundles of three: R/W, R/O and backup).
+    
+    and the following procedural changes are made:
+    
+     (1) The fileserver cursor introduced previously is now fleshed out and
+         used to iterate over fileservers and their addresses.
+    
+     (2) Volume status is checked during iteration, and the server list is
+         replaced if a change is detected.
+    
+     (3) Server status is checked during iteration, and the address list is
+         replaced if a change is detected.
+    
+     (4) The abort code is saved into the address list cursor and -ECONNABORTED
+         returned in afs_make_call() if a remote abort happened rather than
+         translating the abort into an error message.  This allows actions to
+         be taken depending on the abort code more easily.
+    
+         (a) If a VMOVED abort is seen then this is handled by rechecking the
+             volume and restarting the iteration.
+    
+         (b) If a VBUSY, VRESTARTING or VSALVAGING abort is seen then this is
+             handled by sleeping for a short period and retrying and/or trying
+             other servers that might serve that volume.  A message is also
+             displayed once until the condition has cleared.
+    
+         (c) If a VOFFLINE abort is seen, then this is handled as VBUSY for the
+             moment.
+    
+         (d) If a VNOVOL abort is seen, the volume is rechecked in the VLDB to
+             see if it has been deleted; if not, the fileserver is probably
+             indicating that the volume couldn't be attached and needs
+             salvaging.
+    
+         (e) If statfs() sees one of these aborts, it does not sleep, but
+             rather returns an error, so as not to block the umount program.
+    
+     (5) The fileserver iteration functions in vnode.c are now merged into
+         their callers and more heavily macroised around the cursor.  vnode.c
+         is removed.
+    
+     (6) Operations on a particular vnode are serialised on that vnode because
+         the server will lock that vnode whilst it operates on it, so a second
+         op sent will just have to wait.
+    
+     (7) Fileservers are probed with FS.GetCapabilities before being used.
+         This is where service upgrade will be done.
+    
+     (8) A callback interest on a fileserver is set up before an FS operation
+         is performed and passed through to afs_make_call() so that it can be
+         set on the vnode if the operation returns a callback.  The callback
+         interest is passed through to afs_iget() also so that it can be set
+         there too.
+    
+    In general, record updating is done on an as-needed basis when we try to
+    access servers, volumes or vnodes rather than offloading it to work items
+    and special threads.
+    
+    Notes:
+    
+     (1) Pre AFS-3.4 servers are no longer supported, though this can be added
+         back if necessary (AFS-3.4 was released in 1998).
+    
+     (2) VBUSY is retried forever for the moment at intervals of 1s.
+    
+     (3) /proc/fs/afs/<cell>/servers no longer exists.
+    
+    Signed-off-by: David Howells <dhowells@redhat.com>
+
+diff --git a/fs/afs/security.c b/fs/afs/security.c
+index 1b5198fc1657..46a881a4d08f 100644
+--- a/fs/afs/security.c
++++ b/fs/afs/security.c
+@@ -325,7 +325,7 @@ static int afs_check_permit(struct afs_vnode *vnode, struct key *key,
+ 		 */
+ 		_debug("no valid permit");
+ 
+-		ret = afs_vnode_fetch_status(vnode, key, true);
++		ret = afs_fetch_status(vnode, key);
+ 		if (ret < 0) {
+ 			*_access = 0;
+ 			_leave(" = %d", ret);
+
+commit be080a6f43c40976afc950ee55e9b7f8e2b53525
+Author: David Howells <dhowells@redhat.com>
+Date:   Thu Nov 2 15:27:49 2017 +0000
+
+    afs: Overhaul permit caching
+    
+    Overhaul permit caching in AFS by making it per-vnode and sharing permit
+    lists where possible.
+    
+    When most of the fileserver operations are called, they return a status
+    structure indicating the (revised) details of the vnode or vnodes involved
+    in the operation.  This includes the access mark derived from the ACL
+    (named CallerAccess in the protocol definition file).  This is cacheable
+    and if the ACL changes, the server will tell us that it is breaking the
+    callback promise, at which point we can discard the currently cached
+    permits.
+    
+    With this patch, the afs_permits structure has, at the end, an array of
+    { key, CallerAccess } elements, sorted by key pointer.  This is then cached
+    in a hash table so that it can be shared between vnodes with the same
+    access permits.
+    
+    Permit lists can only be shared if they contain the exact same set of
+    key->CallerAccess mappings.
+    
+    Note that that table is global rather than being per-net_ns.  If the keys
+    in a permit list cross net_ns boundaries, there is no problem sharing the
+    cached permits, since the permits are just integer masks.
+    
+    Since permit lists pin keys, the permit cache also makes it easier for a
+    future patch to find all occurrences of a key and remove them by means of
+    setting the afs_permits::invalidated flag and then clearing the appropriate
+    key pointer.  In such an event, memory barriers will need adding.
+    
+    Lastly, the permit caching is skipped if the server has sent either a
+    vnode-specific or an entire-server callback since the start of the
+    operation.
+    
+    Signed-off-by: David Howells <dhowells@redhat.com>
+
+diff --git a/fs/afs/security.c b/fs/afs/security.c
+index 7cc61c8b748b..1b5198fc1657 100644
+--- a/fs/afs/security.c
++++ b/fs/afs/security.c
+@@ -1,6 +1,6 @@
+ /* AFS security handling
+  *
+- * Copyright (C) 2007 Red Hat, Inc. All Rights Reserved.
++ * Copyright (C) 2007, 2017 Red Hat, Inc. All Rights Reserved.
+  * Written by David Howells (dhowells@redhat.com)
+  *
+  * This program is free software; you can redistribute it and/or
+@@ -14,9 +14,13 @@
+ #include <linux/fs.h>
+ #include <linux/ctype.h>
+ #include <linux/sched.h>
++#include <linux/hashtable.h>
+ #include <keys/rxrpc-type.h>
+ #include "internal.h"
+ 
++static DEFINE_HASHTABLE(afs_permits_cache, 10);
++static DEFINE_SPINLOCK(afs_permits_lock);
++
+ /*
+  * get a key
+  */
+@@ -46,168 +50,233 @@ struct key *afs_request_key(struct afs_cell *cell)
+ }
+ 
+ /*
+- * dispose of a permits list
++ * Dispose of a list of permits.
+  */
+-void afs_zap_permits(struct rcu_head *rcu)
++static void afs_permits_rcu(struct rcu_head *rcu)
+ {
+ 	struct afs_permits *permits =
+ 		container_of(rcu, struct afs_permits, rcu);
+-	int loop;
+-
+-	_enter("{%d}", permits->count);
++	int i;
+ 
+-	for (loop = permits->count - 1; loop >= 0; loop--)
+-		key_put(permits->permits[loop].key);
++	for (i = 0; i < permits->nr_permits; i++)
++		key_put(permits->permits[i].key);
+ 	kfree(permits);
+ }
+ 
+ /*
+- * dispose of a permits list in which all the key pointers have been copied
++ * Discard a permission cache.
+  */
+-static void afs_dispose_of_permits(struct rcu_head *rcu)
++void afs_put_permits(struct afs_permits *permits)
+ {
+-	struct afs_permits *permits =
+-		container_of(rcu, struct afs_permits, rcu);
+-
+-	_enter("{%d}", permits->count);
+-
+-	kfree(permits);
++	if (permits && refcount_dec_and_test(&permits->usage)) {
++		spin_lock(&afs_permits_lock);
++		hash_del_rcu(&permits->hash_node);
++		spin_unlock(&afs_permits_lock);
++		call_rcu(&permits->rcu, afs_permits_rcu);
++	}
+ }
+ 
+ /*
+- * get the authorising vnode - this is the specified inode itself if it's a
+- * directory or it's the parent directory if the specified inode is a file or
+- * symlink
+- * - the caller must release the ref on the inode
++ * Clear a permit cache on callback break.
+  */
+-static struct afs_vnode *afs_get_auth_inode(struct afs_vnode *vnode,
+-					    struct key *key)
++void afs_clear_permits(struct afs_vnode *vnode)
+ {
+-	struct afs_vnode *auth_vnode;
+-	struct inode *auth_inode;
+-
+-	_enter("");
++	struct afs_permits *permits;
+ 
+-	if (S_ISDIR(vnode->vfs_inode.i_mode)) {
+-		auth_inode = igrab(&vnode->vfs_inode);
+-		ASSERT(auth_inode != NULL);
+-	} else {
+-		auth_inode = afs_iget(vnode->vfs_inode.i_sb, key,
+-				      &vnode->status.parent, NULL, NULL);
+-		if (IS_ERR(auth_inode))
+-			return ERR_CAST(auth_inode);
+-	}
++	spin_lock(&vnode->lock);
++	permits = rcu_dereference_protected(vnode->permit_cache,
++					    lockdep_is_held(&vnode->lock));
++	RCU_INIT_POINTER(vnode->permit_cache, NULL);
++	vnode->cb_break++;
++	spin_unlock(&vnode->lock);
+ 
+-	auth_vnode = AFS_FS_I(auth_inode);
+-	_leave(" = {%x}", auth_vnode->fid.vnode);
+-	return auth_vnode;
++	if (permits)
++		afs_put_permits(permits);
+ }
+ 
+ /*
+- * clear the permit cache on a directory vnode
++ * Hash a list of permits.  Use simple addition to make it easy to add an extra
++ * one at an as-yet indeterminate position in the list.
+  */
+-void afs_clear_permits(struct afs_vnode *vnode)
++static void afs_hash_permits(struct afs_permits *permits)
+ {
+-	struct afs_permits *permits;
++	unsigned long h = permits->nr_permits;
++	int i;
+ 
+-	_enter("{%x:%u}", vnode->fid.vid, vnode->fid.vnode);
+-
+-	mutex_lock(&vnode->permits_lock);
+-	permits = vnode->permits;
+-	RCU_INIT_POINTER(vnode->permits, NULL);
+-	vnode->cb_break++;
+-	mutex_unlock(&vnode->permits_lock);
++	for (i = 0; i < permits->nr_permits; i++) {
++		h += (unsigned long)permits->permits[i].key / sizeof(void *);
++		h += permits->permits[i].access;
++	}
+ 
+-	if (permits)
+-		call_rcu(&permits->rcu, afs_zap_permits);
+-	_leave("");
++	permits->h = h;
+ }
+ 
+ /*
+- * add the result obtained for a vnode to its or its parent directory's cache
+- * for the key used to access it
++ * Cache the CallerAccess result obtained from doing a fileserver operation
++ * that returned a vnode status for a particular key.  If a callback break
++ * occurs whilst the operation was in progress then we have to ditch the cache
++ * as the ACL *may* have changed.
+  */
+-void afs_cache_permit(struct afs_vnode *vnode, struct key *key, long acl_order)
++void afs_cache_permit(struct afs_vnode *vnode, struct key *key,
++		      unsigned int cb_break)
+ {
+-	struct afs_permits *permits, *xpermits;
+-	struct afs_permit *permit;
+-	struct afs_vnode *auth_vnode;
+-	int count, loop;
++	struct afs_permits *permits, *xpermits, *replacement, *new = NULL;
++	afs_access_t caller_access = READ_ONCE(vnode->status.caller_access);
++	size_t size = 0;
++	bool changed = false;
++	int i, j;
++
++	_enter("{%x:%u},%x,%x",
++	       vnode->fid.vid, vnode->fid.vnode, key_serial(key), caller_access);
++
++	rcu_read_lock();
++
++	/* Check for the common case first: We got back the same access as last
++	 * time we tried and already have it recorded.
++	 */
++	permits = rcu_dereference(vnode->permit_cache);
++	if (permits) {
++		if (!permits->invalidated) {
++			for (i = 0; i < permits->nr_permits; i++) {
++				if (permits->permits[i].key < key)
++					continue;
++				if (permits->permits[i].key > key)
++					break;
++				if (permits->permits[i].access != caller_access) {
++					changed = true;
++					break;
++				}
+ 
+-	_enter("{%x:%u},%x,%lx",
+-	       vnode->fid.vid, vnode->fid.vnode, key_serial(key), acl_order);
++				if (cb_break != (vnode->cb_break +
++						 vnode->cb_interest->server->cb_s_break)) {
++					changed = true;
++					break;
++				}
+ 
+-	auth_vnode = afs_get_auth_inode(vnode, key);
+-	if (IS_ERR(auth_vnode)) {
+-		_leave(" [get error %ld]", PTR_ERR(auth_vnode));
+-		return;
+-	}
++				/* The cache is still good. */
++				rcu_read_unlock();
++				return;
++			}
++		}
+ 
+-	mutex_lock(&auth_vnode->permits_lock);
++		changed |= permits->invalidated;
++		size = permits->nr_permits;
+ 
+-	/* guard against a rename being detected whilst we waited for the
+-	 * lock */
+-	if (memcmp(&auth_vnode->fid, &vnode->status.parent,
+-		   sizeof(struct afs_fid)) != 0) {
+-		_debug("renamed");
+-		goto out_unlock;
++		/* If this set of permits is now wrong, clear the permits
++		 * pointer so that no one tries to use the stale information.
++		 */
++		if (changed) {
++			spin_lock(&vnode->lock);
++			if (permits != rcu_access_pointer(vnode->permit_cache))
++				goto someone_else_changed_it_unlock;
++			RCU_INIT_POINTER(vnode->permit_cache, NULL);
++			spin_unlock(&vnode->lock);
++
++			afs_put_permits(permits);
++			permits = NULL;
++			size = 0;
++		}
+ 	}
+ 
+-	/* have to be careful as the directory's callback may be broken between
+-	 * us receiving the status we're trying to cache and us getting the
+-	 * lock to update the cache for the status */
+-	if (auth_vnode->acl_order - acl_order > 0) {
+-		_debug("ACL changed?");
+-		goto out_unlock;
++	if (cb_break != (vnode->cb_break + vnode->cb_interest->server->cb_s_break)) {
++		rcu_read_unlock();
++		goto someone_else_changed_it;
+ 	}
+ 
+-	/* always update the anonymous mask */
+-	_debug("anon access %x", vnode->status.anon_access);
+-	auth_vnode->status.anon_access = vnode->status.anon_access;
+-	if (key == vnode->volume->cell->anonymous_key)
+-		goto out_unlock;
+-
+-	xpermits = auth_vnode->permits;
+-	count = 0;
+-	if (xpermits) {
+-		/* see if the permit is already in the list
+-		 * - if it is then we just amend the list
+-		 */
+-		count = xpermits->count;
+-		permit = xpermits->permits;
+-		for (loop = count; loop > 0; loop--) {
+-			if (permit->key == key) {
+-				permit->access_mask =
+-					vnode->status.caller_access;
+-				goto out_unlock;
++	/* We need a ref on any permits list we want to copy as we'll have to
++	 * drop the lock to do memory allocation.
++	 */
++	if (permits && !refcount_inc_not_zero(&permits->usage)) {
++		rcu_read_unlock();
++		goto someone_else_changed_it;
++	}
++
++	rcu_read_unlock();
++
++	/* Speculatively create a new list with the revised permission set.  We
++	 * discard this if we find an extant match already in the hash, but
++	 * it's easier to compare with memcmp this way.
++	 *
++	 * We fill in the key pointers at this time, but we don't get the refs
++	 * yet.
++	 */
++	size++;
++	new = kzalloc(sizeof(struct afs_permits) +
++		      sizeof(struct afs_permit) * size, GFP_NOFS);
++	if (!new)
++		return;
++
++	refcount_set(&new->usage, 1);
++	new->nr_permits = size;
++	i = j = 0;
++	if (permits) {
++		for (i = 0; i < permits->nr_permits; i++) {
++			if (j == i && permits->permits[i].key > key) {
++				new->permits[j].key = key;
++				new->permits[j].access = caller_access;
++				j++;
+ 			}
+-			permit++;
++			new->permits[j].key = permits->permits[i].key;
++			new->permits[j].access = permits->permits[i].access;
++			j++;
+ 		}
+ 	}
+ 
+-	permits = kmalloc(sizeof(*permits) + sizeof(*permit) * (count + 1),
+-			  GFP_NOFS);
+-	if (!permits)
+-		goto out_unlock;
+-
+-	if (xpermits)
+-		memcpy(permits->permits, xpermits->permits,
+-			count * sizeof(struct afs_permit));
+-
+-	_debug("key %x access %x",
+-	       key_serial(key), vnode->status.caller_access);
+-	permits->permits[count].access_mask = vnode->status.caller_access;
+-	permits->permits[count].key = key_get(key);
+-	permits->count = count + 1;
+-
+-	rcu_assign_pointer(auth_vnode->permits, permits);
+-	if (xpermits)
+-		call_rcu(&xpermits->rcu, afs_dispose_of_permits);
+-
+-out_unlock:
+-	mutex_unlock(&auth_vnode->permits_lock);
+-	iput(&auth_vnode->vfs_inode);
+-	_leave("");
++	if (j == i) {
++		new->permits[j].key = key;
++		new->permits[j].access = caller_access;
++	}
++
++	afs_hash_permits(new);
++
++	afs_put_permits(permits);
++
++	/* Now see if the permit list we want is actually already available */
++	spin_lock(&afs_permits_lock);
++
++	hash_for_each_possible(afs_permits_cache, xpermits, hash_node, new->h) {
++		if (xpermits->h != new->h ||
++		    xpermits->invalidated ||
++		    xpermits->nr_permits != new->nr_permits ||
++		    memcmp(xpermits->permits, new->permits,
++			   new->nr_permits * sizeof(struct afs_permit)) != 0)
++			continue;
++
++		if (refcount_inc_not_zero(&xpermits->usage)) {
++			replacement = xpermits;
++			goto found;
++		}
++
++		break;
++	}
++
++	for (i = 0; i < new->nr_permits; i++)
++		key_get(new->permits[i].key);
++	hash_add_rcu(afs_permits_cache, &new->hash_node, new->h);
++	replacement = new;
++	new = NULL;
++
++found:
++	spin_unlock(&afs_permits_lock);
++
++	kfree(new);
++
++	spin_lock(&vnode->lock);
++	if (cb_break != (vnode->cb_break + vnode->cb_interest->server->cb_s_break) ||
++	    permits != rcu_access_pointer(vnode->permit_cache))
++		goto someone_else_changed_it_unlock;
++	rcu_assign_pointer(vnode->permit_cache, replacement);
++	spin_unlock(&vnode->lock);
++	afs_put_permits(permits);
++	return;
++
++someone_else_changed_it_unlock:
++	spin_unlock(&vnode->lock);
++someone_else_changed_it:
++	/* Someone else changed the cache under us - don't recheck at this
++	 * time.
++	 */
++	return;
+ }
+ 
+ /*
+@@ -219,55 +288,45 @@ static int afs_check_permit(struct afs_vnode *vnode, struct key *key,
+ 			    afs_access_t *_access)
+ {
+ 	struct afs_permits *permits;
+-	struct afs_permit *permit;
+-	struct afs_vnode *auth_vnode;
+-	bool valid;
+-	int loop, ret;
++	bool valid = false;
++	int i, ret;
+ 
+ 	_enter("{%x:%u},%x",
+ 	       vnode->fid.vid, vnode->fid.vnode, key_serial(key));
+ 
+-	auth_vnode = afs_get_auth_inode(vnode, key);
+-	if (IS_ERR(auth_vnode)) {
+-		*_access = 0;
+-		_leave(" = %ld", PTR_ERR(auth_vnode));
+-		return PTR_ERR(auth_vnode);
+-	}
+-
+-	ASSERT(S_ISDIR(auth_vnode->vfs_inode.i_mode));
++	permits = vnode->permit_cache;
+ 
+ 	/* check the permits to see if we've got one yet */
+-	if (key == auth_vnode->volume->cell->anonymous_key) {
++	if (key == vnode->volume->cell->anonymous_key) {
+ 		_debug("anon");
+-		*_access = auth_vnode->status.anon_access;
++		*_access = vnode->status.anon_access;
+ 		valid = true;
+ 	} else {
+-		valid = false;
+ 		rcu_read_lock();
+-		permits = rcu_dereference(auth_vnode->permits);
++		permits = rcu_dereference(vnode->permit_cache);
+ 		if (permits) {
+-			permit = permits->permits;
+-			for (loop = permits->count; loop > 0; loop--) {
+-				if (permit->key == key) {
+-					_debug("found in cache");
+-					*_access = permit->access_mask;
+-					valid = true;
++			for (i = 0; i < permits->nr_permits; i++) {
++				if (permits->permits[i].key < key)
++					continue;
++				if (permits->permits[i].key > key)
+ 					break;
+-				}
+-				permit++;
++
++				*_access = permits->permits[i].access;
++				valid = !permits->invalidated;
++				break;
+ 			}
+ 		}
+ 		rcu_read_unlock();
+ 	}
+ 
+ 	if (!valid) {
+-		/* check the status on the file we're actually interested in
+-		 * (the post-processing will cache the result on auth_vnode) */
++		/* Check the status on the file we're actually interested in
++		 * (the post-processing will cache the result).
++		 */
+ 		_debug("no valid permit");
+ 
+-		ret = afs_vnode_fetch_status(vnode, auth_vnode, key, true);
++		ret = afs_vnode_fetch_status(vnode, key, true);
+ 		if (ret < 0) {
+-			iput(&auth_vnode->vfs_inode);
+ 			*_access = 0;
+ 			_leave(" = %d", ret);
+ 			return ret;
+@@ -275,7 +334,6 @@ static int afs_check_permit(struct afs_vnode *vnode, struct key *key,
+ 		*_access = vnode->status.caller_access;
+ 	}
+ 
+-	iput(&auth_vnode->vfs_inode);
+ 	_leave(" = 0 [access %x]", *_access);
+ 	return 0;
+ }
+@@ -360,3 +418,12 @@ int afs_permission(struct inode *inode, int mask)
+ 	_leave(" = %d", ret);
+ 	return ret;
+ }
++
++void __exit afs_clean_up_permit_cache(void)
++{
++	int i;
++
++	for (i = 0; i < HASH_SIZE(afs_permits_cache); i++)
++		WARN_ON_ONCE(!hlist_empty(&afs_permits_cache[i]));
++
++}
+
+commit c435ee34551e1f5a02a253ca8e235287efd2727c
+Author: David Howells <dhowells@redhat.com>
+Date:   Thu Nov 2 15:27:49 2017 +0000
+
+    afs: Overhaul the callback handling
+    
+    Overhaul the AFS callback handling by the following means:
+    
+     (1) Don't give up callback promises on vnodes that we are no longer using,
+         rather let them just expire on the server or let the server break
+         them.  This is actually more efficient for the server as the callback
+         lookup is expensive if there are lots of extant callbacks.
+    
+     (2) Only give up the callback promises we have from a server when the
+         server record is destroyed.  Then we can just give up *all* the
+         callback promises on it in one go.
+    
+     (3) Servers can end up being shared between cells if cells are aliased, so
+         don't add all the vnodes being backed by a particular server into a
+         big FID-indexed tree on that server as there may be duplicates.
+    
+         Instead have each volume instance (~= superblock) register an interest
+         in a server as it starts to make use of it and use this to allow the
+         processor for callbacks from the server to find the superblock and
+         thence the inode corresponding to the FID being broken by means of
+         ilookup_nowait().
+    
+     (4) Rather than iterating over the entire callback list when a mass-break
+         comes in from the server, maintain a counter of mass-breaks in
+         afs_server (cb_seq) and make afs_validate() check it against the copy
+         in afs_vnode.
+    
+         It would be nice not to have to take a read_lock whilst doing this,
+         but that's tricky without using RCU.
+    
+     (5) Save a ref on the fileserver we're using for a call in the afs_call
+         struct so that we can access its cb_s_break during call decoding.
+    
+     (6) Write-lock around callback and status storage in a vnode and read-lock
+         around getattr so that we don't see the status mid-update.
+    
+    This has the following consequences:
+    
+     (1) Data invalidation isn't seen until someone calls afs_validate() on a
+         vnode.  Unfortunately, we need to use a key to query the server, but
+         getting one from a background thread is tricky without caching loads
+         of keys all over the place.
+    
+     (2) Mass invalidation isn't seen until someone calls afs_validate().
+    
+     (3) Callback breaking is going to hit the inode_hash_lock quite a bit.
+         Could this be replaced with rcu_read_lock() since inodes are destroyed
+         under RCU conditions.
+    
+    Signed-off-by: David Howells <dhowells@redhat.com>
+
+diff --git a/fs/afs/security.c b/fs/afs/security.c
+index faca66227ecf..7cc61c8b748b 100644
+--- a/fs/afs/security.c
++++ b/fs/afs/security.c
+@@ -115,6 +115,7 @@ void afs_clear_permits(struct afs_vnode *vnode)
+ 	mutex_lock(&vnode->permits_lock);
+ 	permits = vnode->permits;
+ 	RCU_INIT_POINTER(vnode->permits, NULL);
++	vnode->cb_break++;
+ 	mutex_unlock(&vnode->permits_lock);
+ 
+ 	if (permits)
+@@ -264,8 +265,7 @@ static int afs_check_permit(struct afs_vnode *vnode, struct key *key,
+ 		 * (the post-processing will cache the result on auth_vnode) */
+ 		_debug("no valid permit");
+ 
+-		set_bit(AFS_VNODE_CB_BROKEN, &vnode->flags);
+-		ret = afs_vnode_fetch_status(vnode, auth_vnode, key);
++		ret = afs_vnode_fetch_status(vnode, auth_vnode, key, true);
+ 		if (ret < 0) {
+ 			iput(&auth_vnode->vfs_inode);
+ 			*_access = 0;
+@@ -304,14 +304,9 @@ int afs_permission(struct inode *inode, int mask)
+ 		return PTR_ERR(key);
+ 	}
+ 
+-	/* if the promise has expired, we need to check the server again */
+-	if (!vnode->cb_promised) {
+-		_debug("not promised");
+-		ret = afs_vnode_fetch_status(vnode, NULL, key);
+-		if (ret < 0)
+-			goto error;
+-		_debug("new promise [fl=%lx]", vnode->flags);
+-	}
++	ret = afs_validate(vnode, key);
++	if (ret < 0)
++		goto error;
+ 
+ 	/* check the permits to see if we've got one yet */
+ 	ret = afs_check_permit(vnode, key, &access);
+
+commit fd2498211a551fd42b2d6b9050d649d43536e75c
+Author: Marc Dionne <marc.dionne@auristor.com>
+Date:   Thu Jul 6 15:50:18 2017 +0100
+
+    afs: Ignore AFS_ACE_READ and AFS_ACE_WRITE for directories
+    
+    The AFS_ACE_READ and AFS_ACE_WRITE permission bits should not
+    be used to make access decisions for the directory itself.  They
+    are meant to control access for the objects contained in that
+    directory.
+    
+    Reading a directory is allowed if the AFS_ACE_LOOKUP bit is set.
+    This would cause an incorrect access denied error for a directory
+    with AFS_ACE_LOOKUP but not AFS_ACE_READ.
+    
+    The AFS_ACE_WRITE bit does not allow operations that modify the
+    directory.  For a directory with AFS_ACE_WRITE but neither
+    AFS_ACE_INSERT nor AFS_ACE_DELETE, this would result in trying
+    operations that would ultimately be denied by the server.
+    
+    Signed-off-by: Marc Dionne <marc.dionne@auristor.com>
+    Signed-off-by: David Howells <dhowells@redhat.com>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/fs/afs/security.c b/fs/afs/security.c
+index ecb86a670180..faca66227ecf 100644
+--- a/fs/afs/security.c
++++ b/fs/afs/security.c
+@@ -327,12 +327,11 @@ int afs_permission(struct inode *inode, int mask)
+ 			if (!(access & AFS_ACE_LOOKUP))
+ 				goto permission_denied;
+ 		} else if (mask & MAY_READ) {
+-			if (!(access & AFS_ACE_READ))
++			if (!(access & AFS_ACE_LOOKUP))
+ 				goto permission_denied;
+ 		} else if (mask & MAY_WRITE) {
+ 			if (!(access & (AFS_ACE_DELETE | /* rmdir, unlink, rename from */
+-					AFS_ACE_INSERT | /* create, mkdir, symlink, rename to */
+-					AFS_ACE_WRITE))) /* chmod */
++					AFS_ACE_INSERT))) /* create, mkdir, symlink, rename to */
+ 				goto permission_denied;
+ 		} else {
+ 			BUG();
+
+commit df8a09d1b8f9e693ec3f6b7e0162fc817f2cf0db
+Author: Andreea-Cristina Bernat <bernat.ada@gmail.com>
+Date:   Thu Mar 16 16:27:45 2017 +0000
+
+    afs: security: Replace rcu_assign_pointer() with RCU_INIT_POINTER()
+    
+    The use of "rcu_assign_pointer()" is NULLing out the pointer.
+    According to RCU_INIT_POINTER()'s block comment:
+    "1.   This use of RCU_INIT_POINTER() is NULLing out the pointer"
+    it is better to use it instead of rcu_assign_pointer() because it has a
+    smaller overhead.
+    
+    The following Coccinelle semantic patch was used:
+    @@
+    @@
+    
+    - rcu_assign_pointer
+    + RCU_INIT_POINTER
+      (..., NULL)
+    
+    Signed-off-by: Andreea-Cristina Bernat <bernat.ada@gmail.com>
+    Signed-off-by: David Howells <dhowells@redhat.com>
+
+diff --git a/fs/afs/security.c b/fs/afs/security.c
+index bfa9d3428383..ecb86a670180 100644
+--- a/fs/afs/security.c
++++ b/fs/afs/security.c
+@@ -114,7 +114,7 @@ void afs_clear_permits(struct afs_vnode *vnode)
+ 
+ 	mutex_lock(&vnode->permits_lock);
+ 	permits = vnode->permits;
+-	rcu_assign_pointer(vnode->permits, NULL);
++	RCU_INIT_POINTER(vnode->permits, NULL);
+ 	mutex_unlock(&vnode->permits_lock);
+ 
+ 	if (permits)
+
+commit 627f46943ff90bcc32ddeb675d881c043c6fa2ae
+Author: Marc Dionne <marc.dionne@auristor.com>
+Date:   Thu Mar 16 16:27:44 2017 +0000
+
+    afs: Adjust mode bits processing
+    
+    Mode bits for an afs file should not be enforced in the usual
+    way.
+    
+    For files, the absence of user bits can restrict file access
+    with respect to what is granted by the server.
+    
+    These bits apply regardless of the owner or the current uid; the
+    rest of the mode bits (group, other) are ignored.
+    
+    Signed-off-by: Marc Dionne <marc.dionne@auristor.com>
+    Signed-off-by: David Howells <dhowells@redhat.com>
+
+diff --git a/fs/afs/security.c b/fs/afs/security.c
+index 8d010422dc89..bfa9d3428383 100644
+--- a/fs/afs/security.c
++++ b/fs/afs/security.c
+@@ -340,17 +340,22 @@ int afs_permission(struct inode *inode, int mask)
+ 	} else {
+ 		if (!(access & AFS_ACE_LOOKUP))
+ 			goto permission_denied;
++		if ((mask & MAY_EXEC) && !(inode->i_mode & S_IXUSR))
++			goto permission_denied;
+ 		if (mask & (MAY_EXEC | MAY_READ)) {
+ 			if (!(access & AFS_ACE_READ))
+ 				goto permission_denied;
++			if (!(inode->i_mode & S_IRUSR))
++				goto permission_denied;
+ 		} else if (mask & MAY_WRITE) {
+ 			if (!(access & AFS_ACE_WRITE))
+ 				goto permission_denied;
++			if (!(inode->i_mode & S_IWUSR))
++				goto permission_denied;
+ 		}
+ 	}
+ 
+ 	key_put(key);
+-	ret = generic_permission(inode, mask);
+ 	_leave(" = %d", ret);
+ 	return ret;
+ 
+
+commit 10556cb21a0d0b24d95f00ea6df16f599a3345b2
+Author: Al Viro <viro@zeniv.linux.org.uk>
+Date:   Mon Jun 20 19:28:19 2011 -0400
+
+    ->permission() sanitizing: don't pass flags to ->permission()
+    
+    not used by the instances anymore.
+    
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/fs/afs/security.c b/fs/afs/security.c
+index ab6b3147f05f..8d010422dc89 100644
+--- a/fs/afs/security.c
++++ b/fs/afs/security.c
+@@ -285,14 +285,14 @@ static int afs_check_permit(struct afs_vnode *vnode, struct key *key,
+  * - AFS ACLs are attached to directories only, and a file is controlled by its
+  *   parent directory's ACL
+  */
+-int afs_permission(struct inode *inode, int mask, unsigned int flags)
++int afs_permission(struct inode *inode, int mask)
+ {
+ 	struct afs_vnode *vnode = AFS_FS_I(inode);
+ 	afs_access_t uninitialized_var(access);
+ 	struct key *key;
+ 	int ret;
+ 
+-	if (flags & IPERM_FLAG_RCU)
++	if (mask & MAY_NOT_BLOCK)
+ 		return -ECHILD;
+ 
+ 	_enter("{{%x:%u},%lx},%x,",
+
+commit 2830ba7f34ebb27c4e5b8b6ef408cd6d74860890
+Author: Al Viro <viro@zeniv.linux.org.uk>
+Date:   Mon Jun 20 19:16:29 2011 -0400
+
+    ->permission() sanitizing: don't pass flags to generic_permission()
+    
+    redundant; all callers get it duplicated in mask & MAY_NOT_BLOCK and none of
+    them removes that bit.
+    
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/fs/afs/security.c b/fs/afs/security.c
+index 745ee654165f..ab6b3147f05f 100644
+--- a/fs/afs/security.c
++++ b/fs/afs/security.c
+@@ -350,7 +350,7 @@ int afs_permission(struct inode *inode, int mask, unsigned int flags)
+ 	}
+ 
+ 	key_put(key);
+-	ret = generic_permission(inode, mask, flags);
++	ret = generic_permission(inode, mask);
+ 	_leave(" = %d", ret);
+ 	return ret;
+ 
+
+commit 178ea73521d64ba41d7aa5488fb9f549c6d4507d
+Author: Al Viro <viro@zeniv.linux.org.uk>
+Date:   Mon Jun 20 11:31:30 2011 -0400
+
+    kill check_acl callback of generic_permission()
+    
+    its value depends only on inode and does not change; we might as
+    well store it in ->i_op->check_acl and be done with that.
+    
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/fs/afs/security.c b/fs/afs/security.c
+index f44b9d355377..745ee654165f 100644
+--- a/fs/afs/security.c
++++ b/fs/afs/security.c
+@@ -350,7 +350,7 @@ int afs_permission(struct inode *inode, int mask, unsigned int flags)
+ 	}
+ 
+ 	key_put(key);
+-	ret = generic_permission(inode, mask, flags, NULL);
++	ret = generic_permission(inode, mask, flags);
+ 	_leave(" = %d", ret);
+ 	return ret;
+ 
+
+commit b74c79e99389cd79b31fcc08f82c24e492e63c7e
+Author: Nick Piggin <npiggin@kernel.dk>
+Date:   Fri Jan 7 17:49:58 2011 +1100
+
+    fs: provide rcu-walk aware permission i_ops
+    
+    Signed-off-by: Nick Piggin <npiggin@kernel.dk>
+
+diff --git a/fs/afs/security.c b/fs/afs/security.c
+index bb4ed144d0e4..f44b9d355377 100644
+--- a/fs/afs/security.c
++++ b/fs/afs/security.c
+@@ -285,13 +285,16 @@ static int afs_check_permit(struct afs_vnode *vnode, struct key *key,
+  * - AFS ACLs are attached to directories only, and a file is controlled by its
+  *   parent directory's ACL
+  */
+-int afs_permission(struct inode *inode, int mask)
++int afs_permission(struct inode *inode, int mask, unsigned int flags)
+ {
+ 	struct afs_vnode *vnode = AFS_FS_I(inode);
+ 	afs_access_t uninitialized_var(access);
+ 	struct key *key;
+ 	int ret;
+ 
++	if (flags & IPERM_FLAG_RCU)
++		return -ECHILD;
++
+ 	_enter("{{%x:%u},%lx},%x,",
+ 	       vnode->fid.vid, vnode->fid.vnode, vnode->flags, mask);
+ 
+@@ -347,7 +350,7 @@ int afs_permission(struct inode *inode, int mask)
+ 	}
+ 
+ 	key_put(key);
+-	ret = generic_permission(inode, mask, NULL);
++	ret = generic_permission(inode, mask, flags, NULL);
+ 	_leave(" = %d", ret);
+ 	return ret;
+ 
+
+commit 99b437a9257cb6b267bf32adfb7675948dc6d485
+Author: Dan Carpenter <error27@gmail.com>
+Date:   Mon Mar 22 13:07:14 2010 +0000
+
+    AFS: Potential null dereference
+    
+    It seems clear from the surrounding code that xpermits is allowed to be
+    NULL here.
+    
+    Signed-off-by: Dan Carpenter <error27@gmail.com>
+    Signed-off-by: David Howells <dhowells@redhat.com>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/fs/afs/security.c b/fs/afs/security.c
+index 3ef504370034..bb4ed144d0e4 100644
+--- a/fs/afs/security.c
++++ b/fs/afs/security.c
+@@ -189,8 +189,9 @@ void afs_cache_permit(struct afs_vnode *vnode, struct key *key, long acl_order)
+ 	if (!permits)
+ 		goto out_unlock;
+ 
+-	memcpy(permits->permits, xpermits->permits,
+-	       count * sizeof(struct afs_permit));
++	if (xpermits)
++		memcpy(permits->permits, xpermits->permits,
++			count * sizeof(struct afs_permit));
+ 
+ 	_debug("key %x access %x",
+ 	       key_serial(key), vnode->status.caller_access);
+
+commit e6305c43eda10ebfd2ad9e35d6e172ccc7bb3695
+Author: Al Viro <viro@zeniv.linux.org.uk>
+Date:   Tue Jul 15 21:03:57 2008 -0400
+
+    [PATCH] sanitize ->permission() prototype
+    
+    * kill nameidata * argument; map the 3 bits in ->flags anybody cares
+      about to new MAY_... ones and pass with the mask.
+    * kill redundant gfs2_iop_permission()
+    * sanitize ecryptfs_permission()
+    * fix remaining places where ->permission() instances might barf on new
+      MAY_... found in mask.
+    
+    The obvious next target in that direction is permission(9)
+    
+    folded fix for nfs_permission() breakage from Miklos Szeredi <mszeredi@suse.cz>
+    
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/fs/afs/security.c b/fs/afs/security.c
+index 3bcbeceba1bb..3ef504370034 100644
+--- a/fs/afs/security.c
++++ b/fs/afs/security.c
+@@ -284,7 +284,7 @@ static int afs_check_permit(struct afs_vnode *vnode, struct key *key,
+  * - AFS ACLs are attached to directories only, and a file is controlled by its
+  *   parent directory's ACL
+  */
+-int afs_permission(struct inode *inode, int mask, struct nameidata *nd)
++int afs_permission(struct inode *inode, int mask)
+ {
+ 	struct afs_vnode *vnode = AFS_FS_I(inode);
+ 	afs_access_t uninitialized_var(access);
+
+commit 69759454873fd90130007bdb60948a79e880cd82
+Author: Andrew Morton <akpm@linux-foundation.org>
+Date:   Fri Feb 8 04:20:53 2008 -0800
+
+    fs/afs/security.c: fix uninitialized var warning
+    
+    fs/afs/security.c: In function 'afs_permission':
+    fs/afs/security.c:290: warning: 'access' may be used uninitialized in this function
+    
+    Cc: David Howells <dhowells@redhat.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/fs/afs/security.c b/fs/afs/security.c
+index 9446a1fd108a..3bcbeceba1bb 100644
+--- a/fs/afs/security.c
++++ b/fs/afs/security.c
+@@ -287,7 +287,7 @@ static int afs_check_permit(struct afs_vnode *vnode, struct key *key,
+ int afs_permission(struct inode *inode, int mask, struct nameidata *nd)
+ {
+ 	struct afs_vnode *vnode = AFS_FS_I(inode);
+-	afs_access_t access;
++	afs_access_t uninitialized_var(access);
+ 	struct key *key;
+ 	int ret;
+ 
+
+commit e231c2ee64eb1c5cd3c63c31da9dac7d888dcf7f
+Author: David Howells <dhowells@redhat.com>
+Date:   Thu Feb 7 00:15:26 2008 -0800
+
+    Convert ERR_PTR(PTR_ERR(p)) instances to ERR_CAST(p)
+    
+    Convert instances of ERR_PTR(PTR_ERR(p)) to ERR_CAST(p) using:
+    
+    perl -spi -e 's/ERR_PTR[(]PTR_ERR[(](.*)[)][)]/ERR_CAST(\1)/' `grep -rl 'ERR_PTR[(]*PTR_ERR' fs crypto net security`
+    
+    Signed-off-by: David Howells <dhowells@redhat.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/fs/afs/security.c b/fs/afs/security.c
+index 566fe712c682..9446a1fd108a 100644
+--- a/fs/afs/security.c
++++ b/fs/afs/security.c
+@@ -95,7 +95,7 @@ static struct afs_vnode *afs_get_auth_inode(struct afs_vnode *vnode,
+ 		auth_inode = afs_iget(vnode->vfs_inode.i_sb, key,
+ 				      &vnode->status.parent, NULL, NULL);
+ 		if (IS_ERR(auth_inode))
+-			return ERR_PTR(PTR_ERR(auth_inode));
++			return ERR_CAST(auth_inode);
+ 	}
+ 
+ 	auth_vnode = AFS_FS_I(auth_inode);
+
+commit e8edc6e03a5c8562dc70a6d969f732bdb355a7e7
+Author: Alexey Dobriyan <adobriyan@gmail.com>
+Date:   Mon May 21 01:22:52 2007 +0400
+
+    Detach sched.h from mm.h
+    
+    First thing mm.h does is including sched.h solely for can_do_mlock() inline
+    function which has "current" dereference inside. By dealing with can_do_mlock()
+    mm.h can be detached from sched.h which is good. See below, why.
+    
+    This patch
+    a) removes unconditional inclusion of sched.h from mm.h
+    b) makes can_do_mlock() normal function in mm/mlock.c
+    c) exports can_do_mlock() to not break compilation
+    d) adds sched.h inclusions back to files that were getting it indirectly.
+    e) adds less bloated headers to some files (asm/signal.h, jiffies.h) that were
+       getting them indirectly
+    
+    Net result is:
+    a) mm.h users would get less code to open, read, preprocess, parse, ... if
+       they don't need sched.h
+    b) sched.h stops being dependency for significant number of files:
+       on x86_64 allmodconfig touching sched.h results in recompile of 4083 files,
+       after patch it's only 3744 (-8.3%).
+    
+    Cross-compile tested on
+    
+            all arm defconfigs, all mips defconfigs, all powerpc defconfigs,
+            alpha alpha-up
+            arm
+            i386 i386-up i386-defconfig i386-allnoconfig
+            ia64 ia64-up
+            m68k
+            mips
+            parisc parisc-up
+            powerpc powerpc-up
+            s390 s390-up
+            sparc sparc-up
+            sparc64 sparc64-up
+            um-x86_64
+            x86_64 x86_64-up x86_64-defconfig x86_64-allnoconfig
+    
+    as well as my two usual configs.
+    
+    Signed-off-by: Alexey Dobriyan <adobriyan@gmail.com>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/fs/afs/security.c b/fs/afs/security.c
+index e0ea88b63ebf..566fe712c682 100644
+--- a/fs/afs/security.c
++++ b/fs/afs/security.c
+@@ -13,6 +13,7 @@
+ #include <linux/slab.h>
+ #include <linux/fs.h>
+ #include <linux/ctype.h>
++#include <linux/sched.h>
+ #include <keys/rxrpc-type.h>
+ #include "internal.h"
+ 
+
+commit 416351f28d2b31d15ff73e9aff699b2163704c95
+Author: David Howells <dhowells@redhat.com>
+Date:   Wed May 9 02:33:45 2007 -0700
+
+    AFS: AFS fixups
+    
+    Make some miscellaneous changes to the AFS filesystem:
+    
+     (1) Assert RCU barriers on module exit to make sure RCU has finished with
+         callbacks in this module.
+    
+     (2) Correctly handle the AFS server returning a zero-length read.
+    
+     (3) Split out data zapping calls into one function (afs_zap_data).
+    
+     (4) Rename some afs_file_*() functions to afs_*() where they apply to
+         non-regular files too.
+    
+     (5) Be consistent about the presentation of volume ID:vnode ID in debugging
+         output.
+    
+    Signed-off-by: David Howells <dhowells@redhat.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/fs/afs/security.c b/fs/afs/security.c
+index f9f424d80458..e0ea88b63ebf 100644
+--- a/fs/afs/security.c
++++ b/fs/afs/security.c
+@@ -109,7 +109,7 @@ void afs_clear_permits(struct afs_vnode *vnode)
+ {
+ 	struct afs_permits *permits;
+ 
+-	_enter("{%x}", vnode->fid.vnode);
++	_enter("{%x:%u}", vnode->fid.vid, vnode->fid.vnode);
+ 
+ 	mutex_lock(&vnode->permits_lock);
+ 	permits = vnode->permits;
+@@ -132,7 +132,8 @@ void afs_cache_permit(struct afs_vnode *vnode, struct key *key, long acl_order)
+ 	struct afs_vnode *auth_vnode;
+ 	int count, loop;
+ 
+-	_enter("{%x},%x,%lx", vnode->fid.vnode, key_serial(key), acl_order);
++	_enter("{%x:%u},%x,%lx",
++	       vnode->fid.vid, vnode->fid.vnode, key_serial(key), acl_order);
+ 
+ 	auth_vnode = afs_get_auth_inode(vnode, key);
+ 	if (IS_ERR(auth_vnode)) {
+@@ -220,7 +221,8 @@ static int afs_check_permit(struct afs_vnode *vnode, struct key *key,
+ 	bool valid;
+ 	int loop, ret;
+ 
+-	_enter("");
++	_enter("{%x:%u},%x",
++	       vnode->fid.vid, vnode->fid.vnode, key_serial(key));
+ 
+ 	auth_vnode = afs_get_auth_inode(vnode, key);
+ 	if (IS_ERR(auth_vnode)) {
+@@ -268,9 +270,9 @@ static int afs_check_permit(struct afs_vnode *vnode, struct key *key,
+ 			_leave(" = %d", ret);
+ 			return ret;
+ 		}
++		*_access = vnode->status.caller_access;
+ 	}
+ 
+-	*_access = vnode->status.caller_access;
+ 	iput(&auth_vnode->vfs_inode);
+ 	_leave(" = 0 [access %x]", *_access);
+ 	return 0;
+@@ -288,7 +290,7 @@ int afs_permission(struct inode *inode, int mask, struct nameidata *nd)
+ 	struct key *key;
+ 	int ret;
+ 
+-	_enter("{{%x:%x},%lx},%x,",
++	_enter("{{%x:%u},%lx},%x,",
+ 	       vnode->fid.vid, vnode->fid.vnode, vnode->flags, mask);
+ 
+ 	key = afs_request_key(vnode->volume->cell);
+
+commit 260a980317dac80182dd76140cf67c6e81d6d3dd
+Author: David Howells <dhowells@redhat.com>
+Date:   Thu Apr 26 15:59:35 2007 -0700
+
+    [AFS]: Add "directory write" support.
+    
+    Add support for the create, link, symlink, unlink, mkdir, rmdir and
+    rename VFS operations to the in-kernel AFS filesystem.
+    
+    Also:
+    
+     (1) Fix dentry and inode revalidation.  d_revalidate should only look at
+         state of the dentry.  Revalidation of the contents of an inode pointed to
+         by a dentry is now separate.
+    
+     (2) Fix afs_lookup() to hash negative dentries as well as positive ones.
+    
+    Signed-off-by: David Howells <dhowells@redhat.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/fs/afs/security.c b/fs/afs/security.c
+index cbdd7f7162fa..f9f424d80458 100644
+--- a/fs/afs/security.c
++++ b/fs/afs/security.c
+@@ -92,7 +92,7 @@ static struct afs_vnode *afs_get_auth_inode(struct afs_vnode *vnode,
+ 		ASSERT(auth_inode != NULL);
+ 	} else {
+ 		auth_inode = afs_iget(vnode->vfs_inode.i_sb, key,
+-				      &vnode->status.parent);
++				      &vnode->status.parent, NULL, NULL);
+ 		if (IS_ERR(auth_inode))
+ 			return ERR_PTR(PTR_ERR(auth_inode));
+ 	}
+@@ -288,7 +288,8 @@ int afs_permission(struct inode *inode, int mask, struct nameidata *nd)
+ 	struct key *key;
+ 	int ret;
+ 
+-	_enter("{%x:%x},%x,", vnode->fid.vid, vnode->fid.vnode, mask);
++	_enter("{{%x:%x},%lx},%x,",
++	       vnode->fid.vid, vnode->fid.vnode, vnode->flags, mask);
+ 
+ 	key = afs_request_key(vnode->volume->cell);
+ 	if (IS_ERR(key)) {
+@@ -296,13 +297,19 @@ int afs_permission(struct inode *inode, int mask, struct nameidata *nd)
+ 		return PTR_ERR(key);
+ 	}
+ 
++	/* if the promise has expired, we need to check the server again */
++	if (!vnode->cb_promised) {
++		_debug("not promised");
++		ret = afs_vnode_fetch_status(vnode, NULL, key);
++		if (ret < 0)
++			goto error;
++		_debug("new promise [fl=%lx]", vnode->flags);
++	}
++
+ 	/* check the permits to see if we've got one yet */
+ 	ret = afs_check_permit(vnode, key, &access);
+-	if (ret < 0) {
+-		key_put(key);
+-		_leave(" = %d [check]", ret);
+-		return ret;
+-	}
++	if (ret < 0)
++		goto error;
+ 
+ 	/* interpret the access mask */
+ 	_debug("REQ %x ACC %x on %s",
+@@ -336,10 +343,14 @@ int afs_permission(struct inode *inode, int mask, struct nameidata *nd)
+ 	}
+ 
+ 	key_put(key);
+-	return generic_permission(inode, mask, NULL);
++	ret = generic_permission(inode, mask, NULL);
++	_leave(" = %d", ret);
++	return ret;
+ 
+ permission_denied:
++	ret = -EACCES;
++error:
+ 	key_put(key);
+-	_leave(" = -EACCES");
+-	return -EACCES;
++	_leave(" = %d", ret);
++	return ret;
+ }
+
+commit 00d3b7a4533e367b0dc2812a706db8f9f071c27f
+Author: David Howells <dhowells@redhat.com>
+Date:   Thu Apr 26 15:57:07 2007 -0700
+
+    [AFS]: Add security support.
+    
+    Add security support to the AFS filesystem.  Kerberos IV tickets are added as
+    RxRPC keys are added to the session keyring with the klog program.  open() and
+    other VFS operations then find this ticket with request_key() and either use
+    it immediately (eg: mkdir, unlink) or attach it to a file descriptor (open).
+    
+    Signed-off-by: David Howells <dhowells@redhat.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/fs/afs/security.c b/fs/afs/security.c
+new file mode 100644
+index 000000000000..cbdd7f7162fa
+--- /dev/null
++++ b/fs/afs/security.c
+@@ -0,0 +1,345 @@
++/* AFS security handling
++ *
++ * Copyright (C) 2007 Red Hat, Inc. All Rights Reserved.
++ * Written by David Howells (dhowells@redhat.com)
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version
++ * 2 of the License, or (at your option) any later version.
++ */
++
++#include <linux/init.h>
++#include <linux/slab.h>
++#include <linux/fs.h>
++#include <linux/ctype.h>
++#include <keys/rxrpc-type.h>
++#include "internal.h"
++
++/*
++ * get a key
++ */
++struct key *afs_request_key(struct afs_cell *cell)
++{
++	struct key *key;
++
++	_enter("{%x}", key_serial(cell->anonymous_key));
++
++	_debug("key %s", cell->anonymous_key->description);
++	key = request_key(&key_type_rxrpc, cell->anonymous_key->description,
++			  NULL);
++	if (IS_ERR(key)) {
++		if (PTR_ERR(key) != -ENOKEY) {
++			_leave(" = %ld", PTR_ERR(key));
++			return key;
++		}
++
++		/* act as anonymous user */
++		_leave(" = {%x} [anon]", key_serial(cell->anonymous_key));
++		return key_get(cell->anonymous_key);
++	} else {
++		/* act as authorised user */
++		_leave(" = {%x} [auth]", key_serial(key));
++		return key;
++	}
++}
++
++/*
++ * dispose of a permits list
++ */
++void afs_zap_permits(struct rcu_head *rcu)
++{
++	struct afs_permits *permits =
++		container_of(rcu, struct afs_permits, rcu);
++	int loop;
++
++	_enter("{%d}", permits->count);
++
++	for (loop = permits->count - 1; loop >= 0; loop--)
++		key_put(permits->permits[loop].key);
++	kfree(permits);
++}
++
++/*
++ * dispose of a permits list in which all the key pointers have been copied
++ */
++static void afs_dispose_of_permits(struct rcu_head *rcu)
++{
++	struct afs_permits *permits =
++		container_of(rcu, struct afs_permits, rcu);
++
++	_enter("{%d}", permits->count);
++
++	kfree(permits);
++}
++
++/*
++ * get the authorising vnode - this is the specified inode itself if it's a
++ * directory or it's the parent directory if the specified inode is a file or
++ * symlink
++ * - the caller must release the ref on the inode
++ */
++static struct afs_vnode *afs_get_auth_inode(struct afs_vnode *vnode,
++					    struct key *key)
++{
++	struct afs_vnode *auth_vnode;
++	struct inode *auth_inode;
++
++	_enter("");
++
++	if (S_ISDIR(vnode->vfs_inode.i_mode)) {
++		auth_inode = igrab(&vnode->vfs_inode);
++		ASSERT(auth_inode != NULL);
++	} else {
++		auth_inode = afs_iget(vnode->vfs_inode.i_sb, key,
++				      &vnode->status.parent);
++		if (IS_ERR(auth_inode))
++			return ERR_PTR(PTR_ERR(auth_inode));
++	}
++
++	auth_vnode = AFS_FS_I(auth_inode);
++	_leave(" = {%x}", auth_vnode->fid.vnode);
++	return auth_vnode;
++}
++
++/*
++ * clear the permit cache on a directory vnode
++ */
++void afs_clear_permits(struct afs_vnode *vnode)
++{
++	struct afs_permits *permits;
++
++	_enter("{%x}", vnode->fid.vnode);
++
++	mutex_lock(&vnode->permits_lock);
++	permits = vnode->permits;
++	rcu_assign_pointer(vnode->permits, NULL);
++	mutex_unlock(&vnode->permits_lock);
++
++	if (permits)
++		call_rcu(&permits->rcu, afs_zap_permits);
++	_leave("");
++}
++
++/*
++ * add the result obtained for a vnode to its or its parent directory's cache
++ * for the key used to access it
++ */
++void afs_cache_permit(struct afs_vnode *vnode, struct key *key, long acl_order)
++{
++	struct afs_permits *permits, *xpermits;
++	struct afs_permit *permit;
++	struct afs_vnode *auth_vnode;
++	int count, loop;
++
++	_enter("{%x},%x,%lx", vnode->fid.vnode, key_serial(key), acl_order);
++
++	auth_vnode = afs_get_auth_inode(vnode, key);
++	if (IS_ERR(auth_vnode)) {
++		_leave(" [get error %ld]", PTR_ERR(auth_vnode));
++		return;
++	}
++
++	mutex_lock(&auth_vnode->permits_lock);
++
++	/* guard against a rename being detected whilst we waited for the
++	 * lock */
++	if (memcmp(&auth_vnode->fid, &vnode->status.parent,
++		   sizeof(struct afs_fid)) != 0) {
++		_debug("renamed");
++		goto out_unlock;
++	}
++
++	/* have to be careful as the directory's callback may be broken between
++	 * us receiving the status we're trying to cache and us getting the
++	 * lock to update the cache for the status */
++	if (auth_vnode->acl_order - acl_order > 0) {
++		_debug("ACL changed?");
++		goto out_unlock;
++	}
++
++	/* always update the anonymous mask */
++	_debug("anon access %x", vnode->status.anon_access);
++	auth_vnode->status.anon_access = vnode->status.anon_access;
++	if (key == vnode->volume->cell->anonymous_key)
++		goto out_unlock;
++
++	xpermits = auth_vnode->permits;
++	count = 0;
++	if (xpermits) {
++		/* see if the permit is already in the list
++		 * - if it is then we just amend the list
++		 */
++		count = xpermits->count;
++		permit = xpermits->permits;
++		for (loop = count; loop > 0; loop--) {
++			if (permit->key == key) {
++				permit->access_mask =
++					vnode->status.caller_access;
++				goto out_unlock;
++			}
++			permit++;
++		}
++	}
++
++	permits = kmalloc(sizeof(*permits) + sizeof(*permit) * (count + 1),
++			  GFP_NOFS);
++	if (!permits)
++		goto out_unlock;
++
++	memcpy(permits->permits, xpermits->permits,
++	       count * sizeof(struct afs_permit));
++
++	_debug("key %x access %x",
++	       key_serial(key), vnode->status.caller_access);
++	permits->permits[count].access_mask = vnode->status.caller_access;
++	permits->permits[count].key = key_get(key);
++	permits->count = count + 1;
++
++	rcu_assign_pointer(auth_vnode->permits, permits);
++	if (xpermits)
++		call_rcu(&xpermits->rcu, afs_dispose_of_permits);
++
++out_unlock:
++	mutex_unlock(&auth_vnode->permits_lock);
++	iput(&auth_vnode->vfs_inode);
++	_leave("");
++}
++
++/*
++ * check with the fileserver to see if the directory or parent directory is
++ * permitted to be accessed with this authorisation, and if so, what access it
++ * is granted
++ */
++static int afs_check_permit(struct afs_vnode *vnode, struct key *key,
++			    afs_access_t *_access)
++{
++	struct afs_permits *permits;
++	struct afs_permit *permit;
++	struct afs_vnode *auth_vnode;
++	bool valid;
++	int loop, ret;
++
++	_enter("");
++
++	auth_vnode = afs_get_auth_inode(vnode, key);
++	if (IS_ERR(auth_vnode)) {
++		*_access = 0;
++		_leave(" = %ld", PTR_ERR(auth_vnode));
++		return PTR_ERR(auth_vnode);
++	}
++
++	ASSERT(S_ISDIR(auth_vnode->vfs_inode.i_mode));
++
++	/* check the permits to see if we've got one yet */
++	if (key == auth_vnode->volume->cell->anonymous_key) {
++		_debug("anon");
++		*_access = auth_vnode->status.anon_access;
++		valid = true;
++	} else {
++		valid = false;
++		rcu_read_lock();
++		permits = rcu_dereference(auth_vnode->permits);
++		if (permits) {
++			permit = permits->permits;
++			for (loop = permits->count; loop > 0; loop--) {
++				if (permit->key == key) {
++					_debug("found in cache");
++					*_access = permit->access_mask;
++					valid = true;
++					break;
++				}
++				permit++;
++			}
++		}
++		rcu_read_unlock();
++	}
++
++	if (!valid) {
++		/* check the status on the file we're actually interested in
++		 * (the post-processing will cache the result on auth_vnode) */
++		_debug("no valid permit");
++
++		set_bit(AFS_VNODE_CB_BROKEN, &vnode->flags);
++		ret = afs_vnode_fetch_status(vnode, auth_vnode, key);
++		if (ret < 0) {
++			iput(&auth_vnode->vfs_inode);
++			*_access = 0;
++			_leave(" = %d", ret);
++			return ret;
++		}
++	}
++
++	*_access = vnode->status.caller_access;
++	iput(&auth_vnode->vfs_inode);
++	_leave(" = 0 [access %x]", *_access);
++	return 0;
++}
++
++/*
++ * check the permissions on an AFS file
++ * - AFS ACLs are attached to directories only, and a file is controlled by its
++ *   parent directory's ACL
++ */
++int afs_permission(struct inode *inode, int mask, struct nameidata *nd)
++{
++	struct afs_vnode *vnode = AFS_FS_I(inode);
++	afs_access_t access;
++	struct key *key;
++	int ret;
++
++	_enter("{%x:%x},%x,", vnode->fid.vid, vnode->fid.vnode, mask);
++
++	key = afs_request_key(vnode->volume->cell);
++	if (IS_ERR(key)) {
++		_leave(" = %ld [key]", PTR_ERR(key));
++		return PTR_ERR(key);
++	}
++
++	/* check the permits to see if we've got one yet */
++	ret = afs_check_permit(vnode, key, &access);
++	if (ret < 0) {
++		key_put(key);
++		_leave(" = %d [check]", ret);
++		return ret;
++	}
++
++	/* interpret the access mask */
++	_debug("REQ %x ACC %x on %s",
++	       mask, access, S_ISDIR(inode->i_mode) ? "dir" : "file");
++
++	if (S_ISDIR(inode->i_mode)) {
++		if (mask & MAY_EXEC) {
++			if (!(access & AFS_ACE_LOOKUP))
++				goto permission_denied;
++		} else if (mask & MAY_READ) {
++			if (!(access & AFS_ACE_READ))
++				goto permission_denied;
++		} else if (mask & MAY_WRITE) {
++			if (!(access & (AFS_ACE_DELETE | /* rmdir, unlink, rename from */
++					AFS_ACE_INSERT | /* create, mkdir, symlink, rename to */
++					AFS_ACE_WRITE))) /* chmod */
++				goto permission_denied;
++		} else {
++			BUG();
++		}
++	} else {
++		if (!(access & AFS_ACE_LOOKUP))
++			goto permission_denied;
++		if (mask & (MAY_EXEC | MAY_READ)) {
++			if (!(access & AFS_ACE_READ))
++				goto permission_denied;
++		} else if (mask & MAY_WRITE) {
++			if (!(access & AFS_ACE_WRITE))
++				goto permission_denied;
++		}
++	}
++
++	key_put(key);
++	return generic_permission(inode, mask, NULL);
++
++permission_denied:
++	key_put(key);
++	_leave(" = -EACCES");
++	return -EACCES;
++}

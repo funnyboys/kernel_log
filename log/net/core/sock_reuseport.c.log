@@ -1,0 +1,1883 @@
+commit 035ff358f2d9e2f5e1639ba4defe4dc40ac642dd
+Author: Jakub Sitnicki <jakub@cloudflare.com>
+Date:   Tue Feb 18 17:10:21 2020 +0000
+
+    net: Generate reuseport group ID on group creation
+    
+    Commit 736b46027eb4 ("net: Add ID (if needed) to sock_reuseport and expose
+    reuseport_lock") has introduced lazy generation of reuseport group IDs that
+    survive group resize.
+    
+    By comparing the identifier we check if BPF reuseport program is not trying
+    to select a socket from a BPF map that belongs to a different reuseport
+    group than the one the packet is for.
+    
+    Because SOCKARRAY used to be the only BPF map type that can be used with
+    reuseport BPF, it was possible to delay the generation of reuseport group
+    ID until a socket from the group was inserted into BPF map for the first
+    time.
+    
+    Now that SOCK{MAP,HASH} can be used with reuseport BPF we have two options,
+    either generate the reuseport ID on map update, like SOCKARRAY does, or
+    allocate an ID from the start when reuseport group gets created.
+    
+    This patch takes the latter approach to keep sockmap free of calls into
+    reuseport code. This streamlines the reuseport_id access as its lifetime
+    now matches the longevity of reuseport object.
+    
+    The cost of this simplification, however, is that we allocate reuseport IDs
+    for all SO_REUSEPORT users. Even those that don't use SOCKARRAY in their
+    setups. With the way identifiers are currently generated, we can have at
+    most S32_MAX reuseport groups, which hopefully is sufficient. If we ever
+    get close to the limit, we can switch an u64 counter like sk_cookie.
+    
+    Another change is that we now always call into SOCKARRAY logic to unlink
+    the socket from the map when unhashing or closing the socket. Previously we
+    did it only when at least one socket from the group was in a BPF map.
+    
+    It is worth noting that this doesn't conflict with sockmap tear-down in
+    case a socket is in a SOCK{MAP,HASH} and belongs to a reuseport
+    group. sockmap tear-down happens first:
+    
+      prot->unhash
+      `- tcp_bpf_unhash
+         |- tcp_bpf_remove
+         |  `- while (sk_psock_link_pop(psock))
+         |     `- sk_psock_unlink
+         |        `- sock_map_delete_from_link
+         |           `- __sock_map_delete
+         |              `- sock_map_unref
+         |                 `- sk_psock_put
+         |                    `- sk_psock_drop
+         |                       `- rcu_assign_sk_user_data(sk, NULL)
+         `- inet_unhash
+            `- reuseport_detach_sock
+               `- bpf_sk_reuseport_detach
+                  `- WRITE_ONCE(sk->sk_user_data, NULL)
+    
+    Suggested-by: Martin Lau <kafai@fb.com>
+    Signed-off-by: Jakub Sitnicki <jakub@cloudflare.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+    Link: https://lore.kernel.org/bpf/20200218171023.844439-10-jakub@cloudflare.com
+
+diff --git a/net/core/sock_reuseport.c b/net/core/sock_reuseport.c
+index 91e9f2223c39..adcb3aea576d 100644
+--- a/net/core/sock_reuseport.c
++++ b/net/core/sock_reuseport.c
+@@ -16,27 +16,8 @@
+ 
+ DEFINE_SPINLOCK(reuseport_lock);
+ 
+-#define REUSEPORT_MIN_ID 1
+ static DEFINE_IDA(reuseport_ida);
+ 
+-int reuseport_get_id(struct sock_reuseport *reuse)
+-{
+-	int id;
+-
+-	if (reuse->reuseport_id)
+-		return reuse->reuseport_id;
+-
+-	id = ida_simple_get(&reuseport_ida, REUSEPORT_MIN_ID, 0,
+-			    /* Called under reuseport_lock */
+-			    GFP_ATOMIC);
+-	if (id < 0)
+-		return id;
+-
+-	reuse->reuseport_id = id;
+-
+-	return reuse->reuseport_id;
+-}
+-
+ static struct sock_reuseport *__reuseport_alloc(unsigned int max_socks)
+ {
+ 	unsigned int size = sizeof(struct sock_reuseport) +
+@@ -55,6 +36,7 @@ static struct sock_reuseport *__reuseport_alloc(unsigned int max_socks)
+ int reuseport_alloc(struct sock *sk, bool bind_inany)
+ {
+ 	struct sock_reuseport *reuse;
++	int id, ret = 0;
+ 
+ 	/* bh lock used since this function call may precede hlist lock in
+ 	 * soft irq of receive path or setsockopt from process context
+@@ -78,10 +60,18 @@ int reuseport_alloc(struct sock *sk, bool bind_inany)
+ 
+ 	reuse = __reuseport_alloc(INIT_SOCKS);
+ 	if (!reuse) {
+-		spin_unlock_bh(&reuseport_lock);
+-		return -ENOMEM;
++		ret = -ENOMEM;
++		goto out;
+ 	}
+ 
++	id = ida_alloc(&reuseport_ida, GFP_ATOMIC);
++	if (id < 0) {
++		kfree(reuse);
++		ret = id;
++		goto out;
++	}
++
++	reuse->reuseport_id = id;
+ 	reuse->socks[0] = sk;
+ 	reuse->num_socks = 1;
+ 	reuse->bind_inany = bind_inany;
+@@ -90,7 +80,7 @@ int reuseport_alloc(struct sock *sk, bool bind_inany)
+ out:
+ 	spin_unlock_bh(&reuseport_lock);
+ 
+-	return 0;
++	return ret;
+ }
+ EXPORT_SYMBOL(reuseport_alloc);
+ 
+@@ -134,8 +124,7 @@ static void reuseport_free_rcu(struct rcu_head *head)
+ 
+ 	reuse = container_of(head, struct sock_reuseport, rcu);
+ 	sk_reuseport_prog_free(rcu_dereference_protected(reuse->prog, 1));
+-	if (reuse->reuseport_id)
+-		ida_simple_remove(&reuseport_ida, reuse->reuseport_id);
++	ida_free(&reuseport_ida, reuse->reuseport_id);
+ 	kfree(reuse);
+ }
+ 
+@@ -199,12 +188,15 @@ void reuseport_detach_sock(struct sock *sk)
+ 	reuse = rcu_dereference_protected(sk->sk_reuseport_cb,
+ 					  lockdep_is_held(&reuseport_lock));
+ 
+-	/* At least one of the sk in this reuseport group is added to
+-	 * a bpf map.  Notify the bpf side.  The bpf map logic will
+-	 * remove the sk if it is indeed added to a bpf map.
++	/* Notify the bpf side. The sk may be added to a sockarray
++	 * map. If so, sockarray logic will remove it from the map.
++	 *
++	 * Other bpf map types that work with reuseport, like sockmap,
++	 * don't need an explicit callback from here. They override sk
++	 * unhash/close ops to remove the sk from the map before we
++	 * get to this point.
+ 	 */
+-	if (reuse->reuseport_id)
+-		bpf_sk_reuseport_detach(sk);
++	bpf_sk_reuseport_detach(sk);
+ 
+ 	rcu_assign_pointer(sk->sk_reuseport_cb, NULL);
+ 
+
+commit cd94ef06392ffd49e0a0e1c28bc5cd44f37f1f6b
+Author: Kuniyuki Iwashima <kuniyu@amazon.co.jp>
+Date:   Sat Jan 25 10:41:02 2020 +0000
+
+    soreuseport: Cleanup duplicate initialization of more_reuse->max_socks.
+    
+    reuseport_grow() does not need to initialize the more_reuse->max_socks
+    again. It is already initialized in __reuseport_alloc().
+    
+    Signed-off-by: Kuniyuki Iwashima <kuniyu@amazon.co.jp>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/core/sock_reuseport.c b/net/core/sock_reuseport.c
+index f19f179538b9..91e9f2223c39 100644
+--- a/net/core/sock_reuseport.c
++++ b/net/core/sock_reuseport.c
+@@ -107,7 +107,6 @@ static struct sock_reuseport *reuseport_grow(struct sock_reuseport *reuse)
+ 	if (!more_reuse)
+ 		return NULL;
+ 
+-	more_reuse->max_socks = more_socks_size;
+ 	more_reuse->num_socks = reuse->num_socks;
+ 	more_reuse->prog = reuse->prog;
+ 	more_reuse->reuseport_id = reuse->reuseport_id;
+
+commit e3f0d761fcaec5d445c9280d6e09087dc32828d2
+Author: Paul E. McKenney <paulmck@kernel.org>
+Date:   Mon Sep 23 15:42:28 2019 -0700
+
+    net/core: Replace rcu_swap_protected() with rcu_replace_pointer()
+    
+    This commit replaces the use of rcu_swap_protected() with the more
+    intuitively appealing rcu_replace_pointer() as a step towards removing
+    rcu_swap_protected().
+    
+    Link: https://lore.kernel.org/lkml/CAHk-=wiAsJLw1egFEE=Z7-GGtM6wcvtyytXZA1+BHqta4gg6Hw@mail.gmail.com/
+    Reported-by: Linus Torvalds <torvalds@linux-foundation.org>
+    [ paulmck: From rcu_replace() to rcu_replace_pointer() per Ingo Molnar. ]
+    Signed-off-by: Paul E. McKenney <paulmck@kernel.org>
+    Cc: "David S. Miller" <davem@davemloft.net>
+    Cc: Jiri Pirko <jiri@mellanox.com>
+    Cc: Eric Dumazet <edumazet@google.com>
+    Cc: Ido Schimmel <idosch@mellanox.com>
+    Cc: Petr Machata <petrm@mellanox.com>
+    Cc: Paolo Abeni <pabeni@redhat.com>
+    Cc: <netdev@vger.kernel.org>
+
+diff --git a/net/core/sock_reuseport.c b/net/core/sock_reuseport.c
+index f3ceec93f392..f19f179538b9 100644
+--- a/net/core/sock_reuseport.c
++++ b/net/core/sock_reuseport.c
+@@ -356,8 +356,8 @@ int reuseport_detach_prog(struct sock *sk)
+ 	spin_lock_bh(&reuseport_lock);
+ 	reuse = rcu_dereference_protected(sk->sk_reuseport_cb,
+ 					  lockdep_is_held(&reuseport_lock));
+-	rcu_swap_protected(reuse->prog, old_prog,
+-			   lockdep_is_held(&reuseport_lock));
++	old_prog = rcu_replace_pointer(reuse->prog, old_prog,
++				       lockdep_is_held(&reuseport_lock));
+ 	spin_unlock_bh(&reuseport_lock);
+ 
+ 	if (!old_prog)
+
+commit acdcecc61285faed359f1a3568c32089cc3a8329
+Author: Willem de Bruijn <willemb@google.com>
+Date:   Thu Sep 12 21:16:39 2019 -0400
+
+    udp: correct reuseport selection with connected sockets
+    
+    UDP reuseport groups can hold a mix unconnected and connected sockets.
+    Ensure that connections only receive all traffic to their 4-tuple.
+    
+    Fast reuseport returns on the first reuseport match on the assumption
+    that all matches are equal. Only if connections are present, return to
+    the previous behavior of scoring all sockets.
+    
+    Record if connections are present and if so (1) treat such connected
+    sockets as an independent match from the group, (2) only return
+    2-tuple matches from reuseport and (3) do not return on the first
+    2-tuple reuseport match to allow for a higher scoring match later.
+    
+    New field has_conns is set without locks. No other fields in the
+    bitmap are modified at runtime and the field is only ever set
+    unconditionally, so an RMW cannot miss a change.
+    
+    Fixes: e32ea7e74727 ("soreuseport: fast reuseport UDP socket selection")
+    Link: http://lkml.kernel.org/r/CA+FuTSfRP09aJNYRt04SS6qj22ViiOEWaWmLAwX0psk8-PGNxw@mail.gmail.com
+    Signed-off-by: Willem de Bruijn <willemb@google.com>
+    Acked-by: Paolo Abeni <pabeni@redhat.com>
+    Acked-by: Craig Gallek <kraig@google.com>
+    Signed-off-by: Willem de Bruijn <willemb@google.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/core/sock_reuseport.c b/net/core/sock_reuseport.c
+index 9408f9264d05..f3ceec93f392 100644
+--- a/net/core/sock_reuseport.c
++++ b/net/core/sock_reuseport.c
+@@ -295,8 +295,19 @@ struct sock *reuseport_select_sock(struct sock *sk,
+ 
+ select_by_hash:
+ 		/* no bpf or invalid bpf result: fall back to hash usage */
+-		if (!sk2)
+-			sk2 = reuse->socks[reciprocal_scale(hash, socks)];
++		if (!sk2) {
++			int i, j;
++
++			i = j = reciprocal_scale(hash, socks);
++			while (reuse->socks[i]->sk_state == TCP_ESTABLISHED) {
++				i++;
++				if (i >= reuse->num_socks)
++					i = 0;
++				if (i == j)
++					goto out;
++			}
++			sk2 = reuse->socks[i];
++		}
+ 	}
+ 
+ out:
+
+commit 99f3a064bc2e4bd5fe50218646c5be342f2ad18c
+Author: Martin KaFai Lau <kafai@fb.com>
+Date:   Thu Jun 13 15:00:01 2019 -0700
+
+    bpf: net: Add SO_DETACH_REUSEPORT_BPF
+    
+    There is SO_ATTACH_REUSEPORT_[CE]BPF but there is no DETACH.
+    This patch adds SO_DETACH_REUSEPORT_BPF sockopt.  The same
+    sockopt can be used to undo both SO_ATTACH_REUSEPORT_[CE]BPF.
+    
+    reseport_detach_prog() is added and it is mostly a mirror
+    of the existing reuseport_attach_prog().  The differences are,
+    it does not call reuseport_alloc() and returns -ENOENT when
+    there is no old prog.
+    
+    Cc: Craig Gallek <kraig@google.com>
+    Signed-off-by: Martin KaFai Lau <kafai@fb.com>
+    Reviewed-by: Stanislav Fomichev <sdf@google.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/net/core/sock_reuseport.c b/net/core/sock_reuseport.c
+index dc4aefdf2a08..9408f9264d05 100644
+--- a/net/core/sock_reuseport.c
++++ b/net/core/sock_reuseport.c
+@@ -332,3 +332,27 @@ int reuseport_attach_prog(struct sock *sk, struct bpf_prog *prog)
+ 	return 0;
+ }
+ EXPORT_SYMBOL(reuseport_attach_prog);
++
++int reuseport_detach_prog(struct sock *sk)
++{
++	struct sock_reuseport *reuse;
++	struct bpf_prog *old_prog;
++
++	if (!rcu_access_pointer(sk->sk_reuseport_cb))
++		return sk->sk_reuseport ? -ENOENT : -EINVAL;
++
++	old_prog = NULL;
++	spin_lock_bh(&reuseport_lock);
++	reuse = rcu_dereference_protected(sk->sk_reuseport_cb,
++					  lockdep_is_held(&reuseport_lock));
++	rcu_swap_protected(reuse->prog, old_prog,
++			   lockdep_is_held(&reuseport_lock));
++	spin_unlock_bh(&reuseport_lock);
++
++	if (!old_prog)
++		return -ENOENT;
++
++	sk_reuseport_prog_free(old_prog);
++	return 0;
++}
++EXPORT_SYMBOL(reuseport_detach_prog);
+
+commit 37f3c421e8f09eeee3b78991af4fe13c126616d9
+Author: Bart Van Assche <bvanassche@acm.org>
+Date:   Mon Mar 25 09:17:19 2019 -0700
+
+    net/core: Document reuseport_add_sock() bind_inany argument
+    
+    This patch avoids that the following warning is reported when building
+    with W=1:
+    
+    warning: Function parameter or member 'bind_inany' not described in 'reuseport_add_sock'
+    
+    Cc: Martin KaFai Lau <kafai@fb.com>
+    Fixes: 2dbb9b9e6df6 ("bpf: Introduce BPF_PROG_TYPE_SK_REUSEPORT") # v4.19.
+    Signed-off-by: Bart Van Assche <bvanassche@acm.org>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/core/sock_reuseport.c b/net/core/sock_reuseport.c
+index d8fe3e549373..dc4aefdf2a08 100644
+--- a/net/core/sock_reuseport.c
++++ b/net/core/sock_reuseport.c
+@@ -144,6 +144,8 @@ static void reuseport_free_rcu(struct rcu_head *head)
+  *  reuseport_add_sock - Add a socket to the reuseport group of another.
+  *  @sk:  New socket to add to the group.
+  *  @sk2: Socket belonging to the existing reuseport group.
++ *  @bind_inany: Whether or not the group is bound to a local INANY address.
++ *
+  *  May return ENOMEM and not add socket to group under memory pressure.
+  */
+ int reuseport_add_sock(struct sock *sk, struct sock *sk2, bool bind_inany)
+
+commit 76c6d988aeb3c15d57ea0c245a3b5f27802c1fbe
+Author: Xin Long <lucien.xin@gmail.com>
+Date:   Mon Nov 12 18:27:16 2018 +0800
+
+    sctp: add sock_reuseport for the sock in __sctp_hash_endpoint
+    
+    This is a part of sk_reuseport support for sctp. It defines a helper
+    sctp_bind_addrs_check() to check if the bind_addrs in two socks are
+    matched. It will add sock_reuseport if they are completely matched,
+    and return err if they are partly matched, and alloc sock_reuseport
+    if all socks are not matched at all.
+    
+    It will work until sk_reuseport support is added in
+    sctp_get_port_local() in the next patch.
+    
+    v1->v2:
+      - use 'laddr->valid && laddr2->valid' check instead as Marcelo
+        pointed in sctp_bind_addrs_check().
+    
+    Acked-by: Neil Horman <nhorman@tuxdriver.com>
+    Signed-off-by: Xin Long <lucien.xin@gmail.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/core/sock_reuseport.c b/net/core/sock_reuseport.c
+index ba5cba56f574..d8fe3e549373 100644
+--- a/net/core/sock_reuseport.c
++++ b/net/core/sock_reuseport.c
+@@ -187,6 +187,7 @@ int reuseport_add_sock(struct sock *sk, struct sock *sk2, bool bind_inany)
+ 		call_rcu(&old_reuse->rcu, reuseport_free_rcu);
+ 	return 0;
+ }
++EXPORT_SYMBOL(reuseport_add_sock);
+ 
+ void reuseport_detach_sock(struct sock *sk)
+ {
+
+commit 8217ca653ec601246832d562207bc24bdf652d2f
+Author: Martin KaFai Lau <kafai@fb.com>
+Date:   Wed Aug 8 01:01:26 2018 -0700
+
+    bpf: Enable BPF_PROG_TYPE_SK_REUSEPORT bpf prog in reuseport selection
+    
+    This patch allows a BPF_PROG_TYPE_SK_REUSEPORT bpf prog to select a
+    SO_REUSEPORT sk from a BPF_MAP_TYPE_REUSEPORT_ARRAY introduced in
+    the earlier patch.  "bpf_run_sk_reuseport()" will return -ECONNREFUSED
+    when the BPF_PROG_TYPE_SK_REUSEPORT prog returns SK_DROP.
+    The callers, in inet[6]_hashtable.c and ipv[46]/udp.c, are modified to
+    handle this case and return NULL immediately instead of continuing the
+    sk search from its hashtable.
+    
+    It re-uses the existing SO_ATTACH_REUSEPORT_EBPF setsockopt to attach
+    BPF_PROG_TYPE_SK_REUSEPORT.  The "sk_reuseport_attach_bpf()" will check
+    if the attaching bpf prog is in the new SK_REUSEPORT or the existing
+    SOCKET_FILTER type and then check different things accordingly.
+    
+    One level of "__reuseport_attach_prog()" call is removed.  The
+    "sk_unhashed() && ..." and "sk->sk_reuseport_cb" tests are pushed
+    back to "reuseport_attach_prog()" in sock_reuseport.c.  sock_reuseport.c
+    seems to have more knowledge on those test requirements than filter.c.
+    In "reuseport_attach_prog()", after new_prog is attached to reuse->prog,
+    the old_prog (if any) is also directly freed instead of returning the
+    old_prog to the caller and asking the caller to free.
+    
+    The sysctl_optmem_max check is moved back to the
+    "sk_reuseport_attach_filter()" and "sk_reuseport_attach_bpf()".
+    As of other bpf prog types, the new BPF_PROG_TYPE_SK_REUSEPORT is only
+    bounded by the usual "bpf_prog_charge_memlock()" during load time
+    instead of bounded by both bpf_prog_charge_memlock and sysctl_optmem_max.
+    
+    Signed-off-by: Martin KaFai Lau <kafai@fb.com>
+    Acked-by: Alexei Starovoitov <ast@kernel.org>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/net/core/sock_reuseport.c b/net/core/sock_reuseport.c
+index d260167f5f77..ba5cba56f574 100644
+--- a/net/core/sock_reuseport.c
++++ b/net/core/sock_reuseport.c
+@@ -9,6 +9,7 @@
+ #include <net/sock_reuseport.h>
+ #include <linux/bpf.h>
+ #include <linux/idr.h>
++#include <linux/filter.h>
+ #include <linux/rcupdate.h>
+ 
+ #define INIT_SOCKS 128
+@@ -133,8 +134,7 @@ static void reuseport_free_rcu(struct rcu_head *head)
+ 	struct sock_reuseport *reuse;
+ 
+ 	reuse = container_of(head, struct sock_reuseport, rcu);
+-	if (reuse->prog)
+-		bpf_prog_destroy(reuse->prog);
++	sk_reuseport_prog_free(rcu_dereference_protected(reuse->prog, 1));
+ 	if (reuse->reuseport_id)
+ 		ida_simple_remove(&reuseport_ida, reuse->reuseport_id);
+ 	kfree(reuse);
+@@ -219,9 +219,9 @@ void reuseport_detach_sock(struct sock *sk)
+ }
+ EXPORT_SYMBOL(reuseport_detach_sock);
+ 
+-static struct sock *run_bpf(struct sock_reuseport *reuse, u16 socks,
+-			    struct bpf_prog *prog, struct sk_buff *skb,
+-			    int hdr_len)
++static struct sock *run_bpf_filter(struct sock_reuseport *reuse, u16 socks,
++				   struct bpf_prog *prog, struct sk_buff *skb,
++				   int hdr_len)
+ {
+ 	struct sk_buff *nskb = NULL;
+ 	u32 index;
+@@ -282,9 +282,15 @@ struct sock *reuseport_select_sock(struct sock *sk,
+ 		/* paired with smp_wmb() in reuseport_add_sock() */
+ 		smp_rmb();
+ 
+-		if (prog && skb)
+-			sk2 = run_bpf(reuse, socks, prog, skb, hdr_len);
++		if (!prog || !skb)
++			goto select_by_hash;
++
++		if (prog->type == BPF_PROG_TYPE_SK_REUSEPORT)
++			sk2 = bpf_run_sk_reuseport(reuse, sk, prog, skb, hash);
++		else
++			sk2 = run_bpf_filter(reuse, socks, prog, skb, hdr_len);
+ 
++select_by_hash:
+ 		/* no bpf or invalid bpf result: fall back to hash usage */
+ 		if (!sk2)
+ 			sk2 = reuse->socks[reciprocal_scale(hash, socks)];
+@@ -296,12 +302,21 @@ struct sock *reuseport_select_sock(struct sock *sk,
+ }
+ EXPORT_SYMBOL(reuseport_select_sock);
+ 
+-struct bpf_prog *
+-reuseport_attach_prog(struct sock *sk, struct bpf_prog *prog)
++int reuseport_attach_prog(struct sock *sk, struct bpf_prog *prog)
+ {
+ 	struct sock_reuseport *reuse;
+ 	struct bpf_prog *old_prog;
+ 
++	if (sk_unhashed(sk) && sk->sk_reuseport) {
++		int err = reuseport_alloc(sk, false);
++
++		if (err)
++			return err;
++	} else if (!rcu_access_pointer(sk->sk_reuseport_cb)) {
++		/* The socket wasn't bound with SO_REUSEPORT */
++		return -EINVAL;
++	}
++
+ 	spin_lock_bh(&reuseport_lock);
+ 	reuse = rcu_dereference_protected(sk->sk_reuseport_cb,
+ 					  lockdep_is_held(&reuseport_lock));
+@@ -310,6 +325,7 @@ reuseport_attach_prog(struct sock *sk, struct bpf_prog *prog)
+ 	rcu_assign_pointer(reuse->prog, prog);
+ 	spin_unlock_bh(&reuseport_lock);
+ 
+-	return old_prog;
++	sk_reuseport_prog_free(old_prog);
++	return 0;
+ }
+ EXPORT_SYMBOL(reuseport_attach_prog);
+
+commit 2dbb9b9e6df67d444fbe425c7f6014858d337adf
+Author: Martin KaFai Lau <kafai@fb.com>
+Date:   Wed Aug 8 01:01:25 2018 -0700
+
+    bpf: Introduce BPF_PROG_TYPE_SK_REUSEPORT
+    
+    This patch adds a BPF_PROG_TYPE_SK_REUSEPORT which can select
+    a SO_REUSEPORT sk from a BPF_MAP_TYPE_REUSEPORT_ARRAY.  Like other
+    non SK_FILTER/CGROUP_SKB program, it requires CAP_SYS_ADMIN.
+    
+    BPF_PROG_TYPE_SK_REUSEPORT introduces "struct sk_reuseport_kern"
+    to store the bpf context instead of using the skb->cb[48].
+    
+    At the SO_REUSEPORT sk lookup time, it is in the middle of transiting
+    from a lower layer (ipv4/ipv6) to a upper layer (udp/tcp).  At this
+    point,  it is not always clear where the bpf context can be appended
+    in the skb->cb[48] to avoid saving-and-restoring cb[].  Even putting
+    aside the difference between ipv4-vs-ipv6 and udp-vs-tcp.  It is not
+    clear if the lower layer is only ipv4 and ipv6 in the future and
+    will it not touch the cb[] again before transiting to the upper
+    layer.
+    
+    For example, in udp_gro_receive(), it uses the 48 byte NAPI_GRO_CB
+    instead of IP[6]CB and it may still modify the cb[] after calling
+    the udp[46]_lib_lookup_skb().  Because of the above reason, if
+    sk->cb is used for the bpf ctx, saving-and-restoring is needed
+    and likely the whole 48 bytes cb[] has to be saved and restored.
+    
+    Instead of saving, setting and restoring the cb[], this patch opts
+    to create a new "struct sk_reuseport_kern" and setting the needed
+    values in there.
+    
+    The new BPF_PROG_TYPE_SK_REUSEPORT and "struct sk_reuseport_(kern|md)"
+    will serve all ipv4/ipv6 + udp/tcp combinations.  There is no protocol
+    specific usage at this point and it is also inline with the current
+    sock_reuseport.c implementation (i.e. no protocol specific requirement).
+    
+    In "struct sk_reuseport_md", this patch exposes data/data_end/len
+    with semantic similar to other existing usages.  Together
+    with "bpf_skb_load_bytes()" and "bpf_skb_load_bytes_relative()",
+    the bpf prog can peek anywhere in the skb.  The "bind_inany" tells
+    the bpf prog that the reuseport group is bind-ed to a local
+    INANY address which cannot be learned from skb.
+    
+    The new "bind_inany" is added to "struct sock_reuseport" which will be
+    used when running the new "BPF_PROG_TYPE_SK_REUSEPORT" bpf prog in order
+    to avoid repeating the "bind INANY" test on
+    "sk_v6_rcv_saddr/sk->sk_rcv_saddr" every time a bpf prog is run.  It can
+    only be properly initialized when a "sk->sk_reuseport" enabled sk is
+    adding to a hashtable (i.e. during "reuseport_alloc()" and
+    "reuseport_add_sock()").
+    
+    The new "sk_select_reuseport()" is the main helper that the
+    bpf prog will use to select a SO_REUSEPORT sk.  It is the only function
+    that can use the new BPF_MAP_TYPE_REUSEPORT_ARRAY.  As mentioned in
+    the earlier patch, the validity of a selected sk is checked in
+    run time in "sk_select_reuseport()".  Doing the check in
+    verification time is difficult and inflexible (consider the map-in-map
+    use case).  The runtime check is to compare the selected sk's reuseport_id
+    with the reuseport_id that we want.  This helper will return -EXXX if the
+    selected sk cannot serve the incoming request (e.g. reuseport_id
+    not match).  The bpf prog can decide if it wants to do SK_DROP as its
+    discretion.
+    
+    When the bpf prog returns SK_PASS, the kernel will check if a
+    valid sk has been selected (i.e. "reuse_kern->selected_sk != NULL").
+    If it does , it will use the selected sk.  If not, the kernel
+    will select one from "reuse->socks[]" (as before this patch).
+    
+    The SK_DROP and SK_PASS handling logic will be in the next patch.
+    
+    Signed-off-by: Martin KaFai Lau <kafai@fb.com>
+    Acked-by: Alexei Starovoitov <ast@kernel.org>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/net/core/sock_reuseport.c b/net/core/sock_reuseport.c
+index 8235f2439816..d260167f5f77 100644
+--- a/net/core/sock_reuseport.c
++++ b/net/core/sock_reuseport.c
+@@ -51,7 +51,7 @@ static struct sock_reuseport *__reuseport_alloc(unsigned int max_socks)
+ 	return reuse;
+ }
+ 
+-int reuseport_alloc(struct sock *sk)
++int reuseport_alloc(struct sock *sk, bool bind_inany)
+ {
+ 	struct sock_reuseport *reuse;
+ 
+@@ -63,9 +63,17 @@ int reuseport_alloc(struct sock *sk)
+ 	/* Allocation attempts can occur concurrently via the setsockopt path
+ 	 * and the bind/hash path.  Nothing to do when we lose the race.
+ 	 */
+-	if (rcu_dereference_protected(sk->sk_reuseport_cb,
+-				      lockdep_is_held(&reuseport_lock)))
++	reuse = rcu_dereference_protected(sk->sk_reuseport_cb,
++					  lockdep_is_held(&reuseport_lock));
++	if (reuse) {
++		/* Only set reuse->bind_inany if the bind_inany is true.
++		 * Otherwise, it will overwrite the reuse->bind_inany
++		 * which was set by the bind/hash path.
++		 */
++		if (bind_inany)
++			reuse->bind_inany = bind_inany;
+ 		goto out;
++	}
+ 
+ 	reuse = __reuseport_alloc(INIT_SOCKS);
+ 	if (!reuse) {
+@@ -75,6 +83,7 @@ int reuseport_alloc(struct sock *sk)
+ 
+ 	reuse->socks[0] = sk;
+ 	reuse->num_socks = 1;
++	reuse->bind_inany = bind_inany;
+ 	rcu_assign_pointer(sk->sk_reuseport_cb, reuse);
+ 
+ out:
+@@ -101,6 +110,7 @@ static struct sock_reuseport *reuseport_grow(struct sock_reuseport *reuse)
+ 	more_reuse->num_socks = reuse->num_socks;
+ 	more_reuse->prog = reuse->prog;
+ 	more_reuse->reuseport_id = reuse->reuseport_id;
++	more_reuse->bind_inany = reuse->bind_inany;
+ 
+ 	memcpy(more_reuse->socks, reuse->socks,
+ 	       reuse->num_socks * sizeof(struct sock *));
+@@ -136,12 +146,12 @@ static void reuseport_free_rcu(struct rcu_head *head)
+  *  @sk2: Socket belonging to the existing reuseport group.
+  *  May return ENOMEM and not add socket to group under memory pressure.
+  */
+-int reuseport_add_sock(struct sock *sk, struct sock *sk2)
++int reuseport_add_sock(struct sock *sk, struct sock *sk2, bool bind_inany)
+ {
+ 	struct sock_reuseport *old_reuse, *reuse;
+ 
+ 	if (!rcu_access_pointer(sk2->sk_reuseport_cb)) {
+-		int err = reuseport_alloc(sk2);
++		int err = reuseport_alloc(sk2, bind_inany);
+ 
+ 		if (err)
+ 			return err;
+
+commit 5dc4c4b7d4e8115e7cde96a030f98cb3ab2e458c
+Author: Martin KaFai Lau <kafai@fb.com>
+Date:   Wed Aug 8 01:01:24 2018 -0700
+
+    bpf: Introduce BPF_MAP_TYPE_REUSEPORT_SOCKARRAY
+    
+    This patch introduces a new map type BPF_MAP_TYPE_REUSEPORT_SOCKARRAY.
+    
+    To unleash the full potential of a bpf prog, it is essential for the
+    userspace to be capable of directly setting up a bpf map which can then
+    be consumed by the bpf prog to make decision.  In this case, decide which
+    SO_REUSEPORT sk to serve the incoming request.
+    
+    By adding BPF_MAP_TYPE_REUSEPORT_SOCKARRAY, the userspace has total control
+    and visibility on where a SO_REUSEPORT sk should be located in a bpf map.
+    The later patch will introduce BPF_PROG_TYPE_SK_REUSEPORT such that
+    the bpf prog can directly select a sk from the bpf map.  That will
+    raise the programmability of the bpf prog attached to a reuseport
+    group (a group of sk serving the same IP:PORT).
+    
+    For example, in UDP, the bpf prog can peek into the payload (e.g.
+    through the "data" pointer introduced in the later patch) to learn
+    the application level's connection information and then decide which sk
+    to pick from a bpf map.  The userspace can tightly couple the sk's location
+    in a bpf map with the application logic in generating the UDP payload's
+    connection information.  This connection info contact/API stays within the
+    userspace.
+    
+    Also, when used with map-in-map, the userspace can switch the
+    old-server-process's inner map to a new-server-process's inner map
+    in one call "bpf_map_update_elem(outer_map, &index, &new_reuseport_array)".
+    The bpf prog will then direct incoming requests to the new process instead
+    of the old process.  The old process can finish draining the pending
+    requests (e.g. by "accept()") before closing the old-fds.  [Note that
+    deleting a fd from a bpf map does not necessary mean the fd is closed]
+    
+    During map_update_elem(),
+    Only SO_REUSEPORT sk (i.e. which has already been added
+    to a reuse->socks[]) can be used.  That means a SO_REUSEPORT sk that is
+    "bind()" for UDP or "bind()+listen()" for TCP.  These conditions are
+    ensured in "reuseport_array_update_check()".
+    
+    A SO_REUSEPORT sk can only be added once to a map (i.e. the
+    same sk cannot be added twice even to the same map).  SO_REUSEPORT
+    already allows another sk to be created for the same IP:PORT.
+    There is no need to re-create a similar usage in the BPF side.
+    
+    When a SO_REUSEPORT is deleted from the "reuse->socks[]" (e.g. "close()"),
+    it will notify the bpf map to remove it from the map also.  It is
+    done through "bpf_sk_reuseport_detach()" and it will only be called
+    if >=1 of the "reuse->sock[]" has ever been added to a bpf map.
+    
+    The map_update()/map_delete() has to be in-sync with the
+    "reuse->socks[]".  Hence, the same "reuseport_lock" used
+    by "reuse->socks[]" has to be used here also. Care has
+    been taken to ensure the lock is only acquired when the
+    adding sk passes some strict tests. and
+    freeing the map does not require the reuseport_lock.
+    
+    The reuseport_array will also support lookup from the syscall
+    side.  It will return a sock_gen_cookie().  The sock_gen_cookie()
+    is on-demand (i.e. a sk's cookie is not generated until the very
+    first map_lookup_elem()).
+    
+    The lookup cookie is 64bits but it goes against the logical userspace
+    expectation on 32bits sizeof(fd) (and as other fd based bpf maps do also).
+    It may catch user in surprise if we enforce value_size=8 while
+    userspace still pass a 32bits fd during update.  Supporting different
+    value_size between lookup and update seems unintuitive also.
+    
+    We also need to consider what if other existing fd based maps want
+    to return 64bits value from syscall's lookup in the future.
+    Hence, reuseport_array supports both value_size 4 and 8, and
+    assuming user will usually use value_size=4.  The syscall's lookup
+    will return ENOSPC on value_size=4.  It will will only
+    return 64bits value from sock_gen_cookie() when user consciously
+    choose value_size=8 (as a signal that lookup is desired) which then
+    requires a 64bits value in both lookup and update.
+    
+    Signed-off-by: Martin KaFai Lau <kafai@fb.com>
+    Acked-by: Alexei Starovoitov <ast@kernel.org>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/net/core/sock_reuseport.c b/net/core/sock_reuseport.c
+index cf2e4d305af9..8235f2439816 100644
+--- a/net/core/sock_reuseport.c
++++ b/net/core/sock_reuseport.c
+@@ -186,6 +186,14 @@ void reuseport_detach_sock(struct sock *sk)
+ 	spin_lock_bh(&reuseport_lock);
+ 	reuse = rcu_dereference_protected(sk->sk_reuseport_cb,
+ 					  lockdep_is_held(&reuseport_lock));
++
++	/* At least one of the sk in this reuseport group is added to
++	 * a bpf map.  Notify the bpf side.  The bpf map logic will
++	 * remove the sk if it is indeed added to a bpf map.
++	 */
++	if (reuse->reuseport_id)
++		bpf_sk_reuseport_detach(sk);
++
+ 	rcu_assign_pointer(sk->sk_reuseport_cb, NULL);
+ 
+ 	for (i = 0; i < reuse->num_socks; i++) {
+
+commit 736b46027eb4a4c602d3b8b93d2f48c9facbd915
+Author: Martin KaFai Lau <kafai@fb.com>
+Date:   Wed Aug 8 01:01:22 2018 -0700
+
+    net: Add ID (if needed) to sock_reuseport and expose reuseport_lock
+    
+    A later patch will introduce a BPF_MAP_TYPE_REUSEPORT_ARRAY which
+    allows a SO_REUSEPORT sk to be added to a bpf map.  When a sk
+    is removed from reuse->socks[], it also needs to be removed from
+    the bpf map.  Also, when adding a sk to a bpf map, the bpf
+    map needs to ensure it is indeed in a reuse->socks[].
+    Hence, reuseport_lock is needed by the bpf map to ensure its
+    map_update_elem() and map_delete_elem() operations are in-sync with
+    the reuse->socks[].  The BPF_MAP_TYPE_REUSEPORT_ARRAY map will only
+    acquire the reuseport_lock after ensuring the adding sk is already
+    in a reuseport group (i.e. reuse->socks[]).  The map_lookup_elem()
+    will be lockless.
+    
+    This patch also adds an ID to sock_reuseport.  A later patch
+    will introduce BPF_PROG_TYPE_SK_REUSEPORT which allows
+    a bpf prog to select a sk from a bpf map.  It is inflexible to
+    statically enforce a bpf map can only contain the sk belonging to
+    a particular reuse->socks[] (i.e. same IP:PORT) during the bpf
+    verification time. For example, think about the the map-in-map situation
+    where the inner map can be dynamically changed in runtime and the outer
+    map may have inner maps belonging to different reuseport groups.
+    Hence, when the bpf prog (in the new BPF_PROG_TYPE_SK_REUSEPORT
+    type) selects a sk,  this selected sk has to be checked to ensure it
+    belongs to the requesting reuseport group (i.e. the group serving
+    that IP:PORT).
+    
+    The "sk->sk_reuseport_cb" pointer cannot be used for this checking
+    purpose because the pointer value will change after reuseport_grow().
+    Instead of saving all checking conditions like the ones
+    preced calling "reuseport_add_sock()" and compare them everytime a
+    bpf_prog is run, a 32bits ID is introduced to survive the
+    reuseport_grow().  The ID is only acquired if any of the
+    reuse->socks[] is added to the newly introduced
+    "BPF_MAP_TYPE_REUSEPORT_ARRAY" map.
+    
+    If "BPF_MAP_TYPE_REUSEPORT_ARRAY" is not used,  the changes in this
+    patch is a no-op.
+    
+    Signed-off-by: Martin KaFai Lau <kafai@fb.com>
+    Acked-by: Alexei Starovoitov <ast@kernel.org>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/net/core/sock_reuseport.c b/net/core/sock_reuseport.c
+index 3f188fad0162..cf2e4d305af9 100644
+--- a/net/core/sock_reuseport.c
++++ b/net/core/sock_reuseport.c
+@@ -8,11 +8,33 @@
+ 
+ #include <net/sock_reuseport.h>
+ #include <linux/bpf.h>
++#include <linux/idr.h>
+ #include <linux/rcupdate.h>
+ 
+ #define INIT_SOCKS 128
+ 
+-static DEFINE_SPINLOCK(reuseport_lock);
++DEFINE_SPINLOCK(reuseport_lock);
++
++#define REUSEPORT_MIN_ID 1
++static DEFINE_IDA(reuseport_ida);
++
++int reuseport_get_id(struct sock_reuseport *reuse)
++{
++	int id;
++
++	if (reuse->reuseport_id)
++		return reuse->reuseport_id;
++
++	id = ida_simple_get(&reuseport_ida, REUSEPORT_MIN_ID, 0,
++			    /* Called under reuseport_lock */
++			    GFP_ATOMIC);
++	if (id < 0)
++		return id;
++
++	reuse->reuseport_id = id;
++
++	return reuse->reuseport_id;
++}
+ 
+ static struct sock_reuseport *__reuseport_alloc(unsigned int max_socks)
+ {
+@@ -78,6 +100,7 @@ static struct sock_reuseport *reuseport_grow(struct sock_reuseport *reuse)
+ 	more_reuse->max_socks = more_socks_size;
+ 	more_reuse->num_socks = reuse->num_socks;
+ 	more_reuse->prog = reuse->prog;
++	more_reuse->reuseport_id = reuse->reuseport_id;
+ 
+ 	memcpy(more_reuse->socks, reuse->socks,
+ 	       reuse->num_socks * sizeof(struct sock *));
+@@ -102,6 +125,8 @@ static void reuseport_free_rcu(struct rcu_head *head)
+ 	reuse = container_of(head, struct sock_reuseport, rcu);
+ 	if (reuse->prog)
+ 		bpf_prog_destroy(reuse->prog);
++	if (reuse->reuseport_id)
++		ida_simple_remove(&reuseport_ida, reuse->reuseport_id);
+ 	kfree(reuse);
+ }
+ 
+
+commit 40a1227ea845a37ab197dd1caffb60b047fa36b1
+Author: Martin KaFai Lau <kafai@fb.com>
+Date:   Wed Aug 8 01:01:21 2018 -0700
+
+    tcp: Avoid TCP syncookie rejected by SO_REUSEPORT socket
+    
+    Although the actual cookie check "__cookie_v[46]_check()" does
+    not involve sk specific info, it checks whether the sk has recent
+    synq overflow event in "tcp_synq_no_recent_overflow()".  The
+    tcp_sk(sk)->rx_opt.ts_recent_stamp is updated every second
+    when it has sent out a syncookie (through "tcp_synq_overflow()").
+    
+    The above per sk "recent synq overflow event timestamp" works well
+    for non SO_REUSEPORT use case.  However, it may cause random
+    connection request reject/discard when SO_REUSEPORT is used with
+    syncookie because it fails the "tcp_synq_no_recent_overflow()"
+    test.
+    
+    When SO_REUSEPORT is used, it usually has multiple listening
+    socks serving TCP connection requests destinated to the same local IP:PORT.
+    There are cases that the TCP-ACK-COOKIE may not be received
+    by the same sk that sent out the syncookie.  For example,
+    if reuse->socks[] began with {sk0, sk1},
+    1) sk1 sent out syncookies and tcp_sk(sk1)->rx_opt.ts_recent_stamp
+       was updated.
+    2) the reuse->socks[] became {sk1, sk2} later.  e.g. sk0 was first closed
+       and then sk2 was added.  Here, sk2 does not have ts_recent_stamp set.
+       There are other ordering that will trigger the similar situation
+       below but the idea is the same.
+    3) When the TCP-ACK-COOKIE comes back, sk2 was selected.
+       "tcp_synq_no_recent_overflow(sk2)" returns true. In this case,
+       all syncookies sent by sk1 will be handled (and rejected)
+       by sk2 while sk1 is still alive.
+    
+    The userspace may create and remove listening SO_REUSEPORT sockets
+    as it sees fit.  E.g. Adding new thread (and SO_REUSEPORT sock) to handle
+    incoming requests, old process stopping and new process starting...etc.
+    With or without SO_ATTACH_REUSEPORT_[CB]BPF,
+    the sockets leaving and joining a reuseport group makes picking
+    the same sk to check the syncookie very difficult (if not impossible).
+    
+    The later patches will allow bpf prog more flexibility in deciding
+    where a sk should be located in a bpf map and selecting a particular
+    SO_REUSEPORT sock as it sees fit.  e.g. Without closing any sock,
+    replace the whole bpf reuseport_array in one map_update() by using
+    map-in-map.  Getting the syncookie check working smoothly across
+    socks in the same "reuse->socks[]" is important.
+    
+    A partial solution is to set the newly added sk's ts_recent_stamp
+    to the max ts_recent_stamp of a reuseport group but that will require
+    to iterate through reuse->socks[]  OR
+    pessimistically set it to "now - TCP_SYNCOOKIE_VALID" when a sk is
+    joining a reuseport group.  However, neither of them will solve the
+    existing sk getting moved around the reuse->socks[] and that
+    sk may not have ts_recent_stamp updated, unlikely under continuous
+    synflood but not impossible.
+    
+    This patch opts to treat the reuseport group as a whole when
+    considering the last synq overflow timestamp since
+    they are serving the same IP:PORT from the userspace
+    (and BPF program) perspective.
+    
+    "synq_overflow_ts" is added to "struct sock_reuseport".
+    The tcp_synq_overflow() and tcp_synq_no_recent_overflow()
+    will update/check reuse->synq_overflow_ts if the sk is
+    in a reuseport group.  Similar to the reuseport decision in
+    __inet_lookup_listener(), both sk->sk_reuseport and
+    sk->sk_reuseport_cb are tested for SO_REUSEPORT usage.
+    Update on "synq_overflow_ts" happens at roughly once
+    every second.
+    
+    A synflood test was done with a 16 rx-queues and 16 reuseport sockets.
+    No meaningful performance change is observed.  Before and
+    after the change is ~9Mpps in IPv4.
+    
+    Cc: Eric Dumazet <edumazet@google.com>
+    Signed-off-by: Martin KaFai Lau <kafai@fb.com>
+    Acked-by: Alexei Starovoitov <ast@kernel.org>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/net/core/sock_reuseport.c b/net/core/sock_reuseport.c
+index 064acb04be0f..3f188fad0162 100644
+--- a/net/core/sock_reuseport.c
++++ b/net/core/sock_reuseport.c
+@@ -81,6 +81,7 @@ static struct sock_reuseport *reuseport_grow(struct sock_reuseport *reuse)
+ 
+ 	memcpy(more_reuse->socks, reuse->socks,
+ 	       reuse->num_socks * sizeof(struct sock *));
++	more_reuse->synq_overflow_ts = READ_ONCE(reuse->synq_overflow_ts);
+ 
+ 	for (i = 0; i < reuse->num_socks; ++i)
+ 		rcu_assign_pointer(reuse->socks[i]->sk_reuseport_cb,
+
+commit 4db428a7c9ab07e08783e0fcdc4ca0f555da0567
+Author: Eric Dumazet <edumazet@google.com>
+Date:   Fri Feb 2 10:27:27 2018 -0800
+
+    soreuseport: fix mem leak in reuseport_add_sock()
+    
+    reuseport_add_sock() needs to deal with attaching a socket having
+    its own sk_reuseport_cb, after a prior
+    setsockopt(SO_ATTACH_REUSEPORT_?BPF)
+    
+    Without this fix, not only a WARN_ONCE() was issued, but we were also
+    leaking memory.
+    
+    Thanks to sysbot and Eric Biggers for providing us nice C repros.
+    
+    ------------[ cut here ]------------
+    socket already in reuseport group
+    WARNING: CPU: 0 PID: 3496 at net/core/sock_reuseport.c:119  
+    reuseport_add_sock+0x742/0x9b0 net/core/sock_reuseport.c:117
+    Kernel panic - not syncing: panic_on_warn set ...
+    
+    CPU: 0 PID: 3496 Comm: syzkaller869503 Not tainted 4.15.0-rc6+ #245
+    Hardware name: Google Google Compute Engine/Google Compute Engine,
+    BIOS  
+    Google 01/01/2011
+    Call Trace:
+      __dump_stack lib/dump_stack.c:17 [inline]
+      dump_stack+0x194/0x257 lib/dump_stack.c:53
+      panic+0x1e4/0x41c kernel/panic.c:183
+      __warn+0x1dc/0x200 kernel/panic.c:547
+      report_bug+0x211/0x2d0 lib/bug.c:184
+      fixup_bug.part.11+0x37/0x80 arch/x86/kernel/traps.c:178
+      fixup_bug arch/x86/kernel/traps.c:247 [inline]
+      do_error_trap+0x2d7/0x3e0 arch/x86/kernel/traps.c:296
+      do_invalid_op+0x1b/0x20 arch/x86/kernel/traps.c:315
+      invalid_op+0x22/0x40 arch/x86/entry/entry_64.S:1079
+    
+    Fixes: ef456144da8e ("soreuseport: define reuseport groups")
+    Signed-off-by: Eric Dumazet <edumazet@google.com>
+    Reported-by: syzbot+c0ea2226f77a42936bf7@syzkaller.appspotmail.com
+    Acked-by: Craig Gallek <kraig@google.com>
+    
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/core/sock_reuseport.c b/net/core/sock_reuseport.c
+index c5bb52bc73a1..064acb04be0f 100644
+--- a/net/core/sock_reuseport.c
++++ b/net/core/sock_reuseport.c
+@@ -94,6 +94,16 @@ static struct sock_reuseport *reuseport_grow(struct sock_reuseport *reuse)
+ 	return more_reuse;
+ }
+ 
++static void reuseport_free_rcu(struct rcu_head *head)
++{
++	struct sock_reuseport *reuse;
++
++	reuse = container_of(head, struct sock_reuseport, rcu);
++	if (reuse->prog)
++		bpf_prog_destroy(reuse->prog);
++	kfree(reuse);
++}
++
+ /**
+  *  reuseport_add_sock - Add a socket to the reuseport group of another.
+  *  @sk:  New socket to add to the group.
+@@ -102,7 +112,7 @@ static struct sock_reuseport *reuseport_grow(struct sock_reuseport *reuse)
+  */
+ int reuseport_add_sock(struct sock *sk, struct sock *sk2)
+ {
+-	struct sock_reuseport *reuse;
++	struct sock_reuseport *old_reuse, *reuse;
+ 
+ 	if (!rcu_access_pointer(sk2->sk_reuseport_cb)) {
+ 		int err = reuseport_alloc(sk2);
+@@ -113,10 +123,13 @@ int reuseport_add_sock(struct sock *sk, struct sock *sk2)
+ 
+ 	spin_lock_bh(&reuseport_lock);
+ 	reuse = rcu_dereference_protected(sk2->sk_reuseport_cb,
+-					  lockdep_is_held(&reuseport_lock)),
+-	WARN_ONCE(rcu_dereference_protected(sk->sk_reuseport_cb,
+-					    lockdep_is_held(&reuseport_lock)),
+-		  "socket already in reuseport group");
++					  lockdep_is_held(&reuseport_lock));
++	old_reuse = rcu_dereference_protected(sk->sk_reuseport_cb,
++					     lockdep_is_held(&reuseport_lock));
++	if (old_reuse && old_reuse->num_socks != 1) {
++		spin_unlock_bh(&reuseport_lock);
++		return -EBUSY;
++	}
+ 
+ 	if (reuse->num_socks == reuse->max_socks) {
+ 		reuse = reuseport_grow(reuse);
+@@ -134,19 +147,11 @@ int reuseport_add_sock(struct sock *sk, struct sock *sk2)
+ 
+ 	spin_unlock_bh(&reuseport_lock);
+ 
++	if (old_reuse)
++		call_rcu(&old_reuse->rcu, reuseport_free_rcu);
+ 	return 0;
+ }
+ 
+-static void reuseport_free_rcu(struct rcu_head *head)
+-{
+-	struct sock_reuseport *reuse;
+-
+-	reuse = container_of(head, struct sock_reuseport, rcu);
+-	if (reuse->prog)
+-		bpf_prog_destroy(reuse->prog);
+-	kfree(reuse);
+-}
+-
+ void reuseport_detach_sock(struct sock *sk)
+ {
+ 	struct sock_reuseport *reuse;
+
+commit e94a62f507f9498e5f4b2c69ef181b3402934c2a
+Author: Paolo Abeni <pabeni@redhat.com>
+Date:   Thu Nov 30 15:39:34 2017 +0100
+
+    net/reuseport: drop legacy code
+    
+    Since commit e32ea7e74727 ("soreuseport: fast reuseport UDP socket
+    selection") and commit c125e80b8868 ("soreuseport: fast reuseport
+    TCP socket selection") the relevant reuseport socket matching the current
+    packet is selected by the reuseport_select_sock() call. The only
+    exceptions are invalid BPF filters/filters returning out-of-range
+    indices.
+    In the latter case the code implicitly falls back to using the hash
+    demultiplexing, but instead of selecting the socket inside the
+    reuseport_select_sock() function, it relies on the hash selection
+    logic introduced with the early soreuseport implementation.
+    
+    With this patch, in case of a BPF filter returning a bad socket
+    index value, we fall back to hash-based selection inside the
+    reuseport_select_sock() body, so that we can drop some duplicate
+    code in the ipv4 and ipv6 stack.
+    
+    This also allows faster lookup in the above scenario and will allow
+    us to avoid computing the hash value for successful, BPF based
+    demultiplexing - in a later patch.
+    
+    Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+    Acked-by: Craig Gallek <kraig@google.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/core/sock_reuseport.c b/net/core/sock_reuseport.c
+index 5eeb1d20cc38..c5bb52bc73a1 100644
+--- a/net/core/sock_reuseport.c
++++ b/net/core/sock_reuseport.c
+@@ -235,7 +235,9 @@ struct sock *reuseport_select_sock(struct sock *sk,
+ 
+ 		if (prog && skb)
+ 			sk2 = run_bpf(reuse, socks, prog, skb, hdr_len);
+-		else
++
++		/* no bpf or invalid bpf result: fall back to hash usage */
++		if (!sk2)
+ 			sk2 = reuse->socks[reciprocal_scale(hash, socks)];
+ 	}
+ 
+
+commit b24413180f5600bcb3bb70fbed5cf186b60864bd
+Author: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Date:   Wed Nov 1 15:07:57 2017 +0100
+
+    License cleanup: add SPDX GPL-2.0 license identifier to files with no license
+    
+    Many source files in the tree are missing licensing information, which
+    makes it harder for compliance tools to determine the correct license.
+    
+    By default all files without license information are under the default
+    license of the kernel, which is GPL version 2.
+    
+    Update the files which contain no license information with the 'GPL-2.0'
+    SPDX license identifier.  The SPDX identifier is a legally binding
+    shorthand, which can be used instead of the full boiler plate text.
+    
+    This patch is based on work done by Thomas Gleixner and Kate Stewart and
+    Philippe Ombredanne.
+    
+    How this work was done:
+    
+    Patches were generated and checked against linux-4.14-rc6 for a subset of
+    the use cases:
+     - file had no licensing information it it.
+     - file was a */uapi/* one with no licensing information in it,
+     - file was a */uapi/* one with existing licensing information,
+    
+    Further patches will be generated in subsequent months to fix up cases
+    where non-standard license headers were used, and references to license
+    had to be inferred by heuristics based on keywords.
+    
+    The analysis to determine which SPDX License Identifier to be applied to
+    a file was done in a spreadsheet of side by side results from of the
+    output of two independent scanners (ScanCode & Windriver) producing SPDX
+    tag:value files created by Philippe Ombredanne.  Philippe prepared the
+    base worksheet, and did an initial spot review of a few 1000 files.
+    
+    The 4.13 kernel was the starting point of the analysis with 60,537 files
+    assessed.  Kate Stewart did a file by file comparison of the scanner
+    results in the spreadsheet to determine which SPDX license identifier(s)
+    to be applied to the file. She confirmed any determination that was not
+    immediately clear with lawyers working with the Linux Foundation.
+    
+    Criteria used to select files for SPDX license identifier tagging was:
+     - Files considered eligible had to be source code files.
+     - Make and config files were included as candidates if they contained >5
+       lines of source
+     - File already had some variant of a license header in it (even if <5
+       lines).
+    
+    All documentation files were explicitly excluded.
+    
+    The following heuristics were used to determine which SPDX license
+    identifiers to apply.
+    
+     - when both scanners couldn't find any license traces, file was
+       considered to have no license information in it, and the top level
+       COPYING file license applied.
+    
+       For non */uapi/* files that summary was:
+    
+       SPDX license identifier                            # files
+       ---------------------------------------------------|-------
+       GPL-2.0                                              11139
+    
+       and resulted in the first patch in this series.
+    
+       If that file was a */uapi/* path one, it was "GPL-2.0 WITH
+       Linux-syscall-note" otherwise it was "GPL-2.0".  Results of that was:
+    
+       SPDX license identifier                            # files
+       ---------------------------------------------------|-------
+       GPL-2.0 WITH Linux-syscall-note                        930
+    
+       and resulted in the second patch in this series.
+    
+     - if a file had some form of licensing information in it, and was one
+       of the */uapi/* ones, it was denoted with the Linux-syscall-note if
+       any GPL family license was found in the file or had no licensing in
+       it (per prior point).  Results summary:
+    
+       SPDX license identifier                            # files
+       ---------------------------------------------------|------
+       GPL-2.0 WITH Linux-syscall-note                       270
+       GPL-2.0+ WITH Linux-syscall-note                      169
+       ((GPL-2.0 WITH Linux-syscall-note) OR BSD-2-Clause)    21
+       ((GPL-2.0 WITH Linux-syscall-note) OR BSD-3-Clause)    17
+       LGPL-2.1+ WITH Linux-syscall-note                      15
+       GPL-1.0+ WITH Linux-syscall-note                       14
+       ((GPL-2.0+ WITH Linux-syscall-note) OR BSD-3-Clause)    5
+       LGPL-2.0+ WITH Linux-syscall-note                       4
+       LGPL-2.1 WITH Linux-syscall-note                        3
+       ((GPL-2.0 WITH Linux-syscall-note) OR MIT)              3
+       ((GPL-2.0 WITH Linux-syscall-note) AND MIT)             1
+    
+       and that resulted in the third patch in this series.
+    
+     - when the two scanners agreed on the detected license(s), that became
+       the concluded license(s).
+    
+     - when there was disagreement between the two scanners (one detected a
+       license but the other didn't, or they both detected different
+       licenses) a manual inspection of the file occurred.
+    
+     - In most cases a manual inspection of the information in the file
+       resulted in a clear resolution of the license that should apply (and
+       which scanner probably needed to revisit its heuristics).
+    
+     - When it was not immediately clear, the license identifier was
+       confirmed with lawyers working with the Linux Foundation.
+    
+     - If there was any question as to the appropriate license identifier,
+       the file was flagged for further research and to be revisited later
+       in time.
+    
+    In total, over 70 hours of logged manual review was done on the
+    spreadsheet to determine the SPDX license identifiers to apply to the
+    source files by Kate, Philippe, Thomas and, in some cases, confirmation
+    by lawyers working with the Linux Foundation.
+    
+    Kate also obtained a third independent scan of the 4.13 code base from
+    FOSSology, and compared selected files where the other two scanners
+    disagreed against that SPDX file, to see if there was new insights.  The
+    Windriver scanner is based on an older version of FOSSology in part, so
+    they are related.
+    
+    Thomas did random spot checks in about 500 files from the spreadsheets
+    for the uapi headers and agreed with SPDX license identifier in the
+    files he inspected. For the non-uapi files Thomas did random spot checks
+    in about 15000 files.
+    
+    In initial set of patches against 4.14-rc6, 3 files were found to have
+    copy/paste license identifier errors, and have been fixed to reflect the
+    correct identifier.
+    
+    Additionally Philippe spent 10 hours this week doing a detailed manual
+    inspection and review of the 12,461 patched files from the initial patch
+    version early this week with:
+     - a full scancode scan run, collecting the matched texts, detected
+       license ids and scores
+     - reviewing anything where there was a license detected (about 500+
+       files) to ensure that the applied SPDX license was correct
+     - reviewing anything where there was no detection but the patch license
+       was not GPL-2.0 WITH Linux-syscall-note to ensure that the applied
+       SPDX license was correct
+    
+    This produced a worksheet with 20 files needing minor correction.  This
+    worksheet was then exported into 3 different .csv files for the
+    different types of files to be modified.
+    
+    These .csv files were then reviewed by Greg.  Thomas wrote a script to
+    parse the csv files and add the proper SPDX tag to the file, in the
+    format that the file expected.  This script was further refined by Greg
+    based on the output to detect more types of files automatically and to
+    distinguish between header and source .c files (which need different
+    comment types.)  Finally Greg ran the script using the .csv files to
+    generate the patches.
+    
+    Reviewed-by: Kate Stewart <kstewart@linuxfoundation.org>
+    Reviewed-by: Philippe Ombredanne <pombredanne@nexb.com>
+    Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/net/core/sock_reuseport.c b/net/core/sock_reuseport.c
+index b1e0dbea1e8c..5eeb1d20cc38 100644
+--- a/net/core/sock_reuseport.c
++++ b/net/core/sock_reuseport.c
+@@ -1,3 +1,4 @@
++// SPDX-License-Identifier: GPL-2.0
+ /*
+  * To speed up listener socket lookup, create an array to store all sockets
+  * listening on the same port.  This allows a decision to be made after finding
+
+commit 1b5f962e71bfad6284574655c406597535c3ea7a
+Author: Craig Gallek <kraig@google.com>
+Date:   Thu Oct 19 15:00:29 2017 -0400
+
+    soreuseport: fix initialization race
+    
+    Syzkaller stumbled upon a way to trigger
+    WARNING: CPU: 1 PID: 13881 at net/core/sock_reuseport.c:41
+    reuseport_alloc+0x306/0x3b0 net/core/sock_reuseport.c:39
+    
+    There are two initialization paths for the sock_reuseport structure in a
+    socket: Through the udp/tcp bind paths of SO_REUSEPORT sockets or through
+    SO_ATTACH_REUSEPORT_[CE]BPF before bind.  The existing implementation
+    assumedthat the socket lock protected both of these paths when it actually
+    only protects the SO_ATTACH_REUSEPORT path.  Syzkaller triggered this
+    double allocation by running these paths concurrently.
+    
+    This patch moves the check for double allocation into the reuseport_alloc
+    function which is protected by a global spin lock.
+    
+    Fixes: e32ea7e74727 ("soreuseport: fast reuseport UDP socket selection")
+    Fixes: c125e80b8868 ("soreuseport: fast reuseport TCP socket selection")
+    Signed-off-by: Craig Gallek <kraig@google.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/core/sock_reuseport.c b/net/core/sock_reuseport.c
+index eed1ebf7f29d..b1e0dbea1e8c 100644
+--- a/net/core/sock_reuseport.c
++++ b/net/core/sock_reuseport.c
+@@ -36,9 +36,14 @@ int reuseport_alloc(struct sock *sk)
+ 	 * soft irq of receive path or setsockopt from process context
+ 	 */
+ 	spin_lock_bh(&reuseport_lock);
+-	WARN_ONCE(rcu_dereference_protected(sk->sk_reuseport_cb,
+-					    lockdep_is_held(&reuseport_lock)),
+-		  "multiple allocations for the same socket");
++
++	/* Allocation attempts can occur concurrently via the setsockopt path
++	 * and the bind/hash path.  Nothing to do when we lose the race.
++	 */
++	if (rcu_dereference_protected(sk->sk_reuseport_cb,
++				      lockdep_is_held(&reuseport_lock)))
++		goto out;
++
+ 	reuse = __reuseport_alloc(INIT_SOCKS);
+ 	if (!reuse) {
+ 		spin_unlock_bh(&reuseport_lock);
+@@ -49,6 +54,7 @@ int reuseport_alloc(struct sock *sk)
+ 	reuse->num_socks = 1;
+ 	rcu_assign_pointer(sk->sk_reuseport_cb, reuse);
+ 
++out:
+ 	spin_unlock_bh(&reuseport_lock);
+ 
+ 	return 0;
+
+commit 822f9bb104c9d1d2dea3669f1941558c6304cf92
+Author: Alexey Dobriyan <adobriyan@gmail.com>
+Date:   Mon Apr 3 01:18:23 2017 +0300
+
+    soreuseport: use "unsigned int" in __reuseport_alloc()
+    
+    Number of sockets is limited by 16-bit, so 64-bit allocation will never
+    happen.
+    
+    16-bit ops are the worst code density-wise on x86_64 because of
+    additional prefix (66).
+    
+    Space savings:
+    
+            add/remove: 0/0 grow/shrink: 0/1 up/down: 0/-3 (-3)
+            function                                     old     new   delta
+            reuseport_add_sock                           539     536      -3
+    
+    Signed-off-by: Alexey Dobriyan <adobriyan@gmail.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/core/sock_reuseport.c b/net/core/sock_reuseport.c
+index 9a1a352fd1eb..eed1ebf7f29d 100644
+--- a/net/core/sock_reuseport.c
++++ b/net/core/sock_reuseport.c
+@@ -13,9 +13,9 @@
+ 
+ static DEFINE_SPINLOCK(reuseport_lock);
+ 
+-static struct sock_reuseport *__reuseport_alloc(u16 max_socks)
++static struct sock_reuseport *__reuseport_alloc(unsigned int max_socks)
+ {
+-	size_t size = sizeof(struct sock_reuseport) +
++	unsigned int size = sizeof(struct sock_reuseport) +
+ 		      sizeof(struct sock *) * max_socks;
+ 	struct sock_reuseport *reuse = kzalloc(size, GFP_ATOMIC);
+ 
+
+commit 41ee9c557ef5de992843b6dac35a199e651525cf
+Author: Eric Dumazet <edumazet@google.com>
+Date:   Mon Oct 17 14:22:48 2016 -0700
+
+    soreuseport: do not export reuseport_add_sock()
+    
+    reuseport_add_sock() is not used from a module,
+    no need to export it.
+    
+    Signed-off-by: Eric Dumazet <edumazet@google.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/core/sock_reuseport.c b/net/core/sock_reuseport.c
+index e92b759d906c..9a1a352fd1eb 100644
+--- a/net/core/sock_reuseport.c
++++ b/net/core/sock_reuseport.c
+@@ -129,7 +129,6 @@ int reuseport_add_sock(struct sock *sk, struct sock *sk2)
+ 
+ 	return 0;
+ }
+-EXPORT_SYMBOL(reuseport_add_sock);
+ 
+ static void reuseport_free_rcu(struct rcu_head *head)
+ {
+
+commit b4ace4f1ae07691b4f6ea9f3e92efbec083df058
+Author: Craig Gallek <kraig@google.com>
+Date:   Tue Jan 19 14:27:08 2016 -0500
+
+    soreuseport: fix NULL ptr dereference SO_REUSEPORT after bind
+    
+    Marc Dionne discovered a NULL pointer dereference when setting
+    SO_REUSEPORT on a socket after it is bound.
+    This patch removes the assumption that at least one socket in the
+    reuseport group is bound with the SO_REUSEPORT option before other
+    bind calls occur.
+    
+    Fixes: e32ea7e74727 ("soreuseport: fast reuseport UDP socket selection")
+    Reported-by: Marc Dionne <marc.c.dionne@gmail.com>
+    Signed-off-by: Craig Gallek <kraig@google.com>
+    Tested-by: Marc Dionne <marc.dionne@auristor.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/core/sock_reuseport.c b/net/core/sock_reuseport.c
+index 1df98c557440..e92b759d906c 100644
+--- a/net/core/sock_reuseport.c
++++ b/net/core/sock_reuseport.c
+@@ -93,10 +93,17 @@ static struct sock_reuseport *reuseport_grow(struct sock_reuseport *reuse)
+  *  @sk2: Socket belonging to the existing reuseport group.
+  *  May return ENOMEM and not add socket to group under memory pressure.
+  */
+-int reuseport_add_sock(struct sock *sk, const struct sock *sk2)
++int reuseport_add_sock(struct sock *sk, struct sock *sk2)
+ {
+ 	struct sock_reuseport *reuse;
+ 
++	if (!rcu_access_pointer(sk2->sk_reuseport_cb)) {
++		int err = reuseport_alloc(sk2);
++
++		if (err)
++			return err;
++	}
++
+ 	spin_lock_bh(&reuseport_lock);
+ 	reuse = rcu_dereference_protected(sk2->sk_reuseport_cb,
+ 					  lockdep_is_held(&reuseport_lock)),
+
+commit 00ce3a15d811978fcb204a1a3f5f8c059096fa5e
+Author: Craig Gallek <kraig@google.com>
+Date:   Tue Jan 5 10:57:13 2016 -0500
+
+    soreuseport: change consume_skb to kfree_skb in error case
+    
+    Fixes: 538950a1b752 ("soreuseport: setsockopt SO_ATTACH_REUSEPORT_[CE]BPF")
+    Suggested-by: Daniel Borkmann <daniel@iogearbox.net>
+    Signed-off-by: Craig Gallek <kraig@google.com>
+    Acked-by: Daniel Borkmann <daniel@iogearbox.net>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/core/sock_reuseport.c b/net/core/sock_reuseport.c
+index ae0969c0fc2e..1df98c557440 100644
+--- a/net/core/sock_reuseport.c
++++ b/net/core/sock_reuseport.c
+@@ -173,7 +173,7 @@ static struct sock *run_bpf(struct sock_reuseport *reuse, u16 socks,
+ 
+ 	/* temporarily advance data past protocol header */
+ 	if (!pskb_pull(skb, hdr_len)) {
+-		consume_skb(nskb);
++		kfree_skb(nskb);
+ 		return NULL;
+ 	}
+ 	index = bpf_prog_run_save_cb(prog, skb);
+
+commit 538950a1b7527a0a52ccd9337e3fcd304f027f13
+Author: Craig Gallek <kraig@google.com>
+Date:   Mon Jan 4 17:41:47 2016 -0500
+
+    soreuseport: setsockopt SO_ATTACH_REUSEPORT_[CE]BPF
+    
+    Expose socket options for setting a classic or extended BPF program
+    for use when selecting sockets in an SO_REUSEPORT group.  These options
+    can be used on the first socket to belong to a group before bind or
+    on any socket in the group after bind.
+    
+    This change includes refactoring of the existing sk_filter code to
+    allow reuse of the existing BPF filter validation checks.
+    
+    Signed-off-by: Craig Gallek <kraig@google.com>
+    Acked-by: Alexei Starovoitov <ast@kernel.org>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/core/sock_reuseport.c b/net/core/sock_reuseport.c
+index 963c8d5f3027..ae0969c0fc2e 100644
+--- a/net/core/sock_reuseport.c
++++ b/net/core/sock_reuseport.c
+@@ -1,10 +1,12 @@
+ /*
+  * To speed up listener socket lookup, create an array to store all sockets
+  * listening on the same port.  This allows a decision to be made after finding
+- * the first socket.
++ * the first socket.  An optional BPF program can also be configured for
++ * selecting the socket index from the array of available sockets.
+  */
+ 
+ #include <net/sock_reuseport.h>
++#include <linux/bpf.h>
+ #include <linux/rcupdate.h>
+ 
+ #define INIT_SOCKS 128
+@@ -22,6 +24,7 @@ static struct sock_reuseport *__reuseport_alloc(u16 max_socks)
+ 
+ 	reuse->max_socks = max_socks;
+ 
++	RCU_INIT_POINTER(reuse->prog, NULL);
+ 	return reuse;
+ }
+ 
+@@ -67,6 +70,7 @@ static struct sock_reuseport *reuseport_grow(struct sock_reuseport *reuse)
+ 
+ 	more_reuse->max_socks = more_socks_size;
+ 	more_reuse->num_socks = reuse->num_socks;
++	more_reuse->prog = reuse->prog;
+ 
+ 	memcpy(more_reuse->socks, reuse->socks,
+ 	       reuse->num_socks * sizeof(struct sock *));
+@@ -75,6 +79,10 @@ static struct sock_reuseport *reuseport_grow(struct sock_reuseport *reuse)
+ 		rcu_assign_pointer(reuse->socks[i]->sk_reuseport_cb,
+ 				   more_reuse);
+ 
++	/* Note: we use kfree_rcu here instead of reuseport_free_rcu so
++	 * that reuse and more_reuse can temporarily share a reference
++	 * to prog.
++	 */
+ 	kfree_rcu(reuse, rcu);
+ 	return more_reuse;
+ }
+@@ -116,6 +124,16 @@ int reuseport_add_sock(struct sock *sk, const struct sock *sk2)
+ }
+ EXPORT_SYMBOL(reuseport_add_sock);
+ 
++static void reuseport_free_rcu(struct rcu_head *head)
++{
++	struct sock_reuseport *reuse;
++
++	reuse = container_of(head, struct sock_reuseport, rcu);
++	if (reuse->prog)
++		bpf_prog_destroy(reuse->prog);
++	kfree(reuse);
++}
++
+ void reuseport_detach_sock(struct sock *sk)
+ {
+ 	struct sock_reuseport *reuse;
+@@ -131,7 +149,7 @@ void reuseport_detach_sock(struct sock *sk)
+ 			reuse->socks[i] = reuse->socks[reuse->num_socks - 1];
+ 			reuse->num_socks--;
+ 			if (reuse->num_socks == 0)
+-				kfree_rcu(reuse, rcu);
++				call_rcu(&reuse->rcu, reuseport_free_rcu);
+ 			break;
+ 		}
+ 	}
+@@ -139,15 +157,53 @@ void reuseport_detach_sock(struct sock *sk)
+ }
+ EXPORT_SYMBOL(reuseport_detach_sock);
+ 
++static struct sock *run_bpf(struct sock_reuseport *reuse, u16 socks,
++			    struct bpf_prog *prog, struct sk_buff *skb,
++			    int hdr_len)
++{
++	struct sk_buff *nskb = NULL;
++	u32 index;
++
++	if (skb_shared(skb)) {
++		nskb = skb_clone(skb, GFP_ATOMIC);
++		if (!nskb)
++			return NULL;
++		skb = nskb;
++	}
++
++	/* temporarily advance data past protocol header */
++	if (!pskb_pull(skb, hdr_len)) {
++		consume_skb(nskb);
++		return NULL;
++	}
++	index = bpf_prog_run_save_cb(prog, skb);
++	__skb_push(skb, hdr_len);
++
++	consume_skb(nskb);
++
++	if (index >= socks)
++		return NULL;
++
++	return reuse->socks[index];
++}
++
+ /**
+  *  reuseport_select_sock - Select a socket from an SO_REUSEPORT group.
+  *  @sk: First socket in the group.
+- *  @hash: Use this hash to select.
++ *  @hash: When no BPF filter is available, use this hash to select.
++ *  @skb: skb to run through BPF filter.
++ *  @hdr_len: BPF filter expects skb data pointer at payload data.  If
++ *    the skb does not yet point at the payload, this parameter represents
++ *    how far the pointer needs to advance to reach the payload.
+  *  Returns a socket that should receive the packet (or NULL on error).
+  */
+-struct sock *reuseport_select_sock(struct sock *sk, u32 hash)
++struct sock *reuseport_select_sock(struct sock *sk,
++				   u32 hash,
++				   struct sk_buff *skb,
++				   int hdr_len)
+ {
+ 	struct sock_reuseport *reuse;
++	struct bpf_prog *prog;
+ 	struct sock *sk2 = NULL;
+ 	u16 socks;
+ 
+@@ -158,12 +214,16 @@ struct sock *reuseport_select_sock(struct sock *sk, u32 hash)
+ 	if (!reuse)
+ 		goto out;
+ 
++	prog = rcu_dereference(reuse->prog);
+ 	socks = READ_ONCE(reuse->num_socks);
+ 	if (likely(socks)) {
+ 		/* paired with smp_wmb() in reuseport_add_sock() */
+ 		smp_rmb();
+ 
+-		sk2 = reuse->socks[reciprocal_scale(hash, socks)];
++		if (prog && skb)
++			sk2 = run_bpf(reuse, socks, prog, skb, hdr_len);
++		else
++			sk2 = reuse->socks[reciprocal_scale(hash, socks)];
+ 	}
+ 
+ out:
+@@ -171,3 +231,21 @@ struct sock *reuseport_select_sock(struct sock *sk, u32 hash)
+ 	return sk2;
+ }
+ EXPORT_SYMBOL(reuseport_select_sock);
++
++struct bpf_prog *
++reuseport_attach_prog(struct sock *sk, struct bpf_prog *prog)
++{
++	struct sock_reuseport *reuse;
++	struct bpf_prog *old_prog;
++
++	spin_lock_bh(&reuseport_lock);
++	reuse = rcu_dereference_protected(sk->sk_reuseport_cb,
++					  lockdep_is_held(&reuseport_lock));
++	old_prog = rcu_dereference_protected(reuse->prog,
++					     lockdep_is_held(&reuseport_lock));
++	rcu_assign_pointer(reuse->prog, prog);
++	spin_unlock_bh(&reuseport_lock);
++
++	return old_prog;
++}
++EXPORT_SYMBOL(reuseport_attach_prog);
+
+commit ef456144da8ef507c8cf504284b6042e9201a05c
+Author: Craig Gallek <kraig@google.com>
+Date:   Mon Jan 4 17:41:45 2016 -0500
+
+    soreuseport: define reuseport groups
+    
+    struct sock_reuseport is an optional shared structure referenced by each
+    socket belonging to a reuseport group.  When a socket is bound to an
+    address/port not yet in use and the reuseport flag has been set, the
+    structure will be allocated and attached to the newly bound socket.
+    When subsequent calls to bind are made for the same address/port, the
+    shared structure will be updated to include the new socket and the
+    newly bound socket will reference the group structure.
+    
+    Usually, when an incoming packet was destined for a reuseport group,
+    all sockets in the same group needed to be considered before a
+    dispatching decision was made.  With this structure, an appropriate
+    socket can be found after looking up just one socket in the group.
+    
+    This shared structure will also allow for more complicated decisions to
+    be made when selecting a socket (eg a BPF filter).
+    
+    This work is based off a similar implementation written by
+    Ying Cai <ycai@google.com> for implementing policy-based reuseport
+    selection.
+    
+    Signed-off-by: Craig Gallek <kraig@google.com>
+    Acked-by: Eric Dumazet <edumazet@google.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/core/sock_reuseport.c b/net/core/sock_reuseport.c
+new file mode 100644
+index 000000000000..963c8d5f3027
+--- /dev/null
++++ b/net/core/sock_reuseport.c
+@@ -0,0 +1,173 @@
++/*
++ * To speed up listener socket lookup, create an array to store all sockets
++ * listening on the same port.  This allows a decision to be made after finding
++ * the first socket.
++ */
++
++#include <net/sock_reuseport.h>
++#include <linux/rcupdate.h>
++
++#define INIT_SOCKS 128
++
++static DEFINE_SPINLOCK(reuseport_lock);
++
++static struct sock_reuseport *__reuseport_alloc(u16 max_socks)
++{
++	size_t size = sizeof(struct sock_reuseport) +
++		      sizeof(struct sock *) * max_socks;
++	struct sock_reuseport *reuse = kzalloc(size, GFP_ATOMIC);
++
++	if (!reuse)
++		return NULL;
++
++	reuse->max_socks = max_socks;
++
++	return reuse;
++}
++
++int reuseport_alloc(struct sock *sk)
++{
++	struct sock_reuseport *reuse;
++
++	/* bh lock used since this function call may precede hlist lock in
++	 * soft irq of receive path or setsockopt from process context
++	 */
++	spin_lock_bh(&reuseport_lock);
++	WARN_ONCE(rcu_dereference_protected(sk->sk_reuseport_cb,
++					    lockdep_is_held(&reuseport_lock)),
++		  "multiple allocations for the same socket");
++	reuse = __reuseport_alloc(INIT_SOCKS);
++	if (!reuse) {
++		spin_unlock_bh(&reuseport_lock);
++		return -ENOMEM;
++	}
++
++	reuse->socks[0] = sk;
++	reuse->num_socks = 1;
++	rcu_assign_pointer(sk->sk_reuseport_cb, reuse);
++
++	spin_unlock_bh(&reuseport_lock);
++
++	return 0;
++}
++EXPORT_SYMBOL(reuseport_alloc);
++
++static struct sock_reuseport *reuseport_grow(struct sock_reuseport *reuse)
++{
++	struct sock_reuseport *more_reuse;
++	u32 more_socks_size, i;
++
++	more_socks_size = reuse->max_socks * 2U;
++	if (more_socks_size > U16_MAX)
++		return NULL;
++
++	more_reuse = __reuseport_alloc(more_socks_size);
++	if (!more_reuse)
++		return NULL;
++
++	more_reuse->max_socks = more_socks_size;
++	more_reuse->num_socks = reuse->num_socks;
++
++	memcpy(more_reuse->socks, reuse->socks,
++	       reuse->num_socks * sizeof(struct sock *));
++
++	for (i = 0; i < reuse->num_socks; ++i)
++		rcu_assign_pointer(reuse->socks[i]->sk_reuseport_cb,
++				   more_reuse);
++
++	kfree_rcu(reuse, rcu);
++	return more_reuse;
++}
++
++/**
++ *  reuseport_add_sock - Add a socket to the reuseport group of another.
++ *  @sk:  New socket to add to the group.
++ *  @sk2: Socket belonging to the existing reuseport group.
++ *  May return ENOMEM and not add socket to group under memory pressure.
++ */
++int reuseport_add_sock(struct sock *sk, const struct sock *sk2)
++{
++	struct sock_reuseport *reuse;
++
++	spin_lock_bh(&reuseport_lock);
++	reuse = rcu_dereference_protected(sk2->sk_reuseport_cb,
++					  lockdep_is_held(&reuseport_lock)),
++	WARN_ONCE(rcu_dereference_protected(sk->sk_reuseport_cb,
++					    lockdep_is_held(&reuseport_lock)),
++		  "socket already in reuseport group");
++
++	if (reuse->num_socks == reuse->max_socks) {
++		reuse = reuseport_grow(reuse);
++		if (!reuse) {
++			spin_unlock_bh(&reuseport_lock);
++			return -ENOMEM;
++		}
++	}
++
++	reuse->socks[reuse->num_socks] = sk;
++	/* paired with smp_rmb() in reuseport_select_sock() */
++	smp_wmb();
++	reuse->num_socks++;
++	rcu_assign_pointer(sk->sk_reuseport_cb, reuse);
++
++	spin_unlock_bh(&reuseport_lock);
++
++	return 0;
++}
++EXPORT_SYMBOL(reuseport_add_sock);
++
++void reuseport_detach_sock(struct sock *sk)
++{
++	struct sock_reuseport *reuse;
++	int i;
++
++	spin_lock_bh(&reuseport_lock);
++	reuse = rcu_dereference_protected(sk->sk_reuseport_cb,
++					  lockdep_is_held(&reuseport_lock));
++	rcu_assign_pointer(sk->sk_reuseport_cb, NULL);
++
++	for (i = 0; i < reuse->num_socks; i++) {
++		if (reuse->socks[i] == sk) {
++			reuse->socks[i] = reuse->socks[reuse->num_socks - 1];
++			reuse->num_socks--;
++			if (reuse->num_socks == 0)
++				kfree_rcu(reuse, rcu);
++			break;
++		}
++	}
++	spin_unlock_bh(&reuseport_lock);
++}
++EXPORT_SYMBOL(reuseport_detach_sock);
++
++/**
++ *  reuseport_select_sock - Select a socket from an SO_REUSEPORT group.
++ *  @sk: First socket in the group.
++ *  @hash: Use this hash to select.
++ *  Returns a socket that should receive the packet (or NULL on error).
++ */
++struct sock *reuseport_select_sock(struct sock *sk, u32 hash)
++{
++	struct sock_reuseport *reuse;
++	struct sock *sk2 = NULL;
++	u16 socks;
++
++	rcu_read_lock();
++	reuse = rcu_dereference(sk->sk_reuseport_cb);
++
++	/* if memory allocation failed or add call is not yet complete */
++	if (!reuse)
++		goto out;
++
++	socks = READ_ONCE(reuse->num_socks);
++	if (likely(socks)) {
++		/* paired with smp_wmb() in reuseport_add_sock() */
++		smp_rmb();
++
++		sk2 = reuse->socks[reciprocal_scale(hash, socks)];
++	}
++
++out:
++	rcu_read_unlock();
++	return sk2;
++}
++EXPORT_SYMBOL(reuseport_select_sock);

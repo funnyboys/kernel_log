@@ -1,0 +1,413 @@
+commit 834f8933d5ddd732274cb6050252bd1c7cc7349d
+Author: Vladimir Oltean <vladimir.oltean@nxp.com>
+Date:   Tue May 5 22:20:56 2020 +0300
+
+    net: dsa: sja1105: implement tc-gate using time-triggered virtual links
+    
+    Restrict the TTEthernet hardware support on this switch to operate as
+    closely as possible to IEEE 802.1Qci as possible. This means that it can
+    perform PTP-time-based ingress admission control on streams identified
+    by {DMAC, VID, PCP}, which is useful when trying to ensure the
+    determinism of traffic scheduled via IEEE 802.1Qbv.
+    
+    The oddity comes from the fact that in hardware (and in TTEthernet at
+    large), virtual links always need a full-blown action, including not
+    only the type of policing, but also the list of destination ports. So in
+    practice, a single tc-gate action will result in all packets getting
+    dropped. Additional actions (either "trap" or "redirect") need to be
+    specified in the same filter rule such that the conforming packets are
+    actually forwarded somewhere.
+    
+    Apart from the VL Lookup, Policing and Forwarding tables which need to
+    be programmed for each flow (virtual link), the Schedule engine also
+    needs to be told to open/close the admission gates for each individual
+    virtual link. A fairly accurate (and detailed) description of how that
+    works is already present in sja1105_tas.c, since it is already used to
+    trigger the egress gates for the tc-taprio offload (IEEE 802.1Qbv). Key
+    point here, we remember that the schedule engine supports 8
+    "subschedules" (execution threads that iterate through the global
+    schedule in parallel, and that no 2 hardware threads must execute a
+    schedule entry at the same time). For tc-taprio, each egress port used
+    one of these 8 subschedules, leaving a total of 4 subschedules unused.
+    In principle we could have allocated 1 subschedule for the tc-gate
+    offload of each ingress port, but actually the schedules of all virtual
+    links installed on each ingress port would have needed to be merged
+    together, before they could have been programmed to hardware. So
+    simplify our life and just merge the entire tc-gate configuration, for
+    all virtual links on all ingress ports, into a single subschedule. Be
+    sure to check that against the usual hardware scheduling conflicts, and
+    program it to hardware alongside any tc-taprio subschedule that may be
+    present.
+    
+    The following scenarios were tested:
+    
+    1. Quantitative testing:
+    
+       tc qdisc add dev swp2 clsact
+       tc filter add dev swp2 ingress flower skip_sw \
+               dst_mac 42:be:24:9b:76:20 \
+               action gate index 1 base-time 0 \
+               sched-entry OPEN 1200 -1 -1 \
+               sched-entry CLOSE 1200 -1 -1 \
+               action trap
+    
+       ping 192.168.1.2 -f
+       PING 192.168.1.2 (192.168.1.2) 56(84) bytes of data.
+       .............................
+       --- 192.168.1.2 ping statistics ---
+       948 packets transmitted, 467 received, 50.7384% packet loss, time 9671ms
+    
+    2. Qualitative testing (with a phase-aligned schedule - the clocks are
+       synchronized by ptp4l, not shown here):
+    
+       Receiver (sja1105):
+    
+       tc qdisc add dev swp2 clsact
+       now=$(phc_ctl /dev/ptp1 get | awk '/clock time is/ {print $5}') && \
+               sec=$(echo $now | awk -F. '{print $1}') && \
+               base_time="$(((sec + 2) * 1000000000))" && \
+               echo "base time ${base_time}"
+       tc filter add dev swp2 ingress flower skip_sw \
+               dst_mac 42:be:24:9b:76:20 \
+               action gate base-time ${base_time} \
+               sched-entry OPEN  60000 -1 -1 \
+               sched-entry CLOSE 40000 -1 -1 \
+               action trap
+    
+       Sender (enetc):
+       now=$(phc_ctl /dev/ptp0 get | awk '/clock time is/ {print $5}') && \
+               sec=$(echo $now | awk -F. '{print $1}') && \
+               base_time="$(((sec + 2) * 1000000000))" && \
+               echo "base time ${base_time}"
+       tc qdisc add dev eno0 parent root taprio \
+               num_tc 8 \
+               map 0 1 2 3 4 5 6 7 \
+               queues 1@0 1@1 1@2 1@3 1@4 1@5 1@6 1@7 \
+               base-time ${base_time} \
+               sched-entry S 01  50000 \
+               sched-entry S 00  50000 \
+               flags 2
+    
+       ping -A 192.168.1.1
+       PING 192.168.1.1 (192.168.1.1): 56 data bytes
+       ...
+       ^C
+       --- 192.168.1.1 ping statistics ---
+       1425 packets transmitted, 1424 packets received, 0% packet loss
+       round-trip min/avg/max = 0.322/0.361/0.990 ms
+    
+       And just for comparison, with the tc-taprio schedule deleted:
+    
+       ping -A 192.168.1.1
+       PING 192.168.1.1 (192.168.1.1): 56 data bytes
+       ...
+       ^C
+       --- 192.168.1.1 ping statistics ---
+       33 packets transmitted, 19 packets received, 42% packet loss
+       round-trip min/avg/max = 0.336/0.464/0.597 ms
+    
+    Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/dsa/sja1105/sja1105_tas.h b/drivers/net/dsa/sja1105/sja1105_tas.h
+index b226c3dfd5b1..0c173ff51751 100644
+--- a/drivers/net/dsa/sja1105/sja1105_tas.h
++++ b/drivers/net/dsa/sja1105/sja1105_tas.h
+@@ -6,6 +6,10 @@
+ 
+ #include <net/pkt_sched.h>
+ 
++#define SJA1105_TAS_MAX_DELTA		BIT(18)
++
++struct sja1105_private;
++
+ #if IS_ENABLED(CONFIG_NET_DSA_SJA1105_TAS)
+ 
+ enum sja1105_tas_state {
+@@ -20,8 +24,23 @@ enum sja1105_ptp_op {
+ 	SJA1105_PTP_ADJUSTFREQ,
+ };
+ 
++struct sja1105_gate_entry {
++	struct list_head list;
++	struct sja1105_rule *rule;
++	s64 interval;
++	u8 gate_state;
++};
++
++struct sja1105_gating_config {
++	u64 cycle_time;
++	s64 base_time;
++	int num_entries;
++	struct list_head entries;
++};
++
+ struct sja1105_tas_data {
+ 	struct tc_taprio_qopt_offload *offload[SJA1105_NUM_PORTS];
++	struct sja1105_gating_config gating_cfg;
+ 	enum sja1105_tas_state state;
+ 	enum sja1105_ptp_op last_op;
+ 	struct work_struct tas_work;
+@@ -42,6 +61,11 @@ void sja1105_tas_clockstep(struct dsa_switch *ds);
+ 
+ void sja1105_tas_adjfreq(struct dsa_switch *ds);
+ 
++bool sja1105_gating_check_conflicts(struct sja1105_private *priv, int port,
++				    struct netlink_ext_ack *extack);
++
++int sja1105_init_scheduling(struct sja1105_private *priv);
++
+ #else
+ 
+ /* C doesn't allow empty structures, bah! */
+@@ -63,6 +87,18 @@ static inline void sja1105_tas_clockstep(struct dsa_switch *ds) { }
+ 
+ static inline void sja1105_tas_adjfreq(struct dsa_switch *ds) { }
+ 
++static inline bool
++sja1105_gating_check_conflicts(struct dsa_switch *ds, int port,
++			       struct netlink_ext_ack *extack)
++{
++	return true;
++}
++
++static inline int sja1105_init_scheduling(struct sja1105_private *priv)
++{
++	return 0;
++}
++
+ #endif /* IS_ENABLED(CONFIG_NET_DSA_SJA1105_TAS) */
+ 
+ #endif /* _SJA1105_TAS_H */
+
+commit 86db36a347b4ea030ee3e6c73ce04e35e4732999
+Author: Vladimir Oltean <olteanv@gmail.com>
+Date:   Tue Nov 12 02:11:54 2019 +0200
+
+    net: dsa: sja1105: Implement state machine for TAS with PTP clock source
+    
+    Tested using the following bash script and the tc from iproute2-next:
+    
+            #!/bin/bash
+    
+            set -e -u -o pipefail
+    
+            NSEC_PER_SEC="1000000000"
+    
+            gatemask() {
+                    local tc_list="$1"
+                    local mask=0
+    
+                    for tc in ${tc_list}; do
+                            mask=$((${mask} | (1 << ${tc})))
+                    done
+    
+                    printf "%02x" ${mask}
+            }
+    
+            if ! systemctl is-active --quiet ptp4l; then
+                    echo "Please start the ptp4l service"
+                    exit
+            fi
+    
+            now=$(phc_ctl /dev/ptp1 get | gawk '/clock time is/ { print $5; }')
+            # Phase-align the base time to the start of the next second.
+            sec=$(echo "${now}" | gawk -F. '{ print $1; }')
+            base_time="$(((${sec} + 1) * ${NSEC_PER_SEC}))"
+    
+            tc qdisc add dev swp5 parent root handle 100 taprio \
+                    num_tc 8 \
+                    map 0 1 2 3 5 6 7 \
+                    queues 1@0 1@1 1@2 1@3 1@4 1@5 1@6 1@7 \
+                    base-time ${base_time} \
+                    sched-entry S $(gatemask 7) 100000 \
+                    sched-entry S $(gatemask "0 1 2 3 4 5 6") 400000 \
+                    clockid CLOCK_TAI flags 2
+    
+    The "state machine" is a workqueue invoked after each manipulation
+    command on the PTP clock (reset, adjust time, set time, adjust
+    frequency) which checks over the state of the time-aware scheduler.
+    So it is not monitored periodically, only in reaction to a PTP command
+    typically triggered from a userspace daemon (linuxptp). Otherwise there
+    is no reason for things to go wrong.
+    
+    Now that the timecounter/cyclecounter has been replaced with hardware
+    operations on the PTP clock, the TAS Kconfig now depends upon PTP and
+    the standalone clocksource operating mode has been removed.
+    
+    Signed-off-by: Vladimir Oltean <olteanv@gmail.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/dsa/sja1105/sja1105_tas.h b/drivers/net/dsa/sja1105/sja1105_tas.h
+index 0aad212d88b2..b226c3dfd5b1 100644
+--- a/drivers/net/dsa/sja1105/sja1105_tas.h
++++ b/drivers/net/dsa/sja1105/sja1105_tas.h
+@@ -8,8 +8,27 @@
+ 
+ #if IS_ENABLED(CONFIG_NET_DSA_SJA1105_TAS)
+ 
++enum sja1105_tas_state {
++	SJA1105_TAS_STATE_DISABLED,
++	SJA1105_TAS_STATE_ENABLED_NOT_RUNNING,
++	SJA1105_TAS_STATE_RUNNING,
++};
++
++enum sja1105_ptp_op {
++	SJA1105_PTP_NONE,
++	SJA1105_PTP_CLOCKSTEP,
++	SJA1105_PTP_ADJUSTFREQ,
++};
++
+ struct sja1105_tas_data {
+ 	struct tc_taprio_qopt_offload *offload[SJA1105_NUM_PORTS];
++	enum sja1105_tas_state state;
++	enum sja1105_ptp_op last_op;
++	struct work_struct tas_work;
++	s64 earliest_base_time;
++	s64 oper_base_time;
++	u64 max_cycle_time;
++	bool enabled;
+ };
+ 
+ int sja1105_setup_tc_taprio(struct dsa_switch *ds, int port,
+@@ -19,6 +38,10 @@ void sja1105_tas_setup(struct dsa_switch *ds);
+ 
+ void sja1105_tas_teardown(struct dsa_switch *ds);
+ 
++void sja1105_tas_clockstep(struct dsa_switch *ds);
++
++void sja1105_tas_adjfreq(struct dsa_switch *ds);
++
+ #else
+ 
+ /* C doesn't allow empty structures, bah! */
+@@ -36,6 +59,10 @@ static inline void sja1105_tas_setup(struct dsa_switch *ds) { }
+ 
+ static inline void sja1105_tas_teardown(struct dsa_switch *ds) { }
+ 
++static inline void sja1105_tas_clockstep(struct dsa_switch *ds) { }
++
++static inline void sja1105_tas_adjfreq(struct dsa_switch *ds) { }
++
+ #endif /* IS_ENABLED(CONFIG_NET_DSA_SJA1105_TAS) */
+ 
+ #endif /* _SJA1105_TAS_H */
+
+commit b790b5549bdf498ab0ecc5632610a9149532fa38
+Author: Nishad Kamdar <nishadkamdar@gmail.com>
+Date:   Mon Oct 14 21:51:20 2019 +0530
+
+    net: dsa: sja1105: Use the correct style for SPDX License Identifier
+    
+    This patch corrects the SPDX License Identifier style
+    in header files related to Distributed Switch Architecture
+    drivers for NXP SJA1105 series Ethernet switch support.
+    It uses an expilict block comment for the SPDX License
+    Identifier.
+    
+    Changes made by using a script provided by Joe Perches here:
+    https://lkml.org/lkml/2019/2/7/46.
+    
+    Suggested-by: Joe Perches <joe@perches.com>
+    Signed-off-by: Nishad Kamdar <nishadkamdar@gmail.com>
+    Reviewed-by: Andrew Lunn <andrew@lunn.ch>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/dsa/sja1105/sja1105_tas.h b/drivers/net/dsa/sja1105/sja1105_tas.h
+index 0b803c30e640..0aad212d88b2 100644
+--- a/drivers/net/dsa/sja1105/sja1105_tas.h
++++ b/drivers/net/dsa/sja1105/sja1105_tas.h
+@@ -1,5 +1,5 @@
+-/* SPDX-License-Identifier: GPL-2.0
+- * Copyright (c) 2019, Vladimir Oltean <olteanv@gmail.com>
++/* SPDX-License-Identifier: GPL-2.0 */
++/* Copyright (c) 2019, Vladimir Oltean <olteanv@gmail.com>
+  */
+ #ifndef _SJA1105_TAS_H
+ #define _SJA1105_TAS_H
+
+commit 317ab5b86c8e15015efa208ec697affb9bd0b3f2
+Author: Vladimir Oltean <olteanv@gmail.com>
+Date:   Sun Sep 15 05:00:02 2019 +0300
+
+    net: dsa: sja1105: Configure the Time-Aware Scheduler via tc-taprio offload
+    
+    This qdisc offload is the closest thing to what the SJA1105 supports in
+    hardware for time-based egress shaping. The switch core really is built
+    around SAE AS6802/TTEthernet (a TTTech standard) but can be made to
+    operate similarly to IEEE 802.1Qbv with some constraints:
+    
+    - The gate control list is a global list for all ports. There are 8
+      execution threads that iterate through this global list in parallel.
+      I don't know why 8, there are only 4 front-panel ports.
+    
+    - Care must be taken by the user to make sure that two execution threads
+      never get to execute a GCL entry simultaneously. I created a O(n^4)
+      checker for this hardware limitation, prior to accepting a taprio
+      offload configuration as valid.
+    
+    - The spec says that if a GCL entry's interval is shorter than the frame
+      length, you shouldn't send it (and end up in head-of-line blocking).
+      Well, this switch does anyway.
+    
+    - The switch has no concept of ADMIN and OPER configurations. Because
+      it's so simple, the TAS settings are loaded through the static config
+      tables interface, so there isn't even place for any discussion about
+      'graceful switchover between ADMIN and OPER'. You just reset the
+      switch and upload a new OPER config.
+    
+    - The switch accepts multiple time sources for the gate events. Right
+      now I am using the standalone clock source as opposed to PTP. So the
+      base time parameter doesn't really do much. Support for the PTP clock
+      source will be added in a future series.
+    
+    Signed-off-by: Vladimir Oltean <olteanv@gmail.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/dsa/sja1105/sja1105_tas.h b/drivers/net/dsa/sja1105/sja1105_tas.h
+new file mode 100644
+index 000000000000..0b803c30e640
+--- /dev/null
++++ b/drivers/net/dsa/sja1105/sja1105_tas.h
+@@ -0,0 +1,41 @@
++/* SPDX-License-Identifier: GPL-2.0
++ * Copyright (c) 2019, Vladimir Oltean <olteanv@gmail.com>
++ */
++#ifndef _SJA1105_TAS_H
++#define _SJA1105_TAS_H
++
++#include <net/pkt_sched.h>
++
++#if IS_ENABLED(CONFIG_NET_DSA_SJA1105_TAS)
++
++struct sja1105_tas_data {
++	struct tc_taprio_qopt_offload *offload[SJA1105_NUM_PORTS];
++};
++
++int sja1105_setup_tc_taprio(struct dsa_switch *ds, int port,
++			    struct tc_taprio_qopt_offload *admin);
++
++void sja1105_tas_setup(struct dsa_switch *ds);
++
++void sja1105_tas_teardown(struct dsa_switch *ds);
++
++#else
++
++/* C doesn't allow empty structures, bah! */
++struct sja1105_tas_data {
++	u8 dummy;
++};
++
++static inline int sja1105_setup_tc_taprio(struct dsa_switch *ds, int port,
++					  struct tc_taprio_qopt_offload *admin)
++{
++	return -EOPNOTSUPP;
++}
++
++static inline void sja1105_tas_setup(struct dsa_switch *ds) { }
++
++static inline void sja1105_tas_teardown(struct dsa_switch *ds) { }
++
++#endif /* IS_ENABLED(CONFIG_NET_DSA_SJA1105_TAS) */
++
++#endif /* _SJA1105_TAS_H */

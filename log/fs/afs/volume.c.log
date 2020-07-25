@@ -1,0 +1,4717 @@
+commit 20325960f8750165964a6891a733e4cc15d19076
+Author: David Howells <dhowells@redhat.com>
+Date:   Thu Apr 30 01:03:49 2020 +0100
+
+    afs: Reorganise volume and server trees to be rooted on the cell
+    
+    Reorganise afs_volume objects such that they're in a tree keyed on volume
+    ID, rooted at on an afs_cell object rather than being in multiple trees,
+    each of which is rooted on an afs_server object.
+    
+    afs_server structs become per-cell and acquire a pointer to the cell.
+    
+    The process of breaking a callback then starts with finding the server by
+    its network address, following that to the cell and then looking up each
+    volume ID in the volume tree.
+    
+    This is simpler than the afs_vol_interest/afs_cb_interest N:M mapping web
+    and allows those structs and the code for maintaining them to be simplified
+    or removed.
+    
+    It does make a couple of things a bit more tricky, though:
+    
+     (1) Operations now start with a volume, not a server, so there can be more
+         than one answer as to whether or not the server we'll end up using
+         supports the FS.InlineBulkStatus RPC.
+    
+     (2) CB RPC operations that specify the server UUID.  There's still a tree
+         of servers by UUID on the afs_net struct, but the UUIDs in it aren't
+         guaranteed unique.
+    
+    Signed-off-by: David Howells <dhowells@redhat.com>
+
+diff --git a/fs/afs/volume.c b/fs/afs/volume.c
+index 0393f4910a92..9bc0509e3634 100644
+--- a/fs/afs/volume.c
++++ b/fs/afs/volume.c
+@@ -12,6 +12,56 @@
+ unsigned __read_mostly afs_volume_gc_delay = 10;
+ unsigned __read_mostly afs_volume_record_life = 60 * 60;
+ 
++/*
++ * Insert a volume into a cell.  If there's an existing volume record, that is
++ * returned instead with a ref held.
++ */
++static struct afs_volume *afs_insert_volume_into_cell(struct afs_cell *cell,
++						      struct afs_volume *volume)
++{
++	struct afs_volume *p;
++	struct rb_node *parent = NULL, **pp;
++
++	write_seqlock(&cell->volume_lock);
++
++	pp = &cell->volumes.rb_node;
++	while (*pp) {
++		parent = *pp;
++		p = rb_entry(parent, struct afs_volume, cell_node);
++		if (p->vid < volume->vid) {
++			pp = &(*pp)->rb_left;
++		} else if (p->vid > volume->vid) {
++			pp = &(*pp)->rb_right;
++		} else {
++			volume = afs_get_volume(p, afs_volume_trace_get_cell_insert);
++			goto found;
++		}
++	}
++
++	rb_link_node_rcu(&volume->cell_node, parent, pp);
++	rb_insert_color(&volume->cell_node, &cell->volumes);
++	hlist_add_head_rcu(&volume->proc_link, &cell->proc_volumes);
++
++found:
++	write_sequnlock(&cell->volume_lock);
++	return volume;
++
++}
++
++static void afs_remove_volume_from_cell(struct afs_volume *volume)
++{
++	struct afs_cell *cell = volume->cell;
++
++	if (!hlist_unhashed(&volume->proc_link)) {
++		trace_afs_volume(volume->vid, atomic_read(&volume->usage),
++				 afs_volume_trace_remove);
++		write_seqlock(&cell->volume_lock);
++		hlist_del_rcu(&volume->proc_link);
++		rb_erase(&volume->cell_node, &cell->volumes);
++		write_sequnlock(&cell->volume_lock);
++	}
++}
++
+ /*
+  * Allocate a volume record and load it up from a vldb record.
+  */
+@@ -39,7 +89,7 @@ static struct afs_volume *afs_alloc_volume(struct afs_fs_context *params,
+ 	volume->name_len	= vldb->name_len;
+ 
+ 	atomic_set(&volume->usage, 1);
+-	INIT_LIST_HEAD(&volume->proc_link);
++	INIT_HLIST_NODE(&volume->proc_link);
+ 	rwlock_init(&volume->servers_lock);
+ 	rwlock_init(&volume->cb_v_break_lock);
+ 	memcpy(volume->name, vldb->name, vldb->name_len + 1);
+@@ -62,6 +112,25 @@ static struct afs_volume *afs_alloc_volume(struct afs_fs_context *params,
+ 	return ERR_PTR(ret);
+ }
+ 
++/*
++ * Look up or allocate a volume record.
++ */
++static struct afs_volume *afs_lookup_volume(struct afs_fs_context *params,
++					    struct afs_vldb_entry *vldb,
++					    unsigned long type_mask)
++{
++	struct afs_volume *candidate, *volume;
++
++	candidate = afs_alloc_volume(params, vldb, type_mask);
++	if (IS_ERR(candidate))
++		return candidate;
++
++	volume = afs_insert_volume_into_cell(params->cell, candidate);
++	if (volume != candidate)
++		afs_put_volume(params->net, candidate, afs_volume_trace_put_cell_dup);
++	return volume;
++}
++
+ /*
+  * Look up a VLDB record for a volume.
+  */
+@@ -139,7 +208,7 @@ struct afs_volume *afs_create_volume(struct afs_fs_context *params)
+ 	}
+ 
+ 	type_mask = 1UL << params->type;
+-	volume = afs_alloc_volume(params, vldb, type_mask);
++	volume = afs_lookup_volume(params, vldb, type_mask);
+ 
+ error:
+ 	kfree(vldb);
+@@ -157,11 +226,12 @@ static void afs_destroy_volume(struct afs_net *net, struct afs_volume *volume)
+ 	ASSERTCMP(volume->cache, ==, NULL);
+ #endif
+ 
++	afs_remove_volume_from_cell(volume);
+ 	afs_put_serverlist(net, rcu_access_pointer(volume->servers));
+ 	afs_put_cell(net, volume->cell);
+ 	trace_afs_volume(volume->vid, atomic_read(&volume->usage),
+ 			 afs_volume_trace_free);
+-	kfree(volume);
++	kfree_rcu(volume, rcu);
+ 
+ 	_leave(" [destroyed]");
+ }
+@@ -207,10 +277,6 @@ void afs_activate_volume(struct afs_volume *volume)
+ 					       NULL, 0,
+ 					       volume, 0, true);
+ #endif
+-
+-	write_lock(&volume->cell->proc_lock);
+-	list_add_tail(&volume->proc_link, &volume->cell->proc_volumes);
+-	write_unlock(&volume->cell->proc_lock);
+ }
+ 
+ /*
+@@ -220,10 +286,6 @@ void afs_deactivate_volume(struct afs_volume *volume)
+ {
+ 	_enter("%s", volume->name);
+ 
+-	write_lock(&volume->cell->proc_lock);
+-	list_del_init(&volume->proc_link);
+-	write_unlock(&volume->cell->proc_lock);
+-
+ #ifdef CONFIG_AFS_FSCACHE
+ 	fscache_relinquish_cookie(volume->cache, NULL,
+ 				  test_bit(AFS_VOLUME_DELETED, &volume->flags));
+
+commit cca37d45d547434144409ae648a19b7eb6db5eb4
+Author: David Howells <dhowells@redhat.com>
+Date:   Wed Apr 29 17:02:04 2020 +0100
+
+    afs: Add a tracepoint to track the lifetime of the afs_volume struct
+    
+    Add a tracepoint to track the lifetime of the afs_volume struct.
+    
+    Signed-off-by: David Howells <dhowells@redhat.com>
+
+diff --git a/fs/afs/volume.c b/fs/afs/volume.c
+index d4d9a8fbba3d..0393f4910a92 100644
+--- a/fs/afs/volume.c
++++ b/fs/afs/volume.c
+@@ -52,6 +52,7 @@ static struct afs_volume *afs_alloc_volume(struct afs_fs_context *params,
+ 
+ 	refcount_set(&slist->usage, 1);
+ 	rcu_assign_pointer(volume->servers, slist);
++	trace_afs_volume(volume->vid, 1, afs_volume_trace_alloc);
+ 	return volume;
+ 
+ error_1:
+@@ -158,20 +159,38 @@ static void afs_destroy_volume(struct afs_net *net, struct afs_volume *volume)
+ 
+ 	afs_put_serverlist(net, rcu_access_pointer(volume->servers));
+ 	afs_put_cell(net, volume->cell);
++	trace_afs_volume(volume->vid, atomic_read(&volume->usage),
++			 afs_volume_trace_free);
+ 	kfree(volume);
+ 
+ 	_leave(" [destroyed]");
+ }
+ 
+ /*
+- * Drop a reference on a volume record.
++ * Get a reference on a volume record.
+  */
+-void afs_put_volume(struct afs_net *net, struct afs_volume *volume)
++struct afs_volume *afs_get_volume(struct afs_volume *volume,
++				  enum afs_volume_trace reason)
+ {
+ 	if (volume) {
+-		_enter("%s", volume->name);
++		int u = atomic_inc_return(&volume->usage);
++		trace_afs_volume(volume->vid, u, reason);
++	}
++	return volume;
++}
++
+ 
+-		if (atomic_dec_and_test(&volume->usage))
++/*
++ * Drop a reference on a volume record.
++ */
++void afs_put_volume(struct afs_net *net, struct afs_volume *volume,
++		    enum afs_volume_trace reason)
++{
++	if (volume) {
++		afs_volid_t vid = volume->vid;
++		int u = atomic_dec_return(&volume->usage);
++		trace_afs_volume(vid, u, reason);
++		if (u == 0)
+ 			afs_destroy_volume(net, volume);
+ 	}
+ }
+
+commit 8a070a964877c71139cba46202f6f263c2b9419d
+Author: David Howells <dhowells@redhat.com>
+Date:   Sat Apr 25 10:26:02 2020 +0100
+
+    afs: Detect cell aliases 1 - Cells with root volumes
+    
+    Put in the first phase of cell alias detection.  This part handles alias
+    detection for cells that have root.cell volumes (which is expected to be
+    likely).
+    
+    When a cell becomes newly active, it is probed for its root.cell volume,
+    and if it has one, this volume is compared against other root.cell volumes
+    to find out if the list of fileserver UUIDs have any in common - and if
+    that's the case, do the address lists of those fileservers have any
+    addresses in common.  If they do, the new cell is adjudged to be an alias
+    of the old cell and the old cell is used instead.
+    
+    Comparing is aided by the server list in struct afs_server_list being
+    sorted in UUID order and the addresses in the fileserver address lists
+    being sorted in address order.
+    
+    The cell then retains the afs_volume object for the root.cell volume, even
+    if it's not mounted for future alias checking.
+    
+    This necessary because:
+    
+     (1) Whilst fileservers have UUIDs that are meant to be globally unique, in
+         practice they are not because cells get cloned without changing the
+         UUIDs - so afs_server records need to be per cell.
+    
+     (2) Sometimes the DNS is used to make cell aliases - but if we don't know
+         they're the same, we may end up with multiple superblocks and multiple
+         afs_server records for the same thing, impairing our ability to
+         deliver callback notifications of third party changes
+    
+     (3) The fileserver RPC API doesn't contain the cell name, so it can't tell
+         us which cell it's notifying and can't see that a change made to to
+         one cell should notify the same client that's also accessed as the
+         other cell.
+    
+    Reported-by: Jeffrey Altman <jaltman@auristor.com>
+    Signed-off-by: David Howells <dhowells@redhat.com>
+
+diff --git a/fs/afs/volume.c b/fs/afs/volume.c
+index 57d0509f7353..d4d9a8fbba3d 100644
+--- a/fs/afs/volume.c
++++ b/fs/afs/volume.c
+@@ -51,7 +51,7 @@ static struct afs_volume *afs_alloc_volume(struct afs_fs_context *params,
+ 	}
+ 
+ 	refcount_set(&slist->usage, 1);
+-	volume->servers = slist;
++	rcu_assign_pointer(volume->servers, slist);
+ 	return volume;
+ 
+ error_1:
+@@ -156,7 +156,7 @@ static void afs_destroy_volume(struct afs_net *net, struct afs_volume *volume)
+ 	ASSERTCMP(volume->cache, ==, NULL);
+ #endif
+ 
+-	afs_put_serverlist(net, volume->servers);
++	afs_put_serverlist(net, rcu_access_pointer(volume->servers));
+ 	afs_put_cell(net, volume->cell);
+ 	kfree(volume);
+ 
+@@ -256,10 +256,11 @@ static int afs_update_volume_status(struct afs_volume *volume, struct key *key)
+ 	write_lock(&volume->servers_lock);
+ 
+ 	discard = new;
+-	old = volume->servers;
++	old = rcu_dereference_protected(volume->servers,
++					lockdep_is_held(&volume->servers_lock));
+ 	if (afs_annotate_server_list(new, old)) {
+ 		new->seq = volume->servers_seq + 1;
+-		volume->servers = new;
++		rcu_assign_pointer(volume->servers, new);
+ 		smp_wmb();
+ 		volume->servers_seq++;
+ 		discard = old;
+
+commit e49c7b2f6de7ff81ca34c56e4eeb4fa740c099f2
+Author: David Howells <dhowells@redhat.com>
+Date:   Fri Apr 10 20:51:51 2020 +0100
+
+    afs: Build an abstraction around an "operation" concept
+    
+    Turn the afs_operation struct into the main way that most fileserver
+    operations are managed.  Various things are added to the struct, including
+    the following:
+    
+     (1) All the parameters and results of the relevant operations are moved
+         into it, removing corresponding fields from the afs_call struct.
+         afs_call gets a pointer to the op.
+    
+     (2) The target volume is made the main focus of the operation, rather than
+         the target vnode(s), and a bunch of op->vnode->volume are made
+         op->volume instead.
+    
+     (3) Two vnode records are defined (op->file[]) for the vnode(s) involved
+         in most operations.  The vnode record (struct afs_vnode_param)
+         contains:
+    
+            - The vnode pointer.
+    
+            - The fid of the vnode to be included in the parameters or that was
+              returned in the reply (eg. FS.MakeDir).
+    
+            - The status and callback information that may be returned in the
+              reply about the vnode.
+    
+            - Callback break and data version tracking for detecting
+              simultaneous third-parth changes.
+    
+     (4) Pointers to dentries to be updated with new inodes.
+    
+     (5) An operations table pointer.  The table includes pointers to functions
+         for issuing AFS and YFS-variant RPCs, handling the success and abort
+         of an operation and handling post-I/O-lock local editing of a
+         directory.
+    
+    To make this work, the following function restructuring is made:
+    
+     (A) The rotation loop that issues calls to fileservers that can be found
+         in each function that wants to issue an RPC (such as afs_mkdir()) is
+         extracted out into common code, in a new file called fs_operation.c.
+    
+     (B) The rotation loops, such as the one in afs_mkdir(), are replaced with
+         a much smaller piece of code that allocates an operation, sets the
+         parameters and then calls out to the common code to do the actual
+         work.
+    
+     (C) The code for handling the success and failure of an operation are
+         moved into operation functions (as (5) above) and these are called
+         from the core code at appropriate times.
+    
+     (D) The pseudo inode getting stuff used by the dynamic root code is moved
+         over into dynroot.c.
+    
+     (E) struct afs_iget_data is absorbed into the operation struct and
+         afs_iget() expects to be given an op pointer and a vnode record.
+    
+     (F) Point (E) doesn't work for the root dir of a volume, but we know the
+         FID in advance (it's always vnode 1, unique 1), so a separate inode
+         getter, afs_root_iget(), is provided to special-case that.
+    
+     (G) The inode status init/update functions now also take an op and a vnode
+         record.
+    
+     (H) The RPC marshalling functions now, for the most part, just take an
+         afs_operation struct as their only argument.  All the data they need
+         is held there.  The result delivery functions write their answers
+         there as well.
+    
+     (I) The call is attached to the operation and then the operation core does
+         the waiting.
+    
+    And then the new operation code is, for the moment, made to just initialise
+    the operation, get the appropriate vnode I/O locks and do the same rotation
+    loop as before.
+    
+    This lays the foundation for the following changes in the future:
+    
+     (*) Overhauling the rotation (again).
+    
+     (*) Support for asynchronous I/O, where the fileserver rotation must be
+         done asynchronously also.
+    
+    Signed-off-by: David Howells <dhowells@redhat.com>
+
+diff --git a/fs/afs/volume.c b/fs/afs/volume.c
+index 96351088a578..57d0509f7353 100644
+--- a/fs/afs/volume.c
++++ b/fs/afs/volume.c
+@@ -166,13 +166,13 @@ static void afs_destroy_volume(struct afs_net *net, struct afs_volume *volume)
+ /*
+  * Drop a reference on a volume record.
+  */
+-void afs_put_volume(struct afs_cell *cell, struct afs_volume *volume)
++void afs_put_volume(struct afs_net *net, struct afs_volume *volume)
+ {
+ 	if (volume) {
+ 		_enter("%s", volume->name);
+ 
+ 		if (atomic_dec_and_test(&volume->usage))
+-			afs_destroy_volume(cell->net, volume);
++			afs_destroy_volume(net, volume);
+ 	}
+ }
+ 
+@@ -280,7 +280,7 @@ static int afs_update_volume_status(struct afs_volume *volume, struct key *key)
+ /*
+  * Make sure the volume record is up to date.
+  */
+-int afs_check_volume_status(struct afs_volume *volume, struct afs_operation *fc)
++int afs_check_volume_status(struct afs_volume *volume, struct afs_operation *op)
+ {
+ 	int ret, retries = 0;
+ 
+@@ -298,7 +298,7 @@ int afs_check_volume_status(struct afs_volume *volume, struct afs_operation *fc)
+ update:
+ 	if (!test_and_set_bit_lock(AFS_VOLUME_UPDATING, &volume->flags)) {
+ 		clear_bit(AFS_VOLUME_NEEDS_UPDATE, &volume->flags);
+-		ret = afs_update_volume_status(volume, fc->key);
++		ret = afs_update_volume_status(volume, op->key);
+ 		if (ret < 0)
+ 			set_bit(AFS_VOLUME_NEEDS_UPDATE, &volume->flags);
+ 		clear_bit_unlock(AFS_VOLUME_WAIT, &volume->flags);
+@@ -315,8 +315,8 @@ int afs_check_volume_status(struct afs_volume *volume, struct afs_operation *fc)
+ 	}
+ 
+ 	ret = wait_on_bit(&volume->flags, AFS_VOLUME_WAIT,
+-			  (fc->flags & AFS_OPERATION_INTR) ?
+-			  TASK_INTERRUPTIBLE : TASK_UNINTERRUPTIBLE);
++			  (op->flags & AFS_OPERATION_UNINTR) ?
++			  TASK_UNINTERRUPTIBLE : TASK_INTERRUPTIBLE);
+ 	if (ret == -ERESTARTSYS) {
+ 		_leave(" = %d", ret);
+ 		return ret;
+
+commit a310082f6d0afe28797e148726cd52118a8a4428
+Author: David Howells <dhowells@redhat.com>
+Date:   Fri Mar 20 09:32:50 2020 +0000
+
+    afs: Rename struct afs_fs_cursor to afs_operation
+    
+    As a prelude to implementing asynchronous fileserver operations in the afs
+    filesystem, rename struct afs_fs_cursor to afs_operation.
+    
+    This struct is going to form the core of the operation management and is
+    going to acquire more members in later.
+    
+    Signed-off-by: David Howells <dhowells@redhat.com>
+
+diff --git a/fs/afs/volume.c b/fs/afs/volume.c
+index 249000195f8a..96351088a578 100644
+--- a/fs/afs/volume.c
++++ b/fs/afs/volume.c
+@@ -280,7 +280,7 @@ static int afs_update_volume_status(struct afs_volume *volume, struct key *key)
+ /*
+  * Make sure the volume record is up to date.
+  */
+-int afs_check_volume_status(struct afs_volume *volume, struct afs_fs_cursor *fc)
++int afs_check_volume_status(struct afs_volume *volume, struct afs_operation *fc)
+ {
+ 	int ret, retries = 0;
+ 
+@@ -315,7 +315,7 @@ int afs_check_volume_status(struct afs_volume *volume, struct afs_fs_cursor *fc)
+ 	}
+ 
+ 	ret = wait_on_bit(&volume->flags, AFS_VOLUME_WAIT,
+-			  (fc->flags & AFS_FS_CURSOR_INTR) ?
++			  (fc->flags & AFS_OPERATION_INTR) ?
+ 			  TASK_INTERRUPTIBLE : TASK_UNINTERRUPTIBLE);
+ 	if (ret == -ERESTARTSYS) {
+ 		_leave(" = %d", ret);
+
+commit f6cbb368bcb0bc4fa7c11554d5293658bb4b26a2
+Author: David Howells <dhowells@redhat.com>
+Date:   Fri Apr 24 15:10:00 2020 +0100
+
+    afs: Actively poll fileservers to maintain NAT or firewall openings
+    
+    When an AFS client accesses a file, it receives a limited-duration callback
+    promise that the server will notify it if another client changes a file.
+    This callback duration can be a few hours in length.
+    
+    If a client mounts a volume and then an application prevents it from being
+    unmounted, say by chdir'ing into it, but then does nothing for some time,
+    the rxrpc_peer record will expire and rxrpc-level keepalive will cease.
+    
+    If there is NAT or a firewall between the client and the server, the route
+    back for the server may close after a comparatively short duration, meaning
+    that attempts by the server to notify the client may then bounce.
+    
+    The client, however, may (so far as it knows) still have a valid unexpired
+    promise and will then rely on its cached data and will not see changes made
+    on the server by a third party until it incidentally rechecks the status or
+    the promise needs renewal.
+    
+    To deal with this, the client needs to regularly probe the server.  This
+    has two effects: firstly, it keeps a route open back for the server, and
+    secondly, it causes the server to disgorge any notifications that got
+    queued up because they couldn't be sent.
+    
+    Fix this by adding a mechanism to emit regular probes.
+    
+    Two levels of probing are made available: Under normal circumstances the
+    'slow' queue will be used for a fileserver - this just probes the preferred
+    address once every 5 mins or so; however, if server fails to respond to any
+    probes, the server will shift to the 'fast' queue from which all its
+    interfaces will be probed every 30s.  When it finally responds, the record
+    will switch back to the slow queue.
+    
+    Further notes:
+    
+     (1) Probing is now no longer driven from the fileserver rotation
+         algorithm.
+    
+     (2) Probes are dispatched to all interfaces on a fileserver when that an
+         afs_server object is set up to record it.
+    
+     (3) The afs_server object is removed from the probe queues when we start
+         to probe it.  afs_is_probing_server() returns true if it's not listed
+         - ie. it's undergoing probing.
+    
+     (4) The afs_server object is added back on to the probe queue when the
+         final outstanding probe completes, but the probed_at time is set when
+         we're about to launch a probe so that it's not dependent on the probe
+         duration.
+    
+     (5) The timer and the work item added for this must be handed a count on
+         net->servers_outstanding, which they hand on or release.  This makes
+         sure that network namespace cleanup waits for them.
+    
+    Fixes: d2ddc776a458 ("afs: Overhaul volume and server record caching and fileserver rotation")
+    Reported-by: Dave Botsch <botsch@cnf.cornell.edu>
+    Signed-off-by: David Howells <dhowells@redhat.com>
+
+diff --git a/fs/afs/volume.c b/fs/afs/volume.c
+index 4310336b9bb8..249000195f8a 100644
+--- a/fs/afs/volume.c
++++ b/fs/afs/volume.c
+@@ -266,7 +266,6 @@ static int afs_update_volume_status(struct afs_volume *volume, struct key *key)
+ 	}
+ 
+ 	volume->update_at = ktime_get_real_seconds() + afs_volume_record_life;
+-	clear_bit(AFS_VOLUME_NEEDS_UPDATE, &volume->flags);
+ 	write_unlock(&volume->servers_lock);
+ 	ret = 0;
+ 
+@@ -283,23 +282,25 @@ static int afs_update_volume_status(struct afs_volume *volume, struct key *key)
+  */
+ int afs_check_volume_status(struct afs_volume *volume, struct afs_fs_cursor *fc)
+ {
+-	time64_t now = ktime_get_real_seconds();
+ 	int ret, retries = 0;
+ 
+ 	_enter("");
+ 
+-	if (volume->update_at <= now)
+-		set_bit(AFS_VOLUME_NEEDS_UPDATE, &volume->flags);
+-
+ retry:
+-	if (!test_bit(AFS_VOLUME_NEEDS_UPDATE, &volume->flags) &&
+-	    !test_bit(AFS_VOLUME_WAIT, &volume->flags)) {
+-		_leave(" = 0");
+-		return 0;
+-	}
+-
++	if (test_bit(AFS_VOLUME_WAIT, &volume->flags))
++		goto wait;
++	if (volume->update_at <= ktime_get_real_seconds() ||
++	    test_bit(AFS_VOLUME_NEEDS_UPDATE, &volume->flags))
++		goto update;
++	_leave(" = 0");
++	return 0;
++
++update:
+ 	if (!test_and_set_bit_lock(AFS_VOLUME_UPDATING, &volume->flags)) {
++		clear_bit(AFS_VOLUME_NEEDS_UPDATE, &volume->flags);
+ 		ret = afs_update_volume_status(volume, fc->key);
++		if (ret < 0)
++			set_bit(AFS_VOLUME_NEEDS_UPDATE, &volume->flags);
+ 		clear_bit_unlock(AFS_VOLUME_WAIT, &volume->flags);
+ 		clear_bit_unlock(AFS_VOLUME_UPDATING, &volume->flags);
+ 		wake_up_bit(&volume->flags, AFS_VOLUME_WAIT);
+@@ -307,6 +308,7 @@ int afs_check_volume_status(struct afs_volume *volume, struct afs_fs_cursor *fc)
+ 		return ret;
+ 	}
+ 
++wait:
+ 	if (!test_bit(AFS_VOLUME_WAIT, &volume->flags)) {
+ 		_leave(" = 0 [no wait]");
+ 		return 0;
+
+commit c4bfda16d1b40d1c5941c61b5aa336bdd2d9904a
+Author: David Howells <dhowells@redhat.com>
+Date:   Thu Apr 16 18:17:13 2020 +0100
+
+    afs: Make record checking use TASK_UNINTERRUPTIBLE when appropriate
+    
+    When an operation is meant to be done uninterruptibly (such as
+    FS.StoreData), we should not be allowing volume and server record checking
+    to be interrupted.
+    
+    Fixes: d2ddc776a458 ("afs: Overhaul volume and server record caching and fileserver rotation")
+    Signed-off-by: David Howells <dhowells@redhat.com>
+
+diff --git a/fs/afs/volume.c b/fs/afs/volume.c
+index 92ca5e27573b..4310336b9bb8 100644
+--- a/fs/afs/volume.c
++++ b/fs/afs/volume.c
+@@ -281,7 +281,7 @@ static int afs_update_volume_status(struct afs_volume *volume, struct key *key)
+ /*
+  * Make sure the volume record is up to date.
+  */
+-int afs_check_volume_status(struct afs_volume *volume, struct key *key)
++int afs_check_volume_status(struct afs_volume *volume, struct afs_fs_cursor *fc)
+ {
+ 	time64_t now = ktime_get_real_seconds();
+ 	int ret, retries = 0;
+@@ -299,7 +299,7 @@ int afs_check_volume_status(struct afs_volume *volume, struct key *key)
+ 	}
+ 
+ 	if (!test_and_set_bit_lock(AFS_VOLUME_UPDATING, &volume->flags)) {
+-		ret = afs_update_volume_status(volume, key);
++		ret = afs_update_volume_status(volume, fc->key);
+ 		clear_bit_unlock(AFS_VOLUME_WAIT, &volume->flags);
+ 		clear_bit_unlock(AFS_VOLUME_UPDATING, &volume->flags);
+ 		wake_up_bit(&volume->flags, AFS_VOLUME_WAIT);
+@@ -312,7 +312,9 @@ int afs_check_volume_status(struct afs_volume *volume, struct key *key)
+ 		return 0;
+ 	}
+ 
+-	ret = wait_on_bit(&volume->flags, AFS_VOLUME_WAIT, TASK_INTERRUPTIBLE);
++	ret = wait_on_bit(&volume->flags, AFS_VOLUME_WAIT,
++			  (fc->flags & AFS_FS_CURSOR_INTR) ?
++			  TASK_INTERRUPTIBLE : TASK_UNINTERRUPTIBLE);
+ 	if (ret == -ERESTARTSYS) {
+ 		_leave(" = %d", ret);
+ 		return ret;
+
+commit cacf2d7dcf966a57e30f66c0598c88e2b64865a3
+Author: YueHaibing <yuehaibing@huawei.com>
+Date:   Fri Aug 9 16:40:37 2019 +0800
+
+    afs: remove unused variable 'afs_voltypes'
+    
+    fs/afs/volume.c:15:26: warning:
+     afs_voltypes defined but not used [-Wunused-const-variable=]
+    
+    It is not used since commit d2ddc776a458 ("afs: Overhaul
+    volume and server record caching and fileserver rotation")
+    
+    Reported-by: Hulk Robot <hulkci@huawei.com>
+    Signed-off-by: YueHaibing <yuehaibing@huawei.com>
+    Signed-off-by: David Howells <dhowells@redhat.com>
+
+diff --git a/fs/afs/volume.c b/fs/afs/volume.c
+index 1a414300b654..92ca5e27573b 100644
+--- a/fs/afs/volume.c
++++ b/fs/afs/volume.c
+@@ -12,8 +12,6 @@
+ unsigned __read_mostly afs_volume_gc_delay = 10;
+ unsigned __read_mostly afs_volume_record_life = 60 * 60;
+ 
+-static const char *const afs_voltypes[] = { "R/W", "R/O", "BAK" };
+-
+ /*
+  * Allocate a volume record and load it up from a vldb record.
+  */
+
+commit cd0f3aaebc5b17e0ccb1b9ef9ae43042d075d767
+Merge: 139ca2580550 2cd42d19cffa
+Author: Linus Torvalds <torvalds@linux-foundation.org>
+Date:   Fri Jun 28 08:34:12 2019 +0800
+
+    Merge tag 'afs-fixes-20190620' of git://git.kernel.org/pub/scm/linux/kernel/git/dhowells/linux-fs
+    
+    Pull AFS fixes from David Howells:
+     "The in-kernel AFS client has been undergoing testing on opendev.org on
+      one of their mirror machines. They are using AFS to hold data that is
+      then served via apache, and Ian Wienand had reported seeing oopses,
+      spontaneous machine reboots and updates to volumes going missing. This
+      patch series appears to have fixed the problem, very probably due to
+      patch (2), but it's not 100% certain.
+    
+      (1) Fix the printing of the "vnode modified" warning to exclude checks
+          on files for which we don't have a callback promise from the
+          server (and so don't expect the server to tell us when it
+          changes).
+    
+          Without this, for every file or directory for which we still have
+          an in-core inode that gets changed on the server, we may get a
+          message logged when we next look at it. This can happen in bulk
+          if, for instance, someone does "vos release" to update a R/O
+          volume from a R/W volume and a whole set of files are all changed
+          together.
+    
+          We only really want to log a message if the file changed and the
+          server didn't tell us about it or we failed to track the state
+          internally.
+    
+      (2) Fix accidental corruption of either afs_vlserver struct objects or
+          the the following memory locations (which could hold anything).
+          The issue is caused by a union that points to two different
+          structs in struct afs_call (to save space in the struct). The call
+          cleanup code assumes that it can simply call the cleanup for one
+          of those structs if not NULL - when it might be actually pointing
+          to the other struct.
+    
+          This means that every Volume Location RPC op is going to corrupt
+          something.
+    
+      (3) Fix an uninitialised spinlock. This isn't too bad, it just causes
+          a one-off warning if lockdep is enabled when "vos release" is
+          called, but the spinlock still behaves correctly.
+    
+      (4) Fix the setting of i_block in the inode. This causes du, for
+          example, to produce incorrect results, but otherwise should not be
+          dangerous to the kernel"
+    
+    * tag 'afs-fixes-20190620' of git://git.kernel.org/pub/scm/linux/kernel/git/dhowells/linux-fs:
+      afs: Fix setting of i_blocks
+      afs: Fix uninitialised spinlock afs_volume::cb_break_lock
+      afs: Fix vlserver record corruption
+      afs: Fix over zealous "vnode modified" warnings
+
+commit 90fa9b64523a645a97edc0bdcf2d74759957eeee
+Author: David Howells <dhowells@redhat.com>
+Date:   Thu Jun 20 16:49:35 2019 +0100
+
+    afs: Fix uninitialised spinlock afs_volume::cb_break_lock
+    
+    Fix the cb_break_lock spinlock in afs_volume struct by initialising it when
+    the volume record is allocated.
+    
+    Also rename the lock to cb_v_break_lock to distinguish it from the lock of
+    the same name in the afs_server struct.
+    
+    Without this, the following trace may be observed when a volume-break
+    callback is received:
+    
+      INFO: trying to register non-static key.
+      the code is fine but needs lockdep annotation.
+      turning off the locking correctness validator.
+      CPU: 2 PID: 50 Comm: kworker/2:1 Not tainted 5.2.0-rc1-fscache+ #3045
+      Hardware name: ASUS All Series/H97-PLUS, BIOS 2306 10/09/2014
+      Workqueue: afs SRXAFSCB_CallBack
+      Call Trace:
+       dump_stack+0x67/0x8e
+       register_lock_class+0x23b/0x421
+       ? check_usage_forwards+0x13c/0x13c
+       __lock_acquire+0x89/0xf73
+       lock_acquire+0x13b/0x166
+       ? afs_break_callbacks+0x1b2/0x3dd
+       _raw_write_lock+0x2c/0x36
+       ? afs_break_callbacks+0x1b2/0x3dd
+       afs_break_callbacks+0x1b2/0x3dd
+       ? trace_event_raw_event_afs_server+0x61/0xac
+       SRXAFSCB_CallBack+0x11f/0x16c
+       process_one_work+0x2c5/0x4ee
+       ? worker_thread+0x234/0x2ac
+       worker_thread+0x1d8/0x2ac
+       ? cancel_delayed_work_sync+0xf/0xf
+       kthread+0x11f/0x127
+       ? kthread_park+0x76/0x76
+       ret_from_fork+0x24/0x30
+    
+    Fixes: 68251f0a6818 ("afs: Fix whole-volume callback handling")
+    Signed-off-by: David Howells <dhowells@redhat.com>
+
+diff --git a/fs/afs/volume.c b/fs/afs/volume.c
+index f6eba2def0a1..3e8dbee09f87 100644
+--- a/fs/afs/volume.c
++++ b/fs/afs/volume.c
+@@ -47,6 +47,7 @@ static struct afs_volume *afs_alloc_volume(struct afs_fs_context *params,
+ 	atomic_set(&volume->usage, 1);
+ 	INIT_LIST_HEAD(&volume->proc_link);
+ 	rwlock_init(&volume->servers_lock);
++	rwlock_init(&volume->cb_v_break_lock);
+ 	memcpy(volume->name, vldb->name, vldb->name_len + 1);
+ 
+ 	slist = afs_alloc_server_list(params->cell, params->key, vldb, type_mask);
+
+commit 2874c5fd284268364ece81a7bd936f3c8168e567
+Author: Thomas Gleixner <tglx@linutronix.de>
+Date:   Mon May 27 08:55:01 2019 +0200
+
+    treewide: Replace GPLv2 boilerplate/reference with SPDX - rule 152
+    
+    Based on 1 normalized pattern(s):
+    
+      this program is free software you can redistribute it and or modify
+      it under the terms of the gnu general public license as published by
+      the free software foundation either version 2 of the license or at
+      your option any later version
+    
+    extracted by the scancode license scanner the SPDX license identifier
+    
+      GPL-2.0-or-later
+    
+    has been chosen to replace the boilerplate/reference in 3029 file(s).
+    
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Reviewed-by: Allison Randal <allison@lohutok.net>
+    Cc: linux-spdx@vger.kernel.org
+    Link: https://lkml.kernel.org/r/20190527070032.746973796@linutronix.de
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/fs/afs/volume.c b/fs/afs/volume.c
+index f6eba2def0a1..08fdb3951c49 100644
+--- a/fs/afs/volume.c
++++ b/fs/afs/volume.c
+@@ -1,12 +1,8 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
+ /* AFS volume management
+  *
+  * Copyright (C) 2002, 2007 Red Hat, Inc. All Rights Reserved.
+  * Written by David Howells (dhowells@redhat.com)
+- *
+- * This program is free software; you can redistribute it and/or
+- * modify it under the terms of the GNU General Public License
+- * as published by the Free Software Foundation; either version
+- * 2 of the License, or (at your option) any later version.
+  */
+ 
+ #include <linux/kernel.h>
+
+commit 13fcc6837049f1bd76d57e9abc217a91fdbad764
+Author: David Howells <dhowells@redhat.com>
+Date:   Thu Nov 1 23:07:27 2018 +0000
+
+    afs: Add fs_context support
+    
+    Add fs_context support to the AFS filesystem, converting the parameter
+    parsing to store options there.
+    
+    This will form the basis for namespace propagation over mountpoints within
+    the AFS model, thereby allowing AFS to be used in containers more easily.
+    
+    Signed-off-by: David Howells <dhowells@redhat.com>
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/fs/afs/volume.c b/fs/afs/volume.c
+index 00975ed3640f..f6eba2def0a1 100644
+--- a/fs/afs/volume.c
++++ b/fs/afs/volume.c
+@@ -21,7 +21,7 @@ static const char *const afs_voltypes[] = { "R/W", "R/O", "BAK" };
+ /*
+  * Allocate a volume record and load it up from a vldb record.
+  */
+-static struct afs_volume *afs_alloc_volume(struct afs_mount_params *params,
++static struct afs_volume *afs_alloc_volume(struct afs_fs_context *params,
+ 					   struct afs_vldb_entry *vldb,
+ 					   unsigned long type_mask)
+ {
+@@ -113,7 +113,7 @@ static struct afs_vldb_entry *afs_vl_lookup_vldb(struct afs_cell *cell,
+  * - Rule 3: If parent volume is R/W, then only mount R/W volume unless
+  *           explicitly told otherwise
+  */
+-struct afs_volume *afs_create_volume(struct afs_mount_params *params)
++struct afs_volume *afs_create_volume(struct afs_fs_context *params)
+ {
+ 	struct afs_vldb_entry *vldb;
+ 	struct afs_volume *volume;
+
+commit 3bf0fb6f33dd545693da5e65f5b1b9b9f0bfc35e
+Author: David Howells <dhowells@redhat.com>
+Date:   Sat Oct 20 00:57:59 2018 +0100
+
+    afs: Probe multiple fileservers simultaneously
+    
+    Send probes to all the unprobed fileservers in a fileserver list on all
+    addresses simultaneously in an attempt to find out the fastest route whilst
+    not getting stuck for 20s on any server or address that we don't get a
+    reply from.
+    
+    This alleviates the problem whereby attempting to access a new server can
+    take a long time because the rotation algorithm ends up rotating through
+    all servers and addresses until it finds one that responds.
+    
+    Signed-off-by: David Howells <dhowells@redhat.com>
+
+diff --git a/fs/afs/volume.c b/fs/afs/volume.c
+index 7527c081726e..00975ed3640f 100644
+--- a/fs/afs/volume.c
++++ b/fs/afs/volume.c
+@@ -82,22 +82,6 @@ static struct afs_vldb_entry *afs_vl_lookup_vldb(struct afs_cell *cell,
+ 		return ERR_PTR(-ERESTARTSYS);
+ 
+ 	while (afs_select_vlserver(&vc)) {
+-		if (!test_bit(vc.ac.index, &vc.ac.alist->probed)) {
+-			ret = afs_vl_get_capabilities(cell->net, &vc.ac, key);
+-			switch (ret) {
+-			case VL_SERVICE:
+-				clear_bit(vc.ac.index, &vc.ac.alist->yfs);
+-				set_bit(vc.ac.index, &vc.ac.alist->probed);
+-				vc.ac.alist->addrs[vc.ac.index].srx_service = ret;
+-				break;
+-			case YFS_VL_SERVICE:
+-				set_bit(vc.ac.index, &vc.ac.alist->yfs);
+-				set_bit(vc.ac.index, &vc.ac.alist->probed);
+-				vc.ac.alist->addrs[vc.ac.index].srx_service = ret;
+-				break;
+-			}
+-		}
+-
+ 		vldb = afs_vl_get_entry_by_name_u(&vc, volname, volnamesz);
+ 	}
+ 
+
+commit 2feeaf8433c8e68de3d0a06a0ffe7742bcd13c1a
+Author: David Howells <dhowells@redhat.com>
+Date:   Sat Oct 20 00:57:59 2018 +0100
+
+    afs: Eliminate the address pointer from the address list cursor
+    
+    Eliminate the address pointer from the address list cursor as it's
+    redundant (ac->addrs[ac->index] can be used to find the same address) and
+    address lists must be replaced rather than being rearranged, so is of
+    limited value.
+    
+    Signed-off-by: David Howells <dhowells@redhat.com>
+
+diff --git a/fs/afs/volume.c b/fs/afs/volume.c
+index f0020e35bf6f..7527c081726e 100644
+--- a/fs/afs/volume.c
++++ b/fs/afs/volume.c
+@@ -88,16 +88,16 @@ static struct afs_vldb_entry *afs_vl_lookup_vldb(struct afs_cell *cell,
+ 			case VL_SERVICE:
+ 				clear_bit(vc.ac.index, &vc.ac.alist->yfs);
+ 				set_bit(vc.ac.index, &vc.ac.alist->probed);
+-				vc.ac.addr->srx_service = ret;
++				vc.ac.alist->addrs[vc.ac.index].srx_service = ret;
+ 				break;
+ 			case YFS_VL_SERVICE:
+ 				set_bit(vc.ac.index, &vc.ac.alist->yfs);
+ 				set_bit(vc.ac.index, &vc.ac.alist->probed);
+-				vc.ac.addr->srx_service = ret;
++				vc.ac.alist->addrs[vc.ac.index].srx_service = ret;
+ 				break;
+ 			}
+ 		}
+-		
++
+ 		vldb = afs_vl_get_entry_by_name_u(&vc, volname, volnamesz);
+ 	}
+ 
+
+commit 3b6492df4153b8550d347dfc581856138678a231
+Author: David Howells <dhowells@redhat.com>
+Date:   Sat Oct 20 00:57:57 2018 +0100
+
+    afs: Increase to 64-bit volume ID and 96-bit vnode ID for YFS
+    
+    Increase the sizes of the volume ID to 64 bits and the vnode ID (inode
+    number equivalent) to 96 bits to allow the support of YFS.
+    
+    This requires the iget comparator to check the vnode->fid rather than i_ino
+    and i_generation as i_ino is not sufficiently capacious.  It also requires
+    this data to be placed into the vnode cache key for fscache.
+    
+    For the moment, just discard the top 32 bits of the vnode ID when returning
+    it though stat.
+    
+    Signed-off-by: David Howells <dhowells@redhat.com>
+
+diff --git a/fs/afs/volume.c b/fs/afs/volume.c
+index 1cd263fa6028..f0020e35bf6f 100644
+--- a/fs/afs/volume.c
++++ b/fs/afs/volume.c
+@@ -250,7 +250,7 @@ static int afs_update_volume_status(struct afs_volume *volume, struct key *key)
+ 	/* We look up an ID by passing it as a decimal string in the
+ 	 * operation's name parameter.
+ 	 */
+-	idsz = sprintf(idbuf, "%u", volume->vid);
++	idsz = sprintf(idbuf, "%llu", volume->vid);
+ 
+ 	vldb = afs_vl_lookup_vldb(volume->cell, key, idbuf, idsz);
+ 	if (IS_ERR(vldb)) {
+
+commit 0a5143f2f89cc88d8a3eada8e8ccd86c1e988257
+Author: David Howells <dhowells@redhat.com>
+Date:   Sat Oct 20 00:57:57 2018 +0100
+
+    afs: Implement VL server rotation
+    
+    Track VL servers as independent entities rather than lumping all their
+    addresses together into one set and implement server-level rotation by:
+    
+     (1) Add the concept of a VL server list, where each server has its own
+         separate address list.  This code is similar to the FS server list.
+    
+     (2) Use the DNS resolver to retrieve a set of servers and their associated
+         addresses, ports, preference and weight ratings.
+    
+     (3) In the case of a legacy DNS resolver or an address list given directly
+         through /proc/net/afs/cells, create a list containing just a dummy
+         server record and attach all the addresses to that.
+    
+     (4) Implement a simple rotation policy, for the moment ignoring the
+         priorities and weights assigned to the servers.
+    
+     (5) Show the address list through /proc/net/afs/<cell>/vlservers.  This
+         also displays the source and status of the data as indicated by the
+         upcall.
+    
+    Signed-off-by: David Howells <dhowells@redhat.com>
+
+diff --git a/fs/afs/volume.c b/fs/afs/volume.c
+index 3037bd01f617..1cd263fa6028 100644
+--- a/fs/afs/volume.c
++++ b/fs/afs/volume.c
+@@ -74,55 +74,35 @@ static struct afs_vldb_entry *afs_vl_lookup_vldb(struct afs_cell *cell,
+ 						 const char *volname,
+ 						 size_t volnamesz)
+ {
+-	struct afs_addr_cursor ac;
+-	struct afs_vldb_entry *vldb;
++	struct afs_vldb_entry *vldb = ERR_PTR(-EDESTADDRREQ);
++	struct afs_vl_cursor vc;
+ 	int ret;
+ 
+-	ret = afs_set_vl_cursor(&ac, cell);
+-	if (ret < 0)
+-		return ERR_PTR(ret);
++	if (!afs_begin_vlserver_operation(&vc, cell, key))
++		return ERR_PTR(-ERESTARTSYS);
+ 
+-	while (afs_iterate_addresses(&ac)) {
+-		if (!test_bit(ac.index, &ac.alist->probed)) {
+-			ret = afs_vl_get_capabilities(cell->net, &ac, key);
++	while (afs_select_vlserver(&vc)) {
++		if (!test_bit(vc.ac.index, &vc.ac.alist->probed)) {
++			ret = afs_vl_get_capabilities(cell->net, &vc.ac, key);
+ 			switch (ret) {
+ 			case VL_SERVICE:
+-				clear_bit(ac.index, &ac.alist->yfs);
+-				set_bit(ac.index, &ac.alist->probed);
+-				ac.addr->srx_service = ret;
++				clear_bit(vc.ac.index, &vc.ac.alist->yfs);
++				set_bit(vc.ac.index, &vc.ac.alist->probed);
++				vc.ac.addr->srx_service = ret;
+ 				break;
+ 			case YFS_VL_SERVICE:
+-				set_bit(ac.index, &ac.alist->yfs);
+-				set_bit(ac.index, &ac.alist->probed);
+-				ac.addr->srx_service = ret;
++				set_bit(vc.ac.index, &vc.ac.alist->yfs);
++				set_bit(vc.ac.index, &vc.ac.alist->probed);
++				vc.ac.addr->srx_service = ret;
+ 				break;
+ 			}
+ 		}
+ 		
+-		vldb = afs_vl_get_entry_by_name_u(cell->net, &ac, key,
+-						  volname, volnamesz);
+-		switch (ac.error) {
+-		case 0:
+-			afs_end_cursor(&ac);
+-			return vldb;
+-		case -ECONNABORTED:
+-			ac.error = afs_abort_to_error(ac.abort_code);
+-			goto error;
+-		case -ENOMEM:
+-		case -ENONET:
+-			goto error;
+-		case -ENETUNREACH:
+-		case -EHOSTUNREACH:
+-		case -ECONNREFUSED:
+-			break;
+-		default:
+-			ac.error = -EIO;
+-			goto error;
+-		}
++		vldb = afs_vl_get_entry_by_name_u(&vc, volname, volnamesz);
+ 	}
+ 
+-error:
+-	return ERR_PTR(afs_end_cursor(&ac));
++	ret = afs_end_vlserver_operation(&vc);
++	return ret < 0 ? ERR_PTR(ret) : vldb;
+ }
+ 
+ /*
+
+commit ee1235a9a06813429c201bf186397a6feeea07bf
+Author: David Howells <dhowells@redhat.com>
+Date:   Wed Apr 4 13:41:28 2018 +0100
+
+    fscache: Pass object size in rather than calling back for it
+    
+    Pass the object size in to fscache_acquire_cookie() and
+    fscache_write_page() rather than the netfs providing a callback by which it
+    can be received.  This makes it easier to update the size of the object
+    when a new page is written that extends the object.
+    
+    The current object size is also passed by fscache to the check_aux
+    function, obviating the need to store it in the aux data.
+    
+    Signed-off-by: David Howells <dhowells@redhat.com>
+    Acked-by: Anna Schumaker <anna.schumaker@netapp.com>
+    Tested-by: Steve Dickson <steved@redhat.com>
+
+diff --git a/fs/afs/volume.c b/fs/afs/volume.c
+index 345cb2d675d2..3037bd01f617 100644
+--- a/fs/afs/volume.c
++++ b/fs/afs/volume.c
+@@ -227,7 +227,7 @@ void afs_activate_volume(struct afs_volume *volume)
+ 					       &afs_volume_cache_index_def,
+ 					       &volume->vid, sizeof(volume->vid),
+ 					       NULL, 0,
+-					       volume, true);
++					       volume, 0, true);
+ #endif
+ 
+ 	write_lock(&volume->cell->proc_lock);
+
+commit 402cb8dda949d9b8c0df20ad2527d139faad7ca1
+Author: David Howells <dhowells@redhat.com>
+Date:   Wed Apr 4 13:41:28 2018 +0100
+
+    fscache: Attach the index key and aux data to the cookie
+    
+    Attach copies of the index key and auxiliary data to the fscache cookie so
+    that:
+    
+     (1) The callbacks to the netfs for this stuff can be eliminated.  This
+         can simplify things in the cache as the information is still
+         available, even after the cache has relinquished the cookie.
+    
+     (2) Simplifies the locking requirements of accessing the information as we
+         don't have to worry about the netfs object going away on us.
+    
+     (3) The cache can do lazy updating of the coherency information on disk.
+         As long as the cache is flushed before reboot/poweroff, there's no
+         need to update the coherency info on disk every time it changes.
+    
+     (4) Cookies can be hashed or put in a tree as the index key is easily
+         available.  This allows:
+    
+         (a) Checks for duplicate cookies can be made at the top fscache layer
+             rather than down in the bowels of the cache backend.
+    
+         (b) Caching can be added to a netfs object that has a cookie if the
+             cache is brought online after the netfs object is allocated.
+    
+    A certain amount of space is made in the cookie for inline copies of the
+    data, but if it won't fit there, extra memory will be allocated for it.
+    
+    The downside of this is that live cache operation requires more memory.
+    
+    Signed-off-by: David Howells <dhowells@redhat.com>
+    Acked-by: Anna Schumaker <anna.schumaker@netapp.com>
+    Tested-by: Steve Dickson <steved@redhat.com>
+
+diff --git a/fs/afs/volume.c b/fs/afs/volume.c
+index b517a588781f..345cb2d675d2 100644
+--- a/fs/afs/volume.c
++++ b/fs/afs/volume.c
+@@ -225,6 +225,8 @@ void afs_activate_volume(struct afs_volume *volume)
+ #ifdef CONFIG_AFS_FSCACHE
+ 	volume->cache = fscache_acquire_cookie(volume->cell->cache,
+ 					       &afs_volume_cache_index_def,
++					       &volume->vid, sizeof(volume->vid),
++					       NULL, 0,
+ 					       volume, true);
+ #endif
+ 
+@@ -245,7 +247,7 @@ void afs_deactivate_volume(struct afs_volume *volume)
+ 	write_unlock(&volume->cell->proc_lock);
+ 
+ #ifdef CONFIG_AFS_FSCACHE
+-	fscache_relinquish_cookie(volume->cache,
++	fscache_relinquish_cookie(volume->cache, NULL,
+ 				  test_bit(AFS_VOLUME_DELETED, &volume->flags));
+ 	volume->cache = NULL;
+ #endif
+
+commit 45df8462730d2149834980d3db16e2d2b9daaf60
+Author: David Howells <dhowells@redhat.com>
+Date:   Tue Feb 6 14:12:32 2018 +0000
+
+    afs: Fix server list handling
+    
+    Fix server list handling in the following ways:
+    
+     (1) In afs_alloc_volume(), remove duplicate server list build code.  This
+         was already done by afs_alloc_server_list() which afs_alloc_volume()
+         previously called.  This just results in twice as many VL RPCs.
+    
+     (2) In afs_deliver_vl_get_entry_by_name_u(), use the number of server
+         records indicated by ->nServers in the UVLDB record returned by the
+         VL.GetEntryByNameU RPC call rather than scanning all NMAXNSERVERS
+         slots.  Unused slots may contain garbage.
+    
+     (3) In afs_alloc_server_list(), don't stop converting a UVLDB record into
+         a server list just because we can't look up one of the servers.  Just
+         skip that server and go on to the next.  If we can't look up any of
+         the servers then we'll fail at the end.
+    
+    Without this patch, an attempt to view the umich.edu root cell using
+    something like "ls /afs/umich.edu" on a dynamic root (future patch) mount
+    or an autocell mount will result in ENOMEDIUM.  The failure is due to kafs
+    not stopping after nServers'worth of records have been read, but then
+    trying to access a server with a garbage UUID and getting an error, which
+    aborts the server list build.
+    
+    Fixes: d2ddc776a458 ("afs: Overhaul volume and server record caching and fileserver rotation")
+    Reported-by: Jonathan Billings <jsbillings@jsbillings.org>
+    Signed-off-by: David Howells <dhowells@redhat.com>
+    cc: stable@vger.kernel.org
+
+diff --git a/fs/afs/volume.c b/fs/afs/volume.c
+index 79db9021f140..b517a588781f 100644
+--- a/fs/afs/volume.c
++++ b/fs/afs/volume.c
+@@ -26,9 +26,8 @@ static struct afs_volume *afs_alloc_volume(struct afs_mount_params *params,
+ 					   unsigned long type_mask)
+ {
+ 	struct afs_server_list *slist;
+-	struct afs_server *server;
+ 	struct afs_volume *volume;
+-	int ret = -ENOMEM, nr_servers = 0, i, j;
++	int ret = -ENOMEM, nr_servers = 0, i;
+ 
+ 	for (i = 0; i < vldb->nr_servers; i++)
+ 		if (vldb->fs_mask[i] & type_mask)
+@@ -58,49 +57,8 @@ static struct afs_volume *afs_alloc_volume(struct afs_mount_params *params,
+ 
+ 	refcount_set(&slist->usage, 1);
+ 	volume->servers = slist;
+-
+-	/* Make sure a records exists for each server this volume occupies. */
+-	for (i = 0; i < nr_servers; i++) {
+-		if (!(vldb->fs_mask[i] & type_mask))
+-			continue;
+-
+-		server = afs_lookup_server(params->cell, params->key,
+-					   &vldb->fs_server[i]);
+-		if (IS_ERR(server)) {
+-			ret = PTR_ERR(server);
+-			if (ret == -ENOENT)
+-				continue;
+-			goto error_2;
+-		}
+-
+-		/* Insertion-sort by server pointer */
+-		for (j = 0; j < slist->nr_servers; j++)
+-			if (slist->servers[j].server >= server)
+-				break;
+-		if (j < slist->nr_servers) {
+-			if (slist->servers[j].server == server) {
+-				afs_put_server(params->net, server);
+-				continue;
+-			}
+-
+-			memmove(slist->servers + j + 1,
+-				slist->servers + j,
+-				(slist->nr_servers - j) * sizeof(struct afs_server_entry));
+-		}
+-
+-		slist->servers[j].server = server;
+-		slist->nr_servers++;
+-	}
+-
+-	if (slist->nr_servers == 0) {
+-		ret = -EDESTADDRREQ;
+-		goto error_2;
+-	}
+-
+ 	return volume;
+ 
+-error_2:
+-	afs_put_serverlist(params->net, slist);
+ error_1:
+ 	afs_put_cell(params->net, volume->cell);
+ 	kfree(volume);
+@@ -328,7 +286,7 @@ static int afs_update_volume_status(struct afs_volume *volume, struct key *key)
+ 
+ 	/* See if the volume's server list got updated. */
+ 	new = afs_alloc_server_list(volume->cell, key,
+-				      vldb, (1 << volume->type));
++				    vldb, (1 << volume->type));
+ 	if (IS_ERR(new)) {
+ 		ret = PTR_ERR(new);
+ 		goto error_vldb;
+
+commit e44150157f42219fa5c074588efdb31ccfb197fc
+Author: David Howells <dhowells@redhat.com>
+Date:   Tue Feb 6 09:26:27 2018 +0000
+
+    afs: Add missing afs_put_cell()
+    
+    afs_alloc_volume() needs to release the cell ref it obtained in the case of
+    an error.  Fix this by adding an afs_put_cell() call into the error path.
+    
+    This can triggered when a lookup for a cell in a dynamic root or an
+    autocell mount returns an error whilst trying to look up the server (such
+    as ENOMEDIUM).  This results in an assertion failure oops when the module
+    is unloaded due to outstanding refs on a cell record.
+    
+    Fixes: d2ddc776a458 ("afs: Overhaul volume and server record caching and fileserver rotation")
+    Signed-off-by: David Howells <dhowells@redhat.com>
+    cc: stable@vger.kernel.org
+
+diff --git a/fs/afs/volume.c b/fs/afs/volume.c
+index 684c48293353..79db9021f140 100644
+--- a/fs/afs/volume.c
++++ b/fs/afs/volume.c
+@@ -102,6 +102,7 @@ static struct afs_volume *afs_alloc_volume(struct afs_mount_params *params,
+ error_2:
+ 	afs_put_serverlist(params->net, slist);
+ error_1:
++	afs_put_cell(params->net, volume->cell);
+ 	kfree(volume);
+ error_0:
+ 	return ERR_PTR(ret);
+
+commit bf99a53ce22a29d64d3190093edf52f1d44d53b3
+Author: David Howells <dhowells@redhat.com>
+Date:   Thu Nov 2 15:27:51 2017 +0000
+
+    afs: Make use of the YFS service upgrade to fully support IPv6
+    
+    YFS VL servers offer an upgraded Volume Location service that can return
+    IPv6 addresses to fileservers and volume servers in addition to IPv4
+    addresses using the YFSVL.GetEndpoints operation which we should use if
+    it's available.
+    
+    To this end:
+    
+     (1) Make rxrpc_kernel_recv_data() return the call's current service ID so
+         that the caller can detect service upgrade and see what the service
+         was upgraded to.
+    
+     (2) When we see a VL server address we haven't seen before, send a
+         VL.GetCapabilities operation to it with the service upgrade bit set.
+    
+         If we get an upgrade to the YFS VL service, change the service ID in
+         the address list for that address to use the upgraded service and set
+         a flag to note that this appears to be a YFS-compatible server.
+    
+     (3) If, when a server's addresses are being looked up, we note that we
+         previously detected a YFS-compatible server, then send the
+         YFSVL.GetEndpoints operation rather than VL.GetAddrsU.
+    
+     (4) Build a fileserver address list from the reply of YFSVL.GetEndpoints,
+         including both IPv4 and IPv6 addresses.  Volume server addresses are
+         discarded.
+    
+     (5) The address list is sorted by address and port now, instead of just
+         address.  This allows multiple servers on the same host sitting on
+         different ports.
+    
+    Signed-off-by: David Howells <dhowells@redhat.com>
+
+diff --git a/fs/afs/volume.c b/fs/afs/volume.c
+index 2295dd4f9b15..684c48293353 100644
+--- a/fs/afs/volume.c
++++ b/fs/afs/volume.c
+@@ -124,6 +124,22 @@ static struct afs_vldb_entry *afs_vl_lookup_vldb(struct afs_cell *cell,
+ 		return ERR_PTR(ret);
+ 
+ 	while (afs_iterate_addresses(&ac)) {
++		if (!test_bit(ac.index, &ac.alist->probed)) {
++			ret = afs_vl_get_capabilities(cell->net, &ac, key);
++			switch (ret) {
++			case VL_SERVICE:
++				clear_bit(ac.index, &ac.alist->yfs);
++				set_bit(ac.index, &ac.alist->probed);
++				ac.addr->srx_service = ret;
++				break;
++			case YFS_VL_SERVICE:
++				set_bit(ac.index, &ac.alist->yfs);
++				set_bit(ac.index, &ac.alist->probed);
++				ac.addr->srx_service = ret;
++				break;
++			}
++		}
++		
+ 		vldb = afs_vl_get_entry_by_name_u(cell->net, &ac, key,
+ 						  volname, volnamesz);
+ 		switch (ac.error) {
+
+commit d2ddc776a4581d900fc3bdc7803b403daae64d88
+Author: David Howells <dhowells@redhat.com>
+Date:   Thu Nov 2 15:27:50 2017 +0000
+
+    afs: Overhaul volume and server record caching and fileserver rotation
+    
+    The current code assumes that volumes and servers are per-cell and are
+    never shared, but this is not enforced, and, indeed, public cells do exist
+    that are aliases of each other.  Further, an organisation can, say, set up
+    a public cell and a private cell with overlapping, but not identical, sets
+    of servers.  The difference is purely in the database attached to the VL
+    servers.
+    
+    The current code will malfunction if it sees a server in two cells as it
+    assumes global address -> server record mappings and that each server is in
+    just one cell.
+    
+    Further, each server may have multiple addresses - and may have addresses
+    of different families (IPv4 and IPv6, say).
+    
+    To this end, the following structural changes are made:
+    
+     (1) Server record management is overhauled:
+    
+         (a) Server records are made independent of cell.  The namespace keeps
+             track of them, volume records have lists of them and each vnode
+             has a server on which its callback interest currently resides.
+    
+         (b) The cell record no longer keeps a list of servers known to be in
+             that cell.
+    
+         (c) The server records are now kept in a flat list because there's no
+             single address to sort on.
+    
+         (d) Server records are now keyed by their UUID within the namespace.
+    
+         (e) The addresses for a server are obtained with the VL.GetAddrsU
+             rather than with VL.GetEntryByName, using the server's UUID as a
+             parameter.
+    
+         (f) Cached server records are garbage collected after a period of
+             non-use and are counted out of existence before purging is allowed
+             to complete.  This protects the work functions against rmmod.
+    
+         (g) The servers list is now in /proc/fs/afs/servers.
+    
+     (2) Volume record management is overhauled:
+    
+         (a) An RCU-replaceable server list is introduced.  This tracks both
+             servers and their coresponding callback interests.
+    
+         (b) The superblock is now keyed on cell record and numeric volume ID.
+    
+         (c) The volume record is now tied to the superblock which mounts it,
+             and is activated when mounted and deactivated when unmounted.
+             This makes it easier to handle the cache cookie without causing a
+             double-use in fscache.
+    
+         (d) The volume record is loaded from the VLDB using VL.GetEntryByNameU
+             to get the server UUID list.
+    
+         (e) The volume name is updated if it is seen to have changed when the
+             volume is updated (the update is keyed on the volume ID).
+    
+     (3) The vlocation record is got rid of and VLDB records are no longer
+         cached.  Sufficient information is stored in the volume record, though
+         an update to a volume record is now no longer shared between related
+         volumes (volumes come in bundles of three: R/W, R/O and backup).
+    
+    and the following procedural changes are made:
+    
+     (1) The fileserver cursor introduced previously is now fleshed out and
+         used to iterate over fileservers and their addresses.
+    
+     (2) Volume status is checked during iteration, and the server list is
+         replaced if a change is detected.
+    
+     (3) Server status is checked during iteration, and the address list is
+         replaced if a change is detected.
+    
+     (4) The abort code is saved into the address list cursor and -ECONNABORTED
+         returned in afs_make_call() if a remote abort happened rather than
+         translating the abort into an error message.  This allows actions to
+         be taken depending on the abort code more easily.
+    
+         (a) If a VMOVED abort is seen then this is handled by rechecking the
+             volume and restarting the iteration.
+    
+         (b) If a VBUSY, VRESTARTING or VSALVAGING abort is seen then this is
+             handled by sleeping for a short period and retrying and/or trying
+             other servers that might serve that volume.  A message is also
+             displayed once until the condition has cleared.
+    
+         (c) If a VOFFLINE abort is seen, then this is handled as VBUSY for the
+             moment.
+    
+         (d) If a VNOVOL abort is seen, the volume is rechecked in the VLDB to
+             see if it has been deleted; if not, the fileserver is probably
+             indicating that the volume couldn't be attached and needs
+             salvaging.
+    
+         (e) If statfs() sees one of these aborts, it does not sleep, but
+             rather returns an error, so as not to block the umount program.
+    
+     (5) The fileserver iteration functions in vnode.c are now merged into
+         their callers and more heavily macroised around the cursor.  vnode.c
+         is removed.
+    
+     (6) Operations on a particular vnode are serialised on that vnode because
+         the server will lock that vnode whilst it operates on it, so a second
+         op sent will just have to wait.
+    
+     (7) Fileservers are probed with FS.GetCapabilities before being used.
+         This is where service upgrade will be done.
+    
+     (8) A callback interest on a fileserver is set up before an FS operation
+         is performed and passed through to afs_make_call() so that it can be
+         set on the vnode if the operation returns a callback.  The callback
+         interest is passed through to afs_iget() also so that it can be set
+         there too.
+    
+    In general, record updating is done on an as-needed basis when we try to
+    access servers, volumes or vnodes rather than offloading it to work items
+    and special threads.
+    
+    Notes:
+    
+     (1) Pre AFS-3.4 servers are no longer supported, though this can be added
+         back if necessary (AFS-3.4 was released in 1998).
+    
+     (2) VBUSY is retried forever for the moment at intervals of 1s.
+    
+     (3) /proc/fs/afs/<cell>/servers no longer exists.
+    
+    Signed-off-by: David Howells <dhowells@redhat.com>
+
+diff --git a/fs/afs/volume.c b/fs/afs/volume.c
+index 3c5ad1cc50f3..2295dd4f9b15 100644
+--- a/fs/afs/volume.c
++++ b/fs/afs/volume.c
+@@ -13,11 +13,148 @@
+ #include <linux/slab.h>
+ #include "internal.h"
+ 
+-static const char *afs_voltypes[] = { "R/W", "R/O", "BAK" };
++unsigned __read_mostly afs_volume_gc_delay = 10;
++unsigned __read_mostly afs_volume_record_life = 60 * 60;
++
++static const char *const afs_voltypes[] = { "R/W", "R/O", "BAK" };
+ 
+ /*
+- * lookup a volume by name
+- * - this can be one of the following:
++ * Allocate a volume record and load it up from a vldb record.
++ */
++static struct afs_volume *afs_alloc_volume(struct afs_mount_params *params,
++					   struct afs_vldb_entry *vldb,
++					   unsigned long type_mask)
++{
++	struct afs_server_list *slist;
++	struct afs_server *server;
++	struct afs_volume *volume;
++	int ret = -ENOMEM, nr_servers = 0, i, j;
++
++	for (i = 0; i < vldb->nr_servers; i++)
++		if (vldb->fs_mask[i] & type_mask)
++			nr_servers++;
++
++	volume = kzalloc(sizeof(struct afs_volume), GFP_KERNEL);
++	if (!volume)
++		goto error_0;
++
++	volume->vid		= vldb->vid[params->type];
++	volume->update_at	= ktime_get_real_seconds() + afs_volume_record_life;
++	volume->cell		= afs_get_cell(params->cell);
++	volume->type		= params->type;
++	volume->type_force	= params->force;
++	volume->name_len	= vldb->name_len;
++
++	atomic_set(&volume->usage, 1);
++	INIT_LIST_HEAD(&volume->proc_link);
++	rwlock_init(&volume->servers_lock);
++	memcpy(volume->name, vldb->name, vldb->name_len + 1);
++
++	slist = afs_alloc_server_list(params->cell, params->key, vldb, type_mask);
++	if (IS_ERR(slist)) {
++		ret = PTR_ERR(slist);
++		goto error_1;
++	}
++
++	refcount_set(&slist->usage, 1);
++	volume->servers = slist;
++
++	/* Make sure a records exists for each server this volume occupies. */
++	for (i = 0; i < nr_servers; i++) {
++		if (!(vldb->fs_mask[i] & type_mask))
++			continue;
++
++		server = afs_lookup_server(params->cell, params->key,
++					   &vldb->fs_server[i]);
++		if (IS_ERR(server)) {
++			ret = PTR_ERR(server);
++			if (ret == -ENOENT)
++				continue;
++			goto error_2;
++		}
++
++		/* Insertion-sort by server pointer */
++		for (j = 0; j < slist->nr_servers; j++)
++			if (slist->servers[j].server >= server)
++				break;
++		if (j < slist->nr_servers) {
++			if (slist->servers[j].server == server) {
++				afs_put_server(params->net, server);
++				continue;
++			}
++
++			memmove(slist->servers + j + 1,
++				slist->servers + j,
++				(slist->nr_servers - j) * sizeof(struct afs_server_entry));
++		}
++
++		slist->servers[j].server = server;
++		slist->nr_servers++;
++	}
++
++	if (slist->nr_servers == 0) {
++		ret = -EDESTADDRREQ;
++		goto error_2;
++	}
++
++	return volume;
++
++error_2:
++	afs_put_serverlist(params->net, slist);
++error_1:
++	kfree(volume);
++error_0:
++	return ERR_PTR(ret);
++}
++
++/*
++ * Look up a VLDB record for a volume.
++ */
++static struct afs_vldb_entry *afs_vl_lookup_vldb(struct afs_cell *cell,
++						 struct key *key,
++						 const char *volname,
++						 size_t volnamesz)
++{
++	struct afs_addr_cursor ac;
++	struct afs_vldb_entry *vldb;
++	int ret;
++
++	ret = afs_set_vl_cursor(&ac, cell);
++	if (ret < 0)
++		return ERR_PTR(ret);
++
++	while (afs_iterate_addresses(&ac)) {
++		vldb = afs_vl_get_entry_by_name_u(cell->net, &ac, key,
++						  volname, volnamesz);
++		switch (ac.error) {
++		case 0:
++			afs_end_cursor(&ac);
++			return vldb;
++		case -ECONNABORTED:
++			ac.error = afs_abort_to_error(ac.abort_code);
++			goto error;
++		case -ENOMEM:
++		case -ENONET:
++			goto error;
++		case -ENETUNREACH:
++		case -EHOSTUNREACH:
++		case -ECONNREFUSED:
++			break;
++		default:
++			ac.error = -EIO;
++			goto error;
++		}
++	}
++
++error:
++	return ERR_PTR(afs_end_cursor(&ac));
++}
++
++/*
++ * Look up a volume in the VL server and create a candidate volume record for
++ * it.
++ *
++ * The volume name can be one of the following:
+  *	"%[cell:]volume[.]"		R/W volume
+  *	"#[cell:]volume[.]"		R/O or R/W volume (rwparent=0),
+  *					 or R/W (rwparent=1) volume
+@@ -37,169 +174,218 @@ static const char *afs_voltypes[] = { "R/W", "R/O", "BAK" };
+  * - Rule 3: If parent volume is R/W, then only mount R/W volume unless
+  *           explicitly told otherwise
+  */
+-struct afs_volume *afs_volume_lookup(struct afs_mount_params *params)
++struct afs_volume *afs_create_volume(struct afs_mount_params *params)
+ {
+-	struct afs_vlocation *vlocation = NULL;
+-	struct afs_volume *volume = NULL;
+-	struct afs_server *server = NULL;
+-	char srvtmask;
+-	int ret, loop;
+-
+-	_enter("{%*.*s,%d}",
+-	       params->volnamesz, params->volnamesz, params->volname, params->rwpath);
+-
+-	/* lookup the volume location record */
+-	vlocation = afs_vlocation_lookup(params->net, params->cell, params->key,
+-					 params->volname, params->volnamesz);
+-	if (IS_ERR(vlocation)) {
+-		ret = PTR_ERR(vlocation);
+-		vlocation = NULL;
+-		goto error;
+-	}
++	struct afs_vldb_entry *vldb;
++	struct afs_volume *volume;
++	unsigned long type_mask = 1UL << params->type;
+ 
+-	/* make the final decision on the type we want */
+-	ret = -ENOMEDIUM;
+-	if (params->force && !(vlocation->vldb.vidmask & (1 << params->type)))
+-		goto error;
++	vldb = afs_vl_lookup_vldb(params->cell, params->key,
++				  params->volname, params->volnamesz);
++	if (IS_ERR(vldb))
++		return ERR_CAST(vldb);
+ 
+-	srvtmask = 0;
+-	for (loop = 0; loop < vlocation->vldb.nservers; loop++)
+-		srvtmask |= vlocation->vldb.srvtmask[loop];
++	if (test_bit(AFS_VLDB_QUERY_ERROR, &vldb->flags)) {
++		volume = ERR_PTR(vldb->error);
++		goto error;
++	}
+ 
++	/* Make the final decision on the type we want */
++	volume = ERR_PTR(-ENOMEDIUM);
+ 	if (params->force) {
+-		if (!(srvtmask & (1 << params->type)))
++		if (!(vldb->flags & type_mask))
+ 			goto error;
+-	} else if (srvtmask & AFS_VOL_VTM_RO) {
++	} else if (test_bit(AFS_VLDB_HAS_RO, &vldb->flags)) {
+ 		params->type = AFSVL_ROVOL;
+-	} else if (srvtmask & AFS_VOL_VTM_RW) {
++	} else if (test_bit(AFS_VLDB_HAS_RW, &vldb->flags)) {
+ 		params->type = AFSVL_RWVOL;
+ 	} else {
+ 		goto error;
+ 	}
+ 
+-	down_write(&params->cell->vl_sem);
++	type_mask = 1UL << params->type;
++	volume = afs_alloc_volume(params, vldb, type_mask);
+ 
+-	/* is the volume already active? */
+-	if (vlocation->vols[params->type]) {
+-		/* yes - re-use it */
+-		volume = vlocation->vols[params->type];
+-		afs_get_volume(volume);
+-		goto success;
+-	}
++error:
++	kfree(vldb);
++	return volume;
++}
+ 
+-	/* create a new volume record */
+-	_debug("creating new volume record");
++/*
++ * Destroy a volume record
++ */
++static void afs_destroy_volume(struct afs_net *net, struct afs_volume *volume)
++{
++	_enter("%p", volume);
+ 
+-	ret = -ENOMEM;
+-	volume = kzalloc(sizeof(struct afs_volume), GFP_KERNEL);
+-	if (!volume)
+-		goto error_up;
++#ifdef CONFIG_AFS_FSCACHE
++	ASSERTCMP(volume->cache, ==, NULL);
++#endif
+ 
+-	atomic_set(&volume->usage, 1);
+-	volume->type		= params->type;
+-	volume->type_force	= params->force;
+-	volume->cell		= params->cell;
+-	volume->vid		= vlocation->vldb.vid[params->type];
+-
+-	init_rwsem(&volume->server_sem);
+-
+-	/* look up all the applicable server records */
+-	for (loop = 0; loop < 8; loop++) {
+-		if (vlocation->vldb.srvtmask[loop] & (1 << volume->type)) {
+-			server = afs_lookup_server(
+-			       volume->cell, &vlocation->vldb.servers[loop]);
+-			if (IS_ERR(server)) {
+-				ret = PTR_ERR(server);
+-				goto error_discard;
+-			}
++	afs_put_serverlist(net, volume->servers);
++	afs_put_cell(net, volume->cell);
++	kfree(volume);
+ 
+-			volume->servers[volume->nservers] = server;
+-			volume->nservers++;
+-		}
++	_leave(" [destroyed]");
++}
++
++/*
++ * Drop a reference on a volume record.
++ */
++void afs_put_volume(struct afs_cell *cell, struct afs_volume *volume)
++{
++	if (volume) {
++		_enter("%s", volume->name);
++
++		if (atomic_dec_and_test(&volume->usage))
++			afs_destroy_volume(cell->net, volume);
+ 	}
++}
+ 
+-	/* attach the cache and volume location */
++/*
++ * Activate a volume.
++ */
++void afs_activate_volume(struct afs_volume *volume)
++{
+ #ifdef CONFIG_AFS_FSCACHE
+ 	volume->cache = fscache_acquire_cookie(volume->cell->cache,
+ 					       &afs_volume_cache_index_def,
+ 					       volume, true);
+ #endif
+-	afs_get_vlocation(vlocation);
+-	volume->vlocation = vlocation;
+-
+-	vlocation->vols[volume->type] = volume;
+ 
+-success:
+-	_debug("kAFS selected %s volume %08x",
+-	       afs_voltypes[volume->type], volume->vid);
+-	up_write(&params->cell->vl_sem);
+-	afs_put_vlocation(params->net, vlocation);
+-	_leave(" = %p", volume);
+-	return volume;
++	write_lock(&volume->cell->proc_lock);
++	list_add_tail(&volume->proc_link, &volume->cell->proc_volumes);
++	write_unlock(&volume->cell->proc_lock);
++}
+ 
+-	/* clean up */
+-error_up:
+-	up_write(&params->cell->vl_sem);
+-error:
+-	afs_put_vlocation(params->net, vlocation);
+-	_leave(" = %d", ret);
+-	return ERR_PTR(ret);
++/*
++ * Deactivate a volume.
++ */
++void afs_deactivate_volume(struct afs_volume *volume)
++{
++	_enter("%s", volume->name);
+ 
+-error_discard:
+-	up_write(&params->cell->vl_sem);
++	write_lock(&volume->cell->proc_lock);
++	list_del_init(&volume->proc_link);
++	write_unlock(&volume->cell->proc_lock);
+ 
+-	for (loop = volume->nservers - 1; loop >= 0; loop--) {
+-		afs_put_cb_interest(params->net, volume->cb_interests[loop]);
+-		afs_put_server(params->net, volume->servers[loop]);
+-	}
++#ifdef CONFIG_AFS_FSCACHE
++	fscache_relinquish_cookie(volume->cache,
++				  test_bit(AFS_VOLUME_DELETED, &volume->flags));
++	volume->cache = NULL;
++#endif
+ 
+-	kfree(volume);
+-	goto error;
++	_leave("");
+ }
+ 
+ /*
+- * destroy a volume record
++ * Query the VL service to update the volume status.
+  */
+-void afs_put_volume(struct afs_cell *cell, struct afs_volume *volume)
++static int afs_update_volume_status(struct afs_volume *volume, struct key *key)
+ {
+-	struct afs_vlocation *vlocation;
+-	int loop;
++	struct afs_server_list *new, *old, *discard;
++	struct afs_vldb_entry *vldb;
++	char idbuf[16];
++	int ret, idsz;
+ 
+-	if (!volume)
+-		return;
++	_enter("");
+ 
+-	_enter("%p", volume);
++	/* We look up an ID by passing it as a decimal string in the
++	 * operation's name parameter.
++	 */
++	idsz = sprintf(idbuf, "%u", volume->vid);
+ 
+-	ASSERTCMP(atomic_read(&volume->usage), >, 0);
++	vldb = afs_vl_lookup_vldb(volume->cell, key, idbuf, idsz);
++	if (IS_ERR(vldb)) {
++		ret = PTR_ERR(vldb);
++		goto error;
++	}
+ 
+-	vlocation = volume->vlocation;
++	/* See if the volume got renamed. */
++	if (vldb->name_len != volume->name_len ||
++	    memcmp(vldb->name, volume->name, vldb->name_len) != 0) {
++		/* TODO: Use RCU'd string. */
++		memcpy(volume->name, vldb->name, AFS_MAXVOLNAME);
++		volume->name_len = vldb->name_len;
++	}
++
++	/* See if the volume's server list got updated. */
++	new = afs_alloc_server_list(volume->cell, key,
++				      vldb, (1 << volume->type));
++	if (IS_ERR(new)) {
++		ret = PTR_ERR(new);
++		goto error_vldb;
++	}
+ 
+-	/* to prevent a race, the decrement and the dequeue must be effectively
+-	 * atomic */
+-	down_write(&cell->vl_sem);
++	write_lock(&volume->servers_lock);
+ 
+-	if (likely(!atomic_dec_and_test(&volume->usage))) {
+-		up_write(&vlocation->cell->vl_sem);
+-		_leave("");
+-		return;
++	discard = new;
++	old = volume->servers;
++	if (afs_annotate_server_list(new, old)) {
++		new->seq = volume->servers_seq + 1;
++		volume->servers = new;
++		smp_wmb();
++		volume->servers_seq++;
++		discard = old;
+ 	}
+ 
+-	vlocation->vols[volume->type] = NULL;
++	volume->update_at = ktime_get_real_seconds() + afs_volume_record_life;
++	clear_bit(AFS_VOLUME_NEEDS_UPDATE, &volume->flags);
++	write_unlock(&volume->servers_lock);
++	ret = 0;
+ 
+-	up_write(&cell->vl_sem);
++	afs_put_serverlist(volume->cell->net, discard);
++error_vldb:
++	kfree(vldb);
++error:
++	_leave(" = %d", ret);
++	return ret;
++}
+ 
+-	/* finish cleaning up the volume */
+-#ifdef CONFIG_AFS_FSCACHE
+-	fscache_relinquish_cookie(volume->cache, 0);
+-#endif
+-	afs_put_vlocation(cell->net, vlocation);
++/*
++ * Make sure the volume record is up to date.
++ */
++int afs_check_volume_status(struct afs_volume *volume, struct key *key)
++{
++	time64_t now = ktime_get_real_seconds();
++	int ret, retries = 0;
+ 
+-	for (loop = volume->nservers - 1; loop >= 0; loop--) {
+-		afs_put_cb_interest(cell->net, volume->cb_interests[loop]);
+-		afs_put_server(cell->net, volume->servers[loop]);
++	_enter("");
++
++	if (volume->update_at <= now)
++		set_bit(AFS_VOLUME_NEEDS_UPDATE, &volume->flags);
++
++retry:
++	if (!test_bit(AFS_VOLUME_NEEDS_UPDATE, &volume->flags) &&
++	    !test_bit(AFS_VOLUME_WAIT, &volume->flags)) {
++		_leave(" = 0");
++		return 0;
+ 	}
+ 
+-	kfree(volume);
++	if (!test_and_set_bit_lock(AFS_VOLUME_UPDATING, &volume->flags)) {
++		ret = afs_update_volume_status(volume, key);
++		clear_bit_unlock(AFS_VOLUME_WAIT, &volume->flags);
++		clear_bit_unlock(AFS_VOLUME_UPDATING, &volume->flags);
++		wake_up_bit(&volume->flags, AFS_VOLUME_WAIT);
++		_leave(" = %d", ret);
++		return ret;
++	}
+ 
+-	_leave(" [destroyed]");
++	if (!test_bit(AFS_VOLUME_WAIT, &volume->flags)) {
++		_leave(" = 0 [no wait]");
++		return 0;
++	}
++
++	ret = wait_on_bit(&volume->flags, AFS_VOLUME_WAIT, TASK_INTERRUPTIBLE);
++	if (ret == -ERESTARTSYS) {
++		_leave(" = %d", ret);
++		return ret;
++	}
++
++	retries++;
++	if (retries == 4) {
++		_leave(" = -ESTALE");
++		return -ESTALE;
++	}
++	goto retry;
+ }
+
+commit 9cc6fc50f7bc69ac28bee45eed13cbc65a86210f
+Author: David Howells <dhowells@redhat.com>
+Date:   Thu Nov 2 15:27:50 2017 +0000
+
+    afs: Move server rotation code into its own file
+    
+    Move server rotation code into its own file.
+    
+    Signed-off-by: David Howells <dhowells@redhat.com>
+
+diff --git a/fs/afs/volume.c b/fs/afs/volume.c
+index d282cd0ff268..3c5ad1cc50f3 100644
+--- a/fs/afs/volume.c
++++ b/fs/afs/volume.c
+@@ -10,12 +10,7 @@
+  */
+ 
+ #include <linux/kernel.h>
+-#include <linux/module.h>
+-#include <linux/init.h>
+ #include <linux/slab.h>
+-#include <linux/fs.h>
+-#include <linux/pagemap.h>
+-#include <linux/sched.h>
+ #include "internal.h"
+ 
+ static const char *afs_voltypes[] = { "R/W", "R/O", "BAK" };
+@@ -208,248 +203,3 @@ void afs_put_volume(struct afs_cell *cell, struct afs_volume *volume)
+ 
+ 	_leave(" [destroyed]");
+ }
+-
+-/*
+- * Initialise a filesystem server cursor for iterating over FS servers.
+- */
+-void afs_init_fs_cursor(struct afs_fs_cursor *fc, struct afs_vnode *vnode)
+-{
+-	fc->ac.alist = NULL;
+-	fc->ac.addr = NULL;
+-	fc->ac.start = 0;
+-	fc->ac.index = 0;
+-	fc->ac.error = 0;
+-	fc->server = NULL;
+-}
+-
+-/*
+- * Set a filesystem server cursor for using a specific FS server.
+- */
+-int afs_set_fs_cursor(struct afs_fs_cursor *fc, struct afs_vnode *vnode)
+-{
+-	afs_init_fs_cursor(fc, vnode);
+-
+-	read_seqlock_excl(&vnode->cb_lock);
+-	if (vnode->cb_interest) {
+-		if (vnode->cb_interest->server->fs_state == 0)
+-			fc->server = afs_get_server(vnode->cb_interest->server);
+-		else
+-			fc->ac.error = vnode->cb_interest->server->fs_state;
+-	} else {
+-		fc->ac.error = -ESTALE;
+-	}
+-	read_sequnlock_excl(&vnode->cb_lock);
+-
+-	return fc->ac.error;
+-}
+-
+-/*
+- * pick a server to use to try accessing this volume
+- * - returns with an elevated usage count on the server chosen
+- */
+-bool afs_volume_pick_fileserver(struct afs_fs_cursor *fc, struct afs_vnode *vnode)
+-{
+-	struct afs_volume *volume = vnode->volume;
+-	struct afs_server *server;
+-	int ret, state, loop;
+-
+-	_enter("%s", volume->vlocation->vldb.name);
+-
+-	/* stick with the server we're already using if we can */
+-	if (vnode->cb_interest && vnode->cb_interest->server->fs_state == 0) {
+-		fc->server = afs_get_server(vnode->cb_interest->server);
+-		goto set_server;
+-	}
+-
+-	down_read(&volume->server_sem);
+-
+-	/* handle the no-server case */
+-	if (volume->nservers == 0) {
+-		fc->ac.error = volume->rjservers ? -ENOMEDIUM : -ESTALE;
+-		up_read(&volume->server_sem);
+-		_leave(" = f [no servers %d]", fc->ac.error);
+-		return false;
+-	}
+-
+-	/* basically, just search the list for the first live server and use
+-	 * that */
+-	ret = 0;
+-	for (loop = 0; loop < volume->nservers; loop++) {
+-		server = volume->servers[loop];
+-		state = server->fs_state;
+-
+-		_debug("consider %d [%d]", loop, state);
+-
+-		switch (state) {
+-		case 0:
+-			goto picked_server;
+-
+-		case -ENETUNREACH:
+-			if (ret == 0)
+-				ret = state;
+-			break;
+-
+-		case -EHOSTUNREACH:
+-			if (ret == 0 ||
+-			    ret == -ENETUNREACH)
+-				ret = state;
+-			break;
+-
+-		case -ECONNREFUSED:
+-			if (ret == 0 ||
+-			    ret == -ENETUNREACH ||
+-			    ret == -EHOSTUNREACH)
+-				ret = state;
+-			break;
+-
+-		default:
+-		case -EREMOTEIO:
+-			if (ret == 0 ||
+-			    ret == -ENETUNREACH ||
+-			    ret == -EHOSTUNREACH ||
+-			    ret == -ECONNREFUSED)
+-				ret = state;
+-			break;
+-		}
+-	}
+-
+-error:
+-	fc->ac.error = ret;
+-
+-	/* no available servers
+-	 * - TODO: handle the no active servers case better
+-	 */
+-	up_read(&volume->server_sem);
+-	_leave(" = f [%d]", fc->ac.error);
+-	return false;
+-
+-picked_server:
+-	/* Found an apparently healthy server.  We need to register an interest
+-	 * in receiving callbacks before we talk to it.
+-	 */
+-	ret = afs_register_server_cb_interest(vnode,
+-					      &volume->cb_interests[loop], server);
+-	if (ret < 0)
+-		goto error;
+-
+-	fc->server = afs_get_server(server);
+-	up_read(&volume->server_sem);
+-set_server:
+-	fc->ac.alist = afs_get_addrlist(fc->server->addrs);
+-	fc->ac.addr = &fc->ac.alist->addrs[0];
+-	_debug("USING SERVER: %pIS\n", &fc->ac.addr->transport);
+-	_leave(" = t (picked %pIS)", &fc->ac.addr->transport);
+-	return true;
+-}
+-
+-/*
+- * release a server after use
+- * - releases the ref on the server struct that was acquired by picking
+- * - records result of using a particular server to access a volume
+- * - return true to try again, false if okay or to issue error
+- * - the caller must release the server struct if result was false
+- */
+-bool afs_iterate_fs_cursor(struct afs_fs_cursor *fc,
+-			   struct afs_vnode *vnode)
+-{
+-	struct afs_volume *volume = vnode->volume;
+-	struct afs_server *server = fc->server;
+-	unsigned loop;
+-
+-	_enter("%s,%pIS,%d",
+-	       volume->vlocation->vldb.name, &fc->ac.addr->transport,
+-	       fc->ac.error);
+-
+-	switch (fc->ac.error) {
+-		/* success */
+-	case 0:
+-		server->fs_state = 0;
+-		_leave(" = f");
+-		return false;
+-
+-		/* the fileserver denied all knowledge of the volume */
+-	case -ENOMEDIUM:
+-		down_write(&volume->server_sem);
+-
+-		/* firstly, find where the server is in the active list (if it
+-		 * is) */
+-		for (loop = 0; loop < volume->nservers; loop++)
+-			if (volume->servers[loop] == server)
+-				goto present;
+-
+-		/* no longer there - may have been discarded by another op */
+-		goto try_next_server_upw;
+-
+-	present:
+-		volume->nservers--;
+-		memmove(&volume->servers[loop],
+-			&volume->servers[loop + 1],
+-			sizeof(volume->servers[loop]) *
+-			(volume->nservers - loop));
+-		volume->servers[volume->nservers] = NULL;
+-		afs_put_server(afs_v2net(vnode), server);
+-		volume->rjservers++;
+-
+-		if (volume->nservers > 0)
+-			/* another server might acknowledge its existence */
+-			goto try_next_server_upw;
+-
+-		/* handle the case where all the fileservers have rejected the
+-		 * volume
+-		 * - TODO: try asking the fileservers for volume information
+-		 * - TODO: contact the VL server again to see if the volume is
+-		 *         no longer registered
+-		 */
+-		up_write(&volume->server_sem);
+-		afs_put_server(afs_v2net(vnode), server);
+-		fc->server = NULL;
+-		_leave(" = f [completely rejected]");
+-		return false;
+-
+-		/* problem reaching the server */
+-	case -ENETUNREACH:
+-	case -EHOSTUNREACH:
+-	case -ECONNREFUSED:
+-	case -ETIME:
+-	case -ETIMEDOUT:
+-	case -EREMOTEIO:
+-		/* mark the server as dead
+-		 * TODO: vary dead timeout depending on error
+-		 */
+-		spin_lock(&server->fs_lock);
+-		if (!server->fs_state) {
+-			server->fs_state = fc->ac.error;
+-			printk("kAFS: SERVER DEAD state=%d\n", fc->ac.error);
+-		}
+-		spin_unlock(&server->fs_lock);
+-		goto try_next_server;
+-
+-		/* miscellaneous error */
+-	default:
+-	case -ENOMEM:
+-	case -ENONET:
+-		/* tell the caller to accept the result */
+-		afs_put_server(afs_v2net(vnode), server);
+-		fc->server = NULL;
+-		_leave(" = f [local failure]");
+-		return false;
+-	}
+-
+-	/* tell the caller to loop around and try the next server */
+-try_next_server_upw:
+-	up_write(&volume->server_sem);
+-try_next_server:
+-	afs_put_server(afs_v2net(vnode), server);
+-	_leave(" = t [try next server]");
+-	return true;
+-}
+-
+-/*
+- * Clean up a fileserver cursor.
+- */
+-int afs_end_fs_cursor(struct afs_fs_cursor *fc, struct afs_net *net)
+-{
+-	afs_end_cursor(&fc->ac);
+-	afs_put_server(net, fc->server);
+-	return fc->ac.error;
+-}
+
+commit 8b2a464ced77fe35be72ab7d38152a9439daf8d3
+Author: David Howells <dhowells@redhat.com>
+Date:   Thu Nov 2 15:27:50 2017 +0000
+
+    afs: Add an address list concept
+    
+    Add an RCU replaceable address list structure to hold a list of server
+    addresses.  The list also holds the
+    
+    To this end:
+    
+     (1) A cell's VL server address list can be loaded directly via insmod or
+         echo to /proc/fs/afs/cells or dynamically from a DNS query for AFSDB
+         or SRV records.
+    
+     (2) Anyone wanting to use a cell's VL server address must wait until the
+         cell record comes online and has tried to obtain some addresses.
+    
+     (3) An FS server's address list, for the moment, has a single entry that
+         is the key to the server list.  This will change in the future when a
+         server is instead keyed on its UUID and the VL.GetAddrsU operation is
+         used.
+    
+     (4) An 'address cursor' concept is introduced to handle iteration through
+         the address list.  This is passed to the afs_make_call() as, in the
+         future, stuff (such as abort code) that doesn't outlast the call will
+         be returned in it.
+    
+    In the future, we might want to annotate the list with information about
+    how each address fares.  We might then want to propagate such annotations
+    over address list replacement.
+    
+    Whilst we're at it, we allow IPv6 addresses to be specified in
+    colon-delimited lists by enclosing them in square brackets.
+    
+    Signed-off-by: David Howells <dhowells@redhat.com>
+
+diff --git a/fs/afs/volume.c b/fs/afs/volume.c
+index 4f6fd10094c6..d282cd0ff268 100644
+--- a/fs/afs/volume.c
++++ b/fs/afs/volume.c
+@@ -209,11 +209,45 @@ void afs_put_volume(struct afs_cell *cell, struct afs_volume *volume)
+ 	_leave(" [destroyed]");
+ }
+ 
++/*
++ * Initialise a filesystem server cursor for iterating over FS servers.
++ */
++void afs_init_fs_cursor(struct afs_fs_cursor *fc, struct afs_vnode *vnode)
++{
++	fc->ac.alist = NULL;
++	fc->ac.addr = NULL;
++	fc->ac.start = 0;
++	fc->ac.index = 0;
++	fc->ac.error = 0;
++	fc->server = NULL;
++}
++
++/*
++ * Set a filesystem server cursor for using a specific FS server.
++ */
++int afs_set_fs_cursor(struct afs_fs_cursor *fc, struct afs_vnode *vnode)
++{
++	afs_init_fs_cursor(fc, vnode);
++
++	read_seqlock_excl(&vnode->cb_lock);
++	if (vnode->cb_interest) {
++		if (vnode->cb_interest->server->fs_state == 0)
++			fc->server = afs_get_server(vnode->cb_interest->server);
++		else
++			fc->ac.error = vnode->cb_interest->server->fs_state;
++	} else {
++		fc->ac.error = -ESTALE;
++	}
++	read_sequnlock_excl(&vnode->cb_lock);
++
++	return fc->ac.error;
++}
++
+ /*
+  * pick a server to use to try accessing this volume
+  * - returns with an elevated usage count on the server chosen
+  */
+-struct afs_server *afs_volume_pick_fileserver(struct afs_vnode *vnode)
++bool afs_volume_pick_fileserver(struct afs_fs_cursor *fc, struct afs_vnode *vnode)
+ {
+ 	struct afs_volume *volume = vnode->volume;
+ 	struct afs_server *server;
+@@ -223,19 +257,18 @@ struct afs_server *afs_volume_pick_fileserver(struct afs_vnode *vnode)
+ 
+ 	/* stick with the server we're already using if we can */
+ 	if (vnode->cb_interest && vnode->cb_interest->server->fs_state == 0) {
+-		afs_get_server(vnode->cb_interest->server);
+-		_leave(" = %p [current]", vnode->cb_interest->server);
+-		return vnode->cb_interest->server;
++		fc->server = afs_get_server(vnode->cb_interest->server);
++		goto set_server;
+ 	}
+ 
+ 	down_read(&volume->server_sem);
+ 
+ 	/* handle the no-server case */
+ 	if (volume->nservers == 0) {
+-		ret = volume->rjservers ? -ENOMEDIUM : -ESTALE;
++		fc->ac.error = volume->rjservers ? -ENOMEDIUM : -ESTALE;
+ 		up_read(&volume->server_sem);
+-		_leave(" = %d [no servers]", ret);
+-		return ERR_PTR(ret);
++		_leave(" = f [no servers %d]", fc->ac.error);
++		return false;
+ 	}
+ 
+ 	/* basically, just search the list for the first live server and use
+@@ -280,13 +313,15 @@ struct afs_server *afs_volume_pick_fileserver(struct afs_vnode *vnode)
+ 		}
+ 	}
+ 
++error:
++	fc->ac.error = ret;
++
+ 	/* no available servers
+ 	 * - TODO: handle the no active servers case better
+ 	 */
+-error:
+ 	up_read(&volume->server_sem);
+-	_leave(" = %d", ret);
+-	return ERR_PTR(ret);
++	_leave(" = f [%d]", fc->ac.error);
++	return false;
+ 
+ picked_server:
+ 	/* Found an apparently healthy server.  We need to register an interest
+@@ -296,37 +331,41 @@ struct afs_server *afs_volume_pick_fileserver(struct afs_vnode *vnode)
+ 					      &volume->cb_interests[loop], server);
+ 	if (ret < 0)
+ 		goto error;
+-	
+-	afs_get_server(server);
++
++	fc->server = afs_get_server(server);
+ 	up_read(&volume->server_sem);
+-	_leave(" = %p (picked %pIS)",
+-	       server, &server->addr.transport);
+-	return server;
++set_server:
++	fc->ac.alist = afs_get_addrlist(fc->server->addrs);
++	fc->ac.addr = &fc->ac.alist->addrs[0];
++	_debug("USING SERVER: %pIS\n", &fc->ac.addr->transport);
++	_leave(" = t (picked %pIS)", &fc->ac.addr->transport);
++	return true;
+ }
+ 
+ /*
+  * release a server after use
+  * - releases the ref on the server struct that was acquired by picking
+  * - records result of using a particular server to access a volume
+- * - return 0 to try again, 1 if okay or to issue error
+- * - the caller must release the server struct if result was 0
++ * - return true to try again, false if okay or to issue error
++ * - the caller must release the server struct if result was false
+  */
+-int afs_volume_release_fileserver(struct afs_vnode *vnode,
+-				  struct afs_server *server,
+-				  int result)
++bool afs_iterate_fs_cursor(struct afs_fs_cursor *fc,
++			   struct afs_vnode *vnode)
+ {
+ 	struct afs_volume *volume = vnode->volume;
++	struct afs_server *server = fc->server;
+ 	unsigned loop;
+ 
+ 	_enter("%s,%pIS,%d",
+-	       volume->vlocation->vldb.name, &server->addr.transport, result);
++	       volume->vlocation->vldb.name, &fc->ac.addr->transport,
++	       fc->ac.error);
+ 
+-	switch (result) {
++	switch (fc->ac.error) {
+ 		/* success */
+ 	case 0:
+ 		server->fs_state = 0;
+-		_leave("");
+-		return 1;
++		_leave(" = f");
++		return false;
+ 
+ 		/* the fileserver denied all knowledge of the volume */
+ 	case -ENOMEDIUM:
+@@ -363,8 +402,9 @@ int afs_volume_release_fileserver(struct afs_vnode *vnode,
+ 		 */
+ 		up_write(&volume->server_sem);
+ 		afs_put_server(afs_v2net(vnode), server);
+-		_leave(" [completely rejected]");
+-		return 1;
++		fc->server = NULL;
++		_leave(" = f [completely rejected]");
++		return false;
+ 
+ 		/* problem reaching the server */
+ 	case -ENETUNREACH:
+@@ -378,8 +418,8 @@ int afs_volume_release_fileserver(struct afs_vnode *vnode,
+ 		 */
+ 		spin_lock(&server->fs_lock);
+ 		if (!server->fs_state) {
+-			server->fs_state = result;
+-			printk("kAFS: SERVER DEAD state=%d\n", result);
++			server->fs_state = fc->ac.error;
++			printk("kAFS: SERVER DEAD state=%d\n", fc->ac.error);
+ 		}
+ 		spin_unlock(&server->fs_lock);
+ 		goto try_next_server;
+@@ -390,8 +430,9 @@ int afs_volume_release_fileserver(struct afs_vnode *vnode,
+ 	case -ENONET:
+ 		/* tell the caller to accept the result */
+ 		afs_put_server(afs_v2net(vnode), server);
+-		_leave(" [local failure]");
+-		return 1;
++		fc->server = NULL;
++		_leave(" = f [local failure]");
++		return false;
+ 	}
+ 
+ 	/* tell the caller to loop around and try the next server */
+@@ -399,6 +440,16 @@ int afs_volume_release_fileserver(struct afs_vnode *vnode,
+ 	up_write(&volume->server_sem);
+ try_next_server:
+ 	afs_put_server(afs_v2net(vnode), server);
+-	_leave(" [try next server]");
+-	return 0;
++	_leave(" = t [try next server]");
++	return true;
++}
++
++/*
++ * Clean up a fileserver cursor.
++ */
++int afs_end_fs_cursor(struct afs_fs_cursor *fc, struct afs_net *net)
++{
++	afs_end_cursor(&fc->ac);
++	afs_put_server(net, fc->server);
++	return fc->ac.error;
+ }
+
+commit c435ee34551e1f5a02a253ca8e235287efd2727c
+Author: David Howells <dhowells@redhat.com>
+Date:   Thu Nov 2 15:27:49 2017 +0000
+
+    afs: Overhaul the callback handling
+    
+    Overhaul the AFS callback handling by the following means:
+    
+     (1) Don't give up callback promises on vnodes that we are no longer using,
+         rather let them just expire on the server or let the server break
+         them.  This is actually more efficient for the server as the callback
+         lookup is expensive if there are lots of extant callbacks.
+    
+     (2) Only give up the callback promises we have from a server when the
+         server record is destroyed.  Then we can just give up *all* the
+         callback promises on it in one go.
+    
+     (3) Servers can end up being shared between cells if cells are aliased, so
+         don't add all the vnodes being backed by a particular server into a
+         big FID-indexed tree on that server as there may be duplicates.
+    
+         Instead have each volume instance (~= superblock) register an interest
+         in a server as it starts to make use of it and use this to allow the
+         processor for callbacks from the server to find the superblock and
+         thence the inode corresponding to the FID being broken by means of
+         ilookup_nowait().
+    
+     (4) Rather than iterating over the entire callback list when a mass-break
+         comes in from the server, maintain a counter of mass-breaks in
+         afs_server (cb_seq) and make afs_validate() check it against the copy
+         in afs_vnode.
+    
+         It would be nice not to have to take a read_lock whilst doing this,
+         but that's tricky without using RCU.
+    
+     (5) Save a ref on the fileserver we're using for a call in the afs_call
+         struct so that we can access its cb_s_break during call decoding.
+    
+     (6) Write-lock around callback and status storage in a vnode and read-lock
+         around getattr so that we don't see the status mid-update.
+    
+    This has the following consequences:
+    
+     (1) Data invalidation isn't seen until someone calls afs_validate() on a
+         vnode.  Unfortunately, we need to use a key to query the server, but
+         getting one from a background thread is tricky without caching loads
+         of keys all over the place.
+    
+     (2) Mass invalidation isn't seen until someone calls afs_validate().
+    
+     (3) Callback breaking is going to hit the inode_hash_lock quite a bit.
+         Could this be replaced with rcu_read_lock() since inodes are destroyed
+         under RCU conditions.
+    
+    Signed-off-by: David Howells <dhowells@redhat.com>
+
+diff --git a/fs/afs/volume.c b/fs/afs/volume.c
+index 52f0dc40732b..4f6fd10094c6 100644
+--- a/fs/afs/volume.c
++++ b/fs/afs/volume.c
+@@ -153,8 +153,10 @@ struct afs_volume *afs_volume_lookup(struct afs_mount_params *params)
+ error_discard:
+ 	up_write(&params->cell->vl_sem);
+ 
+-	for (loop = volume->nservers - 1; loop >= 0; loop--)
++	for (loop = volume->nservers - 1; loop >= 0; loop--) {
++		afs_put_cb_interest(params->net, volume->cb_interests[loop]);
+ 		afs_put_server(params->net, volume->servers[loop]);
++	}
+ 
+ 	kfree(volume);
+ 	goto error;
+@@ -197,8 +199,10 @@ void afs_put_volume(struct afs_cell *cell, struct afs_volume *volume)
+ #endif
+ 	afs_put_vlocation(cell->net, vlocation);
+ 
+-	for (loop = volume->nservers - 1; loop >= 0; loop--)
++	for (loop = volume->nservers - 1; loop >= 0; loop--) {
++		afs_put_cb_interest(cell->net, volume->cb_interests[loop]);
+ 		afs_put_server(cell->net, volume->servers[loop]);
++	}
+ 
+ 	kfree(volume);
+ 
+@@ -218,10 +222,10 @@ struct afs_server *afs_volume_pick_fileserver(struct afs_vnode *vnode)
+ 	_enter("%s", volume->vlocation->vldb.name);
+ 
+ 	/* stick with the server we're already using if we can */
+-	if (vnode->server && vnode->server->fs_state == 0) {
+-		afs_get_server(vnode->server);
+-		_leave(" = %p [current]", vnode->server);
+-		return vnode->server;
++	if (vnode->cb_interest && vnode->cb_interest->server->fs_state == 0) {
++		afs_get_server(vnode->cb_interest->server);
++		_leave(" = %p [current]", vnode->cb_interest->server);
++		return vnode->cb_interest->server;
+ 	}
+ 
+ 	down_read(&volume->server_sem);
+@@ -244,13 +248,8 @@ struct afs_server *afs_volume_pick_fileserver(struct afs_vnode *vnode)
+ 		_debug("consider %d [%d]", loop, state);
+ 
+ 		switch (state) {
+-			/* found an apparently healthy server */
+ 		case 0:
+-			afs_get_server(server);
+-			up_read(&volume->server_sem);
+-			_leave(" = %p (picked %pIS)",
+-			       server, &server->addr.transport);
+-			return server;
++			goto picked_server;
+ 
+ 		case -ENETUNREACH:
+ 			if (ret == 0)
+@@ -284,9 +283,25 @@ struct afs_server *afs_volume_pick_fileserver(struct afs_vnode *vnode)
+ 	/* no available servers
+ 	 * - TODO: handle the no active servers case better
+ 	 */
++error:
+ 	up_read(&volume->server_sem);
+ 	_leave(" = %d", ret);
+ 	return ERR_PTR(ret);
++
++picked_server:
++	/* Found an apparently healthy server.  We need to register an interest
++	 * in receiving callbacks before we talk to it.
++	 */
++	ret = afs_register_server_cb_interest(vnode,
++					      &volume->cb_interests[loop], server);
++	if (ret < 0)
++		goto error;
++	
++	afs_get_server(server);
++	up_read(&volume->server_sem);
++	_leave(" = %p (picked %pIS)",
++	       server, &server->addr.transport);
++	return server;
+ }
+ 
+ /*
+@@ -309,14 +324,12 @@ int afs_volume_release_fileserver(struct afs_vnode *vnode,
+ 	switch (result) {
+ 		/* success */
+ 	case 0:
+-		server->fs_act_jif = jiffies;
+ 		server->fs_state = 0;
+ 		_leave("");
+ 		return 1;
+ 
+ 		/* the fileserver denied all knowledge of the volume */
+ 	case -ENOMEDIUM:
+-		server->fs_act_jif = jiffies;
+ 		down_write(&volume->server_sem);
+ 
+ 		/* firstly, find where the server is in the active list (if it
+@@ -365,7 +378,6 @@ int afs_volume_release_fileserver(struct afs_vnode *vnode,
+ 		 */
+ 		spin_lock(&server->fs_lock);
+ 		if (!server->fs_state) {
+-			server->fs_dead_jif = jiffies + HZ * 10;
+ 			server->fs_state = result;
+ 			printk("kAFS: SERVER DEAD state=%d\n", result);
+ 		}
+@@ -374,7 +386,6 @@ int afs_volume_release_fileserver(struct afs_vnode *vnode,
+ 
+ 		/* miscellaneous error */
+ 	default:
+-		server->fs_act_jif = jiffies;
+ 	case -ENOMEM:
+ 	case -ENONET:
+ 		/* tell the caller to accept the result */
+
+commit 4d9df9868f31df6725481135c10ac6419ce58d44
+Author: David Howells <dhowells@redhat.com>
+Date:   Thu Nov 2 15:27:47 2017 +0000
+
+    afs: Keep and pass sockaddr_rxrpc addresses rather than in_addr
+    
+    Keep and pass sockaddr_rxrpc addresses around rather than keeping and
+    passing in_addr addresses to allow for the use of IPv6 and non-standard
+    port numbers in future.
+    
+    This also allows the port and service_id fields to be removed from the
+    afs_call struct.
+    
+    Signed-off-by: David Howells <dhowells@redhat.com>
+
+diff --git a/fs/afs/volume.c b/fs/afs/volume.c
+index ccac5b1e079d..52f0dc40732b 100644
+--- a/fs/afs/volume.c
++++ b/fs/afs/volume.c
+@@ -248,8 +248,8 @@ struct afs_server *afs_volume_pick_fileserver(struct afs_vnode *vnode)
+ 		case 0:
+ 			afs_get_server(server);
+ 			up_read(&volume->server_sem);
+-			_leave(" = %p (picked %08x)",
+-			       server, ntohl(server->addr.s_addr));
++			_leave(" = %p (picked %pIS)",
++			       server, &server->addr.transport);
+ 			return server;
+ 
+ 		case -ENETUNREACH:
+@@ -303,9 +303,8 @@ int afs_volume_release_fileserver(struct afs_vnode *vnode,
+ 	struct afs_volume *volume = vnode->volume;
+ 	unsigned loop;
+ 
+-	_enter("%s,%08x,%d",
+-	       volume->vlocation->vldb.name, ntohl(server->addr.s_addr),
+-	       result);
++	_enter("%s,%pIS,%d",
++	       volume->vlocation->vldb.name, &server->addr.transport, result);
+ 
+ 	switch (result) {
+ 		/* success */
+
+commit ad6a942a9e74edea8a4a126a1e434feff6a6d5c2
+Author: David Howells <dhowells@redhat.com>
+Date:   Thu Nov 2 15:27:47 2017 +0000
+
+    afs: Update the cache index structure
+    
+    Update the cache index structure in the following ways:
+    
+     (1) Don't use the volume name followed by the volume type as levels in the
+         cache index.  Volumes can be renamed.  Use the volume ID instead.
+    
+     (2) Don't store the VLDB data for a volume in the tree.  If the volume
+         database should be cached locally, then it should be done in a separate
+         tree.
+    
+     (3) Expand the volume ID stored in the cache to 64 bits.
+    
+     (4) Expand the file/vnode ID stored in the cache to 96 bits.
+    
+     (5) Increment the cache structure version number to 1.
+    
+    Signed-off-by: David Howells <dhowells@redhat.com>
+
+diff --git a/fs/afs/volume.c b/fs/afs/volume.c
+index e2f0e8ec527d..ccac5b1e079d 100644
+--- a/fs/afs/volume.c
++++ b/fs/afs/volume.c
+@@ -125,7 +125,7 @@ struct afs_volume *afs_volume_lookup(struct afs_mount_params *params)
+ 
+ 	/* attach the cache and volume location */
+ #ifdef CONFIG_AFS_FSCACHE
+-	volume->cache = fscache_acquire_cookie(vlocation->cache,
++	volume->cache = fscache_acquire_cookie(volume->cell->cache,
+ 					       &afs_volume_cache_index_def,
+ 					       volume, true);
+ #endif
+
+commit 9ed900b1160ef306bc74ad0228d7ab199234c758
+Author: David Howells <dhowells@redhat.com>
+Date:   Thu Nov 2 15:27:46 2017 +0000
+
+    afs: Push the net ns pointer to more places
+    
+    Push the network namespace pointer to more places in AFS, including the
+    afs_server structure (which doesn't hold a ref on the netns).
+    
+    In particular, afs_put_cell() now takes requires a net ns parameter so that
+    it can safely alter the netns after decrementing the cell usage count - the
+    cell will be deallocated by a background thread after being cached for a
+    period, which means that it's not safe to access it after reducing its
+    usage count.
+    
+    Signed-off-by: David Howells <dhowells@redhat.com>
+
+diff --git a/fs/afs/volume.c b/fs/afs/volume.c
+index 3d5363e0b7e1..e2f0e8ec527d 100644
+--- a/fs/afs/volume.c
++++ b/fs/afs/volume.c
+@@ -154,7 +154,7 @@ struct afs_volume *afs_volume_lookup(struct afs_mount_params *params)
+ 	up_write(&params->cell->vl_sem);
+ 
+ 	for (loop = volume->nservers - 1; loop >= 0; loop--)
+-		afs_put_server(volume->servers[loop]);
++		afs_put_server(params->net, volume->servers[loop]);
+ 
+ 	kfree(volume);
+ 	goto error;
+@@ -163,7 +163,7 @@ struct afs_volume *afs_volume_lookup(struct afs_mount_params *params)
+ /*
+  * destroy a volume record
+  */
+-void afs_put_volume(struct afs_net *net, struct afs_volume *volume)
++void afs_put_volume(struct afs_cell *cell, struct afs_volume *volume)
+ {
+ 	struct afs_vlocation *vlocation;
+ 	int loop;
+@@ -179,7 +179,7 @@ void afs_put_volume(struct afs_net *net, struct afs_volume *volume)
+ 
+ 	/* to prevent a race, the decrement and the dequeue must be effectively
+ 	 * atomic */
+-	down_write(&vlocation->cell->vl_sem);
++	down_write(&cell->vl_sem);
+ 
+ 	if (likely(!atomic_dec_and_test(&volume->usage))) {
+ 		up_write(&vlocation->cell->vl_sem);
+@@ -189,16 +189,16 @@ void afs_put_volume(struct afs_net *net, struct afs_volume *volume)
+ 
+ 	vlocation->vols[volume->type] = NULL;
+ 
+-	up_write(&vlocation->cell->vl_sem);
++	up_write(&cell->vl_sem);
+ 
+ 	/* finish cleaning up the volume */
+ #ifdef CONFIG_AFS_FSCACHE
+ 	fscache_relinquish_cookie(volume->cache, 0);
+ #endif
+-	afs_put_vlocation(net, vlocation);
++	afs_put_vlocation(cell->net, vlocation);
+ 
+ 	for (loop = volume->nservers - 1; loop >= 0; loop--)
+-		afs_put_server(volume->servers[loop]);
++		afs_put_server(cell->net, volume->servers[loop]);
+ 
+ 	kfree(volume);
+ 
+@@ -336,7 +336,7 @@ int afs_volume_release_fileserver(struct afs_vnode *vnode,
+ 			sizeof(volume->servers[loop]) *
+ 			(volume->nservers - loop));
+ 		volume->servers[volume->nservers] = NULL;
+-		afs_put_server(server);
++		afs_put_server(afs_v2net(vnode), server);
+ 		volume->rjservers++;
+ 
+ 		if (volume->nservers > 0)
+@@ -350,7 +350,7 @@ int afs_volume_release_fileserver(struct afs_vnode *vnode,
+ 		 *         no longer registered
+ 		 */
+ 		up_write(&volume->server_sem);
+-		afs_put_server(server);
++		afs_put_server(afs_v2net(vnode), server);
+ 		_leave(" [completely rejected]");
+ 		return 1;
+ 
+@@ -379,7 +379,7 @@ int afs_volume_release_fileserver(struct afs_vnode *vnode,
+ 	case -ENOMEM:
+ 	case -ENONET:
+ 		/* tell the caller to accept the result */
+-		afs_put_server(server);
++		afs_put_server(afs_v2net(vnode), server);
+ 		_leave(" [local failure]");
+ 		return 1;
+ 	}
+@@ -388,7 +388,7 @@ int afs_volume_release_fileserver(struct afs_vnode *vnode,
+ try_next_server_upw:
+ 	up_write(&volume->server_sem);
+ try_next_server:
+-	afs_put_server(server);
++	afs_put_server(afs_v2net(vnode), server);
+ 	_leave(" [try next server]");
+ 	return 0;
+ }
+
+commit f044c8847bb61eff5e1e95b6f6bb950e7f4a73a4
+Author: David Howells <dhowells@redhat.com>
+Date:   Thu Nov 2 15:27:45 2017 +0000
+
+    afs: Lay the groundwork for supporting network namespaces
+    
+    Lay the groundwork for supporting network namespaces (netns) to the AFS
+    filesystem by moving various global features to a network-namespace struct
+    (afs_net) and providing an instance of this as a temporary global variable
+    that everything uses via accessor functions for the moment.
+    
+    The following changes have been made:
+    
+     (1) Store the netns in the superblock info.  This will be obtained from
+         the mounter's nsproxy on a manual mount and inherited from the parent
+         superblock on an automount.
+    
+     (2) The cell list is made per-netns.  It can be viewed through
+         /proc/net/afs/cells and also be modified by writing commands to that
+         file.
+    
+     (3) The local workstation cell is set per-ns in /proc/net/afs/rootcell.
+         This is unset by default.
+    
+     (4) The 'rootcell' module parameter, which sets a cell and VL server list
+         modifies the init net namespace, thereby allowing an AFS root fs to be
+         theoretically used.
+    
+     (5) The volume location lists and the file lock manager are made
+         per-netns.
+    
+     (6) The AF_RXRPC socket and associated I/O bits are made per-ns.
+    
+    The various workqueues remain global for the moment.
+    
+    Changes still to be made:
+    
+     (1) /proc/fs/afs/ should be moved to /proc/net/afs/ and a symlink emplaced
+         from the old name.
+    
+     (2) A per-netns subsys needs to be registered for AFS into which it can
+         store its per-netns data.
+    
+     (3) Rather than the AF_RXRPC socket being opened on module init, it needs
+         to be opened on the creation of a superblock in that netns.
+    
+     (4) The socket needs to be closed when the last superblock using it is
+         destroyed and all outstanding client calls on it have been completed.
+         This prevents a reference loop on the namespace.
+    
+     (5) It is possible that several namespaces will want to use AFS, in which
+         case each one will need its own UDP port.  These can either be set
+         through /proc/net/afs/cm_port or the kernel can pick one at random.
+         The init_ns gets 7001 by default.
+    
+    Other issues that need resolving:
+    
+     (1) The DNS keyring needs net-namespacing.
+    
+     (2) Where do upcalls go (eg. DNS request-key upcall)?
+    
+     (3) Need something like open_socket_in_file_ns() syscall so that AFS
+         command line tools attempting to operate on an AFS file/volume have
+         their RPC calls go to the right place.
+    
+    Signed-off-by: David Howells <dhowells@redhat.com>
+
+diff --git a/fs/afs/volume.c b/fs/afs/volume.c
+index db73d6dad02b..3d5363e0b7e1 100644
+--- a/fs/afs/volume.c
++++ b/fs/afs/volume.c
+@@ -54,7 +54,7 @@ struct afs_volume *afs_volume_lookup(struct afs_mount_params *params)
+ 	       params->volnamesz, params->volnamesz, params->volname, params->rwpath);
+ 
+ 	/* lookup the volume location record */
+-	vlocation = afs_vlocation_lookup(params->cell, params->key,
++	vlocation = afs_vlocation_lookup(params->net, params->cell, params->key,
+ 					 params->volname, params->volnamesz);
+ 	if (IS_ERR(vlocation)) {
+ 		ret = PTR_ERR(vlocation);
+@@ -138,7 +138,7 @@ struct afs_volume *afs_volume_lookup(struct afs_mount_params *params)
+ 	_debug("kAFS selected %s volume %08x",
+ 	       afs_voltypes[volume->type], volume->vid);
+ 	up_write(&params->cell->vl_sem);
+-	afs_put_vlocation(vlocation);
++	afs_put_vlocation(params->net, vlocation);
+ 	_leave(" = %p", volume);
+ 	return volume;
+ 
+@@ -146,7 +146,7 @@ struct afs_volume *afs_volume_lookup(struct afs_mount_params *params)
+ error_up:
+ 	up_write(&params->cell->vl_sem);
+ error:
+-	afs_put_vlocation(vlocation);
++	afs_put_vlocation(params->net, vlocation);
+ 	_leave(" = %d", ret);
+ 	return ERR_PTR(ret);
+ 
+@@ -163,7 +163,7 @@ struct afs_volume *afs_volume_lookup(struct afs_mount_params *params)
+ /*
+  * destroy a volume record
+  */
+-void afs_put_volume(struct afs_volume *volume)
++void afs_put_volume(struct afs_net *net, struct afs_volume *volume)
+ {
+ 	struct afs_vlocation *vlocation;
+ 	int loop;
+@@ -195,7 +195,7 @@ void afs_put_volume(struct afs_volume *volume)
+ #ifdef CONFIG_AFS_FSCACHE
+ 	fscache_relinquish_cookie(volume->cache, 0);
+ #endif
+-	afs_put_vlocation(vlocation);
++	afs_put_vlocation(net, vlocation);
+ 
+ 	for (loop = volume->nservers - 1; loop >= 0; loop--)
+ 		afs_put_server(volume->servers[loop]);
+
+commit edd3ba94c4e5ef6ec045d5730d365d557fb54f98
+Author: Jan Kara <jack@suse.cz>
+Date:   Wed Apr 12 12:24:36 2017 +0200
+
+    afs: Convert to separately allocated bdi
+    
+    Allocate struct backing_dev_info separately instead of embedding it
+    inside the superblock. This unifies handling of bdi among users.
+    
+    CC: David Howells <dhowells@redhat.com>
+    CC: linux-afs@lists.infradead.org
+    Reviewed-by: Christoph Hellwig <hch@lst.de>
+    Signed-off-by: Jan Kara <jack@suse.cz>
+    Signed-off-by: Jens Axboe <axboe@fb.com>
+
+diff --git a/fs/afs/volume.c b/fs/afs/volume.c
+index 546f9d01710b..db73d6dad02b 100644
+--- a/fs/afs/volume.c
++++ b/fs/afs/volume.c
+@@ -106,11 +106,6 @@ struct afs_volume *afs_volume_lookup(struct afs_mount_params *params)
+ 	volume->cell		= params->cell;
+ 	volume->vid		= vlocation->vldb.vid[params->type];
+ 
+-	volume->bdi.ra_pages	= VM_MAX_READAHEAD*1024/PAGE_SIZE; 
+-	ret = bdi_setup_and_register(&volume->bdi, "afs");
+-	if (ret)
+-		goto error_bdi;
+-
+ 	init_rwsem(&volume->server_sem);
+ 
+ 	/* look up all the applicable server records */
+@@ -156,8 +151,6 @@ struct afs_volume *afs_volume_lookup(struct afs_mount_params *params)
+ 	return ERR_PTR(ret);
+ 
+ error_discard:
+-	bdi_destroy(&volume->bdi);
+-error_bdi:
+ 	up_write(&params->cell->vl_sem);
+ 
+ 	for (loop = volume->nservers - 1; loop >= 0; loop--)
+@@ -207,7 +200,6 @@ void afs_put_volume(struct afs_volume *volume)
+ 	for (loop = volume->nservers - 1; loop >= 0; loop--)
+ 		afs_put_server(volume->servers[loop]);
+ 
+-	bdi_destroy(&volume->bdi);
+ 	kfree(volume);
+ 
+ 	_leave(" [destroyed]");
+
+commit 91b467e0a3f5fa861265eda94640b7d4c0290551
+Author: David Howells <dhowells@redhat.com>
+Date:   Thu Jan 5 10:38:35 2017 +0000
+
+    afs: Make afs_readpages() fetch data in bulk
+    
+    Make afs_readpages() use afs_vnode_fetch_data()'s new ability to take a
+    list of pages and do a bulk fetch.
+    
+    Signed-off-by: David Howells <dhowells@redhat.com>
+
+diff --git a/fs/afs/volume.c b/fs/afs/volume.c
+index d142a2449e65..546f9d01710b 100644
+--- a/fs/afs/volume.c
++++ b/fs/afs/volume.c
+@@ -106,6 +106,7 @@ struct afs_volume *afs_volume_lookup(struct afs_mount_params *params)
+ 	volume->cell		= params->cell;
+ 	volume->vid		= vlocation->vldb.vid[params->type];
+ 
++	volume->bdi.ra_pages	= VM_MAX_READAHEAD*1024/PAGE_SIZE; 
+ 	ret = bdi_setup_and_register(&volume->bdi, "afs");
+ 	if (ret)
+ 		goto error_bdi;
+
+commit b4caecd48005fbed3949dde6c1cb233142fd69e9
+Author: Christoph Hellwig <hch@lst.de>
+Date:   Wed Jan 14 10:42:32 2015 +0100
+
+    fs: introduce f_op->mmap_capabilities for nommu mmap support
+    
+    Since "BDI: Provide backing device capability information [try #3]" the
+    backing_dev_info structure also provides flags for the kind of mmap
+    operation available in a nommu environment, which is entirely unrelated
+    to it's original purpose.
+    
+    Introduce a new nommu-only file operation to provide this information to
+    the nommu mmap code instead.  Splitting this from the backing_dev_info
+    structure allows to remove lots of backing_dev_info instance that aren't
+    otherwise needed, and entirely gets rid of the concept of providing a
+    backing_dev_info for a character device.  It also removes the need for
+    the mtd_inodefs filesystem.
+    
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Reviewed-by: Tejun Heo <tj@kernel.org>
+    Acked-by: Brian Norris <computersforpeace@gmail.com>
+    Signed-off-by: Jens Axboe <axboe@fb.com>
+
+diff --git a/fs/afs/volume.c b/fs/afs/volume.c
+index 2b607257820c..d142a2449e65 100644
+--- a/fs/afs/volume.c
++++ b/fs/afs/volume.c
+@@ -106,7 +106,7 @@ struct afs_volume *afs_volume_lookup(struct afs_mount_params *params)
+ 	volume->cell		= params->cell;
+ 	volume->vid		= vlocation->vldb.vid[params->type];
+ 
+-	ret = bdi_setup_and_register(&volume->bdi, "afs", BDI_CAP_MAP_COPY);
++	ret = bdi_setup_and_register(&volume->bdi, "afs");
+ 	if (ret)
+ 		goto error_bdi;
+ 
+
+commit 94d30ae90a00cafe686c1057be57f4885f963abf
+Author: David Howells <dhowells@redhat.com>
+Date:   Sat Sep 21 00:09:31 2013 +0100
+
+    FS-Cache: Provide the ability to enable/disable cookies
+    
+    Provide the ability to enable and disable fscache cookies.  A disabled cookie
+    will reject or ignore further requests to:
+    
+            Acquire a child cookie
+            Invalidate and update backing objects
+            Check the consistency of a backing object
+            Allocate storage for backing page
+            Read backing pages
+            Write to backing pages
+    
+    but still allows:
+    
+            Checks/waits on the completion of already in-progress objects
+            Uncaching of pages
+            Relinquishment of cookies
+    
+    Two new operations are provided:
+    
+     (1) Disable a cookie:
+    
+            void fscache_disable_cookie(struct fscache_cookie *cookie,
+                                        bool invalidate);
+    
+         If the cookie is not already disabled, this locks the cookie against other
+         dis/enablement ops, marks the cookie as being disabled, discards or
+         invalidates any backing objects and waits for cessation of activity on any
+         associated object.
+    
+         This is a wrapper around a chunk split out of fscache_relinquish_cookie(),
+         but it reinitialises the cookie such that it can be reenabled.
+    
+         All possible failures are handled internally.  The caller should consider
+         calling fscache_uncache_all_inode_pages() afterwards to make sure all page
+         markings are cleared up.
+    
+     (2) Enable a cookie:
+    
+            void fscache_enable_cookie(struct fscache_cookie *cookie,
+                                       bool (*can_enable)(void *data),
+                                       void *data)
+    
+         If the cookie is not already enabled, this locks the cookie against other
+         dis/enablement ops, invokes can_enable() and, if the cookie is not an
+         index cookie, will begin the procedure of acquiring backing objects.
+    
+         The optional can_enable() function is passed the data argument and returns
+         a ruling as to whether or not enablement should actually be permitted to
+         begin.
+    
+         All possible failures are handled internally.  The cookie will only be
+         marked as enabled if provisional backing objects are allocated.
+    
+    A later patch will introduce these to NFS.  Cookie enablement during nfs_open()
+    is then contingent on i_writecount <= 0.  can_enable() checks for a race
+    between open(O_RDONLY) and open(O_WRONLY/O_RDWR).  This simplifies NFS's cookie
+    handling and allows us to get rid of open(O_RDONLY) accidentally introducing
+    caching to an inode that's open for writing already.
+    
+    One operation has its API modified:
+    
+     (3) Acquire a cookie.
+    
+            struct fscache_cookie *fscache_acquire_cookie(
+                    struct fscache_cookie *parent,
+                    const struct fscache_cookie_def *def,
+                    void *netfs_data,
+                    bool enable);
+    
+         This now has an additional argument that indicates whether the requested
+         cookie should be enabled by default.  It doesn't need the can_enable()
+         function because the caller must prevent multiple calls for the same netfs
+         object and it doesn't need to take the enablement lock because no one else
+         can get at the cookie before this returns.
+    
+    Signed-off-by: David Howells <dhowells@redhat.com
+
+diff --git a/fs/afs/volume.c b/fs/afs/volume.c
+index 401eeb21869f..2b607257820c 100644
+--- a/fs/afs/volume.c
++++ b/fs/afs/volume.c
+@@ -131,7 +131,7 @@ struct afs_volume *afs_volume_lookup(struct afs_mount_params *params)
+ #ifdef CONFIG_AFS_FSCACHE
+ 	volume->cache = fscache_acquire_cookie(vlocation->cache,
+ 					       &afs_volume_cache_index_def,
+-					       volume);
++					       volume, true);
+ #endif
+ 	afs_get_vlocation(vlocation);
+ 	volume->vlocation = vlocation;
+
+commit e1da0222753a2322d76c97fc02396fb83143c7ac
+Author: Jens Axboe <jens.axboe@oracle.com>
+Date:   Thu Apr 22 11:58:18 2010 +0200
+
+    afs: add bdi backing to mount session.
+    
+    This ensures that dirty data gets flushed properly.
+    
+    Signed-off-by: Jens Axboe <jens.axboe@oracle.com>
+
+diff --git a/fs/afs/volume.c b/fs/afs/volume.c
+index a353e69e2391..401eeb21869f 100644
+--- a/fs/afs/volume.c
++++ b/fs/afs/volume.c
+@@ -106,6 +106,10 @@ struct afs_volume *afs_volume_lookup(struct afs_mount_params *params)
+ 	volume->cell		= params->cell;
+ 	volume->vid		= vlocation->vldb.vid[params->type];
+ 
++	ret = bdi_setup_and_register(&volume->bdi, "afs", BDI_CAP_MAP_COPY);
++	if (ret)
++		goto error_bdi;
++
+ 	init_rwsem(&volume->server_sem);
+ 
+ 	/* look up all the applicable server records */
+@@ -151,6 +155,8 @@ struct afs_volume *afs_volume_lookup(struct afs_mount_params *params)
+ 	return ERR_PTR(ret);
+ 
+ error_discard:
++	bdi_destroy(&volume->bdi);
++error_bdi:
+ 	up_write(&params->cell->vl_sem);
+ 
+ 	for (loop = volume->nservers - 1; loop >= 0; loop--)
+@@ -200,6 +206,7 @@ void afs_put_volume(struct afs_volume *volume)
+ 	for (loop = volume->nservers - 1; loop >= 0; loop--)
+ 		afs_put_server(volume->servers[loop]);
+ 
++	bdi_destroy(&volume->bdi);
+ 	kfree(volume);
+ 
+ 	_leave(" [destroyed]");
+
+commit 9b3f26c9110dcea62716aca9b8c68ceb482227ef
+Author: David Howells <dhowells@redhat.com>
+Date:   Fri Apr 3 16:42:41 2009 +0100
+
+    FS-Cache: Make kAFS use FS-Cache
+    
+    The attached patch makes the kAFS filesystem in fs/afs/ use FS-Cache, and
+    through it any attached caches.  The kAFS filesystem will use caching
+    automatically if it's available.
+    
+    Signed-off-by: David Howells <dhowells@redhat.com>
+    Acked-by: Steve Dickson <steved@redhat.com>
+    Acked-by: Trond Myklebust <Trond.Myklebust@netapp.com>
+    Acked-by: Al Viro <viro@zeniv.linux.org.uk>
+    Tested-by: Daire Byrne <Daire.Byrne@framestore.com>
+
+diff --git a/fs/afs/volume.c b/fs/afs/volume.c
+index 8bab0e3437f9..a353e69e2391 100644
+--- a/fs/afs/volume.c
++++ b/fs/afs/volume.c
+@@ -124,13 +124,11 @@ struct afs_volume *afs_volume_lookup(struct afs_mount_params *params)
+ 	}
+ 
+ 	/* attach the cache and volume location */
+-#ifdef AFS_CACHING_SUPPORT
+-	cachefs_acquire_cookie(vlocation->cache,
+-			       &afs_vnode_cache_index_def,
+-			       volume,
+-			       &volume->cache);
++#ifdef CONFIG_AFS_FSCACHE
++	volume->cache = fscache_acquire_cookie(vlocation->cache,
++					       &afs_volume_cache_index_def,
++					       volume);
+ #endif
+-
+ 	afs_get_vlocation(vlocation);
+ 	volume->vlocation = vlocation;
+ 
+@@ -194,8 +192,8 @@ void afs_put_volume(struct afs_volume *volume)
+ 	up_write(&vlocation->cell->vl_sem);
+ 
+ 	/* finish cleaning up the volume */
+-#ifdef AFS_CACHING_SUPPORT
+-	cachefs_relinquish_cookie(volume->cache, 0);
++#ifdef CONFIG_AFS_FSCACHE
++	fscache_relinquish_cookie(volume->cache, 0);
+ #endif
+ 	afs_put_vlocation(vlocation);
+ 
+
+commit e8edc6e03a5c8562dc70a6d969f732bdb355a7e7
+Author: Alexey Dobriyan <adobriyan@gmail.com>
+Date:   Mon May 21 01:22:52 2007 +0400
+
+    Detach sched.h from mm.h
+    
+    First thing mm.h does is including sched.h solely for can_do_mlock() inline
+    function which has "current" dereference inside. By dealing with can_do_mlock()
+    mm.h can be detached from sched.h which is good. See below, why.
+    
+    This patch
+    a) removes unconditional inclusion of sched.h from mm.h
+    b) makes can_do_mlock() normal function in mm/mlock.c
+    c) exports can_do_mlock() to not break compilation
+    d) adds sched.h inclusions back to files that were getting it indirectly.
+    e) adds less bloated headers to some files (asm/signal.h, jiffies.h) that were
+       getting them indirectly
+    
+    Net result is:
+    a) mm.h users would get less code to open, read, preprocess, parse, ... if
+       they don't need sched.h
+    b) sched.h stops being dependency for significant number of files:
+       on x86_64 allmodconfig touching sched.h results in recompile of 4083 files,
+       after patch it's only 3744 (-8.3%).
+    
+    Cross-compile tested on
+    
+            all arm defconfigs, all mips defconfigs, all powerpc defconfigs,
+            alpha alpha-up
+            arm
+            i386 i386-up i386-defconfig i386-allnoconfig
+            ia64 ia64-up
+            m68k
+            mips
+            parisc parisc-up
+            powerpc powerpc-up
+            s390 s390-up
+            sparc sparc-up
+            sparc64 sparc64-up
+            um-x86_64
+            x86_64 x86_64-up x86_64-defconfig x86_64-allnoconfig
+    
+    as well as my two usual configs.
+    
+    Signed-off-by: Alexey Dobriyan <adobriyan@gmail.com>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/fs/afs/volume.c b/fs/afs/volume.c
+index dd160cada45d..8bab0e3437f9 100644
+--- a/fs/afs/volume.c
++++ b/fs/afs/volume.c
+@@ -15,6 +15,7 @@
+ #include <linux/slab.h>
+ #include <linux/fs.h>
+ #include <linux/pagemap.h>
++#include <linux/sched.h>
+ #include "internal.h"
+ 
+ static const char *afs_voltypes[] = { "R/W", "R/O", "BAK" };
+
+commit 260a980317dac80182dd76140cf67c6e81d6d3dd
+Author: David Howells <dhowells@redhat.com>
+Date:   Thu Apr 26 15:59:35 2007 -0700
+
+    [AFS]: Add "directory write" support.
+    
+    Add support for the create, link, symlink, unlink, mkdir, rmdir and
+    rename VFS operations to the in-kernel AFS filesystem.
+    
+    Also:
+    
+     (1) Fix dentry and inode revalidation.  d_revalidate should only look at
+         state of the dentry.  Revalidation of the contents of an inode pointed to
+         by a dentry is now separate.
+    
+     (2) Fix afs_lookup() to hash negative dentries as well as positive ones.
+    
+    Signed-off-by: David Howells <dhowells@redhat.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/fs/afs/volume.c b/fs/afs/volume.c
+index 15e13678c216..dd160cada45d 100644
+--- a/fs/afs/volume.c
++++ b/fs/afs/volume.c
+@@ -295,6 +295,7 @@ struct afs_server *afs_volume_pick_fileserver(struct afs_vnode *vnode)
+  * - releases the ref on the server struct that was acquired by picking
+  * - records result of using a particular server to access a volume
+  * - return 0 to try again, 1 if okay or to issue error
++ * - the caller must release the server struct if result was 0
+  */
+ int afs_volume_release_fileserver(struct afs_vnode *vnode,
+ 				  struct afs_server *server,
+@@ -312,7 +313,8 @@ int afs_volume_release_fileserver(struct afs_vnode *vnode,
+ 	case 0:
+ 		server->fs_act_jif = jiffies;
+ 		server->fs_state = 0;
+-		break;
++		_leave("");
++		return 1;
+ 
+ 		/* the fileserver denied all knowledge of the volume */
+ 	case -ENOMEDIUM:
+@@ -377,14 +379,12 @@ int afs_volume_release_fileserver(struct afs_vnode *vnode,
+ 		server->fs_act_jif = jiffies;
+ 	case -ENOMEM:
+ 	case -ENONET:
+-		break;
++		/* tell the caller to accept the result */
++		afs_put_server(server);
++		_leave(" [local failure]");
++		return 1;
+ 	}
+ 
+-	/* tell the caller to accept the result */
+-	afs_put_server(server);
+-	_leave("");
+-	return 1;
+-
+ 	/* tell the caller to loop around and try the next server */
+ try_next_server_upw:
+ 	up_write(&volume->server_sem);
+
+commit 00d3b7a4533e367b0dc2812a706db8f9f071c27f
+Author: David Howells <dhowells@redhat.com>
+Date:   Thu Apr 26 15:57:07 2007 -0700
+
+    [AFS]: Add security support.
+    
+    Add security support to the AFS filesystem.  Kerberos IV tickets are added as
+    RxRPC keys are added to the session keyring with the klog program.  open() and
+    other VFS operations then find this ticket with request_key() and either use
+    it immediately (eg: mkdir, unlink) or attach it to a file descriptor (open).
+    
+    Signed-off-by: David Howells <dhowells@redhat.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/fs/afs/volume.c b/fs/afs/volume.c
+index 45491cfd4f4f..15e13678c216 100644
+--- a/fs/afs/volume.c
++++ b/fs/afs/volume.c
+@@ -41,83 +41,20 @@ static const char *afs_voltypes[] = { "R/W", "R/O", "BAK" };
+  * - Rule 3: If parent volume is R/W, then only mount R/W volume unless
+  *           explicitly told otherwise
+  */
+-struct afs_volume *afs_volume_lookup(const char *name, struct afs_cell *cell,
+-				     int rwpath)
++struct afs_volume *afs_volume_lookup(struct afs_mount_params *params)
+ {
+ 	struct afs_vlocation *vlocation = NULL;
+ 	struct afs_volume *volume = NULL;
+ 	struct afs_server *server = NULL;
+-	afs_voltype_t type;
+-	const char *cellname, *volname, *suffix;
+ 	char srvtmask;
+-	int force, ret, loop, cellnamesz, volnamesz;
++	int ret, loop;
+ 
+-	_enter("%s,,%d,", name, rwpath);
+-
+-	if (!name || (name[0] != '%' && name[0] != '#') || !name[1]) {
+-		printk("kAFS: unparsable volume name\n");
+-		return ERR_PTR(-EINVAL);
+-	}
+-
+-	/* determine the type of volume we're looking for */
+-	force = 0;
+-	type = AFSVL_ROVOL;
+-
+-	if (rwpath || name[0] == '%') {
+-		type = AFSVL_RWVOL;
+-		force = 1;
+-	}
+-
+-	suffix = strrchr(name, '.');
+-	if (suffix) {
+-		if (strcmp(suffix, ".readonly") == 0) {
+-			type = AFSVL_ROVOL;
+-			force = 1;
+-		} else if (strcmp(suffix, ".backup") == 0) {
+-			type = AFSVL_BACKVOL;
+-			force = 1;
+-		} else if (suffix[1] == 0) {
+-		} else {
+-			suffix = NULL;
+-		}
+-	}
+-
+-	/* split the cell and volume names */
+-	name++;
+-	volname = strchr(name, ':');
+-	if (volname) {
+-		cellname = name;
+-		cellnamesz = volname - name;
+-		volname++;
+-	} else {
+-		volname = name;
+-		cellname = NULL;
+-		cellnamesz = 0;
+-	}
+-
+-	volnamesz = suffix ? suffix - volname : strlen(volname);
+-
+-	_debug("CELL:%*.*s [%p] VOLUME:%*.*s SUFFIX:%s TYPE:%d%s",
+-	       cellnamesz, cellnamesz, cellname ?: "", cell,
+-	       volnamesz, volnamesz, volname, suffix ?: "-",
+-	       type,
+-	       force ? " FORCE" : "");
+-
+-	/* lookup the cell record */
+-	if (cellname || !cell) {
+-		cell = afs_cell_lookup(cellname, cellnamesz);
+-		if (IS_ERR(cell)) {
+-			ret = PTR_ERR(cell);
+-			printk("kAFS: unable to lookup cell '%s'\n",
+-			       cellname ?: "");
+-			goto error;
+-		}
+-	} else {
+-		afs_get_cell(cell);
+-	}
++	_enter("{%*.*s,%d}",
++	       params->volnamesz, params->volnamesz, params->volname, params->rwpath);
+ 
+ 	/* lookup the volume location record */
+-	vlocation = afs_vlocation_lookup(cell, volname, volnamesz);
++	vlocation = afs_vlocation_lookup(params->cell, params->key,
++					 params->volname, params->volnamesz);
+ 	if (IS_ERR(vlocation)) {
+ 		ret = PTR_ERR(vlocation);
+ 		vlocation = NULL;
+@@ -126,30 +63,30 @@ struct afs_volume *afs_volume_lookup(const char *name, struct afs_cell *cell,
+ 
+ 	/* make the final decision on the type we want */
+ 	ret = -ENOMEDIUM;
+-	if (force && !(vlocation->vldb.vidmask & (1 << type)))
++	if (params->force && !(vlocation->vldb.vidmask & (1 << params->type)))
+ 		goto error;
+ 
+ 	srvtmask = 0;
+ 	for (loop = 0; loop < vlocation->vldb.nservers; loop++)
+ 		srvtmask |= vlocation->vldb.srvtmask[loop];
+ 
+-	if (force) {
+-		if (!(srvtmask & (1 << type)))
++	if (params->force) {
++		if (!(srvtmask & (1 << params->type)))
+ 			goto error;
+ 	} else if (srvtmask & AFS_VOL_VTM_RO) {
+-		type = AFSVL_ROVOL;
++		params->type = AFSVL_ROVOL;
+ 	} else if (srvtmask & AFS_VOL_VTM_RW) {
+-		type = AFSVL_RWVOL;
++		params->type = AFSVL_RWVOL;
+ 	} else {
+ 		goto error;
+ 	}
+ 
+-	down_write(&cell->vl_sem);
++	down_write(&params->cell->vl_sem);
+ 
+ 	/* is the volume already active? */
+-	if (vlocation->vols[type]) {
++	if (vlocation->vols[params->type]) {
+ 		/* yes - re-use it */
+-		volume = vlocation->vols[type];
++		volume = vlocation->vols[params->type];
+ 		afs_get_volume(volume);
+ 		goto success;
+ 	}
+@@ -163,10 +100,10 @@ struct afs_volume *afs_volume_lookup(const char *name, struct afs_cell *cell,
+ 		goto error_up;
+ 
+ 	atomic_set(&volume->usage, 1);
+-	volume->type		= type;
+-	volume->type_force	= force;
+-	volume->cell		= cell;
+-	volume->vid		= vlocation->vldb.vid[type];
++	volume->type		= params->type;
++	volume->type_force	= params->force;
++	volume->cell		= params->cell;
++	volume->vid		= vlocation->vldb.vid[params->type];
+ 
+ 	init_rwsem(&volume->server_sem);
+ 
+@@ -196,28 +133,26 @@ struct afs_volume *afs_volume_lookup(const char *name, struct afs_cell *cell,
+ 	afs_get_vlocation(vlocation);
+ 	volume->vlocation = vlocation;
+ 
+-	vlocation->vols[type] = volume;
++	vlocation->vols[volume->type] = volume;
+ 
+ success:
+ 	_debug("kAFS selected %s volume %08x",
+ 	       afs_voltypes[volume->type], volume->vid);
+-	up_write(&cell->vl_sem);
++	up_write(&params->cell->vl_sem);
+ 	afs_put_vlocation(vlocation);
+-	afs_put_cell(cell);
+ 	_leave(" = %p", volume);
+ 	return volume;
+ 
+ 	/* clean up */
+ error_up:
+-	up_write(&cell->vl_sem);
++	up_write(&params->cell->vl_sem);
+ error:
+ 	afs_put_vlocation(vlocation);
+-	afs_put_cell(cell);
+ 	_leave(" = %d", ret);
+ 	return ERR_PTR(ret);
+ 
+ error_discard:
+-	up_write(&cell->vl_sem);
++	up_write(&params->cell->vl_sem);
+ 
+ 	for (loop = volume->nservers - 1; loop >= 0; loop--)
+ 		afs_put_server(volume->servers[loop]);
+
+commit 08e0e7c82eeadec6f4871a386b86bf0f0fbcb4eb
+Author: David Howells <dhowells@redhat.com>
+Date:   Thu Apr 26 15:55:03 2007 -0700
+
+    [AF_RXRPC]: Make the in-kernel AFS filesystem use AF_RXRPC.
+    
+    Make the in-kernel AFS filesystem use AF_RXRPC instead of the old RxRPC code.
+    
+    Signed-off-by: David Howells <dhowells@redhat.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/fs/afs/volume.c b/fs/afs/volume.c
+index c82e1bb4f2dd..45491cfd4f4f 100644
+--- a/fs/afs/volume.c
++++ b/fs/afs/volume.c
+@@ -1,6 +1,6 @@
+ /* AFS volume management
+  *
+- * Copyright (C) 2002 Red Hat, Inc. All Rights Reserved.
++ * Copyright (C) 2002, 2007 Red Hat, Inc. All Rights Reserved.
+  * Written by David Howells (dhowells@redhat.com)
+  *
+  * This program is free software; you can redistribute it and/or
+@@ -15,33 +15,9 @@
+ #include <linux/slab.h>
+ #include <linux/fs.h>
+ #include <linux/pagemap.h>
+-#include "volume.h"
+-#include "vnode.h"
+-#include "cell.h"
+-#include "cache.h"
+-#include "cmservice.h"
+-#include "fsclient.h"
+-#include "vlclient.h"
+ #include "internal.h"
+ 
+-#ifdef __KDEBUG
+ static const char *afs_voltypes[] = { "R/W", "R/O", "BAK" };
+-#endif
+-
+-#ifdef AFS_CACHING_SUPPORT
+-static cachefs_match_val_t afs_volume_cache_match(void *target,
+-						  const void *entry);
+-static void afs_volume_cache_update(void *source, void *entry);
+-
+-struct cachefs_index_def afs_volume_cache_index_def = {
+-	.name		= "volume",
+-	.data_size	= sizeof(struct afs_cache_vhash),
+-	.keys[0]	= { CACHEFS_INDEX_KEYS_BIN, 1 },
+-	.keys[1]	= { CACHEFS_INDEX_KEYS_BIN, 1 },
+-	.match		= afs_volume_cache_match,
+-	.update		= afs_volume_cache_update,
+-};
+-#endif
+ 
+ /*
+  * lookup a volume by name
+@@ -65,11 +41,12 @@ struct cachefs_index_def afs_volume_cache_index_def = {
+  * - Rule 3: If parent volume is R/W, then only mount R/W volume unless
+  *           explicitly told otherwise
+  */
+-int afs_volume_lookup(const char *name, struct afs_cell *cell, int rwpath,
+-		      struct afs_volume **_volume)
++struct afs_volume *afs_volume_lookup(const char *name, struct afs_cell *cell,
++				     int rwpath)
+ {
+ 	struct afs_vlocation *vlocation = NULL;
+ 	struct afs_volume *volume = NULL;
++	struct afs_server *server = NULL;
+ 	afs_voltype_t type;
+ 	const char *cellname, *volname, *suffix;
+ 	char srvtmask;
+@@ -79,7 +56,7 @@ int afs_volume_lookup(const char *name, struct afs_cell *cell, int rwpath,
+ 
+ 	if (!name || (name[0] != '%' && name[0] != '#') || !name[1]) {
+ 		printk("kAFS: unparsable volume name\n");
+-		return -EINVAL;
++		return ERR_PTR(-EINVAL);
+ 	}
+ 
+ 	/* determine the type of volume we're looking for */
+@@ -128,8 +105,9 @@ int afs_volume_lookup(const char *name, struct afs_cell *cell, int rwpath,
+ 
+ 	/* lookup the cell record */
+ 	if (cellname || !cell) {
+-		ret = afs_cell_lookup(cellname, cellnamesz, &cell);
+-		if (ret<0) {
++		cell = afs_cell_lookup(cellname, cellnamesz);
++		if (IS_ERR(cell)) {
++			ret = PTR_ERR(cell);
+ 			printk("kAFS: unable to lookup cell '%s'\n",
+ 			       cellname ?: "");
+ 			goto error;
+@@ -139,9 +117,12 @@ int afs_volume_lookup(const char *name, struct afs_cell *cell, int rwpath,
+ 	}
+ 
+ 	/* lookup the volume location record */
+-	ret = afs_vlocation_lookup(cell, volname, volnamesz, &vlocation);
+-	if (ret < 0)
++	vlocation = afs_vlocation_lookup(cell, volname, volnamesz);
++	if (IS_ERR(vlocation)) {
++		ret = PTR_ERR(vlocation);
++		vlocation = NULL;
+ 		goto error;
++	}
+ 
+ 	/* make the final decision on the type we want */
+ 	ret = -ENOMEDIUM;
+@@ -192,13 +173,14 @@ int afs_volume_lookup(const char *name, struct afs_cell *cell, int rwpath,
+ 	/* look up all the applicable server records */
+ 	for (loop = 0; loop < 8; loop++) {
+ 		if (vlocation->vldb.srvtmask[loop] & (1 << volume->type)) {
+-			ret = afs_server_lookup(
+-				volume->cell,
+-				&vlocation->vldb.servers[loop],
+-				&volume->servers[volume->nservers]);
+-			if (ret < 0)
++			server = afs_lookup_server(
++			       volume->cell, &vlocation->vldb.servers[loop]);
++			if (IS_ERR(server)) {
++				ret = PTR_ERR(server);
+ 				goto error_discard;
++			}
+ 
++			volume->servers[volume->nservers] = server;
+ 			volume->nservers++;
+ 		}
+ 	}
+@@ -219,8 +201,11 @@ int afs_volume_lookup(const char *name, struct afs_cell *cell, int rwpath,
+ success:
+ 	_debug("kAFS selected %s volume %08x",
+ 	       afs_voltypes[volume->type], volume->vid);
+-	*_volume = volume;
+-	ret = 0;
++	up_write(&cell->vl_sem);
++	afs_put_vlocation(vlocation);
++	afs_put_cell(cell);
++	_leave(" = %p", volume);
++	return volume;
+ 
+ 	/* clean up */
+ error_up:
+@@ -228,9 +213,8 @@ int afs_volume_lookup(const char *name, struct afs_cell *cell, int rwpath,
+ error:
+ 	afs_put_vlocation(vlocation);
+ 	afs_put_cell(cell);
+-
+-	_leave(" = %d (%p)", ret, volume);
+-	return ret;
++	_leave(" = %d", ret);
++	return ERR_PTR(ret);
+ 
+ error_discard:
+ 	up_write(&cell->vl_sem);
+@@ -255,10 +239,9 @@ void afs_put_volume(struct afs_volume *volume)
+ 
+ 	_enter("%p", volume);
+ 
+-	vlocation = volume->vlocation;
++	ASSERTCMP(atomic_read(&volume->usage), >, 0);
+ 
+-	/* sanity check */
+-	BUG_ON(atomic_read(&volume->usage) <= 0);
++	vlocation = volume->vlocation;
+ 
+ 	/* to prevent a race, the decrement and the dequeue must be effectively
+ 	 * atomic */
+@@ -292,14 +275,21 @@ void afs_put_volume(struct afs_volume *volume)
+  * pick a server to use to try accessing this volume
+  * - returns with an elevated usage count on the server chosen
+  */
+-int afs_volume_pick_fileserver(struct afs_volume *volume,
+-			       struct afs_server **_server)
++struct afs_server *afs_volume_pick_fileserver(struct afs_vnode *vnode)
+ {
++	struct afs_volume *volume = vnode->volume;
+ 	struct afs_server *server;
+ 	int ret, state, loop;
+ 
+ 	_enter("%s", volume->vlocation->vldb.name);
+ 
++	/* stick with the server we're already using if we can */
++	if (vnode->server && vnode->server->fs_state == 0) {
++		afs_get_server(vnode->server);
++		_leave(" = %p [current]", vnode->server);
++		return vnode->server;
++	}
++
+ 	down_read(&volume->server_sem);
+ 
+ 	/* handle the no-server case */
+@@ -307,7 +297,7 @@ int afs_volume_pick_fileserver(struct afs_volume *volume,
+ 		ret = volume->rjservers ? -ENOMEDIUM : -ESTALE;
+ 		up_read(&volume->server_sem);
+ 		_leave(" = %d [no servers]", ret);
+-		return ret;
++		return ERR_PTR(ret);
+ 	}
+ 
+ 	/* basically, just search the list for the first live server and use
+@@ -317,15 +307,16 @@ int afs_volume_pick_fileserver(struct afs_volume *volume,
+ 		server = volume->servers[loop];
+ 		state = server->fs_state;
+ 
++		_debug("consider %d [%d]", loop, state);
++
+ 		switch (state) {
+ 			/* found an apparently healthy server */
+ 		case 0:
+ 			afs_get_server(server);
+ 			up_read(&volume->server_sem);
+-			*_server = server;
+-			_leave(" = 0 (picked %08x)",
+-			       ntohl(server->addr.s_addr));
+-			return 0;
++			_leave(" = %p (picked %08x)",
++			       server, ntohl(server->addr.s_addr));
++			return server;
+ 
+ 		case -ENETUNREACH:
+ 			if (ret == 0)
+@@ -361,7 +352,7 @@ int afs_volume_pick_fileserver(struct afs_volume *volume,
+ 	 */
+ 	up_read(&volume->server_sem);
+ 	_leave(" = %d", ret);
+-	return ret;
++	return ERR_PTR(ret);
+ }
+ 
+ /*
+@@ -370,10 +361,11 @@ int afs_volume_pick_fileserver(struct afs_volume *volume,
+  * - records result of using a particular server to access a volume
+  * - return 0 to try again, 1 if okay or to issue error
+  */
+-int afs_volume_release_fileserver(struct afs_volume *volume,
++int afs_volume_release_fileserver(struct afs_vnode *vnode,
+ 				  struct afs_server *server,
+ 				  int result)
+ {
++	struct afs_volume *volume = vnode->volume;
+ 	unsigned loop;
+ 
+ 	_enter("%s,%08x,%d",
+@@ -384,6 +376,7 @@ int afs_volume_release_fileserver(struct afs_volume *volume,
+ 		/* success */
+ 	case 0:
+ 		server->fs_act_jif = jiffies;
++		server->fs_state = 0;
+ 		break;
+ 
+ 		/* the fileserver denied all knowledge of the volume */
+@@ -391,7 +384,7 @@ int afs_volume_release_fileserver(struct afs_volume *volume,
+ 		server->fs_act_jif = jiffies;
+ 		down_write(&volume->server_sem);
+ 
+-		/* first, find where the server is in the active list (if it
++		/* firstly, find where the server is in the active list (if it
+ 		 * is) */
+ 		for (loop = 0; loop < volume->nservers; loop++)
+ 			if (volume->servers[loop] == server)
+@@ -429,6 +422,7 @@ int afs_volume_release_fileserver(struct afs_volume *volume,
+ 	case -ENETUNREACH:
+ 	case -EHOSTUNREACH:
+ 	case -ECONNREFUSED:
++	case -ETIME:
+ 	case -ETIMEDOUT:
+ 	case -EREMOTEIO:
+ 		/* mark the server as dead
+@@ -464,40 +458,3 @@ int afs_volume_release_fileserver(struct afs_volume *volume,
+ 	_leave(" [try next server]");
+ 	return 0;
+ }
+-
+-/*
+- * match a volume hash record stored in the cache
+- */
+-#ifdef AFS_CACHING_SUPPORT
+-static cachefs_match_val_t afs_volume_cache_match(void *target,
+-						  const void *entry)
+-{
+-	const struct afs_cache_vhash *vhash = entry;
+-	struct afs_volume *volume = target;
+-
+-	_enter("{%u},{%u}", volume->type, vhash->vtype);
+-
+-	if (volume->type == vhash->vtype) {
+-		_leave(" = SUCCESS");
+-		return CACHEFS_MATCH_SUCCESS;
+-	}
+-
+-	_leave(" = FAILED");
+-	return CACHEFS_MATCH_FAILED;
+-}
+-#endif
+-
+-/*
+- * update a volume hash record stored in the cache
+- */
+-#ifdef AFS_CACHING_SUPPORT
+-static void afs_volume_cache_update(void *source, void *entry)
+-{
+-	struct afs_cache_vhash *vhash = entry;
+-	struct afs_volume *volume = source;
+-
+-	_enter("");
+-
+-	vhash->vtype = volume->type;
+-}
+-#endif
+
+commit ec26815ad847dbf74a1e27aa5515fb7d5dc6ee6f
+Author: David Howells <dhowells@redhat.com>
+Date:   Thu Apr 26 15:49:28 2007 -0700
+
+    [AFS]: Clean up the AFS sources
+    
+    Clean up the AFS sources.
+    
+    Also remove references to AFS keys.  RxRPC keys are used instead.
+    
+    Signed-off-by: David Howells <dhowells@redhat.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/fs/afs/volume.c b/fs/afs/volume.c
+index 768c6dbd323a..c82e1bb4f2dd 100644
+--- a/fs/afs/volume.c
++++ b/fs/afs/volume.c
+@@ -1,4 +1,4 @@
+-/* volume.c: AFS volume management
++/* AFS volume management
+  *
+  * Copyright (C) 2002 Red Hat, Inc. All Rights Reserved.
+  * Written by David Howells (dhowells@redhat.com)
+@@ -43,7 +43,6 @@ struct cachefs_index_def afs_volume_cache_index_def = {
+ };
+ #endif
+ 
+-/*****************************************************************************/
+ /*
+  * lookup a volume by name
+  * - this can be one of the following:
+@@ -97,14 +96,11 @@ int afs_volume_lookup(const char *name, struct afs_cell *cell, int rwpath,
+ 		if (strcmp(suffix, ".readonly") == 0) {
+ 			type = AFSVL_ROVOL;
+ 			force = 1;
+-		}
+-		else if (strcmp(suffix, ".backup") == 0) {
++		} else if (strcmp(suffix, ".backup") == 0) {
+ 			type = AFSVL_BACKVOL;
+ 			force = 1;
+-		}
+-		else if (suffix[1] == 0) {
+-		}
+-		else {
++		} else if (suffix[1] == 0) {
++		} else {
+ 			suffix = NULL;
+ 		}
+ 	}
+@@ -116,8 +112,7 @@ int afs_volume_lookup(const char *name, struct afs_cell *cell, int rwpath,
+ 		cellname = name;
+ 		cellnamesz = volname - name;
+ 		volname++;
+-	}
+-	else {
++	} else {
+ 		volname = name;
+ 		cellname = NULL;
+ 		cellnamesz = 0;
+@@ -139,8 +134,7 @@ int afs_volume_lookup(const char *name, struct afs_cell *cell, int rwpath,
+ 			       cellname ?: "");
+ 			goto error;
+ 		}
+-	}
+-	else {
++	} else {
+ 		afs_get_cell(cell);
+ 	}
+ 
+@@ -161,14 +155,11 @@ int afs_volume_lookup(const char *name, struct afs_cell *cell, int rwpath,
+ 	if (force) {
+ 		if (!(srvtmask & (1 << type)))
+ 			goto error;
+-	}
+-	else if (srvtmask & AFS_VOL_VTM_RO) {
++	} else if (srvtmask & AFS_VOL_VTM_RO) {
+ 		type = AFSVL_ROVOL;
+-	}
+-	else if (srvtmask & AFS_VOL_VTM_RW) {
++	} else if (srvtmask & AFS_VOL_VTM_RW) {
+ 		type = AFSVL_RWVOL;
+-	}
+-	else {
++	} else {
+ 		goto error;
+ 	}
+ 
+@@ -225,23 +216,23 @@ int afs_volume_lookup(const char *name, struct afs_cell *cell, int rwpath,
+ 
+ 	vlocation->vols[type] = volume;
+ 
+- success:
++success:
+ 	_debug("kAFS selected %s volume %08x",
+ 	       afs_voltypes[volume->type], volume->vid);
+ 	*_volume = volume;
+ 	ret = 0;
+ 
+ 	/* clean up */
+- error_up:
++error_up:
+ 	up_write(&cell->vl_sem);
+- error:
++error:
+ 	afs_put_vlocation(vlocation);
+ 	afs_put_cell(cell);
+ 
+ 	_leave(" = %d (%p)", ret, volume);
+ 	return ret;
+ 
+- error_discard:
++error_discard:
+ 	up_write(&cell->vl_sem);
+ 
+ 	for (loop = volume->nservers - 1; loop >= 0; loop--)
+@@ -249,9 +240,8 @@ int afs_volume_lookup(const char *name, struct afs_cell *cell, int rwpath,
+ 
+ 	kfree(volume);
+ 	goto error;
+-} /* end afs_volume_lookup() */
++}
+ 
+-/*****************************************************************************/
+ /*
+  * destroy a volume record
+  */
+@@ -296,9 +286,8 @@ void afs_put_volume(struct afs_volume *volume)
+ 	kfree(volume);
+ 
+ 	_leave(" [destroyed]");
+-} /* end afs_put_volume() */
++}
+ 
+-/*****************************************************************************/
+ /*
+  * pick a server to use to try accessing this volume
+  * - returns with an elevated usage count on the server chosen
+@@ -373,9 +362,8 @@ int afs_volume_pick_fileserver(struct afs_volume *volume,
+ 	up_read(&volume->server_sem);
+ 	_leave(" = %d", ret);
+ 	return ret;
+-} /* end afs_volume_pick_fileserver() */
++}
+ 
+-/*****************************************************************************/
+ /*
+  * release a server after use
+  * - releases the ref on the server struct that was acquired by picking
+@@ -469,16 +457,14 @@ int afs_volume_release_fileserver(struct afs_volume *volume,
+ 	return 1;
+ 
+ 	/* tell the caller to loop around and try the next server */
+- try_next_server_upw:
++try_next_server_upw:
+ 	up_write(&volume->server_sem);
+- try_next_server:
++try_next_server:
+ 	afs_put_server(server);
+ 	_leave(" [try next server]");
+ 	return 0;
++}
+ 
+-} /* end afs_volume_release_fileserver() */
+-
+-/*****************************************************************************/
+ /*
+  * match a volume hash record stored in the cache
+  */
+@@ -498,10 +484,9 @@ static cachefs_match_val_t afs_volume_cache_match(void *target,
+ 
+ 	_leave(" = FAILED");
+ 	return CACHEFS_MATCH_FAILED;
+-} /* end afs_volume_cache_match() */
++}
+ #endif
+ 
+-/*****************************************************************************/
+ /*
+  * update a volume hash record stored in the cache
+  */
+@@ -514,6 +499,5 @@ static void afs_volume_cache_update(void *source, void *entry)
+ 	_enter("");
+ 
+ 	vhash->vtype = volume->type;
+-
+-} /* end afs_volume_cache_update() */
++}
+ #endif
+
+commit f8314dc60ccba7e41f425048c4160dc7f63377d5
+Author: Panagiotis Issaris <takis@issaris.org>
+Date:   Wed Sep 27 01:49:37 2006 -0700
+
+    [PATCH] fs: Conversions from kmalloc+memset to k(z|c)alloc
+    
+    Conversions from kmalloc+memset to kzalloc.
+    
+    Signed-off-by: Panagiotis Issaris <takis@issaris.org>
+    Jffs2-bit-acked-by: David Woodhouse <dwmw2@infradead.org>
+    Signed-off-by: Andrew Morton <akpm@osdl.org>
+    Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+
+diff --git a/fs/afs/volume.c b/fs/afs/volume.c
+index 0ff4b86476e3..768c6dbd323a 100644
+--- a/fs/afs/volume.c
++++ b/fs/afs/volume.c
+@@ -186,11 +186,10 @@ int afs_volume_lookup(const char *name, struct afs_cell *cell, int rwpath,
+ 	_debug("creating new volume record");
+ 
+ 	ret = -ENOMEM;
+-	volume = kmalloc(sizeof(struct afs_volume), GFP_KERNEL);
++	volume = kzalloc(sizeof(struct afs_volume), GFP_KERNEL);
+ 	if (!volume)
+ 		goto error_up;
+ 
+-	memset(volume, 0, sizeof(struct afs_volume));
+ 	atomic_set(&volume->usage, 1);
+ 	volume->type		= type;
+ 	volume->type_force	= force;
+
+commit 1da177e4c3f41524e886b7f1b8a0c1fc7321cac2
+Author: Linus Torvalds <torvalds@ppc970.osdl.org>
+Date:   Sat Apr 16 15:20:36 2005 -0700
+
+    Linux-2.6.12-rc2
+    
+    Initial git repository build. I'm not bothering with the full history,
+    even though we have it. We can create a separate "historical" git
+    archive of that later if we want to, and in the meantime it's about
+    3.2GB when imported into git - space that would just make the early
+    git days unnecessarily complicated, when we don't have a lot of good
+    infrastructure for it.
+    
+    Let it rip!
+
+diff --git a/fs/afs/volume.c b/fs/afs/volume.c
+new file mode 100644
+index 000000000000..0ff4b86476e3
+--- /dev/null
++++ b/fs/afs/volume.c
+@@ -0,0 +1,520 @@
++/* volume.c: AFS volume management
++ *
++ * Copyright (C) 2002 Red Hat, Inc. All Rights Reserved.
++ * Written by David Howells (dhowells@redhat.com)
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version
++ * 2 of the License, or (at your option) any later version.
++ */
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/init.h>
++#include <linux/slab.h>
++#include <linux/fs.h>
++#include <linux/pagemap.h>
++#include "volume.h"
++#include "vnode.h"
++#include "cell.h"
++#include "cache.h"
++#include "cmservice.h"
++#include "fsclient.h"
++#include "vlclient.h"
++#include "internal.h"
++
++#ifdef __KDEBUG
++static const char *afs_voltypes[] = { "R/W", "R/O", "BAK" };
++#endif
++
++#ifdef AFS_CACHING_SUPPORT
++static cachefs_match_val_t afs_volume_cache_match(void *target,
++						  const void *entry);
++static void afs_volume_cache_update(void *source, void *entry);
++
++struct cachefs_index_def afs_volume_cache_index_def = {
++	.name		= "volume",
++	.data_size	= sizeof(struct afs_cache_vhash),
++	.keys[0]	= { CACHEFS_INDEX_KEYS_BIN, 1 },
++	.keys[1]	= { CACHEFS_INDEX_KEYS_BIN, 1 },
++	.match		= afs_volume_cache_match,
++	.update		= afs_volume_cache_update,
++};
++#endif
++
++/*****************************************************************************/
++/*
++ * lookup a volume by name
++ * - this can be one of the following:
++ *	"%[cell:]volume[.]"		R/W volume
++ *	"#[cell:]volume[.]"		R/O or R/W volume (rwparent=0),
++ *					 or R/W (rwparent=1) volume
++ *	"%[cell:]volume.readonly"	R/O volume
++ *	"#[cell:]volume.readonly"	R/O volume
++ *	"%[cell:]volume.backup"		Backup volume
++ *	"#[cell:]volume.backup"		Backup volume
++ *
++ * The cell name is optional, and defaults to the current cell.
++ *
++ * See "The Rules of Mount Point Traversal" in Chapter 5 of the AFS SysAdmin
++ * Guide
++ * - Rule 1: Explicit type suffix forces access of that type or nothing
++ *           (no suffix, then use Rule 2 & 3)
++ * - Rule 2: If parent volume is R/O, then mount R/O volume by preference, R/W
++ *           if not available
++ * - Rule 3: If parent volume is R/W, then only mount R/W volume unless
++ *           explicitly told otherwise
++ */
++int afs_volume_lookup(const char *name, struct afs_cell *cell, int rwpath,
++		      struct afs_volume **_volume)
++{
++	struct afs_vlocation *vlocation = NULL;
++	struct afs_volume *volume = NULL;
++	afs_voltype_t type;
++	const char *cellname, *volname, *suffix;
++	char srvtmask;
++	int force, ret, loop, cellnamesz, volnamesz;
++
++	_enter("%s,,%d,", name, rwpath);
++
++	if (!name || (name[0] != '%' && name[0] != '#') || !name[1]) {
++		printk("kAFS: unparsable volume name\n");
++		return -EINVAL;
++	}
++
++	/* determine the type of volume we're looking for */
++	force = 0;
++	type = AFSVL_ROVOL;
++
++	if (rwpath || name[0] == '%') {
++		type = AFSVL_RWVOL;
++		force = 1;
++	}
++
++	suffix = strrchr(name, '.');
++	if (suffix) {
++		if (strcmp(suffix, ".readonly") == 0) {
++			type = AFSVL_ROVOL;
++			force = 1;
++		}
++		else if (strcmp(suffix, ".backup") == 0) {
++			type = AFSVL_BACKVOL;
++			force = 1;
++		}
++		else if (suffix[1] == 0) {
++		}
++		else {
++			suffix = NULL;
++		}
++	}
++
++	/* split the cell and volume names */
++	name++;
++	volname = strchr(name, ':');
++	if (volname) {
++		cellname = name;
++		cellnamesz = volname - name;
++		volname++;
++	}
++	else {
++		volname = name;
++		cellname = NULL;
++		cellnamesz = 0;
++	}
++
++	volnamesz = suffix ? suffix - volname : strlen(volname);
++
++	_debug("CELL:%*.*s [%p] VOLUME:%*.*s SUFFIX:%s TYPE:%d%s",
++	       cellnamesz, cellnamesz, cellname ?: "", cell,
++	       volnamesz, volnamesz, volname, suffix ?: "-",
++	       type,
++	       force ? " FORCE" : "");
++
++	/* lookup the cell record */
++	if (cellname || !cell) {
++		ret = afs_cell_lookup(cellname, cellnamesz, &cell);
++		if (ret<0) {
++			printk("kAFS: unable to lookup cell '%s'\n",
++			       cellname ?: "");
++			goto error;
++		}
++	}
++	else {
++		afs_get_cell(cell);
++	}
++
++	/* lookup the volume location record */
++	ret = afs_vlocation_lookup(cell, volname, volnamesz, &vlocation);
++	if (ret < 0)
++		goto error;
++
++	/* make the final decision on the type we want */
++	ret = -ENOMEDIUM;
++	if (force && !(vlocation->vldb.vidmask & (1 << type)))
++		goto error;
++
++	srvtmask = 0;
++	for (loop = 0; loop < vlocation->vldb.nservers; loop++)
++		srvtmask |= vlocation->vldb.srvtmask[loop];
++
++	if (force) {
++		if (!(srvtmask & (1 << type)))
++			goto error;
++	}
++	else if (srvtmask & AFS_VOL_VTM_RO) {
++		type = AFSVL_ROVOL;
++	}
++	else if (srvtmask & AFS_VOL_VTM_RW) {
++		type = AFSVL_RWVOL;
++	}
++	else {
++		goto error;
++	}
++
++	down_write(&cell->vl_sem);
++
++	/* is the volume already active? */
++	if (vlocation->vols[type]) {
++		/* yes - re-use it */
++		volume = vlocation->vols[type];
++		afs_get_volume(volume);
++		goto success;
++	}
++
++	/* create a new volume record */
++	_debug("creating new volume record");
++
++	ret = -ENOMEM;
++	volume = kmalloc(sizeof(struct afs_volume), GFP_KERNEL);
++	if (!volume)
++		goto error_up;
++
++	memset(volume, 0, sizeof(struct afs_volume));
++	atomic_set(&volume->usage, 1);
++	volume->type		= type;
++	volume->type_force	= force;
++	volume->cell		= cell;
++	volume->vid		= vlocation->vldb.vid[type];
++
++	init_rwsem(&volume->server_sem);
++
++	/* look up all the applicable server records */
++	for (loop = 0; loop < 8; loop++) {
++		if (vlocation->vldb.srvtmask[loop] & (1 << volume->type)) {
++			ret = afs_server_lookup(
++				volume->cell,
++				&vlocation->vldb.servers[loop],
++				&volume->servers[volume->nservers]);
++			if (ret < 0)
++				goto error_discard;
++
++			volume->nservers++;
++		}
++	}
++
++	/* attach the cache and volume location */
++#ifdef AFS_CACHING_SUPPORT
++	cachefs_acquire_cookie(vlocation->cache,
++			       &afs_vnode_cache_index_def,
++			       volume,
++			       &volume->cache);
++#endif
++
++	afs_get_vlocation(vlocation);
++	volume->vlocation = vlocation;
++
++	vlocation->vols[type] = volume;
++
++ success:
++	_debug("kAFS selected %s volume %08x",
++	       afs_voltypes[volume->type], volume->vid);
++	*_volume = volume;
++	ret = 0;
++
++	/* clean up */
++ error_up:
++	up_write(&cell->vl_sem);
++ error:
++	afs_put_vlocation(vlocation);
++	afs_put_cell(cell);
++
++	_leave(" = %d (%p)", ret, volume);
++	return ret;
++
++ error_discard:
++	up_write(&cell->vl_sem);
++
++	for (loop = volume->nservers - 1; loop >= 0; loop--)
++		afs_put_server(volume->servers[loop]);
++
++	kfree(volume);
++	goto error;
++} /* end afs_volume_lookup() */
++
++/*****************************************************************************/
++/*
++ * destroy a volume record
++ */
++void afs_put_volume(struct afs_volume *volume)
++{
++	struct afs_vlocation *vlocation;
++	int loop;
++
++	if (!volume)
++		return;
++
++	_enter("%p", volume);
++
++	vlocation = volume->vlocation;
++
++	/* sanity check */
++	BUG_ON(atomic_read(&volume->usage) <= 0);
++
++	/* to prevent a race, the decrement and the dequeue must be effectively
++	 * atomic */
++	down_write(&vlocation->cell->vl_sem);
++
++	if (likely(!atomic_dec_and_test(&volume->usage))) {
++		up_write(&vlocation->cell->vl_sem);
++		_leave("");
++		return;
++	}
++
++	vlocation->vols[volume->type] = NULL;
++
++	up_write(&vlocation->cell->vl_sem);
++
++	/* finish cleaning up the volume */
++#ifdef AFS_CACHING_SUPPORT
++	cachefs_relinquish_cookie(volume->cache, 0);
++#endif
++	afs_put_vlocation(vlocation);
++
++	for (loop = volume->nservers - 1; loop >= 0; loop--)
++		afs_put_server(volume->servers[loop]);
++
++	kfree(volume);
++
++	_leave(" [destroyed]");
++} /* end afs_put_volume() */
++
++/*****************************************************************************/
++/*
++ * pick a server to use to try accessing this volume
++ * - returns with an elevated usage count on the server chosen
++ */
++int afs_volume_pick_fileserver(struct afs_volume *volume,
++			       struct afs_server **_server)
++{
++	struct afs_server *server;
++	int ret, state, loop;
++
++	_enter("%s", volume->vlocation->vldb.name);
++
++	down_read(&volume->server_sem);
++
++	/* handle the no-server case */
++	if (volume->nservers == 0) {
++		ret = volume->rjservers ? -ENOMEDIUM : -ESTALE;
++		up_read(&volume->server_sem);
++		_leave(" = %d [no servers]", ret);
++		return ret;
++	}
++
++	/* basically, just search the list for the first live server and use
++	 * that */
++	ret = 0;
++	for (loop = 0; loop < volume->nservers; loop++) {
++		server = volume->servers[loop];
++		state = server->fs_state;
++
++		switch (state) {
++			/* found an apparently healthy server */
++		case 0:
++			afs_get_server(server);
++			up_read(&volume->server_sem);
++			*_server = server;
++			_leave(" = 0 (picked %08x)",
++			       ntohl(server->addr.s_addr));
++			return 0;
++
++		case -ENETUNREACH:
++			if (ret == 0)
++				ret = state;
++			break;
++
++		case -EHOSTUNREACH:
++			if (ret == 0 ||
++			    ret == -ENETUNREACH)
++				ret = state;
++			break;
++
++		case -ECONNREFUSED:
++			if (ret == 0 ||
++			    ret == -ENETUNREACH ||
++			    ret == -EHOSTUNREACH)
++				ret = state;
++			break;
++
++		default:
++		case -EREMOTEIO:
++			if (ret == 0 ||
++			    ret == -ENETUNREACH ||
++			    ret == -EHOSTUNREACH ||
++			    ret == -ECONNREFUSED)
++				ret = state;
++			break;
++		}
++	}
++
++	/* no available servers
++	 * - TODO: handle the no active servers case better
++	 */
++	up_read(&volume->server_sem);
++	_leave(" = %d", ret);
++	return ret;
++} /* end afs_volume_pick_fileserver() */
++
++/*****************************************************************************/
++/*
++ * release a server after use
++ * - releases the ref on the server struct that was acquired by picking
++ * - records result of using a particular server to access a volume
++ * - return 0 to try again, 1 if okay or to issue error
++ */
++int afs_volume_release_fileserver(struct afs_volume *volume,
++				  struct afs_server *server,
++				  int result)
++{
++	unsigned loop;
++
++	_enter("%s,%08x,%d",
++	       volume->vlocation->vldb.name, ntohl(server->addr.s_addr),
++	       result);
++
++	switch (result) {
++		/* success */
++	case 0:
++		server->fs_act_jif = jiffies;
++		break;
++
++		/* the fileserver denied all knowledge of the volume */
++	case -ENOMEDIUM:
++		server->fs_act_jif = jiffies;
++		down_write(&volume->server_sem);
++
++		/* first, find where the server is in the active list (if it
++		 * is) */
++		for (loop = 0; loop < volume->nservers; loop++)
++			if (volume->servers[loop] == server)
++				goto present;
++
++		/* no longer there - may have been discarded by another op */
++		goto try_next_server_upw;
++
++	present:
++		volume->nservers--;
++		memmove(&volume->servers[loop],
++			&volume->servers[loop + 1],
++			sizeof(volume->servers[loop]) *
++			(volume->nservers - loop));
++		volume->servers[volume->nservers] = NULL;
++		afs_put_server(server);
++		volume->rjservers++;
++
++		if (volume->nservers > 0)
++			/* another server might acknowledge its existence */
++			goto try_next_server_upw;
++
++		/* handle the case where all the fileservers have rejected the
++		 * volume
++		 * - TODO: try asking the fileservers for volume information
++		 * - TODO: contact the VL server again to see if the volume is
++		 *         no longer registered
++		 */
++		up_write(&volume->server_sem);
++		afs_put_server(server);
++		_leave(" [completely rejected]");
++		return 1;
++
++		/* problem reaching the server */
++	case -ENETUNREACH:
++	case -EHOSTUNREACH:
++	case -ECONNREFUSED:
++	case -ETIMEDOUT:
++	case -EREMOTEIO:
++		/* mark the server as dead
++		 * TODO: vary dead timeout depending on error
++		 */
++		spin_lock(&server->fs_lock);
++		if (!server->fs_state) {
++			server->fs_dead_jif = jiffies + HZ * 10;
++			server->fs_state = result;
++			printk("kAFS: SERVER DEAD state=%d\n", result);
++		}
++		spin_unlock(&server->fs_lock);
++		goto try_next_server;
++
++		/* miscellaneous error */
++	default:
++		server->fs_act_jif = jiffies;
++	case -ENOMEM:
++	case -ENONET:
++		break;
++	}
++
++	/* tell the caller to accept the result */
++	afs_put_server(server);
++	_leave("");
++	return 1;
++
++	/* tell the caller to loop around and try the next server */
++ try_next_server_upw:
++	up_write(&volume->server_sem);
++ try_next_server:
++	afs_put_server(server);
++	_leave(" [try next server]");
++	return 0;
++
++} /* end afs_volume_release_fileserver() */
++
++/*****************************************************************************/
++/*
++ * match a volume hash record stored in the cache
++ */
++#ifdef AFS_CACHING_SUPPORT
++static cachefs_match_val_t afs_volume_cache_match(void *target,
++						  const void *entry)
++{
++	const struct afs_cache_vhash *vhash = entry;
++	struct afs_volume *volume = target;
++
++	_enter("{%u},{%u}", volume->type, vhash->vtype);
++
++	if (volume->type == vhash->vtype) {
++		_leave(" = SUCCESS");
++		return CACHEFS_MATCH_SUCCESS;
++	}
++
++	_leave(" = FAILED");
++	return CACHEFS_MATCH_FAILED;
++} /* end afs_volume_cache_match() */
++#endif
++
++/*****************************************************************************/
++/*
++ * update a volume hash record stored in the cache
++ */
++#ifdef AFS_CACHING_SUPPORT
++static void afs_volume_cache_update(void *source, void *entry)
++{
++	struct afs_cache_vhash *vhash = entry;
++	struct afs_volume *volume = source;
++
++	_enter("");
++
++	vhash->vtype = volume->type;
++
++} /* end afs_volume_cache_update() */
++#endif

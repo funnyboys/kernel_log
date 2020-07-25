@@ -1,0 +1,3892 @@
+commit 601ef0d52e9617588fcff3df26953592f2eb44ac
+Author: Bob Peterson <rpeterso@redhat.com>
+Date:   Tue Jan 28 20:23:45 2020 +0100
+
+    gfs2: Force withdraw to replay journals and wait for it to finish
+    
+    When a node withdraws from a file system, it often leaves its journal
+    in an incomplete state. This is especially true when the withdraw is
+    caused by io errors writing to the journal. Before this patch, a
+    withdraw would try to write a "shutdown" record to the journal, tell
+    dlm it's done with the file system, and none of the other nodes
+    know about the problem. Later, when the problem is fixed and the
+    withdrawn node is rebooted, it would then discover that its own
+    journal was incomplete, and replay it. However, replaying it at this
+    point is almost guaranteed to introduce corruption because the other
+    nodes are likely to have used affected resource groups that appeared
+    in the journal since the time of the withdraw. Replaying the journal
+    later will overwrite any changes made, and not through any fault of
+    dlm, which was instructed during the withdraw to release those
+    resources.
+    
+    This patch makes file system withdraws seen by the entire cluster.
+    Withdrawing nodes dequeue their journal glock to allow recovery.
+    
+    The remaining nodes check all the journals to see if they are
+    clean or in need of replay. They try to replay dirty journals, but
+    only the journals of withdrawn nodes will be "not busy" and
+    therefore available for replay.
+    
+    Until the journal replay is complete, no i/o related glocks may be
+    given out, to ensure that the replay does not cause the
+    aforementioned corruption: We cannot allow any journal replay to
+    overwrite blocks associated with a glock once it is held.
+    
+    The "live" glock which is now used to signal when a withdraw
+    occurs. When a withdraw occurs, the node signals its withdraw by
+    dequeueing the "live" glock and trying to enqueue it in EX mode,
+    thus forcing the other nodes to all see a demote request, by way
+    of a "1CB" (one callback) try lock. The "live" glock is not
+    granted in EX; the callback is only just used to indicate a
+    withdraw has occurred.
+    
+    Note that all nodes in the cluster must wait for the recovering
+    node to finish replaying the withdrawing node's journal before
+    continuing. To this end, it checks that the journals are clean
+    multiple times in a retry loop.
+    
+    Also note that the withdraw function may be called from a wide
+    variety of situations, and therefore, we need to take extra
+    precautions to make sure pointers are valid before using them in
+    many circumstances.
+    
+    We also need to take care when glocks decide to withdraw, since
+    the withdraw code now uses glocks.
+    
+    Also, before this patch, if a process encountered an error and
+    decided to withdraw, if another process was already withdrawing,
+    the second withdraw would be silently ignored, which set it free
+    to unlock its glocks. That's correct behavior if the original
+    withdrawer encounters further errors down the road. But if
+    secondary waiters don't wait for the journal replay, unlocking
+    glocks will allow other nodes to use them, despite the fact that
+    the journal containing those blocks is being replayed. The
+    replay needs to finish before our glocks are released to other
+    nodes. IOW, secondary withdraws need to wait for the first
+    withdraw to finish.
+    
+    For example, if an rgrp glock is unlocked by a process that didn't
+    wait for the first withdraw, a journal replay could introduce file
+    system corruption by replaying a rgrp block that has already been
+    granted to a different cluster node.
+    
+    Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+
+diff --git a/fs/gfs2/lock_dlm.c b/fs/gfs2/lock_dlm.c
+index 57fdf53d2246..9f2b5609f225 100644
+--- a/fs/gfs2/lock_dlm.c
++++ b/fs/gfs2/lock_dlm.c
+@@ -16,6 +16,8 @@
+ 
+ #include "incore.h"
+ #include "glock.h"
++#include "glops.h"
++#include "recovery.h"
+ #include "util.h"
+ #include "sys.h"
+ #include "trace_gfs2.h"
+@@ -124,6 +126,8 @@ static void gdlm_ast(void *arg)
+ 
+ 	switch (gl->gl_lksb.sb_status) {
+ 	case -DLM_EUNLOCK: /* Unlocked, so glock can be freed */
++		if (gl->gl_ops->go_free)
++			gl->gl_ops->go_free(gl);
+ 		gfs2_glock_free(gl);
+ 		return;
+ 	case -DLM_ECANCEL: /* Cancel while getting lock */
+@@ -323,6 +327,7 @@ static void gdlm_cancel(struct gfs2_glock *gl)
+ /*
+  * dlm/gfs2 recovery coordination using dlm_recover callbacks
+  *
++ *  0. gfs2 checks for another cluster node withdraw, needing journal replay
+  *  1. dlm_controld sees lockspace members change
+  *  2. dlm_controld blocks dlm-kernel locking activity
+  *  3. dlm_controld within dlm-kernel notifies gfs2 (recover_prep)
+@@ -571,6 +576,28 @@ static int control_lock(struct gfs2_sbd *sdp, int mode, uint32_t flags)
+ 			 &ls->ls_control_lksb, "control_lock");
+ }
+ 
++/**
++ * remote_withdraw - react to a node withdrawing from the file system
++ * @sdp: The superblock
++ */
++static void remote_withdraw(struct gfs2_sbd *sdp)
++{
++	struct gfs2_jdesc *jd;
++	int ret = 0, count = 0;
++
++	list_for_each_entry(jd, &sdp->sd_jindex_list, jd_list) {
++		if (jd->jd_jid == sdp->sd_lockstruct.ls_jid)
++			continue;
++		ret = gfs2_recover_journal(jd, true);
++		if (ret)
++			break;
++		count++;
++	}
++
++	/* Now drop the additional reference we acquired */
++	fs_err(sdp, "Journals checked: %d, ret = %d.\n", count, ret);
++}
++
+ static void gfs2_control_func(struct work_struct *work)
+ {
+ 	struct gfs2_sbd *sdp = container_of(work, struct gfs2_sbd, sd_control_work.work);
+@@ -581,6 +608,13 @@ static void gfs2_control_func(struct work_struct *work)
+ 	int recover_size;
+ 	int i, error;
+ 
++	/* First check for other nodes that may have done a withdraw. */
++	if (test_bit(SDF_REMOTE_WITHDRAW, &sdp->sd_flags)) {
++		remote_withdraw(sdp);
++		clear_bit(SDF_REMOTE_WITHDRAW, &sdp->sd_flags);
++		return;
++	}
++
+ 	spin_lock(&ls->ls_recover_spin);
+ 	/*
+ 	 * No MOUNT_DONE means we're still mounting; control_mount()
+
+commit 03678a99d13831b938fdc9d81b5a7608fc6ef416
+Author: Bob Peterson <rpeterso@redhat.com>
+Date:   Tue Feb 12 13:58:40 2019 -0700
+
+    gfs2: Ignore dlm recovery requests if gfs2 is withdrawn
+    
+    When a node fails, user space informs dlm of the node failure,
+    and dlm instructs gfs2 on the surviving nodes to perform journal
+    recovery. It does this by calling various callback functions in
+    lock_dlm.c. To mark its progress, it keeps generation numbers
+    and recover bits in a dlm "control" lock lvb, which is seen by
+    all nodes to determine which journals need to be replayed.
+    
+    The gfs2 on all nodes get the same recovery requests from dlm,
+    so they all try to do the recovery, but only one will be
+    granted the exclusive lock on the journal. The others fail
+    with a "Busy" message on their "try lock."
+    
+    However, when a node is withdrawn, it cannot safely do any
+    recovery or replay any journals. To make matters worse,
+    gfs2 might withdraw as a result of attempting recovery. For
+    example, this might happen if the device goes offline, or if
+    an hba fails. But in today's gfs2 code, it doesn't check for
+    being withdrawn at any step in the recovery process. What's
+    worse is that these callbacks from dlm have no return code,
+    so there is no way to indicate failure back to dlm. We can
+    send a "Recovery failed" uevent eventually, but that tells
+    user space what happened, not dlm's kernel code.
+    
+    Before this patch, lock_dlm would perform its recovery steps but
+    ignore the result, and eventually it would still update its
+    generation number in the lvb, despite the fact that it may have
+    withdrawn or encountered an error. The other nodes would then
+    see the newer generation number in the lvb and conclude that
+    they don't need to do recovery because the generation number
+    is newer than the last one they saw. They think a different
+    node has already recovered the journal.
+    
+    This patch adds checks to several of the callbacks used by dlm
+    in its recovery state machine so that the functions are ignored
+    and skipped if an io error has occurred or if the file system
+    is withdrawn. That prevents the lvb bits from being updated, and
+    therefore dlm and user space still see the need for recovery to
+    take place.
+    
+    Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+    Reviewed-by: Andreas Gruenbacher <agruenba@redhat.com>
+
+diff --git a/fs/gfs2/lock_dlm.c b/fs/gfs2/lock_dlm.c
+index 7c7197343ee2..57fdf53d2246 100644
+--- a/fs/gfs2/lock_dlm.c
++++ b/fs/gfs2/lock_dlm.c
+@@ -1079,6 +1079,10 @@ static void gdlm_recover_prep(void *arg)
+ 	struct gfs2_sbd *sdp = arg;
+ 	struct lm_lockstruct *ls = &sdp->sd_lockstruct;
+ 
++	if (gfs2_withdrawn(sdp)) {
++		fs_err(sdp, "recover_prep ignored due to withdraw.\n");
++		return;
++	}
+ 	spin_lock(&ls->ls_recover_spin);
+ 	ls->ls_recover_block = ls->ls_recover_start;
+ 	set_bit(DFL_DLM_RECOVERY, &ls->ls_recover_flags);
+@@ -1101,6 +1105,11 @@ static void gdlm_recover_slot(void *arg, struct dlm_slot *slot)
+ 	struct lm_lockstruct *ls = &sdp->sd_lockstruct;
+ 	int jid = slot->slot - 1;
+ 
++	if (gfs2_withdrawn(sdp)) {
++		fs_err(sdp, "recover_slot jid %d ignored due to withdraw.\n",
++		       jid);
++		return;
++	}
+ 	spin_lock(&ls->ls_recover_spin);
+ 	if (ls->ls_recover_size < jid + 1) {
+ 		fs_err(sdp, "recover_slot jid %d gen %u short size %d\n",
+@@ -1125,6 +1134,10 @@ static void gdlm_recover_done(void *arg, struct dlm_slot *slots, int num_slots,
+ 	struct gfs2_sbd *sdp = arg;
+ 	struct lm_lockstruct *ls = &sdp->sd_lockstruct;
+ 
++	if (gfs2_withdrawn(sdp)) {
++		fs_err(sdp, "recover_done ignored due to withdraw.\n");
++		return;
++	}
+ 	/* ensure the ls jid arrays are large enough */
+ 	set_recover_size(sdp, slots, num_slots);
+ 
+@@ -1152,6 +1165,11 @@ static void gdlm_recovery_result(struct gfs2_sbd *sdp, unsigned int jid,
+ {
+ 	struct lm_lockstruct *ls = &sdp->sd_lockstruct;
+ 
++	if (gfs2_withdrawn(sdp)) {
++		fs_err(sdp, "recovery_result jid %d ignored due to withdraw.\n",
++		       jid);
++		return;
++	}
+ 	if (test_bit(DFL_NO_DLM_OPS, &ls->ls_recover_flags))
+ 		return;
+ 
+
+commit 8f0daef5f797c13d7f9bd248190933932b14df36
+Author: Andreas Gruenbacher <agruenba@redhat.com>
+Date:   Thu Aug 22 18:07:09 2019 +0200
+
+    gfs2: Fix recovery slot bumping
+    
+    Get rid of the assumption that the number of slots can at most increase by
+    RECOVER_SIZE_INC (16) in set_recover_size.
+    
+    Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+
+diff --git a/fs/gfs2/lock_dlm.c b/fs/gfs2/lock_dlm.c
+index 4361804646d8..7c7197343ee2 100644
+--- a/fs/gfs2/lock_dlm.c
++++ b/fs/gfs2/lock_dlm.c
+@@ -1035,12 +1035,12 @@ static int set_recover_size(struct gfs2_sbd *sdp, struct dlm_slot *slots,
+ 	}
+ 
+ 	old_size = ls->ls_recover_size;
+-
+-	if (old_size >= max_jid + 1)
++	new_size = old_size;
++	while (new_size < max_jid + 1)
++		new_size += RECOVER_SIZE_INC;
++	if (new_size == old_size)
+ 		return 0;
+ 
+-	new_size = old_size + RECOVER_SIZE_INC;
+-
+ 	submit = kcalloc(new_size, sizeof(uint32_t), GFP_NOFS);
+ 	result = kcalloc(new_size, sizeof(uint32_t), GFP_NOFS);
+ 	if (!submit || !result) {
+
+commit 7336d0e654f7acc0ecee33a8ae68c4fd1c1c44b5
+Author: Thomas Gleixner <tglx@linutronix.de>
+Date:   Fri May 31 01:09:56 2019 -0700
+
+    treewide: Replace GPLv2 boilerplate/reference with SPDX - rule 398
+    
+    Based on 1 normalized pattern(s):
+    
+      this copyrighted material is made available to anyone wishing to use
+      modify copy or redistribute it subject to the terms and conditions
+      of the gnu general public license version 2
+    
+    extracted by the scancode license scanner the SPDX license identifier
+    
+      GPL-2.0-only
+    
+    has been chosen to replace the boilerplate/reference in 44 file(s).
+    
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Reviewed-by: Allison Randal <allison@lohutok.net>
+    Reviewed-by: Kate Stewart <kstewart@linuxfoundation.org>
+    Cc: linux-spdx@vger.kernel.org
+    Link: https://lkml.kernel.org/r/20190531081038.653000175@linutronix.de
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/fs/gfs2/lock_dlm.c b/fs/gfs2/lock_dlm.c
+index 69bd1597bacf..4361804646d8 100644
+--- a/fs/gfs2/lock_dlm.c
++++ b/fs/gfs2/lock_dlm.c
+@@ -1,10 +1,7 @@
++// SPDX-License-Identifier: GPL-2.0-only
+ /*
+  * Copyright (C) Sistina Software, Inc.  1997-2003 All rights reserved.
+  * Copyright 2004-2011 Red Hat, Inc.
+- *
+- * This copyrighted material is made available to anyone wishing to use,
+- * modify, copy, or redistribute it subject to the terms and conditions
+- * of the GNU General Public License version 2.
+  */
+ 
+ #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+
+commit 5a5ec83d6ac974b12085cd99b196795f14079037
+Author: Andreas Gruenbacher <agruenba@redhat.com>
+Date:   Fri May 17 19:18:43 2019 +0100
+
+    gfs2: Fix sign extension bug in gfs2_update_stats
+    
+    Commit 4d207133e9c3 changed the types of the statistic values in struct
+    gfs2_lkstats from s64 to u64.  Because of that, what should be a signed
+    value in gfs2_update_stats turned into an unsigned value.  When shifted
+    right, we end up with a large positive value instead of a small negative
+    value, which results in an incorrect variance estimate.
+    
+    Fixes: 4d207133e9c3 ("gfs2: Make statistics unsigned, suitable for use with do_div()")
+    Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+    Cc: stable@vger.kernel.org # v4.4+
+
+diff --git a/fs/gfs2/lock_dlm.c b/fs/gfs2/lock_dlm.c
+index 31df26ed7854..69bd1597bacf 100644
+--- a/fs/gfs2/lock_dlm.c
++++ b/fs/gfs2/lock_dlm.c
+@@ -31,9 +31,10 @@
+  * @delta is the difference between the current rtt sample and the
+  * running average srtt. We add 1/8 of that to the srtt in order to
+  * update the current srtt estimate. The variance estimate is a bit
+- * more complicated. We subtract the abs value of the @delta from
+- * the current variance estimate and add 1/4 of that to the running
+- * total.
++ * more complicated. We subtract the current variance estimate from
++ * the abs value of the @delta and add 1/4 of that to the running
++ * total.  That's equivalent to 3/4 of the current variance
++ * estimate plus 1/4 of the abs of @delta.
+  *
+  * Note that the index points at the array entry containing the smoothed
+  * mean value, and the variance is always in the following entry
+@@ -49,7 +50,7 @@ static inline void gfs2_update_stats(struct gfs2_lkstats *s, unsigned index,
+ 	s64 delta = sample - s->stats[index];
+ 	s->stats[index] += (delta >> 3);
+ 	index++;
+-	s->stats[index] += ((abs(delta) - s->stats[index]) >> 2);
++	s->stats[index] += (s64)(abs(delta) - s->stats[index]) >> 2;
+ }
+ 
+ /**
+
+commit e54c78a27fcdef406af799f360a93e6754adeefe
+Author: Bob Peterson <rpeterso@redhat.com>
+Date:   Wed Oct 3 08:47:36 2018 -0500
+
+    gfs2: Use fs_* functions instead of pr_* function where we can
+    
+    Before this patch, various errors and messages were reported using
+    the pr_* functions: pr_err, pr_warn, pr_info, etc., but that does
+    not tell you which gfs2 mount had the problem, which is often vital
+    to debugging. This patch changes the calls from pr_* to fs_* in
+    most of the messages so that the file system id is printed along
+    with the message.
+    
+    Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+
+diff --git a/fs/gfs2/lock_dlm.c b/fs/gfs2/lock_dlm.c
+index ac7caa267ed6..31df26ed7854 100644
+--- a/fs/gfs2/lock_dlm.c
++++ b/fs/gfs2/lock_dlm.c
+@@ -177,14 +177,14 @@ static void gdlm_bast(void *arg, int mode)
+ 		gfs2_glock_cb(gl, LM_ST_SHARED);
+ 		break;
+ 	default:
+-		pr_err("unknown bast mode %d\n", mode);
++		fs_err(gl->gl_name.ln_sbd, "unknown bast mode %d\n", mode);
+ 		BUG();
+ 	}
+ }
+ 
+ /* convert gfs lock-state to dlm lock-mode */
+ 
+-static int make_mode(const unsigned int lmstate)
++static int make_mode(struct gfs2_sbd *sdp, const unsigned int lmstate)
+ {
+ 	switch (lmstate) {
+ 	case LM_ST_UNLOCKED:
+@@ -196,7 +196,7 @@ static int make_mode(const unsigned int lmstate)
+ 	case LM_ST_SHARED:
+ 		return DLM_LOCK_PR;
+ 	}
+-	pr_err("unknown LM state %d\n", lmstate);
++	fs_err(sdp, "unknown LM state %d\n", lmstate);
+ 	BUG();
+ 	return -1;
+ }
+@@ -257,7 +257,7 @@ static int gdlm_lock(struct gfs2_glock *gl, unsigned int req_state,
+ 	u32 lkf;
+ 	char strname[GDLM_STRNAME_BYTES] = "";
+ 
+-	req = make_mode(req_state);
++	req = make_mode(gl->gl_name.ln_sbd, req_state);
+ 	lkf = make_flags(gl, flags, req);
+ 	gfs2_glstats_inc(gl, GFS2_LKS_DCOUNT);
+ 	gfs2_sbstats_inc(gl, GFS2_LKS_DCOUNT);
+@@ -309,7 +309,7 @@ static void gdlm_put_lock(struct gfs2_glock *gl)
+ 	error = dlm_unlock(ls->ls_dlm, gl->gl_lksb.sb_lkid, DLM_LKF_VALBLK,
+ 			   NULL, gl);
+ 	if (error) {
+-		pr_err("gdlm_unlock %x,%llx err=%d\n",
++		fs_err(sdp, "gdlm_unlock %x,%llx err=%d\n",
+ 		       gl->gl_name.ln_type,
+ 		       (unsigned long long)gl->gl_name.ln_number, error);
+ 		return;
+
+commit 4a7727725dc7d73769c5ab24c566df454093285f
+Author: Bob Peterson <rpeterso@redhat.com>
+Date:   Thu Jul 5 14:40:46 2018 -0500
+
+    GFS2: Fix recovery issues for spectators
+    
+    This patch fixes a couple problems dealing with spectators who
+    remain with gfs2 mounts after the last non-spectator node fails.
+    
+    Before this patch, spectator mounts would try to acquire the dlm's
+    mounted lock EX as part of its normal recovery sequence.
+    The mounted lock is only used to determine whether the node is
+    the first mounter, the first node to mount the file system, for
+    the purposes of file system recovery and journal replay.
+    
+    It's not necessary for spectators: they should never do journal
+    recovery. If they acquire the lock it will prevent another "real"
+    first-mounter from acquiring the lock in EX mode, which means it
+    also cannot do journal recovery because it doesn't think it's the
+    first node to mount the file system.
+    
+    This patch checks if the mounter is a spectator, and if so, avoids
+    grabbing the mounted lock. This allows a secondary mounter who is
+    really the first non-spectator mounter, to do journal recovery:
+    since the spectator doesn't acquire the lock, it can grab it in
+    EX mode, and therefore consider itself to be the first mounter
+    both as a "real" first mount, and as a first-real-after-spectator.
+    
+    Note that the control lock still needs to be taken in PR mode
+    in order to fetch the lvb value so it has the current status of
+    all journal's recovery. This is used as it is today by a first
+    mounter to replay the journals. For spectators, it's merely
+    used to fetch the status bits. All recovery is bypassed and the
+    node waits until recovery is completed by a non-spectator node.
+    
+    I also improved the cryptic message given by control_mount when
+    a spectator is waiting for a non-spectator to perform recovery.
+    
+    It also fixes a problem in gfs2_recover_set whereby spectators
+    were never queueing recovery work for their own journal.
+    They cannot do recovery themselves, but they still need to queue
+    the work so they can check the recovery bits and clear the
+    DFL_BLOCK_LOCKS bit once the recovery happens on another node.
+    
+    When the work queue runs on a spectator, it bypasses most of the
+    work so it won't print a bunch of annoying messages. All it will
+    print is a bunch of messages that look like this until recovery
+    completes on the non-spectator node:
+    
+    GFS2: fsid=mycluster:scratch.s: recover generation 3 jid 0
+    GFS2: fsid=mycluster:scratch.s: recover jid 0 result busy
+    
+    These continue every 1.5 seconds until the recovery is done by
+    the non-spectator, at which time it says:
+    
+    GFS2: fsid=mycluster:scratch.s: recover generation 4 done
+    
+    Then it proceeds with its mount.
+    
+    If the file system is mounted in spectator node and the last
+    remaining non-spectator is fenced, any IO to the file system is
+    blocked by dlm and the spectator waits until recovery is
+    performed by a non-spectator.
+    
+    If a spectator tries to mount the file system before any
+    non-spectators, it blocks and repeatedly gives this kernel
+    message:
+    
+    GFS2: fsid=mycluster:scratch: Recovery is required. Waiting for a non-spectator to mount.
+    GFS2: fsid=mycluster:scratch: Recovery is required. Waiting for a non-spectator to mount.
+    
+    Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+    Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+
+diff --git a/fs/gfs2/lock_dlm.c b/fs/gfs2/lock_dlm.c
+index 006c6164f759..ac7caa267ed6 100644
+--- a/fs/gfs2/lock_dlm.c
++++ b/fs/gfs2/lock_dlm.c
+@@ -821,6 +821,13 @@ static int control_mount(struct gfs2_sbd *sdp)
+ 		goto fail;
+ 	}
+ 
++	/**
++	 * If we're a spectator, we don't want to take the lock in EX because
++	 * we cannot do the first-mount responsibility it implies: recovery.
++	 */
++	if (sdp->sd_args.ar_spectator)
++		goto locks_done;
++
+ 	error = mounted_lock(sdp, DLM_LOCK_EX, DLM_LKF_CONVERT|DLM_LKF_NOQUEUE);
+ 	if (!error) {
+ 		mounted_mode = DLM_LOCK_EX;
+@@ -896,9 +903,16 @@ static int control_mount(struct gfs2_sbd *sdp)
+ 	if (lvb_gen < mount_gen) {
+ 		/* wait for mounted nodes to update control_lock lvb to our
+ 		   generation, which might include new recovery bits set */
+-		fs_info(sdp, "control_mount wait1 block %u start %u mount %u "
+-			"lvb %u flags %lx\n", block_gen, start_gen, mount_gen,
+-			lvb_gen, ls->ls_recover_flags);
++		if (sdp->sd_args.ar_spectator) {
++			fs_info(sdp, "Recovery is required. Waiting for a "
++				"non-spectator to mount.\n");
++			msleep_interruptible(1000);
++		} else {
++			fs_info(sdp, "control_mount wait1 block %u start %u "
++				"mount %u lvb %u flags %lx\n", block_gen,
++				start_gen, mount_gen, lvb_gen,
++				ls->ls_recover_flags);
++		}
+ 		spin_unlock(&ls->ls_recover_spin);
+ 		goto restart;
+ 	}
+
+commit af38816e4801d2868258085831172a003d1634ff
+Author: Andreas Gruenbacher <agruenba@redhat.com>
+Date:   Tue Jan 30 10:32:30 2018 -0700
+
+    gfs2: Add a few missing newlines in messages
+    
+    Some of the info, warning, and error messages are missing their trailing
+    newline.
+    
+    Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+    Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+
+diff --git a/fs/gfs2/lock_dlm.c b/fs/gfs2/lock_dlm.c
+index 65f33a0ac190..006c6164f759 100644
+--- a/fs/gfs2/lock_dlm.c
++++ b/fs/gfs2/lock_dlm.c
+@@ -1091,7 +1091,7 @@ static void gdlm_recover_slot(void *arg, struct dlm_slot *slot)
+ 
+ 	spin_lock(&ls->ls_recover_spin);
+ 	if (ls->ls_recover_size < jid + 1) {
+-		fs_err(sdp, "recover_slot jid %d gen %u short size %d",
++		fs_err(sdp, "recover_slot jid %d gen %u short size %d\n",
+ 		       jid, ls->ls_recover_block, ls->ls_recover_size);
+ 		spin_unlock(&ls->ls_recover_spin);
+ 		return;
+@@ -1153,7 +1153,7 @@ static void gdlm_recovery_result(struct gfs2_sbd *sdp, unsigned int jid,
+ 		return;
+ 	}
+ 	if (ls->ls_recover_size < jid + 1) {
+-		fs_err(sdp, "recovery_result jid %d short size %d",
++		fs_err(sdp, "recovery_result jid %d short size %d\n",
+ 		       jid, ls->ls_recover_size);
+ 		spin_unlock(&ls->ls_recover_spin);
+ 		return;
+
+commit 27c3b415f6ffe6d29a95c8187e35436fcc9638b6
+Author: Bob Peterson <rpeterso@redhat.com>
+Date:   Fri Aug 18 09:15:13 2017 -0500
+
+    GFS2: Fix up some sparse warnings
+    
+    This patch cleans up various pieces of GFS2 to avoid sparse errors.
+    This doesn't fix them all, but it fixes several. The first error,
+    in function glock_hash_walk was a genuine bug where the rhashtable
+    could be started and not stopped.
+    
+    Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+
+diff --git a/fs/gfs2/lock_dlm.c b/fs/gfs2/lock_dlm.c
+index 1d98b8a36eb3..65f33a0ac190 100644
+--- a/fs/gfs2/lock_dlm.c
++++ b/fs/gfs2/lock_dlm.c
+@@ -23,8 +23,6 @@
+ #include "sys.h"
+ #include "trace_gfs2.h"
+ 
+-extern struct workqueue_struct *gfs2_control_wq;
+-
+ /**
+  * gfs2_update_stats - Update time based stats
+  * @mv: Pointer to mean/variance structure to update
+@@ -1176,7 +1174,7 @@ static void gdlm_recovery_result(struct gfs2_sbd *sdp, unsigned int jid,
+ 	spin_unlock(&ls->ls_recover_spin);
+ }
+ 
+-const struct dlm_lockspace_ops gdlm_lockspace_ops = {
++static const struct dlm_lockspace_ops gdlm_lockspace_ops = {
+ 	.recover_prep = gdlm_recover_prep,
+ 	.recover_slot = gdlm_recover_slot,
+ 	.recover_done = gdlm_recover_done,
+
+commit cc1dfa8b7571ea16dec9a29e0f4c4cad90b2a761
+Author: Thomas Tai <thomas.tai@oracle.com>
+Date:   Tue Aug 15 11:54:09 2017 -0500
+
+    gfs2: fix slab corruption during mounting and umounting gfs file system
+    
+    When using cman-3.0.12.1 and gfs2-utils-3.0.12.1, mounting and
+    unmounting GFS2 file system would cause kernel to hang. The slab
+    allocator suggests that it is likely a double free memory corruption.
+    The issue is traced back to v3.9-rc6 where a patch is submitted to
+    use kzalloc() for storing a bitmap instead of using a local variable.
+    The intention is to allocate memory during mount and to free memory
+    during unmount. The original patch misses a code path which has
+    already freed the memory and caused memory corruption. This patch sets
+    the memory pointer to NULL after the memory is freed, so that double
+    free memory corruption will not happen.
+    
+    gdlm_mount()
+      '-- set_recover_size() which use kzalloc()
+      '-- if dlm does not support ops callbacks then
+              '--- free_recover_size() which use kfree()
+    
+    gldm_unmount()
+      '-- free_recover_size() which use kfree()
+    
+    Previous patch which introduced the double free issue is
+    commit 57c7310b8eb9 ("GFS2: use kmalloc for lvb bitmap")
+    
+    Signed-off-by: Thomas Tai <thomas.tai@oracle.com>
+    Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+    Reviewed-by: Liam R. Howlett <Liam.Howlett@Oracle.com>
+
+diff --git a/fs/gfs2/lock_dlm.c b/fs/gfs2/lock_dlm.c
+index 0515f0a68637..1d98b8a36eb3 100644
+--- a/fs/gfs2/lock_dlm.c
++++ b/fs/gfs2/lock_dlm.c
+@@ -1059,6 +1059,7 @@ static void free_recover_size(struct lm_lockstruct *ls)
+ 	ls->ls_recover_submit = NULL;
+ 	ls->ls_recover_result = NULL;
+ 	ls->ls_recover_size = 0;
++	ls->ls_lvb_bits = NULL;
+ }
+ 
+ /* dlm calls before it does lock recovery */
+
+commit 174cd4b1e5fbd0d74c68cf3a74f5bd4923485512
+Author: Ingo Molnar <mingo@kernel.org>
+Date:   Thu Feb 2 19:15:33 2017 +0100
+
+    sched/headers: Prepare to move signal wakeup & sigpending methods from <linux/sched.h> into <linux/sched/signal.h>
+    
+    Fix up affected files that include this signal functionality via sched.h.
+    
+    Acked-by: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Mike Galbraith <efault@gmx.de>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: linux-kernel@vger.kernel.org
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/fs/gfs2/lock_dlm.c b/fs/gfs2/lock_dlm.c
+index 8b907c5cc913..0515f0a68637 100644
+--- a/fs/gfs2/lock_dlm.c
++++ b/fs/gfs2/lock_dlm.c
+@@ -15,6 +15,7 @@
+ #include <linux/types.h>
+ #include <linux/delay.h>
+ #include <linux/gfs2_ondisk.h>
++#include <linux/sched/signal.h>
+ 
+ #include "incore.h"
+ #include "glock.h"
+
+commit 79211c8ed19c055ca105502c8733800d442a0ae6
+Author: Andrew Morton <akpm@linux-foundation.org>
+Date:   Mon Nov 9 14:58:13 2015 -0800
+
+    remove abs64()
+    
+    Switch everything to the new and more capable implementation of abs().
+    Mainly to give the new abs() a bit of a workout.
+    
+    Cc: Michal Nazarewicz <mina86@mina86.com>
+    Cc: John Stultz <john.stultz@linaro.org>
+    Cc: Ingo Molnar <mingo@kernel.org>
+    Cc: Steven Rostedt <rostedt@goodmis.org>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Masami Hiramatsu <masami.hiramatsu.pt@hitachi.com>
+    Cc: Peter Zijlstra <a.p.zijlstra@chello.nl>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/fs/gfs2/lock_dlm.c b/fs/gfs2/lock_dlm.c
+index 284c1542783e..8b907c5cc913 100644
+--- a/fs/gfs2/lock_dlm.c
++++ b/fs/gfs2/lock_dlm.c
+@@ -50,7 +50,7 @@ static inline void gfs2_update_stats(struct gfs2_lkstats *s, unsigned index,
+ 	s64 delta = sample - s->stats[index];
+ 	s->stats[index] += (delta >> 3);
+ 	index++;
+-	s->stats[index] += ((abs64(delta) - s->stats[index]) >> 2);
++	s->stats[index] += ((abs(delta) - s->stats[index]) >> 2);
+ }
+ 
+ /**
+
+commit c9ea8c8b74b5fb2584879e4338770ed252d8a489
+Author: Andreas Gruenbacher <agruenba@redhat.com>
+Date:   Thu Aug 27 13:05:08 2015 -0500
+
+    gfs2: Fix a typo in a comment
+    
+    Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+    Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+
+diff --git a/fs/gfs2/lock_dlm.c b/fs/gfs2/lock_dlm.c
+index c962cfcf19b0..284c1542783e 100644
+--- a/fs/gfs2/lock_dlm.c
++++ b/fs/gfs2/lock_dlm.c
+@@ -31,7 +31,7 @@ extern struct workqueue_struct *gfs2_control_wq;
+  *
+  * @delta is the difference between the current rtt sample and the
+  * running average srtt. We add 1/8 of that to the srtt in order to
+- * update the current srtt estimate. The varience estimate is a bit
++ * update the current srtt estimate. The variance estimate is a bit
+  * more complicated. We subtract the abs value of the @delta from
+  * the current variance estimate and add 1/4 of that to the running
+  * total.
+
+commit 15562c439d0a1850b71aa1c0d92d1f4fb9503c8d
+Author: Bob Peterson <rpeterso@redhat.com>
+Date:   Mon Mar 16 11:52:05 2015 -0500
+
+    GFS2: Move glock superblock pointer to field gl_name
+    
+    What uniquely identifies a glock in the glock hash table is not
+    gl_name, but gl_name and its superblock pointer. This patch makes
+    the gl_name field correspond to a unique glock identifier. That will
+    allow us to simplify hashing with a future patch, since the hash
+    algorithm can then take the gl_name and hash its components in one
+    operation.
+    
+    Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+    Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+    Acked-by: Steven Whitehouse <swhiteho@redhat.com>
+
+diff --git a/fs/gfs2/lock_dlm.c b/fs/gfs2/lock_dlm.c
+index 641383a9c1bb..c962cfcf19b0 100644
+--- a/fs/gfs2/lock_dlm.c
++++ b/fs/gfs2/lock_dlm.c
+@@ -80,7 +80,7 @@ static inline void gfs2_update_reply_times(struct gfs2_glock *gl)
+ 
+ 	preempt_disable();
+ 	rtt = ktime_to_ns(ktime_sub(ktime_get_real(), gl->gl_dstamp));
+-	lks = this_cpu_ptr(gl->gl_sbd->sd_lkstats);
++	lks = this_cpu_ptr(gl->gl_name.ln_sbd->sd_lkstats);
+ 	gfs2_update_stats(&gl->gl_stats, index, rtt);		/* Local */
+ 	gfs2_update_stats(&lks->lkstats[gltype], index, rtt);	/* Global */
+ 	preempt_enable();
+@@ -108,7 +108,7 @@ static inline void gfs2_update_request_times(struct gfs2_glock *gl)
+ 	dstamp = gl->gl_dstamp;
+ 	gl->gl_dstamp = ktime_get_real();
+ 	irt = ktime_to_ns(ktime_sub(gl->gl_dstamp, dstamp));
+-	lks = this_cpu_ptr(gl->gl_sbd->sd_lkstats);
++	lks = this_cpu_ptr(gl->gl_name.ln_sbd->sd_lkstats);
+ 	gfs2_update_stats(&gl->gl_stats, GFS2_LKS_SIRT, irt);		/* Local */
+ 	gfs2_update_stats(&lks->lkstats[gltype], GFS2_LKS_SIRT, irt);	/* Global */
+ 	preempt_enable();
+@@ -253,7 +253,7 @@ static void gfs2_reverse_hex(char *c, u64 value)
+ static int gdlm_lock(struct gfs2_glock *gl, unsigned int req_state,
+ 		     unsigned int flags)
+ {
+-	struct lm_lockstruct *ls = &gl->gl_sbd->sd_lockstruct;
++	struct lm_lockstruct *ls = &gl->gl_name.ln_sbd->sd_lockstruct;
+ 	int req;
+ 	u32 lkf;
+ 	char strname[GDLM_STRNAME_BYTES] = "";
+@@ -281,7 +281,7 @@ static int gdlm_lock(struct gfs2_glock *gl, unsigned int req_state,
+ 
+ static void gdlm_put_lock(struct gfs2_glock *gl)
+ {
+-	struct gfs2_sbd *sdp = gl->gl_sbd;
++	struct gfs2_sbd *sdp = gl->gl_name.ln_sbd;
+ 	struct lm_lockstruct *ls = &sdp->sd_lockstruct;
+ 	int lvb_needs_unlock = 0;
+ 	int error;
+@@ -319,7 +319,7 @@ static void gdlm_put_lock(struct gfs2_glock *gl)
+ 
+ static void gdlm_cancel(struct gfs2_glock *gl)
+ {
+-	struct lm_lockstruct *ls = &gl->gl_sbd->sd_lockstruct;
++	struct lm_lockstruct *ls = &gl->gl_name.ln_sbd->sd_lockstruct;
+ 	dlm_unlock(ls->ls_dlm, gl->gl_lksb.sb_lkid, DLM_LKF_CANCEL, NULL, gl);
+ }
+ 
+
+commit ca5bc6cd5de5b53eb8fd6fea39aa3fe2a1e8c3d9
+Merge: c1221321b7c2 d8d28c8f00e8
+Author: Ingo Molnar <mingo@kernel.org>
+Date:   Mon Jul 28 10:03:00 2014 +0200
+
+    Merge branch 'sched/urgent' into sched/core, to merge fixes before applying new changes
+    
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+commit 6ec43b1838bd71633ac3f853c63ddf1f5940b1ed
+Author: Fabian Frederick <fabf@skynet.be>
+Date:   Wed Jun 25 20:40:45 2014 +0200
+
+    GFS2: replace count*size kzalloc by kcalloc
+    
+    kcalloc manages count*sizeof overflow.
+    
+    Cc: cluster-devel@redhat.com
+    Signed-off-by: Fabian Frederick <fabf@skynet.be>
+    Signed-off-by: Steven Whitehouse <swhiteho@redhat.com>
+
+diff --git a/fs/gfs2/lock_dlm.c b/fs/gfs2/lock_dlm.c
+index 91f274de1246..4fafea1c9ecf 100644
+--- a/fs/gfs2/lock_dlm.c
++++ b/fs/gfs2/lock_dlm.c
+@@ -1036,8 +1036,8 @@ static int set_recover_size(struct gfs2_sbd *sdp, struct dlm_slot *slots,
+ 
+ 	new_size = old_size + RECOVER_SIZE_INC;
+ 
+-	submit = kzalloc(new_size * sizeof(uint32_t), GFP_NOFS);
+-	result = kzalloc(new_size * sizeof(uint32_t), GFP_NOFS);
++	submit = kcalloc(new_size, sizeof(uint32_t), GFP_NOFS);
++	result = kcalloc(new_size, sizeof(uint32_t), GFP_NOFS);
+ 	if (!submit || !result) {
+ 		kfree(submit);
+ 		kfree(result);
+
+commit 743162013d40ca612b4cb53d3a200dff2d9ab26e
+Author: NeilBrown <neilb@suse.de>
+Date:   Mon Jul 7 15:16:04 2014 +1000
+
+    sched: Remove proliferation of wait_on_bit() action functions
+    
+    The current "wait_on_bit" interface requires an 'action'
+    function to be provided which does the actual waiting.
+    There are over 20 such functions, many of them identical.
+    Most cases can be satisfied by one of just two functions, one
+    which uses io_schedule() and one which just uses schedule().
+    
+    So:
+     Rename wait_on_bit and        wait_on_bit_lock to
+            wait_on_bit_action and wait_on_bit_lock_action
+     to make it explicit that they need an action function.
+    
+     Introduce new wait_on_bit{,_lock} and wait_on_bit{,_lock}_io
+     which are *not* given an action function but implicitly use
+     a standard one.
+     The decision to error-out if a signal is pending is now made
+     based on the 'mode' argument rather than being encoded in the action
+     function.
+    
+     All instances of the old wait_on_bit and wait_on_bit_lock which
+     can use the new version have been changed accordingly and their
+     action functions have been discarded.
+     wait_on_bit{_lock} does not return any specific error code in the
+     event of a signal so the caller must check for non-zero and
+     interpolate their own error code as appropriate.
+    
+    The wait_on_bit() call in __fscache_wait_on_invalidate() was
+    ambiguous as it specified TASK_UNINTERRUPTIBLE but used
+    fscache_wait_bit_interruptible as an action function.
+    David Howells confirms this should be uniformly
+    "uninterruptible"
+    
+    The main remaining user of wait_on_bit{,_lock}_action is NFS
+    which needs to use a freezer-aware schedule() call.
+    
+    A comment in fs/gfs2/glock.c notes that having multiple 'action'
+    functions is useful as they display differently in the 'wchan'
+    field of 'ps'. (and /proc/$PID/wchan).
+    As the new bit_wait{,_io} functions are tagged "__sched", they
+    will not show up at all, but something higher in the stack.  So
+    the distinction will still be visible, only with different
+    function names (gds2_glock_wait versus gfs2_glock_dq_wait in the
+    gfs2/glock.c case).
+    
+    Since first version of this patch (against 3.15) two new action
+    functions appeared, on in NFS and one in CIFS.  CIFS also now
+    uses an action function that makes the same freezer aware
+    schedule call as NFS.
+    
+    Signed-off-by: NeilBrown <neilb@suse.de>
+    Acked-by: David Howells <dhowells@redhat.com> (fscache, keys)
+    Acked-by: Steven Whitehouse <swhiteho@redhat.com> (gfs2)
+    Acked-by: Peter Zijlstra <peterz@infradead.org>
+    Cc: Oleg Nesterov <oleg@redhat.com>
+    Cc: Steve French <sfrench@samba.org>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Link: http://lkml.kernel.org/r/20140707051603.28027.72349.stgit@notabene.brown
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/fs/gfs2/lock_dlm.c b/fs/gfs2/lock_dlm.c
+index 91f274de1246..992ca5b1e045 100644
+--- a/fs/gfs2/lock_dlm.c
++++ b/fs/gfs2/lock_dlm.c
+@@ -936,12 +936,6 @@ static int control_mount(struct gfs2_sbd *sdp)
+ 	return error;
+ }
+ 
+-static int dlm_recovery_wait(void *word)
+-{
+-	schedule();
+-	return 0;
+-}
+-
+ static int control_first_done(struct gfs2_sbd *sdp)
+ {
+ 	struct lm_lockstruct *ls = &sdp->sd_lockstruct;
+@@ -976,7 +970,7 @@ static int control_first_done(struct gfs2_sbd *sdp)
+ 		fs_info(sdp, "control_first_done wait gen %u\n", start_gen);
+ 
+ 		wait_on_bit(&ls->ls_recover_flags, DFL_DLM_RECOVERY,
+-			    dlm_recovery_wait, TASK_UNINTERRUPTIBLE);
++			    TASK_UNINTERRUPTIBLE);
+ 		goto restart;
+ 	}
+ 
+
+commit 4e857c58efeb99393cba5a5d0d8ec7117183137c
+Author: Peter Zijlstra <peterz@infradead.org>
+Date:   Mon Mar 17 18:06:10 2014 +0100
+
+    arch: Mass conversion of smp_mb__*()
+    
+    Mostly scripted conversion of the smp_mb__* barriers.
+    
+    Signed-off-by: Peter Zijlstra <peterz@infradead.org>
+    Acked-by: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+    Link: http://lkml.kernel.org/n/tip-55dhyhocezdw1dg7u19hmh1u@git.kernel.org
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: linux-arch@vger.kernel.org
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/fs/gfs2/lock_dlm.c b/fs/gfs2/lock_dlm.c
+index c1eb555dc588..91f274de1246 100644
+--- a/fs/gfs2/lock_dlm.c
++++ b/fs/gfs2/lock_dlm.c
+@@ -1134,7 +1134,7 @@ static void gdlm_recover_done(void *arg, struct dlm_slot *slots, int num_slots,
+ 		queue_delayed_work(gfs2_control_wq, &sdp->sd_control_work, 0);
+ 
+ 	clear_bit(DFL_DLM_RECOVERY, &ls->ls_recover_flags);
+-	smp_mb__after_clear_bit();
++	smp_mb__after_atomic();
+ 	wake_up_bit(&ls->ls_recover_flags, DFL_DLM_RECOVERY);
+ 	spin_unlock(&ls->ls_recover_spin);
+ }
+@@ -1271,7 +1271,7 @@ static int gdlm_mount(struct gfs2_sbd *sdp, const char *table)
+ 
+ 	ls->ls_first = !!test_bit(DFL_FIRST_MOUNT, &ls->ls_recover_flags);
+ 	clear_bit(SDF_NOJOURNALID, &sdp->sd_flags);
+-	smp_mb__after_clear_bit();
++	smp_mb__after_atomic();
+ 	wake_up_bit(&sdp->sd_flags, SDF_NOJOURNALID);
+ 	return 0;
+ 
+
+commit d77d1b58aaf4456946b8502c67f16b52fda60303
+Author: Joe Perches <joe@perches.com>
+Date:   Thu Mar 6 12:10:45 2014 -0800
+
+    GFS2: Use pr_<level> more consistently
+    
+    Add pr_fmt, remove embedded "GFS2: " prefixes.
+    This now consistently emits lower case "gfs2: " for each message.
+    
+    Other miscellanea around these changes:
+    
+    o Add missing newlines
+    o Coalesce formats
+    o Realign arguments
+    
+    Signed-off-by: Joe Perches <joe@perches.com>
+    Signed-off-by: Steven Whitehouse <swhiteho@redhat.com>
+
+diff --git a/fs/gfs2/lock_dlm.c b/fs/gfs2/lock_dlm.c
+index a664dddd91b1..c1eb555dc588 100644
+--- a/fs/gfs2/lock_dlm.c
++++ b/fs/gfs2/lock_dlm.c
+@@ -7,6 +7,8 @@
+  * of the GNU General Public License version 2.
+  */
+ 
++#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++
+ #include <linux/fs.h>
+ #include <linux/dlm.h>
+ #include <linux/slab.h>
+@@ -176,7 +178,7 @@ static void gdlm_bast(void *arg, int mode)
+ 		gfs2_glock_cb(gl, LM_ST_SHARED);
+ 		break;
+ 	default:
+-		pr_err("unknown bast mode %d", mode);
++		pr_err("unknown bast mode %d\n", mode);
+ 		BUG();
+ 	}
+ }
+@@ -195,7 +197,7 @@ static int make_mode(const unsigned int lmstate)
+ 	case LM_ST_SHARED:
+ 		return DLM_LOCK_PR;
+ 	}
+-	pr_err("unknown LM state %d", lmstate);
++	pr_err("unknown LM state %d\n", lmstate);
+ 	BUG();
+ 	return -1;
+ }
+@@ -308,7 +310,8 @@ static void gdlm_put_lock(struct gfs2_glock *gl)
+ 	error = dlm_unlock(ls->ls_dlm, gl->gl_lksb.sb_lkid, DLM_LKF_VALBLK,
+ 			   NULL, gl);
+ 	if (error) {
+-		pr_err("gdlm_unlock %x,%llx err=%d\n", gl->gl_name.ln_type,
++		pr_err("gdlm_unlock %x,%llx err=%d\n",
++		       gl->gl_name.ln_type,
+ 		       (unsigned long long)gl->gl_name.ln_number, error);
+ 		return;
+ 	}
+
+commit fc554ed3d89d220b9d0c020e19aa52fb6bf1d673
+Author: Fabian Frederick <fabf@skynet.be>
+Date:   Wed Mar 5 22:06:42 2014 +0800
+
+    GFS2: global conversion to pr_foo()
+    
+    -All printk(KERN_foo converted to pr_foo().
+    -Messages updated to fit in 80 columns.
+    -fs_macros converted as well.
+    -fs_printk removed.
+    
+    Signed-off-by: Fabian Frederick <fabf@skynet.be>
+    Signed-off-by: Steven Whitehouse <swhiteho@redhat.com>
+
+diff --git a/fs/gfs2/lock_dlm.c b/fs/gfs2/lock_dlm.c
+index 6b97d98919a6..a664dddd91b1 100644
+--- a/fs/gfs2/lock_dlm.c
++++ b/fs/gfs2/lock_dlm.c
+@@ -176,7 +176,7 @@ static void gdlm_bast(void *arg, int mode)
+ 		gfs2_glock_cb(gl, LM_ST_SHARED);
+ 		break;
+ 	default:
+-		printk(KERN_ERR "unknown bast mode %d", mode);
++		pr_err("unknown bast mode %d", mode);
+ 		BUG();
+ 	}
+ }
+@@ -195,7 +195,7 @@ static int make_mode(const unsigned int lmstate)
+ 	case LM_ST_SHARED:
+ 		return DLM_LOCK_PR;
+ 	}
+-	printk(KERN_ERR "unknown LM state %d", lmstate);
++	pr_err("unknown LM state %d", lmstate);
+ 	BUG();
+ 	return -1;
+ }
+@@ -308,8 +308,7 @@ static void gdlm_put_lock(struct gfs2_glock *gl)
+ 	error = dlm_unlock(ls->ls_dlm, gl->gl_lksb.sb_lkid, DLM_LKF_VALBLK,
+ 			   NULL, gl);
+ 	if (error) {
+-		printk(KERN_ERR "gdlm_unlock %x,%llx err=%d\n",
+-		       gl->gl_name.ln_type,
++		pr_err("gdlm_unlock %x,%llx err=%d\n", gl->gl_name.ln_type,
+ 		       (unsigned long long)gl->gl_name.ln_number, error);
+ 		return;
+ 	}
+
+commit ad781971d9b8b409be09645be56d160865c952a6
+Author: David Teigland <teigland@redhat.com>
+Date:   Fri Feb 14 12:10:19 2014 -0600
+
+    GFS2: add missing newline
+    
+    Log message is missing newline.
+    
+    Signed-off-by: David Teigland <teigland@redhat.com>
+    Signed-off-by: Steven Whitehouse <swhiteho@redhat.com>
+
+diff --git a/fs/gfs2/lock_dlm.c b/fs/gfs2/lock_dlm.c
+index 2a6ba06bee6f..6b97d98919a6 100644
+--- a/fs/gfs2/lock_dlm.c
++++ b/fs/gfs2/lock_dlm.c
+@@ -1102,7 +1102,7 @@ static void gdlm_recover_slot(void *arg, struct dlm_slot *slot)
+ 	}
+ 
+ 	if (ls->ls_recover_submit[jid]) {
+-		fs_info(sdp, "recover_slot jid %d gen %u prev %u",
++		fs_info(sdp, "recover_slot jid %d gen %u prev %u\n",
+ 			jid, ls->ls_recover_block, ls->ls_recover_submit[jid]);
+ 	}
+ 	ls->ls_recover_submit[jid] = ls->ls_recover_block;
+
+commit 951b4bd553e35a291e6b5732ab0124619e81da05
+Author: Al Viro <viro@zeniv.linux.org.uk>
+Date:   Sun Jun 2 19:53:40 2013 -0400
+
+    gfs2: endianness misannotations
+    
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/fs/gfs2/lock_dlm.c b/fs/gfs2/lock_dlm.c
+index c8423d6de6c3..2a6ba06bee6f 100644
+--- a/fs/gfs2/lock_dlm.c
++++ b/fs/gfs2/lock_dlm.c
+@@ -466,19 +466,19 @@ static void gdlm_cancel(struct gfs2_glock *gl)
+ static void control_lvb_read(struct lm_lockstruct *ls, uint32_t *lvb_gen,
+ 			     char *lvb_bits)
+ {
+-	uint32_t gen;
++	__le32 gen;
+ 	memcpy(lvb_bits, ls->ls_control_lvb, GDLM_LVB_SIZE);
+-	memcpy(&gen, lvb_bits, sizeof(uint32_t));
++	memcpy(&gen, lvb_bits, sizeof(__le32));
+ 	*lvb_gen = le32_to_cpu(gen);
+ }
+ 
+ static void control_lvb_write(struct lm_lockstruct *ls, uint32_t lvb_gen,
+ 			      char *lvb_bits)
+ {
+-	uint32_t gen;
++	__le32 gen;
+ 	memcpy(ls->ls_control_lvb, lvb_bits, GDLM_LVB_SIZE);
+ 	gen = cpu_to_le32(lvb_gen);
+-	memcpy(ls->ls_control_lvb, &gen, sizeof(uint32_t));
++	memcpy(ls->ls_control_lvb, &gen, sizeof(__le32));
+ }
+ 
+ static int all_jid_bits_clear(char *lvb)
+
+commit 4146c3d469dc400eefa253fb37aa1e74fb5e41f8
+Author: Akinobu Mita <akinobu.mita@gmail.com>
+Date:   Thu Mar 7 23:42:52 2013 +0900
+
+    GFS2: use memchr_inv
+    
+    Use memchr_inv to verify that the specified memory range is cleared.
+    
+    Signed-off-by: Akinobu Mita <akinobu.mita@gmail.com>
+    Cc: Steven Whitehouse <swhiteho@redhat.com>
+    Cc: cluster-devel@redhat.com
+    Cc: Christine Caulfield <ccaulfie@redhat.com>
+    Cc: David Teigland <teigland@redhat.com>
+
+diff --git a/fs/gfs2/lock_dlm.c b/fs/gfs2/lock_dlm.c
+index b15bb45911ca..c8423d6de6c3 100644
+--- a/fs/gfs2/lock_dlm.c
++++ b/fs/gfs2/lock_dlm.c
+@@ -483,12 +483,8 @@ static void control_lvb_write(struct lm_lockstruct *ls, uint32_t lvb_gen,
+ 
+ static int all_jid_bits_clear(char *lvb)
+ {
+-	int i;
+-	for (i = JID_BITMAP_OFFSET; i < GDLM_LVB_SIZE; i++) {
+-		if (lvb[i])
+-			return 0;
+-	}
+-	return 1;
++	return !memchr_inv(lvb + JID_BITMAP_OFFSET, 0,
++			GDLM_LVB_SIZE - JID_BITMAP_OFFSET);
+ }
+ 
+ static void sync_wait_cb(void *arg)
+
+commit 57c7310b8eb96b0fe3b0aaa8dc194adbae03bef3
+Author: David Teigland <teigland@redhat.com>
+Date:   Tue Mar 5 16:01:47 2013 -0500
+
+    GFS2: use kmalloc for lvb bitmap
+    
+    The temp lvb bitmap was on the stack, which could
+    be an alignment problem for __set_bit_le.  Use
+    kmalloc for it instead.
+    
+    Signed-off-by: David Teigland <teigland@redhat.com>
+    Signed-off-by: Steven Whitehouse <swhiteho@redhat.com>
+
+diff --git a/fs/gfs2/lock_dlm.c b/fs/gfs2/lock_dlm.c
+index 9802de0f85e6..b15bb45911ca 100644
+--- a/fs/gfs2/lock_dlm.c
++++ b/fs/gfs2/lock_dlm.c
+@@ -580,7 +580,6 @@ static void gfs2_control_func(struct work_struct *work)
+ {
+ 	struct gfs2_sbd *sdp = container_of(work, struct gfs2_sbd, sd_control_work.work);
+ 	struct lm_lockstruct *ls = &sdp->sd_lockstruct;
+-	char lvb_bits[GDLM_LVB_SIZE];
+ 	uint32_t block_gen, start_gen, lvb_gen, flags;
+ 	int recover_set = 0;
+ 	int write_lvb = 0;
+@@ -634,7 +633,7 @@ static void gfs2_control_func(struct work_struct *work)
+ 		return;
+ 	}
+ 
+-	control_lvb_read(ls, &lvb_gen, lvb_bits);
++	control_lvb_read(ls, &lvb_gen, ls->ls_lvb_bits);
+ 
+ 	spin_lock(&ls->ls_recover_spin);
+ 	if (block_gen != ls->ls_recover_block ||
+@@ -664,10 +663,10 @@ static void gfs2_control_func(struct work_struct *work)
+ 
+ 			ls->ls_recover_result[i] = 0;
+ 
+-			if (!test_bit_le(i, lvb_bits + JID_BITMAP_OFFSET))
++			if (!test_bit_le(i, ls->ls_lvb_bits + JID_BITMAP_OFFSET))
+ 				continue;
+ 
+-			__clear_bit_le(i, lvb_bits + JID_BITMAP_OFFSET);
++			__clear_bit_le(i, ls->ls_lvb_bits + JID_BITMAP_OFFSET);
+ 			write_lvb = 1;
+ 		}
+ 	}
+@@ -691,7 +690,7 @@ static void gfs2_control_func(struct work_struct *work)
+ 				continue;
+ 			if (ls->ls_recover_submit[i] < start_gen) {
+ 				ls->ls_recover_submit[i] = 0;
+-				__set_bit_le(i, lvb_bits + JID_BITMAP_OFFSET);
++				__set_bit_le(i, ls->ls_lvb_bits + JID_BITMAP_OFFSET);
+ 			}
+ 		}
+ 		/* even if there are no bits to set, we need to write the
+@@ -705,7 +704,7 @@ static void gfs2_control_func(struct work_struct *work)
+ 	spin_unlock(&ls->ls_recover_spin);
+ 
+ 	if (write_lvb) {
+-		control_lvb_write(ls, start_gen, lvb_bits);
++		control_lvb_write(ls, start_gen, ls->ls_lvb_bits);
+ 		flags = DLM_LKF_CONVERT | DLM_LKF_VALBLK;
+ 	} else {
+ 		flags = DLM_LKF_CONVERT;
+@@ -725,7 +724,7 @@ static void gfs2_control_func(struct work_struct *work)
+ 	 */
+ 
+ 	for (i = 0; i < recover_size; i++) {
+-		if (test_bit_le(i, lvb_bits + JID_BITMAP_OFFSET)) {
++		if (test_bit_le(i, ls->ls_lvb_bits + JID_BITMAP_OFFSET)) {
+ 			fs_info(sdp, "recover generation %u jid %d\n",
+ 				start_gen, i);
+ 			gfs2_recover_set(sdp, i);
+@@ -758,7 +757,6 @@ static void gfs2_control_func(struct work_struct *work)
+ static int control_mount(struct gfs2_sbd *sdp)
+ {
+ 	struct lm_lockstruct *ls = &sdp->sd_lockstruct;
+-	char lvb_bits[GDLM_LVB_SIZE];
+ 	uint32_t start_gen, block_gen, mount_gen, lvb_gen;
+ 	int mounted_mode;
+ 	int retries = 0;
+@@ -857,7 +855,7 @@ static int control_mount(struct gfs2_sbd *sdp)
+ 	 * lvb_gen will be non-zero.
+ 	 */
+ 
+-	control_lvb_read(ls, &lvb_gen, lvb_bits);
++	control_lvb_read(ls, &lvb_gen, ls->ls_lvb_bits);
+ 
+ 	if (lvb_gen == 0xFFFFFFFF) {
+ 		/* special value to force mount attempts to fail */
+@@ -887,7 +885,7 @@ static int control_mount(struct gfs2_sbd *sdp)
+ 	 * and all lvb bits to be clear (no pending journal recoveries.)
+ 	 */
+ 
+-	if (!all_jid_bits_clear(lvb_bits)) {
++	if (!all_jid_bits_clear(ls->ls_lvb_bits)) {
+ 		/* journals need recovery, wait until all are clear */
+ 		fs_info(sdp, "control_mount wait for journal recovery\n");
+ 		goto restart;
+@@ -949,7 +947,6 @@ static int dlm_recovery_wait(void *word)
+ static int control_first_done(struct gfs2_sbd *sdp)
+ {
+ 	struct lm_lockstruct *ls = &sdp->sd_lockstruct;
+-	char lvb_bits[GDLM_LVB_SIZE];
+ 	uint32_t start_gen, block_gen;
+ 	int error;
+ 
+@@ -991,8 +988,8 @@ static int control_first_done(struct gfs2_sbd *sdp)
+ 	memset(ls->ls_recover_result, 0, ls->ls_recover_size*sizeof(uint32_t));
+ 	spin_unlock(&ls->ls_recover_spin);
+ 
+-	memset(lvb_bits, 0, sizeof(lvb_bits));
+-	control_lvb_write(ls, start_gen, lvb_bits);
++	memset(ls->ls_lvb_bits, 0, GDLM_LVB_SIZE);
++	control_lvb_write(ls, start_gen, ls->ls_lvb_bits);
+ 
+ 	error = mounted_lock(sdp, DLM_LOCK_PR, DLM_LKF_CONVERT);
+ 	if (error)
+@@ -1022,6 +1019,12 @@ static int set_recover_size(struct gfs2_sbd *sdp, struct dlm_slot *slots,
+ 	uint32_t old_size, new_size;
+ 	int i, max_jid;
+ 
++	if (!ls->ls_lvb_bits) {
++		ls->ls_lvb_bits = kzalloc(GDLM_LVB_SIZE, GFP_NOFS);
++		if (!ls->ls_lvb_bits)
++			return -ENOMEM;
++	}
++
+ 	max_jid = 0;
+ 	for (i = 0; i < num_slots; i++) {
+ 		if (max_jid < slots[i].slot - 1)
+@@ -1057,6 +1060,7 @@ static int set_recover_size(struct gfs2_sbd *sdp, struct dlm_slot *slots,
+ 
+ static void free_recover_size(struct lm_lockstruct *ls)
+ {
++	kfree(ls->ls_lvb_bits);
+ 	kfree(ls->ls_recover_submit);
+ 	kfree(ls->ls_recover_result);
+ 	ls->ls_recover_submit = NULL;
+@@ -1205,6 +1209,7 @@ static int gdlm_mount(struct gfs2_sbd *sdp, const char *table)
+ 	ls->ls_recover_size = 0;
+ 	ls->ls_recover_submit = NULL;
+ 	ls->ls_recover_result = NULL;
++	ls->ls_lvb_bits = NULL;
+ 
+ 	error = set_recover_size(sdp, NULL, 0);
+ 	if (error)
+
+commit d4e0bfec9b6fbb9b58640b44e01bb74ae0d29b22
+Author: David Teigland <teigland@redhat.com>
+Date:   Thu Jan 3 17:52:07 2013 -0500
+
+    GFS2: fix skip unlock condition
+    
+    The recent commit fb6791d100d1bba20b5cdbc4912e1f7086ec60f8
+    included the wrong logic.  The lvbptr check was incorrectly
+    added after the patch was tested.
+    
+    Signed-off-by: David Teigland <teigland@redhat.com>
+    Signed-off-by: Steven Whitehouse <swhiteho@redhat.com>
+
+diff --git a/fs/gfs2/lock_dlm.c b/fs/gfs2/lock_dlm.c
+index b906ed17a839..9802de0f85e6 100644
+--- a/fs/gfs2/lock_dlm.c
++++ b/fs/gfs2/lock_dlm.c
+@@ -281,6 +281,7 @@ static void gdlm_put_lock(struct gfs2_glock *gl)
+ {
+ 	struct gfs2_sbd *sdp = gl->gl_sbd;
+ 	struct lm_lockstruct *ls = &sdp->sd_lockstruct;
++	int lvb_needs_unlock = 0;
+ 	int error;
+ 
+ 	if (gl->gl_lksb.sb_lkid == 0) {
+@@ -294,8 +295,12 @@ static void gdlm_put_lock(struct gfs2_glock *gl)
+ 	gfs2_update_request_times(gl);
+ 
+ 	/* don't want to skip dlm_unlock writing the lvb when lock is ex */
++
++	if (gl->gl_lksb.sb_lvbptr && (gl->gl_state == LM_ST_EXCLUSIVE))
++		lvb_needs_unlock = 1;
++
+ 	if (test_bit(SDF_SKIP_DLM_UNLOCK, &sdp->sd_flags) &&
+-	    gl->gl_lksb.sb_lvbptr && (gl->gl_state != LM_ST_EXCLUSIVE)) {
++	    !lvb_needs_unlock) {
+ 		gfs2_glock_free(gl);
+ 		return;
+ 	}
+
+commit ec1487528bed94c4aaff3687834fe94203880fd6
+Author: Nathan Straz <nstraz@redhat.com>
+Date:   Tue Dec 11 17:01:24 2012 -0500
+
+    GFS2: Initialize hex string to '0'
+    
+    When generating the DLM lock name, a value of 0 would skip
+    the loop and leave the string unchanged.  This left locks with
+    a value of 0 unlabeled.  Initializing the string to '0' fixes this.
+    
+    Signed-off-by: Nathan Straz <nstraz@redhat.com>
+    Signed-off-by: Steven Whitehouse <swhiteho@redhat.com>
+
+diff --git a/fs/gfs2/lock_dlm.c b/fs/gfs2/lock_dlm.c
+index 8dad6b093716..b906ed17a839 100644
+--- a/fs/gfs2/lock_dlm.c
++++ b/fs/gfs2/lock_dlm.c
+@@ -241,6 +241,7 @@ static u32 make_flags(struct gfs2_glock *gl, const unsigned int gfs_flags,
+ 
+ static void gfs2_reverse_hex(char *c, u64 value)
+ {
++	*c = '0';
+ 	while (value) {
+ 		*c-- = hex_asc[value & 0x0f];
+ 		value >>= 4;
+
+commit 4e2f8849def738092ad6c0fc2b34737381bc9d26
+Author: David Teigland <teigland@redhat.com>
+Date:   Wed Nov 14 13:47:37 2012 -0500
+
+    GFS2: remove redundant lvb pointer
+    
+    The lksb struct already contains a pointer to the lvb,
+    so another directly from the glock struct is not needed.
+    
+    Signed-off-by: David Teigland <teigland@redhat.com>
+    Signed-off-by: Steven Whitehouse <swhiteho@redhat.com>
+
+diff --git a/fs/gfs2/lock_dlm.c b/fs/gfs2/lock_dlm.c
+index d28ae37ceb3c..8dad6b093716 100644
+--- a/fs/gfs2/lock_dlm.c
++++ b/fs/gfs2/lock_dlm.c
+@@ -120,8 +120,8 @@ static void gdlm_ast(void *arg)
+ 	gfs2_update_reply_times(gl);
+ 	BUG_ON(gl->gl_lksb.sb_flags & DLM_SBF_DEMOTED);
+ 
+-	if (gl->gl_lksb.sb_flags & DLM_SBF_VALNOTVALID && gl->gl_lvb)
+-		memset(gl->gl_lvb, 0, GDLM_LVB_SIZE);
++	if ((gl->gl_lksb.sb_flags & DLM_SBF_VALNOTVALID) && gl->gl_lksb.sb_lvbptr)
++		memset(gl->gl_lksb.sb_lvbptr, 0, GDLM_LVB_SIZE);
+ 
+ 	switch (gl->gl_lksb.sb_status) {
+ 	case -DLM_EUNLOCK: /* Unlocked, so glock can be freed */
+@@ -205,7 +205,7 @@ static u32 make_flags(struct gfs2_glock *gl, const unsigned int gfs_flags,
+ {
+ 	u32 lkf = 0;
+ 
+-	if (gl->gl_lvb)
++	if (gl->gl_lksb.sb_lvbptr)
+ 		lkf |= DLM_LKF_VALBLK;
+ 
+ 	if (gfs_flags & LM_FLAG_TRY)
+@@ -294,7 +294,7 @@ static void gdlm_put_lock(struct gfs2_glock *gl)
+ 
+ 	/* don't want to skip dlm_unlock writing the lvb when lock is ex */
+ 	if (test_bit(SDF_SKIP_DLM_UNLOCK, &sdp->sd_flags) &&
+-	    gl->gl_lvb && gl->gl_state != LM_ST_EXCLUSIVE) {
++	    gl->gl_lksb.sb_lvbptr && (gl->gl_state != LM_ST_EXCLUSIVE)) {
+ 		gfs2_glock_free(gl);
+ 		return;
+ 	}
+
+commit dba2d70c5dc520fdb569d1fd8dbd45c0e330253e
+Author: David Teigland <teigland@redhat.com>
+Date:   Wed Nov 14 13:46:53 2012 -0500
+
+    GFS2: only use lvb on glocks that need it
+    
+    Save the effort of allocating, reading and writing
+    the lvb for most glocks that do not use it.
+    
+    Signed-off-by: David Teigland <teigland@redhat.com>
+    Signed-off-by: Steven Whitehouse <swhiteho@redhat.com>
+
+diff --git a/fs/gfs2/lock_dlm.c b/fs/gfs2/lock_dlm.c
+index f6504d3fadb3..d28ae37ceb3c 100644
+--- a/fs/gfs2/lock_dlm.c
++++ b/fs/gfs2/lock_dlm.c
+@@ -120,7 +120,7 @@ static void gdlm_ast(void *arg)
+ 	gfs2_update_reply_times(gl);
+ 	BUG_ON(gl->gl_lksb.sb_flags & DLM_SBF_DEMOTED);
+ 
+-	if (gl->gl_lksb.sb_flags & DLM_SBF_VALNOTVALID)
++	if (gl->gl_lksb.sb_flags & DLM_SBF_VALNOTVALID && gl->gl_lvb)
+ 		memset(gl->gl_lvb, 0, GDLM_LVB_SIZE);
+ 
+ 	switch (gl->gl_lksb.sb_status) {
+@@ -203,8 +203,10 @@ static int make_mode(const unsigned int lmstate)
+ static u32 make_flags(struct gfs2_glock *gl, const unsigned int gfs_flags,
+ 		      const int req)
+ {
+-	u32 lkf = DLM_LKF_VALBLK;
+-	u32 lkid = gl->gl_lksb.sb_lkid;
++	u32 lkf = 0;
++
++	if (gl->gl_lvb)
++		lkf |= DLM_LKF_VALBLK;
+ 
+ 	if (gfs_flags & LM_FLAG_TRY)
+ 		lkf |= DLM_LKF_NOQUEUE;
+@@ -228,7 +230,7 @@ static u32 make_flags(struct gfs2_glock *gl, const unsigned int gfs_flags,
+ 			BUG();
+ 	}
+ 
+-	if (lkid != 0) {
++	if (gl->gl_lksb.sb_lkid != 0) {
+ 		lkf |= DLM_LKF_CONVERT;
+ 		if (test_bit(GLF_BLOCKING, &gl->gl_flags))
+ 			lkf |= DLM_LKF_QUECVT;
+@@ -292,7 +294,7 @@ static void gdlm_put_lock(struct gfs2_glock *gl)
+ 
+ 	/* don't want to skip dlm_unlock writing the lvb when lock is ex */
+ 	if (test_bit(SDF_SKIP_DLM_UNLOCK, &sdp->sd_flags) &&
+-	    gl->gl_state != LM_ST_EXCLUSIVE) {
++	    gl->gl_lvb && gl->gl_state != LM_ST_EXCLUSIVE) {
+ 		gfs2_glock_free(gl);
+ 		return;
+ 	}
+
+commit fb6791d100d1bba20b5cdbc4912e1f7086ec60f8
+Author: David Teigland <teigland@redhat.com>
+Date:   Tue Nov 13 10:58:56 2012 -0500
+
+    GFS2: skip dlm_unlock calls in unmount
+    
+    When unmounting, gfs2 does a full dlm_unlock operation on every
+    cached lock.  This can create a very large amount of work and can
+    take a long time to complete.  However, the vast majority of these
+    dlm unlock operations are unnecessary because after all the unlocks
+    are done, gfs2 leaves the dlm lockspace, which automatically clears
+    the locks of the leaving node, without unlocking each one individually.
+    So, gfs2 can skip explicit dlm unlocks, and use dlm_release_lockspace to
+    remove the locks implicitly.  The one exception is when the lock's lvb is
+    being used.  In this case, dlm_unlock is called because it may update the
+    lvb of the resource.
+    
+    Signed-off-by: David Teigland <teigland@redhat.com>
+    Signed-off-by: Steven Whitehouse <swhiteho@redhat.com>
+
+diff --git a/fs/gfs2/lock_dlm.c b/fs/gfs2/lock_dlm.c
+index 0fb6539b0c8c..f6504d3fadb3 100644
+--- a/fs/gfs2/lock_dlm.c
++++ b/fs/gfs2/lock_dlm.c
+@@ -289,6 +289,14 @@ static void gdlm_put_lock(struct gfs2_glock *gl)
+ 	gfs2_glstats_inc(gl, GFS2_LKS_DCOUNT);
+ 	gfs2_sbstats_inc(gl, GFS2_LKS_DCOUNT);
+ 	gfs2_update_request_times(gl);
++
++	/* don't want to skip dlm_unlock writing the lvb when lock is ex */
++	if (test_bit(SDF_SKIP_DLM_UNLOCK, &sdp->sd_flags) &&
++	    gl->gl_state != LM_ST_EXCLUSIVE) {
++		gfs2_glock_free(gl);
++		return;
++	}
++
+ 	error = dlm_unlock(ls->ls_dlm, gl->gl_lksb.sb_lkid, DLM_LKF_VALBLK,
+ 			   NULL, gl);
+ 	if (error) {
+
+commit 43829731dd372d04d6706c51052b9dabab9ca356
+Author: Tejun Heo <tj@kernel.org>
+Date:   Mon Aug 20 14:51:24 2012 -0700
+
+    workqueue: deprecate flush[_delayed]_work_sync()
+    
+    flush[_delayed]_work_sync() are now spurious.  Mark them deprecated
+    and convert all users to flush[_delayed]_work().
+    
+    If you're cc'd and wondering what's going on: Now all workqueues are
+    non-reentrant and the regular flushes guarantee that the work item is
+    not pending or running on any CPU on return, so there's no reason to
+    use the sync flushes at all and they're going away.
+    
+    This patch doesn't make any functional difference.
+    
+    Signed-off-by: Tejun Heo <tj@kernel.org>
+    Cc: Russell King <linux@arm.linux.org.uk>
+    Cc: Paul Mundt <lethal@linux-sh.org>
+    Cc: Ian Campbell <ian.campbell@citrix.com>
+    Cc: Jens Axboe <axboe@kernel.dk>
+    Cc: Mattia Dongili <malattia@linux.it>
+    Cc: Kent Yoder <key@linux.vnet.ibm.com>
+    Cc: David Airlie <airlied@linux.ie>
+    Cc: Jiri Kosina <jkosina@suse.cz>
+    Cc: Karsten Keil <isdn@linux-pingi.de>
+    Cc: Bryan Wu <bryan.wu@canonical.com>
+    Cc: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+    Cc: Alasdair Kergon <agk@redhat.com>
+    Cc: Mauro Carvalho Chehab <mchehab@infradead.org>
+    Cc: Florian Tobias Schandinat <FlorianSchandinat@gmx.de>
+    Cc: David Woodhouse <dwmw2@infradead.org>
+    Cc: "David S. Miller" <davem@davemloft.net>
+    Cc: linux-wireless@vger.kernel.org
+    Cc: Anton Vorontsov <cbou@mail.ru>
+    Cc: Sangbeom Kim <sbkim73@samsung.com>
+    Cc: "James E.J. Bottomley" <James.Bottomley@HansenPartnership.com>
+    Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+    Cc: Eric Van Hensbergen <ericvh@gmail.com>
+    Cc: Takashi Iwai <tiwai@suse.de>
+    Cc: Steven Whitehouse <swhiteho@redhat.com>
+    Cc: Petr Vandrovec <petr@vandrovec.name>
+    Cc: Mark Fasheh <mfasheh@suse.com>
+    Cc: Christoph Hellwig <hch@infradead.org>
+    Cc: Avi Kivity <avi@redhat.com>
+
+diff --git a/fs/gfs2/lock_dlm.c b/fs/gfs2/lock_dlm.c
+index 4a38db739ca0..0fb6539b0c8c 100644
+--- a/fs/gfs2/lock_dlm.c
++++ b/fs/gfs2/lock_dlm.c
+@@ -1289,7 +1289,7 @@ static void gdlm_unmount(struct gfs2_sbd *sdp)
+ 	spin_lock(&ls->ls_recover_spin);
+ 	set_bit(DFL_UNMOUNT, &ls->ls_recover_flags);
+ 	spin_unlock(&ls->ls_recover_spin);
+-	flush_delayed_work_sync(&sdp->sd_control_work);
++	flush_delayed_work(&sdp->sd_control_work);
+ 
+ 	/* mounted_lock and control_lock will be purged in dlm recovery */
+ release:
+
+commit 4875647a08e35f77274838d97ca8fa44158d50e2
+Author: David Teigland <teigland@redhat.com>
+Date:   Thu Apr 26 15:54:29 2012 -0500
+
+    dlm: fixes for nodir mode
+    
+    The "nodir" mode (statically assign master nodes instead
+    of using the resource directory) has always been highly
+    experimental, and never seriously used.  This commit
+    fixes a number of problems, making nodir much more usable.
+    
+    - Major change to recovery: recover all locks and restart
+      all in-progress operations after recovery.  In some
+      cases it's not possible to know which in-progess locks
+      to recover, so recover all.  (Most require recovery
+      in nodir mode anyway since rehashing changes most
+      master nodes.)
+    
+    - Change the way nodir mode is enabled, from a command
+      line mount arg passed through gfs2, into a sysfs
+      file managed by dlm_controld, consistent with the
+      other config settings.
+    
+    - Allow recovering MSTCPY locks on an rsb that has not
+      yet been turned into a master copy.
+    
+    - Ignore RCOM_LOCK and RCOM_LOCK_REPLY recovery messages
+      from a previous, aborted recovery cycle.  Base this
+      on the local recovery status not being in the state
+      where any nodes should be sending LOCK messages for the
+      current recovery cycle.
+    
+    - Hold rsb lock around dlm_purge_mstcpy_locks() because it
+      may run concurrently with dlm_recover_master_copy().
+    
+    - Maintain highbast on process-copy lkb's (in addition to
+      the master as is usual), because the lkb can switch
+      back and forth between being a master and being a
+      process copy as the master node changes in recovery.
+    
+    - When recovering MSTCPY locks, flag rsb's that have
+      non-empty convert or waiting queues for granting
+      at the end of recovery.  (Rename flag from LOCKS_PURGED
+      to RECOVER_GRANT and similar for the recovery function,
+      because it's not only resources with purged locks
+      that need grant a grant attempt.)
+    
+    - Replace a couple of unnecessary assertion panics with
+      error messages.
+    
+    Signed-off-by: David Teigland <teigland@redhat.com>
+
+diff --git a/fs/gfs2/lock_dlm.c b/fs/gfs2/lock_dlm.c
+index 5f5e70e047dc..4a38db739ca0 100644
+--- a/fs/gfs2/lock_dlm.c
++++ b/fs/gfs2/lock_dlm.c
+@@ -1209,8 +1209,6 @@ static int gdlm_mount(struct gfs2_sbd *sdp, const char *table)
+ 	fsname++;
+ 
+ 	flags = DLM_LSFL_FS | DLM_LSFL_NEWEXCL;
+-	if (ls->ls_nodir)
+-		flags |= DLM_LSFL_NODIR;
+ 
+ 	/*
+ 	 * create/join lockspace
+
+commit 4c569a72c30dfee9b5133284aba67e3aa0c9505d
+Author: Bob Peterson <rpeterso@redhat.com>
+Date:   Tue Apr 10 14:45:24 2012 -0400
+
+    GFS2: Instruct DLM to avoid queue convert slowdown
+    
+    This patch instructs DLM to prevent an "in place" conversion, where the
+    lock just stays on the granted queue, and instead forces the conversion to
+    the back of the convert queue. This is done on upward conversions only.
+    
+    This is useful in cases where, for example, a lock is frequently needed in
+    PR on one node, but another node needs it temporarily in EX to update it.
+    This may happen, for example, when the rindex is being updated by gfs2_grow.
+    The gfs2_grow needs to have the lock in EX, but the other nodes need to
+    re-read it to retrieve the updates. The glock is already granted in PR on
+    the non-growing nodes, so this prevents them from continually re-granting
+    the lock in PR, and forces the EX from gfs2_grow to go through.
+    
+    Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+    Signed-off-by: Steven Whitehouse <swhiteho@redhat.com>
+
+diff --git a/fs/gfs2/lock_dlm.c b/fs/gfs2/lock_dlm.c
+index f8411bd1b805..5f5e70e047dc 100644
+--- a/fs/gfs2/lock_dlm.c
++++ b/fs/gfs2/lock_dlm.c
+@@ -200,10 +200,11 @@ static int make_mode(const unsigned int lmstate)
+ 	return -1;
+ }
+ 
+-static u32 make_flags(const u32 lkid, const unsigned int gfs_flags,
++static u32 make_flags(struct gfs2_glock *gl, const unsigned int gfs_flags,
+ 		      const int req)
+ {
+ 	u32 lkf = DLM_LKF_VALBLK;
++	u32 lkid = gl->gl_lksb.sb_lkid;
+ 
+ 	if (gfs_flags & LM_FLAG_TRY)
+ 		lkf |= DLM_LKF_NOQUEUE;
+@@ -227,8 +228,11 @@ static u32 make_flags(const u32 lkid, const unsigned int gfs_flags,
+ 			BUG();
+ 	}
+ 
+-	if (lkid != 0) 
++	if (lkid != 0) {
+ 		lkf |= DLM_LKF_CONVERT;
++		if (test_bit(GLF_BLOCKING, &gl->gl_flags))
++			lkf |= DLM_LKF_QUECVT;
++	}
+ 
+ 	return lkf;
+ }
+@@ -250,7 +254,7 @@ static int gdlm_lock(struct gfs2_glock *gl, unsigned int req_state,
+ 	char strname[GDLM_STRNAME_BYTES] = "";
+ 
+ 	req = make_mode(req_state);
+-	lkf = make_flags(gl->gl_lksb.sb_lkid, flags, req);
++	lkf = make_flags(gl, flags, req);
+ 	gfs2_glstats_inc(gl, GFS2_LKS_DCOUNT);
+ 	gfs2_sbstats_inc(gl, GFS2_LKS_DCOUNT);
+ 	if (gl->gl_lksb.sb_lkid) {
+
+commit a245769f254bbbea868e2cf8dc42daa061cd276f
+Author: Steven Whitehouse <swhiteho@redhat.com>
+Date:   Fri Jan 20 10:38:36 2012 +0000
+
+    GFS2: glock statistics gathering
+    
+    The stats are divided into two sets: those relating to the
+    super block and those relating to an individual glock. The
+    super block stats are done on a per cpu basis in order to
+    try and reduce the overhead of gathering them. They are also
+    further divided by glock type.
+    
+    In the case of both the super block and glock statistics,
+    the same information is gathered in each case. The super
+    block statistics are used to provide default values for
+    most of the glock statistics, so that newly created glocks
+    should have, as far as possible, a sensible starting point.
+    
+    The statistics are divided into three pairs of mean and
+    variance, plus two counters. The mean/variance pairs are
+    smoothed exponential estimates and the algorithm used is
+    one which will be very familiar to those used to calculation
+    of round trip times in network code.
+    
+    The three pairs of mean/variance measure the following
+    things:
+    
+     1. DLM lock time (non-blocking requests)
+     2. DLM lock time (blocking requests)
+     3. Inter-request time (again to the DLM)
+    
+    A non-blocking request is one which will complete right
+    away, whatever the state of the DLM lock in question. That
+    currently means any requests when (a) the current state of
+    the lock is exclusive (b) the requested state is either null
+    or unlocked or (c) the "try lock" flag is set. A blocking
+    request covers all the other lock requests.
+    
+    There are two counters. The first is there primarily to show
+    how many lock requests have been made, and thus how much data
+    has gone into the mean/variance calculations. The other counter
+    is counting queueing of holders at the top layer of the glock
+    code. Hopefully that number will be a lot larger than the number
+    of dlm lock requests issued.
+    
+    So why gather these statistics? There are several reasons
+    we'd like to get a better idea of these timings:
+    
+    1. To be able to better set the glock "min hold time"
+    2. To spot performance issues more easily
+    3. To improve the algorithm for selecting resource groups for
+    allocation (to base it on lock wait time, rather than blindly
+    using a "try lock")
+    Due to the smoothing action of the updates, a step change in
+    some input quantity being sampled will only fully be taken
+    into account after 8 samples (or 4 for the variance) and this
+    needs to be carefully considered when interpreting the
+    results.
+    
+    Knowing both the time it takes a lock request to complete and
+    the average time between lock requests for a glock means we
+    can compute the total percentage of the time for which the
+    node is able to use a glock vs. time that the rest of the
+    cluster has its share. That will be very useful when setting
+    the lock min hold time.
+    
+    The other point to remember is that all times are in
+    nanoseconds. Great care has been taken to ensure that we
+    measure exactly the quantities that we want, as accurately
+    as possible. There are always inaccuracies in any
+    measuring system, but I hope this is as accurate as we
+    can reasonably make it.
+    
+    Signed-off-by: Steven Whitehouse <swhiteho@redhat.com>
+
+diff --git a/fs/gfs2/lock_dlm.c b/fs/gfs2/lock_dlm.c
+index 8944d1e32ab5..f8411bd1b805 100644
+--- a/fs/gfs2/lock_dlm.c
++++ b/fs/gfs2/lock_dlm.c
+@@ -18,14 +18,106 @@
+ #include "glock.h"
+ #include "util.h"
+ #include "sys.h"
++#include "trace_gfs2.h"
+ 
+ extern struct workqueue_struct *gfs2_control_wq;
+ 
++/**
++ * gfs2_update_stats - Update time based stats
++ * @mv: Pointer to mean/variance structure to update
++ * @sample: New data to include
++ *
++ * @delta is the difference between the current rtt sample and the
++ * running average srtt. We add 1/8 of that to the srtt in order to
++ * update the current srtt estimate. The varience estimate is a bit
++ * more complicated. We subtract the abs value of the @delta from
++ * the current variance estimate and add 1/4 of that to the running
++ * total.
++ *
++ * Note that the index points at the array entry containing the smoothed
++ * mean value, and the variance is always in the following entry
++ *
++ * Reference: TCP/IP Illustrated, vol 2, p. 831,832
++ * All times are in units of integer nanoseconds. Unlike the TCP/IP case,
++ * they are not scaled fixed point.
++ */
++
++static inline void gfs2_update_stats(struct gfs2_lkstats *s, unsigned index,
++				     s64 sample)
++{
++	s64 delta = sample - s->stats[index];
++	s->stats[index] += (delta >> 3);
++	index++;
++	s->stats[index] += ((abs64(delta) - s->stats[index]) >> 2);
++}
++
++/**
++ * gfs2_update_reply_times - Update locking statistics
++ * @gl: The glock to update
++ *
++ * This assumes that gl->gl_dstamp has been set earlier.
++ *
++ * The rtt (lock round trip time) is an estimate of the time
++ * taken to perform a dlm lock request. We update it on each
++ * reply from the dlm.
++ *
++ * The blocking flag is set on the glock for all dlm requests
++ * which may potentially block due to lock requests from other nodes.
++ * DLM requests where the current lock state is exclusive, the
++ * requested state is null (or unlocked) or where the TRY or
++ * TRY_1CB flags are set are classified as non-blocking. All
++ * other DLM requests are counted as (potentially) blocking.
++ */
++static inline void gfs2_update_reply_times(struct gfs2_glock *gl)
++{
++	struct gfs2_pcpu_lkstats *lks;
++	const unsigned gltype = gl->gl_name.ln_type;
++	unsigned index = test_bit(GLF_BLOCKING, &gl->gl_flags) ?
++			 GFS2_LKS_SRTTB : GFS2_LKS_SRTT;
++	s64 rtt;
++
++	preempt_disable();
++	rtt = ktime_to_ns(ktime_sub(ktime_get_real(), gl->gl_dstamp));
++	lks = this_cpu_ptr(gl->gl_sbd->sd_lkstats);
++	gfs2_update_stats(&gl->gl_stats, index, rtt);		/* Local */
++	gfs2_update_stats(&lks->lkstats[gltype], index, rtt);	/* Global */
++	preempt_enable();
++
++	trace_gfs2_glock_lock_time(gl, rtt);
++}
++
++/**
++ * gfs2_update_request_times - Update locking statistics
++ * @gl: The glock to update
++ *
++ * The irt (lock inter-request times) measures the average time
++ * between requests to the dlm. It is updated immediately before
++ * each dlm call.
++ */
++
++static inline void gfs2_update_request_times(struct gfs2_glock *gl)
++{
++	struct gfs2_pcpu_lkstats *lks;
++	const unsigned gltype = gl->gl_name.ln_type;
++	ktime_t dstamp;
++	s64 irt;
++
++	preempt_disable();
++	dstamp = gl->gl_dstamp;
++	gl->gl_dstamp = ktime_get_real();
++	irt = ktime_to_ns(ktime_sub(gl->gl_dstamp, dstamp));
++	lks = this_cpu_ptr(gl->gl_sbd->sd_lkstats);
++	gfs2_update_stats(&gl->gl_stats, GFS2_LKS_SIRT, irt);		/* Local */
++	gfs2_update_stats(&lks->lkstats[gltype], GFS2_LKS_SIRT, irt);	/* Global */
++	preempt_enable();
++}
++ 
+ static void gdlm_ast(void *arg)
+ {
+ 	struct gfs2_glock *gl = arg;
+ 	unsigned ret = gl->gl_state;
+ 
++	gfs2_update_reply_times(gl);
+ 	BUG_ON(gl->gl_lksb.sb_flags & DLM_SBF_DEMOTED);
+ 
+ 	if (gl->gl_lksb.sb_flags & DLM_SBF_VALNOTVALID)
+@@ -111,7 +203,7 @@ static int make_mode(const unsigned int lmstate)
+ static u32 make_flags(const u32 lkid, const unsigned int gfs_flags,
+ 		      const int req)
+ {
+-	u32 lkf = 0;
++	u32 lkf = DLM_LKF_VALBLK;
+ 
+ 	if (gfs_flags & LM_FLAG_TRY)
+ 		lkf |= DLM_LKF_NOQUEUE;
+@@ -138,26 +230,43 @@ static u32 make_flags(const u32 lkid, const unsigned int gfs_flags,
+ 	if (lkid != 0) 
+ 		lkf |= DLM_LKF_CONVERT;
+ 
+-	lkf |= DLM_LKF_VALBLK;
+-
+ 	return lkf;
+ }
+ 
++static void gfs2_reverse_hex(char *c, u64 value)
++{
++	while (value) {
++		*c-- = hex_asc[value & 0x0f];
++		value >>= 4;
++	}
++}
++
+ static int gdlm_lock(struct gfs2_glock *gl, unsigned int req_state,
+ 		     unsigned int flags)
+ {
+ 	struct lm_lockstruct *ls = &gl->gl_sbd->sd_lockstruct;
+ 	int req;
+ 	u32 lkf;
++	char strname[GDLM_STRNAME_BYTES] = "";
+ 
+ 	req = make_mode(req_state);
+ 	lkf = make_flags(gl->gl_lksb.sb_lkid, flags, req);
+-
++	gfs2_glstats_inc(gl, GFS2_LKS_DCOUNT);
++	gfs2_sbstats_inc(gl, GFS2_LKS_DCOUNT);
++	if (gl->gl_lksb.sb_lkid) {
++		gfs2_update_request_times(gl);
++	} else {
++		memset(strname, ' ', GDLM_STRNAME_BYTES - 1);
++		strname[GDLM_STRNAME_BYTES - 1] = '\0';
++		gfs2_reverse_hex(strname + 7, gl->gl_name.ln_type);
++		gfs2_reverse_hex(strname + 23, gl->gl_name.ln_number);
++		gl->gl_dstamp = ktime_get_real();
++	}
+ 	/*
+ 	 * Submit the actual lock request.
+ 	 */
+ 
+-	return dlm_lock(ls->ls_dlm, req, &gl->gl_lksb, lkf, gl->gl_strname,
++	return dlm_lock(ls->ls_dlm, req, &gl->gl_lksb, lkf, strname,
+ 			GDLM_STRNAME_BYTES - 1, 0, gdlm_ast, gl, gdlm_bast);
+ }
+ 
+@@ -172,6 +281,10 @@ static void gdlm_put_lock(struct gfs2_glock *gl)
+ 		return;
+ 	}
+ 
++	clear_bit(GLF_BLOCKING, &gl->gl_flags);
++	gfs2_glstats_inc(gl, GFS2_LKS_DCOUNT);
++	gfs2_sbstats_inc(gl, GFS2_LKS_DCOUNT);
++	gfs2_update_request_times(gl);
+ 	error = dlm_unlock(ls->ls_dlm, gl->gl_lksb.sb_lkid, DLM_LKF_VALBLK,
+ 			   NULL, gl);
+ 	if (error) {
+
+commit e0c2a9aa1e68455dc3439e95d85cabcaff073666
+Author: David Teigland <teigland@redhat.com>
+Date:   Mon Jan 9 17:18:05 2012 -0500
+
+    GFS2: dlm based recovery coordination
+    
+    This new method of managing recovery is an alternative to
+    the previous approach of using the userland gfs_controld.
+    
+    - use dlm slot numbers to assign journal id's
+    - use dlm recovery callbacks to initiate journal recovery
+    - use a dlm lock to determine the first node to mount fs
+    - use a dlm lock to track journals that need recovery
+    
+    Signed-off-by: David Teigland <teigland@redhat.com>
+    Signed-off-by: Steven Whitehouse <swhiteho@redhat.com>
+
+diff --git a/fs/gfs2/lock_dlm.c b/fs/gfs2/lock_dlm.c
+index ce85b62bc0a2..8944d1e32ab5 100644
+--- a/fs/gfs2/lock_dlm.c
++++ b/fs/gfs2/lock_dlm.c
+@@ -1,6 +1,6 @@
+ /*
+  * Copyright (C) Sistina Software, Inc.  1997-2003 All rights reserved.
+- * Copyright (C) 2004-2009 Red Hat, Inc.  All rights reserved.
++ * Copyright 2004-2011 Red Hat, Inc.
+  *
+  * This copyrighted material is made available to anyone wishing to use,
+  * modify, copy, or redistribute it subject to the terms and conditions
+@@ -11,12 +11,15 @@
+ #include <linux/dlm.h>
+ #include <linux/slab.h>
+ #include <linux/types.h>
++#include <linux/delay.h>
+ #include <linux/gfs2_ondisk.h>
+ 
+ #include "incore.h"
+ #include "glock.h"
+ #include "util.h"
++#include "sys.h"
+ 
++extern struct workqueue_struct *gfs2_control_wq;
+ 
+ static void gdlm_ast(void *arg)
+ {
+@@ -185,34 +188,1002 @@ static void gdlm_cancel(struct gfs2_glock *gl)
+ 	dlm_unlock(ls->ls_dlm, gl->gl_lksb.sb_lkid, DLM_LKF_CANCEL, NULL, gl);
+ }
+ 
+-static int gdlm_mount(struct gfs2_sbd *sdp, const char *fsname)
++/*
++ * dlm/gfs2 recovery coordination using dlm_recover callbacks
++ *
++ *  1. dlm_controld sees lockspace members change
++ *  2. dlm_controld blocks dlm-kernel locking activity
++ *  3. dlm_controld within dlm-kernel notifies gfs2 (recover_prep)
++ *  4. dlm_controld starts and finishes its own user level recovery
++ *  5. dlm_controld starts dlm-kernel dlm_recoverd to do kernel recovery
++ *  6. dlm_recoverd notifies gfs2 of failed nodes (recover_slot)
++ *  7. dlm_recoverd does its own lock recovery
++ *  8. dlm_recoverd unblocks dlm-kernel locking activity
++ *  9. dlm_recoverd notifies gfs2 when done (recover_done with new generation)
++ * 10. gfs2_control updates control_lock lvb with new generation and jid bits
++ * 11. gfs2_control enqueues journals for gfs2_recover to recover (maybe none)
++ * 12. gfs2_recover dequeues and recovers journals of failed nodes
++ * 13. gfs2_recover provides recovery results to gfs2_control (recovery_result)
++ * 14. gfs2_control updates control_lock lvb jid bits for recovered journals
++ * 15. gfs2_control unblocks normal locking when all journals are recovered
++ *
++ * - failures during recovery
++ *
++ * recover_prep() may set BLOCK_LOCKS (step 3) again before gfs2_control
++ * clears BLOCK_LOCKS (step 15), e.g. another node fails while still
++ * recovering for a prior failure.  gfs2_control needs a way to detect
++ * this so it can leave BLOCK_LOCKS set in step 15.  This is managed using
++ * the recover_block and recover_start values.
++ *
++ * recover_done() provides a new lockspace generation number each time it
++ * is called (step 9).  This generation number is saved as recover_start.
++ * When recover_prep() is called, it sets BLOCK_LOCKS and sets
++ * recover_block = recover_start.  So, while recover_block is equal to
++ * recover_start, BLOCK_LOCKS should remain set.  (recover_spin must
++ * be held around the BLOCK_LOCKS/recover_block/recover_start logic.)
++ *
++ * - more specific gfs2 steps in sequence above
++ *
++ *  3. recover_prep sets BLOCK_LOCKS and sets recover_block = recover_start
++ *  6. recover_slot records any failed jids (maybe none)
++ *  9. recover_done sets recover_start = new generation number
++ * 10. gfs2_control sets control_lock lvb = new gen + bits for failed jids
++ * 12. gfs2_recover does journal recoveries for failed jids identified above
++ * 14. gfs2_control clears control_lock lvb bits for recovered jids
++ * 15. gfs2_control checks if recover_block == recover_start (step 3 occured
++ *     again) then do nothing, otherwise if recover_start > recover_block
++ *     then clear BLOCK_LOCKS.
++ *
++ * - parallel recovery steps across all nodes
++ *
++ * All nodes attempt to update the control_lock lvb with the new generation
++ * number and jid bits, but only the first to get the control_lock EX will
++ * do so; others will see that it's already done (lvb already contains new
++ * generation number.)
++ *
++ * . All nodes get the same recover_prep/recover_slot/recover_done callbacks
++ * . All nodes attempt to set control_lock lvb gen + bits for the new gen
++ * . One node gets control_lock first and writes the lvb, others see it's done
++ * . All nodes attempt to recover jids for which they see control_lock bits set
++ * . One node succeeds for a jid, and that one clears the jid bit in the lvb
++ * . All nodes will eventually see all lvb bits clear and unblock locks
++ *
++ * - is there a problem with clearing an lvb bit that should be set
++ *   and missing a journal recovery?
++ *
++ * 1. jid fails
++ * 2. lvb bit set for step 1
++ * 3. jid recovered for step 1
++ * 4. jid taken again (new mount)
++ * 5. jid fails (for step 4)
++ * 6. lvb bit set for step 5 (will already be set)
++ * 7. lvb bit cleared for step 3
++ *
++ * This is not a problem because the failure in step 5 does not
++ * require recovery, because the mount in step 4 could not have
++ * progressed far enough to unblock locks and access the fs.  The
++ * control_mount() function waits for all recoveries to be complete
++ * for the latest lockspace generation before ever unblocking locks
++ * and returning.  The mount in step 4 waits until the recovery in
++ * step 1 is done.
++ *
++ * - special case of first mounter: first node to mount the fs
++ *
++ * The first node to mount a gfs2 fs needs to check all the journals
++ * and recover any that need recovery before other nodes are allowed
++ * to mount the fs.  (Others may begin mounting, but they must wait
++ * for the first mounter to be done before taking locks on the fs
++ * or accessing the fs.)  This has two parts:
++ *
++ * 1. The mounted_lock tells a node it's the first to mount the fs.
++ * Each node holds the mounted_lock in PR while it's mounted.
++ * Each node tries to acquire the mounted_lock in EX when it mounts.
++ * If a node is granted the mounted_lock EX it means there are no
++ * other mounted nodes (no PR locks exist), and it is the first mounter.
++ * The mounted_lock is demoted to PR when first recovery is done, so
++ * others will fail to get an EX lock, but will get a PR lock.
++ *
++ * 2. The control_lock blocks others in control_mount() while the first
++ * mounter is doing first mount recovery of all journals.
++ * A mounting node needs to acquire control_lock in EX mode before
++ * it can proceed.  The first mounter holds control_lock in EX while doing
++ * the first mount recovery, blocking mounts from other nodes, then demotes
++ * control_lock to NL when it's done (others_may_mount/first_done),
++ * allowing other nodes to continue mounting.
++ *
++ * first mounter:
++ * control_lock EX/NOQUEUE success
++ * mounted_lock EX/NOQUEUE success (no other PR, so no other mounters)
++ * set first=1
++ * do first mounter recovery
++ * mounted_lock EX->PR
++ * control_lock EX->NL, write lvb generation
++ *
++ * other mounter:
++ * control_lock EX/NOQUEUE success (if fail -EAGAIN, retry)
++ * mounted_lock EX/NOQUEUE fail -EAGAIN (expected due to other mounters PR)
++ * mounted_lock PR/NOQUEUE success
++ * read lvb generation
++ * control_lock EX->NL
++ * set first=0
++ *
++ * - mount during recovery
++ *
++ * If a node mounts while others are doing recovery (not first mounter),
++ * the mounting node will get its initial recover_done() callback without
++ * having seen any previous failures/callbacks.
++ *
++ * It must wait for all recoveries preceding its mount to be finished
++ * before it unblocks locks.  It does this by repeating the "other mounter"
++ * steps above until the lvb generation number is >= its mount generation
++ * number (from initial recover_done) and all lvb bits are clear.
++ *
++ * - control_lock lvb format
++ *
++ * 4 bytes generation number: the latest dlm lockspace generation number
++ * from recover_done callback.  Indicates the jid bitmap has been updated
++ * to reflect all slot failures through that generation.
++ * 4 bytes unused.
++ * GDLM_LVB_SIZE-8 bytes of jid bit map. If bit N is set, it indicates
++ * that jid N needs recovery.
++ */
++
++#define JID_BITMAP_OFFSET 8 /* 4 byte generation number + 4 byte unused */
++
++static void control_lvb_read(struct lm_lockstruct *ls, uint32_t *lvb_gen,
++			     char *lvb_bits)
++{
++	uint32_t gen;
++	memcpy(lvb_bits, ls->ls_control_lvb, GDLM_LVB_SIZE);
++	memcpy(&gen, lvb_bits, sizeof(uint32_t));
++	*lvb_gen = le32_to_cpu(gen);
++}
++
++static void control_lvb_write(struct lm_lockstruct *ls, uint32_t lvb_gen,
++			      char *lvb_bits)
++{
++	uint32_t gen;
++	memcpy(ls->ls_control_lvb, lvb_bits, GDLM_LVB_SIZE);
++	gen = cpu_to_le32(lvb_gen);
++	memcpy(ls->ls_control_lvb, &gen, sizeof(uint32_t));
++}
++
++static int all_jid_bits_clear(char *lvb)
++{
++	int i;
++	for (i = JID_BITMAP_OFFSET; i < GDLM_LVB_SIZE; i++) {
++		if (lvb[i])
++			return 0;
++	}
++	return 1;
++}
++
++static void sync_wait_cb(void *arg)
++{
++	struct lm_lockstruct *ls = arg;
++	complete(&ls->ls_sync_wait);
++}
++
++static int sync_unlock(struct gfs2_sbd *sdp, struct dlm_lksb *lksb, char *name)
+ {
+ 	struct lm_lockstruct *ls = &sdp->sd_lockstruct;
+ 	int error;
+ 
+-	if (fsname == NULL) {
+-		fs_info(sdp, "no fsname found\n");
+-		return -EINVAL;
++	error = dlm_unlock(ls->ls_dlm, lksb->sb_lkid, 0, lksb, ls);
++	if (error) {
++		fs_err(sdp, "%s lkid %x error %d\n",
++		       name, lksb->sb_lkid, error);
++		return error;
++	}
++
++	wait_for_completion(&ls->ls_sync_wait);
++
++	if (lksb->sb_status != -DLM_EUNLOCK) {
++		fs_err(sdp, "%s lkid %x status %d\n",
++		       name, lksb->sb_lkid, lksb->sb_status);
++		return -1;
++	}
++	return 0;
++}
++
++static int sync_lock(struct gfs2_sbd *sdp, int mode, uint32_t flags,
++		     unsigned int num, struct dlm_lksb *lksb, char *name)
++{
++	struct lm_lockstruct *ls = &sdp->sd_lockstruct;
++	char strname[GDLM_STRNAME_BYTES];
++	int error, status;
++
++	memset(strname, 0, GDLM_STRNAME_BYTES);
++	snprintf(strname, GDLM_STRNAME_BYTES, "%8x%16x", LM_TYPE_NONDISK, num);
++
++	error = dlm_lock(ls->ls_dlm, mode, lksb, flags,
++			 strname, GDLM_STRNAME_BYTES - 1,
++			 0, sync_wait_cb, ls, NULL);
++	if (error) {
++		fs_err(sdp, "%s lkid %x flags %x mode %d error %d\n",
++		       name, lksb->sb_lkid, flags, mode, error);
++		return error;
++	}
++
++	wait_for_completion(&ls->ls_sync_wait);
++
++	status = lksb->sb_status;
++
++	if (status && status != -EAGAIN) {
++		fs_err(sdp, "%s lkid %x flags %x mode %d status %d\n",
++		       name, lksb->sb_lkid, flags, mode, status);
++	}
++
++	return status;
++}
++
++static int mounted_unlock(struct gfs2_sbd *sdp)
++{
++	struct lm_lockstruct *ls = &sdp->sd_lockstruct;
++	return sync_unlock(sdp, &ls->ls_mounted_lksb, "mounted_lock");
++}
++
++static int mounted_lock(struct gfs2_sbd *sdp, int mode, uint32_t flags)
++{
++	struct lm_lockstruct *ls = &sdp->sd_lockstruct;
++	return sync_lock(sdp, mode, flags, GFS2_MOUNTED_LOCK,
++			 &ls->ls_mounted_lksb, "mounted_lock");
++}
++
++static int control_unlock(struct gfs2_sbd *sdp)
++{
++	struct lm_lockstruct *ls = &sdp->sd_lockstruct;
++	return sync_unlock(sdp, &ls->ls_control_lksb, "control_lock");
++}
++
++static int control_lock(struct gfs2_sbd *sdp, int mode, uint32_t flags)
++{
++	struct lm_lockstruct *ls = &sdp->sd_lockstruct;
++	return sync_lock(sdp, mode, flags, GFS2_CONTROL_LOCK,
++			 &ls->ls_control_lksb, "control_lock");
++}
++
++static void gfs2_control_func(struct work_struct *work)
++{
++	struct gfs2_sbd *sdp = container_of(work, struct gfs2_sbd, sd_control_work.work);
++	struct lm_lockstruct *ls = &sdp->sd_lockstruct;
++	char lvb_bits[GDLM_LVB_SIZE];
++	uint32_t block_gen, start_gen, lvb_gen, flags;
++	int recover_set = 0;
++	int write_lvb = 0;
++	int recover_size;
++	int i, error;
++
++	spin_lock(&ls->ls_recover_spin);
++	/*
++	 * No MOUNT_DONE means we're still mounting; control_mount()
++	 * will set this flag, after which this thread will take over
++	 * all further clearing of BLOCK_LOCKS.
++	 *
++	 * FIRST_MOUNT means this node is doing first mounter recovery,
++	 * for which recovery control is handled by
++	 * control_mount()/control_first_done(), not this thread.
++	 */
++	if (!test_bit(DFL_MOUNT_DONE, &ls->ls_recover_flags) ||
++	     test_bit(DFL_FIRST_MOUNT, &ls->ls_recover_flags)) {
++		spin_unlock(&ls->ls_recover_spin);
++		return;
++	}
++	block_gen = ls->ls_recover_block;
++	start_gen = ls->ls_recover_start;
++	spin_unlock(&ls->ls_recover_spin);
++
++	/*
++	 * Equal block_gen and start_gen implies we are between
++	 * recover_prep and recover_done callbacks, which means
++	 * dlm recovery is in progress and dlm locking is blocked.
++	 * There's no point trying to do any work until recover_done.
++	 */
++
++	if (block_gen == start_gen)
++		return;
++
++	/*
++	 * Propagate recover_submit[] and recover_result[] to lvb:
++	 * dlm_recoverd adds to recover_submit[] jids needing recovery
++	 * gfs2_recover adds to recover_result[] journal recovery results
++	 *
++	 * set lvb bit for jids in recover_submit[] if the lvb has not
++	 * yet been updated for the generation of the failure
++	 *
++	 * clear lvb bit for jids in recover_result[] if the result of
++	 * the journal recovery is SUCCESS
++	 */
++
++	error = control_lock(sdp, DLM_LOCK_EX, DLM_LKF_CONVERT|DLM_LKF_VALBLK);
++	if (error) {
++		fs_err(sdp, "control lock EX error %d\n", error);
++		return;
++	}
++
++	control_lvb_read(ls, &lvb_gen, lvb_bits);
++
++	spin_lock(&ls->ls_recover_spin);
++	if (block_gen != ls->ls_recover_block ||
++	    start_gen != ls->ls_recover_start) {
++		fs_info(sdp, "recover generation %u block1 %u %u\n",
++			start_gen, block_gen, ls->ls_recover_block);
++		spin_unlock(&ls->ls_recover_spin);
++		control_lock(sdp, DLM_LOCK_NL, DLM_LKF_CONVERT);
++		return;
++	}
++
++	recover_size = ls->ls_recover_size;
++
++	if (lvb_gen <= start_gen) {
++		/*
++		 * Clear lvb bits for jids we've successfully recovered.
++		 * Because all nodes attempt to recover failed journals,
++		 * a journal can be recovered multiple times successfully
++		 * in succession.  Only the first will really do recovery,
++		 * the others find it clean, but still report a successful
++		 * recovery.  So, another node may have already recovered
++		 * the jid and cleared the lvb bit for it.
++		 */
++		for (i = 0; i < recover_size; i++) {
++			if (ls->ls_recover_result[i] != LM_RD_SUCCESS)
++				continue;
++
++			ls->ls_recover_result[i] = 0;
++
++			if (!test_bit_le(i, lvb_bits + JID_BITMAP_OFFSET))
++				continue;
++
++			__clear_bit_le(i, lvb_bits + JID_BITMAP_OFFSET);
++			write_lvb = 1;
++		}
++	}
++
++	if (lvb_gen == start_gen) {
++		/*
++		 * Failed slots before start_gen are already set in lvb.
++		 */
++		for (i = 0; i < recover_size; i++) {
++			if (!ls->ls_recover_submit[i])
++				continue;
++			if (ls->ls_recover_submit[i] < lvb_gen)
++				ls->ls_recover_submit[i] = 0;
++		}
++	} else if (lvb_gen < start_gen) {
++		/*
++		 * Failed slots before start_gen are not yet set in lvb.
++		 */
++		for (i = 0; i < recover_size; i++) {
++			if (!ls->ls_recover_submit[i])
++				continue;
++			if (ls->ls_recover_submit[i] < start_gen) {
++				ls->ls_recover_submit[i] = 0;
++				__set_bit_le(i, lvb_bits + JID_BITMAP_OFFSET);
++			}
++		}
++		/* even if there are no bits to set, we need to write the
++		   latest generation to the lvb */
++		write_lvb = 1;
++	} else {
++		/*
++		 * we should be getting a recover_done() for lvb_gen soon
++		 */
++	}
++	spin_unlock(&ls->ls_recover_spin);
++
++	if (write_lvb) {
++		control_lvb_write(ls, start_gen, lvb_bits);
++		flags = DLM_LKF_CONVERT | DLM_LKF_VALBLK;
++	} else {
++		flags = DLM_LKF_CONVERT;
++	}
++
++	error = control_lock(sdp, DLM_LOCK_NL, flags);
++	if (error) {
++		fs_err(sdp, "control lock NL error %d\n", error);
++		return;
++	}
++
++	/*
++	 * Everyone will see jid bits set in the lvb, run gfs2_recover_set(),
++	 * and clear a jid bit in the lvb if the recovery is a success.
++	 * Eventually all journals will be recovered, all jid bits will
++	 * be cleared in the lvb, and everyone will clear BLOCK_LOCKS.
++	 */
++
++	for (i = 0; i < recover_size; i++) {
++		if (test_bit_le(i, lvb_bits + JID_BITMAP_OFFSET)) {
++			fs_info(sdp, "recover generation %u jid %d\n",
++				start_gen, i);
++			gfs2_recover_set(sdp, i);
++			recover_set++;
++		}
++	}
++	if (recover_set)
++		return;
++
++	/*
++	 * No more jid bits set in lvb, all recovery is done, unblock locks
++	 * (unless a new recover_prep callback has occured blocking locks
++	 * again while working above)
++	 */
++
++	spin_lock(&ls->ls_recover_spin);
++	if (ls->ls_recover_block == block_gen &&
++	    ls->ls_recover_start == start_gen) {
++		clear_bit(DFL_BLOCK_LOCKS, &ls->ls_recover_flags);
++		spin_unlock(&ls->ls_recover_spin);
++		fs_info(sdp, "recover generation %u done\n", start_gen);
++		gfs2_glock_thaw(sdp);
++	} else {
++		fs_info(sdp, "recover generation %u block2 %u %u\n",
++			start_gen, block_gen, ls->ls_recover_block);
++		spin_unlock(&ls->ls_recover_spin);
++	}
++}
++
++static int control_mount(struct gfs2_sbd *sdp)
++{
++	struct lm_lockstruct *ls = &sdp->sd_lockstruct;
++	char lvb_bits[GDLM_LVB_SIZE];
++	uint32_t start_gen, block_gen, mount_gen, lvb_gen;
++	int mounted_mode;
++	int retries = 0;
++	int error;
++
++	memset(&ls->ls_mounted_lksb, 0, sizeof(struct dlm_lksb));
++	memset(&ls->ls_control_lksb, 0, sizeof(struct dlm_lksb));
++	memset(&ls->ls_control_lvb, 0, GDLM_LVB_SIZE);
++	ls->ls_control_lksb.sb_lvbptr = ls->ls_control_lvb;
++	init_completion(&ls->ls_sync_wait);
++
++	set_bit(DFL_BLOCK_LOCKS, &ls->ls_recover_flags);
++
++	error = control_lock(sdp, DLM_LOCK_NL, DLM_LKF_VALBLK);
++	if (error) {
++		fs_err(sdp, "control_mount control_lock NL error %d\n", error);
++		return error;
++	}
++
++	error = mounted_lock(sdp, DLM_LOCK_NL, 0);
++	if (error) {
++		fs_err(sdp, "control_mount mounted_lock NL error %d\n", error);
++		control_unlock(sdp);
++		return error;
++	}
++	mounted_mode = DLM_LOCK_NL;
++
++restart:
++	if (retries++ && signal_pending(current)) {
++		error = -EINTR;
++		goto fail;
++	}
++
++	/*
++	 * We always start with both locks in NL. control_lock is
++	 * demoted to NL below so we don't need to do it here.
++	 */
++
++	if (mounted_mode != DLM_LOCK_NL) {
++		error = mounted_lock(sdp, DLM_LOCK_NL, DLM_LKF_CONVERT);
++		if (error)
++			goto fail;
++		mounted_mode = DLM_LOCK_NL;
++	}
++
++	/*
++	 * Other nodes need to do some work in dlm recovery and gfs2_control
++	 * before the recover_done and control_lock will be ready for us below.
++	 * A delay here is not required but often avoids having to retry.
++	 */
++
++	msleep_interruptible(500);
++
++	/*
++	 * Acquire control_lock in EX and mounted_lock in either EX or PR.
++	 * control_lock lvb keeps track of any pending journal recoveries.
++	 * mounted_lock indicates if any other nodes have the fs mounted.
++	 */
++
++	error = control_lock(sdp, DLM_LOCK_EX, DLM_LKF_CONVERT|DLM_LKF_NOQUEUE|DLM_LKF_VALBLK);
++	if (error == -EAGAIN) {
++		goto restart;
++	} else if (error) {
++		fs_err(sdp, "control_mount control_lock EX error %d\n", error);
++		goto fail;
++	}
++
++	error = mounted_lock(sdp, DLM_LOCK_EX, DLM_LKF_CONVERT|DLM_LKF_NOQUEUE);
++	if (!error) {
++		mounted_mode = DLM_LOCK_EX;
++		goto locks_done;
++	} else if (error != -EAGAIN) {
++		fs_err(sdp, "control_mount mounted_lock EX error %d\n", error);
++		goto fail;
++	}
++
++	error = mounted_lock(sdp, DLM_LOCK_PR, DLM_LKF_CONVERT|DLM_LKF_NOQUEUE);
++	if (!error) {
++		mounted_mode = DLM_LOCK_PR;
++		goto locks_done;
++	} else {
++		/* not even -EAGAIN should happen here */
++		fs_err(sdp, "control_mount mounted_lock PR error %d\n", error);
++		goto fail;
++	}
++
++locks_done:
++	/*
++	 * If we got both locks above in EX, then we're the first mounter.
++	 * If not, then we need to wait for the control_lock lvb to be
++	 * updated by other mounted nodes to reflect our mount generation.
++	 *
++	 * In simple first mounter cases, first mounter will see zero lvb_gen,
++	 * but in cases where all existing nodes leave/fail before mounting
++	 * nodes finish control_mount, then all nodes will be mounting and
++	 * lvb_gen will be non-zero.
++	 */
++
++	control_lvb_read(ls, &lvb_gen, lvb_bits);
++
++	if (lvb_gen == 0xFFFFFFFF) {
++		/* special value to force mount attempts to fail */
++		fs_err(sdp, "control_mount control_lock disabled\n");
++		error = -EINVAL;
++		goto fail;
++	}
++
++	if (mounted_mode == DLM_LOCK_EX) {
++		/* first mounter, keep both EX while doing first recovery */
++		spin_lock(&ls->ls_recover_spin);
++		clear_bit(DFL_BLOCK_LOCKS, &ls->ls_recover_flags);
++		set_bit(DFL_MOUNT_DONE, &ls->ls_recover_flags);
++		set_bit(DFL_FIRST_MOUNT, &ls->ls_recover_flags);
++		spin_unlock(&ls->ls_recover_spin);
++		fs_info(sdp, "first mounter control generation %u\n", lvb_gen);
++		return 0;
++	}
++
++	error = control_lock(sdp, DLM_LOCK_NL, DLM_LKF_CONVERT);
++	if (error)
++		goto fail;
++
++	/*
++	 * We are not first mounter, now we need to wait for the control_lock
++	 * lvb generation to be >= the generation from our first recover_done
++	 * and all lvb bits to be clear (no pending journal recoveries.)
++	 */
++
++	if (!all_jid_bits_clear(lvb_bits)) {
++		/* journals need recovery, wait until all are clear */
++		fs_info(sdp, "control_mount wait for journal recovery\n");
++		goto restart;
++	}
++
++	spin_lock(&ls->ls_recover_spin);
++	block_gen = ls->ls_recover_block;
++	start_gen = ls->ls_recover_start;
++	mount_gen = ls->ls_recover_mount;
++
++	if (lvb_gen < mount_gen) {
++		/* wait for mounted nodes to update control_lock lvb to our
++		   generation, which might include new recovery bits set */
++		fs_info(sdp, "control_mount wait1 block %u start %u mount %u "
++			"lvb %u flags %lx\n", block_gen, start_gen, mount_gen,
++			lvb_gen, ls->ls_recover_flags);
++		spin_unlock(&ls->ls_recover_spin);
++		goto restart;
++	}
++
++	if (lvb_gen != start_gen) {
++		/* wait for mounted nodes to update control_lock lvb to the
++		   latest recovery generation */
++		fs_info(sdp, "control_mount wait2 block %u start %u mount %u "
++			"lvb %u flags %lx\n", block_gen, start_gen, mount_gen,
++			lvb_gen, ls->ls_recover_flags);
++		spin_unlock(&ls->ls_recover_spin);
++		goto restart;
++	}
++
++	if (block_gen == start_gen) {
++		/* dlm recovery in progress, wait for it to finish */
++		fs_info(sdp, "control_mount wait3 block %u start %u mount %u "
++			"lvb %u flags %lx\n", block_gen, start_gen, mount_gen,
++			lvb_gen, ls->ls_recover_flags);
++		spin_unlock(&ls->ls_recover_spin);
++		goto restart;
+ 	}
+ 
+-	error = dlm_new_lockspace(fsname, NULL, 
+-				  DLM_LSFL_FS | DLM_LSFL_NEWEXCL |
+-				  (ls->ls_nodir ? DLM_LSFL_NODIR : 0),
+-				  GDLM_LVB_SIZE, NULL, NULL, NULL, &ls->ls_dlm);
++	clear_bit(DFL_BLOCK_LOCKS, &ls->ls_recover_flags);
++	set_bit(DFL_MOUNT_DONE, &ls->ls_recover_flags);
++	memset(ls->ls_recover_submit, 0, ls->ls_recover_size*sizeof(uint32_t));
++	memset(ls->ls_recover_result, 0, ls->ls_recover_size*sizeof(uint32_t));
++	spin_unlock(&ls->ls_recover_spin);
++	return 0;
++
++fail:
++	mounted_unlock(sdp);
++	control_unlock(sdp);
++	return error;
++}
++
++static int dlm_recovery_wait(void *word)
++{
++	schedule();
++	return 0;
++}
++
++static int control_first_done(struct gfs2_sbd *sdp)
++{
++	struct lm_lockstruct *ls = &sdp->sd_lockstruct;
++	char lvb_bits[GDLM_LVB_SIZE];
++	uint32_t start_gen, block_gen;
++	int error;
++
++restart:
++	spin_lock(&ls->ls_recover_spin);
++	start_gen = ls->ls_recover_start;
++	block_gen = ls->ls_recover_block;
++
++	if (test_bit(DFL_BLOCK_LOCKS, &ls->ls_recover_flags) ||
++	    !test_bit(DFL_MOUNT_DONE, &ls->ls_recover_flags) ||
++	    !test_bit(DFL_FIRST_MOUNT, &ls->ls_recover_flags)) {
++		/* sanity check, should not happen */
++		fs_err(sdp, "control_first_done start %u block %u flags %lx\n",
++		       start_gen, block_gen, ls->ls_recover_flags);
++		spin_unlock(&ls->ls_recover_spin);
++		control_unlock(sdp);
++		return -1;
++	}
++
++	if (start_gen == block_gen) {
++		/*
++		 * Wait for the end of a dlm recovery cycle to switch from
++		 * first mounter recovery.  We can ignore any recover_slot
++		 * callbacks between the recover_prep and next recover_done
++		 * because we are still the first mounter and any failed nodes
++		 * have not fully mounted, so they don't need recovery.
++		 */
++		spin_unlock(&ls->ls_recover_spin);
++		fs_info(sdp, "control_first_done wait gen %u\n", start_gen);
++
++		wait_on_bit(&ls->ls_recover_flags, DFL_DLM_RECOVERY,
++			    dlm_recovery_wait, TASK_UNINTERRUPTIBLE);
++		goto restart;
++	}
++
++	clear_bit(DFL_FIRST_MOUNT, &ls->ls_recover_flags);
++	set_bit(DFL_FIRST_MOUNT_DONE, &ls->ls_recover_flags);
++	memset(ls->ls_recover_submit, 0, ls->ls_recover_size*sizeof(uint32_t));
++	memset(ls->ls_recover_result, 0, ls->ls_recover_size*sizeof(uint32_t));
++	spin_unlock(&ls->ls_recover_spin);
++
++	memset(lvb_bits, 0, sizeof(lvb_bits));
++	control_lvb_write(ls, start_gen, lvb_bits);
++
++	error = mounted_lock(sdp, DLM_LOCK_PR, DLM_LKF_CONVERT);
++	if (error)
++		fs_err(sdp, "control_first_done mounted PR error %d\n", error);
++
++	error = control_lock(sdp, DLM_LOCK_NL, DLM_LKF_CONVERT|DLM_LKF_VALBLK);
+ 	if (error)
+-		printk(KERN_ERR "dlm_new_lockspace error %d", error);
++		fs_err(sdp, "control_first_done control NL error %d\n", error);
+ 
+ 	return error;
+ }
+ 
++/*
++ * Expand static jid arrays if necessary (by increments of RECOVER_SIZE_INC)
++ * to accomodate the largest slot number.  (NB dlm slot numbers start at 1,
++ * gfs2 jids start at 0, so jid = slot - 1)
++ */
++
++#define RECOVER_SIZE_INC 16
++
++static int set_recover_size(struct gfs2_sbd *sdp, struct dlm_slot *slots,
++			    int num_slots)
++{
++	struct lm_lockstruct *ls = &sdp->sd_lockstruct;
++	uint32_t *submit = NULL;
++	uint32_t *result = NULL;
++	uint32_t old_size, new_size;
++	int i, max_jid;
++
++	max_jid = 0;
++	for (i = 0; i < num_slots; i++) {
++		if (max_jid < slots[i].slot - 1)
++			max_jid = slots[i].slot - 1;
++	}
++
++	old_size = ls->ls_recover_size;
++
++	if (old_size >= max_jid + 1)
++		return 0;
++
++	new_size = old_size + RECOVER_SIZE_INC;
++
++	submit = kzalloc(new_size * sizeof(uint32_t), GFP_NOFS);
++	result = kzalloc(new_size * sizeof(uint32_t), GFP_NOFS);
++	if (!submit || !result) {
++		kfree(submit);
++		kfree(result);
++		return -ENOMEM;
++	}
++
++	spin_lock(&ls->ls_recover_spin);
++	memcpy(submit, ls->ls_recover_submit, old_size * sizeof(uint32_t));
++	memcpy(result, ls->ls_recover_result, old_size * sizeof(uint32_t));
++	kfree(ls->ls_recover_submit);
++	kfree(ls->ls_recover_result);
++	ls->ls_recover_submit = submit;
++	ls->ls_recover_result = result;
++	ls->ls_recover_size = new_size;
++	spin_unlock(&ls->ls_recover_spin);
++	return 0;
++}
++
++static void free_recover_size(struct lm_lockstruct *ls)
++{
++	kfree(ls->ls_recover_submit);
++	kfree(ls->ls_recover_result);
++	ls->ls_recover_submit = NULL;
++	ls->ls_recover_result = NULL;
++	ls->ls_recover_size = 0;
++}
++
++/* dlm calls before it does lock recovery */
++
++static void gdlm_recover_prep(void *arg)
++{
++	struct gfs2_sbd *sdp = arg;
++	struct lm_lockstruct *ls = &sdp->sd_lockstruct;
++
++	spin_lock(&ls->ls_recover_spin);
++	ls->ls_recover_block = ls->ls_recover_start;
++	set_bit(DFL_DLM_RECOVERY, &ls->ls_recover_flags);
++
++	if (!test_bit(DFL_MOUNT_DONE, &ls->ls_recover_flags) ||
++	     test_bit(DFL_FIRST_MOUNT, &ls->ls_recover_flags)) {
++		spin_unlock(&ls->ls_recover_spin);
++		return;
++	}
++	set_bit(DFL_BLOCK_LOCKS, &ls->ls_recover_flags);
++	spin_unlock(&ls->ls_recover_spin);
++}
++
++/* dlm calls after recover_prep has been completed on all lockspace members;
++   identifies slot/jid of failed member */
++
++static void gdlm_recover_slot(void *arg, struct dlm_slot *slot)
++{
++	struct gfs2_sbd *sdp = arg;
++	struct lm_lockstruct *ls = &sdp->sd_lockstruct;
++	int jid = slot->slot - 1;
++
++	spin_lock(&ls->ls_recover_spin);
++	if (ls->ls_recover_size < jid + 1) {
++		fs_err(sdp, "recover_slot jid %d gen %u short size %d",
++		       jid, ls->ls_recover_block, ls->ls_recover_size);
++		spin_unlock(&ls->ls_recover_spin);
++		return;
++	}
++
++	if (ls->ls_recover_submit[jid]) {
++		fs_info(sdp, "recover_slot jid %d gen %u prev %u",
++			jid, ls->ls_recover_block, ls->ls_recover_submit[jid]);
++	}
++	ls->ls_recover_submit[jid] = ls->ls_recover_block;
++	spin_unlock(&ls->ls_recover_spin);
++}
++
++/* dlm calls after recover_slot and after it completes lock recovery */
++
++static void gdlm_recover_done(void *arg, struct dlm_slot *slots, int num_slots,
++			      int our_slot, uint32_t generation)
++{
++	struct gfs2_sbd *sdp = arg;
++	struct lm_lockstruct *ls = &sdp->sd_lockstruct;
++
++	/* ensure the ls jid arrays are large enough */
++	set_recover_size(sdp, slots, num_slots);
++
++	spin_lock(&ls->ls_recover_spin);
++	ls->ls_recover_start = generation;
++
++	if (!ls->ls_recover_mount) {
++		ls->ls_recover_mount = generation;
++		ls->ls_jid = our_slot - 1;
++	}
++
++	if (!test_bit(DFL_UNMOUNT, &ls->ls_recover_flags))
++		queue_delayed_work(gfs2_control_wq, &sdp->sd_control_work, 0);
++
++	clear_bit(DFL_DLM_RECOVERY, &ls->ls_recover_flags);
++	smp_mb__after_clear_bit();
++	wake_up_bit(&ls->ls_recover_flags, DFL_DLM_RECOVERY);
++	spin_unlock(&ls->ls_recover_spin);
++}
++
++/* gfs2_recover thread has a journal recovery result */
++
++static void gdlm_recovery_result(struct gfs2_sbd *sdp, unsigned int jid,
++				 unsigned int result)
++{
++	struct lm_lockstruct *ls = &sdp->sd_lockstruct;
++
++	if (test_bit(DFL_NO_DLM_OPS, &ls->ls_recover_flags))
++		return;
++
++	/* don't care about the recovery of own journal during mount */
++	if (jid == ls->ls_jid)
++		return;
++
++	spin_lock(&ls->ls_recover_spin);
++	if (test_bit(DFL_FIRST_MOUNT, &ls->ls_recover_flags)) {
++		spin_unlock(&ls->ls_recover_spin);
++		return;
++	}
++	if (ls->ls_recover_size < jid + 1) {
++		fs_err(sdp, "recovery_result jid %d short size %d",
++		       jid, ls->ls_recover_size);
++		spin_unlock(&ls->ls_recover_spin);
++		return;
++	}
++
++	fs_info(sdp, "recover jid %d result %s\n", jid,
++		result == LM_RD_GAVEUP ? "busy" : "success");
++
++	ls->ls_recover_result[jid] = result;
++
++	/* GAVEUP means another node is recovering the journal; delay our
++	   next attempt to recover it, to give the other node a chance to
++	   finish before trying again */
++
++	if (!test_bit(DFL_UNMOUNT, &ls->ls_recover_flags))
++		queue_delayed_work(gfs2_control_wq, &sdp->sd_control_work,
++				   result == LM_RD_GAVEUP ? HZ : 0);
++	spin_unlock(&ls->ls_recover_spin);
++}
++
++const struct dlm_lockspace_ops gdlm_lockspace_ops = {
++	.recover_prep = gdlm_recover_prep,
++	.recover_slot = gdlm_recover_slot,
++	.recover_done = gdlm_recover_done,
++};
++
++static int gdlm_mount(struct gfs2_sbd *sdp, const char *table)
++{
++	struct lm_lockstruct *ls = &sdp->sd_lockstruct;
++	char cluster[GFS2_LOCKNAME_LEN];
++	const char *fsname;
++	uint32_t flags;
++	int error, ops_result;
++
++	/*
++	 * initialize everything
++	 */
++
++	INIT_DELAYED_WORK(&sdp->sd_control_work, gfs2_control_func);
++	spin_lock_init(&ls->ls_recover_spin);
++	ls->ls_recover_flags = 0;
++	ls->ls_recover_mount = 0;
++	ls->ls_recover_start = 0;
++	ls->ls_recover_block = 0;
++	ls->ls_recover_size = 0;
++	ls->ls_recover_submit = NULL;
++	ls->ls_recover_result = NULL;
++
++	error = set_recover_size(sdp, NULL, 0);
++	if (error)
++		goto fail;
++
++	/*
++	 * prepare dlm_new_lockspace args
++	 */
++
++	fsname = strchr(table, ':');
++	if (!fsname) {
++		fs_info(sdp, "no fsname found\n");
++		error = -EINVAL;
++		goto fail_free;
++	}
++	memset(cluster, 0, sizeof(cluster));
++	memcpy(cluster, table, strlen(table) - strlen(fsname));
++	fsname++;
++
++	flags = DLM_LSFL_FS | DLM_LSFL_NEWEXCL;
++	if (ls->ls_nodir)
++		flags |= DLM_LSFL_NODIR;
++
++	/*
++	 * create/join lockspace
++	 */
++
++	error = dlm_new_lockspace(fsname, cluster, flags, GDLM_LVB_SIZE,
++				  &gdlm_lockspace_ops, sdp, &ops_result,
++				  &ls->ls_dlm);
++	if (error) {
++		fs_err(sdp, "dlm_new_lockspace error %d\n", error);
++		goto fail_free;
++	}
++
++	if (ops_result < 0) {
++		/*
++		 * dlm does not support ops callbacks,
++		 * old dlm_controld/gfs_controld are used, try without ops.
++		 */
++		fs_info(sdp, "dlm lockspace ops not used\n");
++		free_recover_size(ls);
++		set_bit(DFL_NO_DLM_OPS, &ls->ls_recover_flags);
++		return 0;
++	}
++
++	if (!test_bit(SDF_NOJOURNALID, &sdp->sd_flags)) {
++		fs_err(sdp, "dlm lockspace ops disallow jid preset\n");
++		error = -EINVAL;
++		goto fail_release;
++	}
++
++	/*
++	 * control_mount() uses control_lock to determine first mounter,
++	 * and for later mounts, waits for any recoveries to be cleared.
++	 */
++
++	error = control_mount(sdp);
++	if (error) {
++		fs_err(sdp, "mount control error %d\n", error);
++		goto fail_release;
++	}
++
++	ls->ls_first = !!test_bit(DFL_FIRST_MOUNT, &ls->ls_recover_flags);
++	clear_bit(SDF_NOJOURNALID, &sdp->sd_flags);
++	smp_mb__after_clear_bit();
++	wake_up_bit(&sdp->sd_flags, SDF_NOJOURNALID);
++	return 0;
++
++fail_release:
++	dlm_release_lockspace(ls->ls_dlm, 2);
++fail_free:
++	free_recover_size(ls);
++fail:
++	return error;
++}
++
++static void gdlm_first_done(struct gfs2_sbd *sdp)
++{
++	struct lm_lockstruct *ls = &sdp->sd_lockstruct;
++	int error;
++
++	if (test_bit(DFL_NO_DLM_OPS, &ls->ls_recover_flags))
++		return;
++
++	error = control_first_done(sdp);
++	if (error)
++		fs_err(sdp, "mount first_done error %d\n", error);
++}
++
+ static void gdlm_unmount(struct gfs2_sbd *sdp)
+ {
+ 	struct lm_lockstruct *ls = &sdp->sd_lockstruct;
+ 
++	if (test_bit(DFL_NO_DLM_OPS, &ls->ls_recover_flags))
++		goto release;
++
++	/* wait for gfs2_control_wq to be done with this mount */
++
++	spin_lock(&ls->ls_recover_spin);
++	set_bit(DFL_UNMOUNT, &ls->ls_recover_flags);
++	spin_unlock(&ls->ls_recover_spin);
++	flush_delayed_work_sync(&sdp->sd_control_work);
++
++	/* mounted_lock and control_lock will be purged in dlm recovery */
++release:
+ 	if (ls->ls_dlm) {
+ 		dlm_release_lockspace(ls->ls_dlm, 2);
+ 		ls->ls_dlm = NULL;
+ 	}
++
++	free_recover_size(ls);
+ }
+ 
+ static const match_table_t dlm_tokens = {
+@@ -226,6 +1197,8 @@ static const match_table_t dlm_tokens = {
+ const struct lm_lockops gfs2_dlm_ops = {
+ 	.lm_proto_name = "lock_dlm",
+ 	.lm_mount = gdlm_mount,
++	.lm_first_done = gdlm_first_done,
++	.lm_recovery_result = gdlm_recovery_result,
+ 	.lm_unmount = gdlm_unmount,
+ 	.lm_put_lock = gdlm_put_lock,
+ 	.lm_lock = gdlm_lock,
+
+commit 60f98d1839376d30e13f3e452dce2433fad3060e
+Author: David Teigland <teigland@redhat.com>
+Date:   Wed Nov 2 14:30:58 2011 -0500
+
+    dlm: add recovery callbacks
+    
+    These new callbacks notify the dlm user about lock recovery.
+    GFS2, and possibly others, need to be aware of when the dlm
+    will be doing lock recovery for a failed lockspace member.
+    
+    In the past, this coordination has been done between dlm and
+    file system daemons in userspace, which then direct their
+    kernel counterparts.  These callbacks allow the same
+    coordination directly, and more simply.
+    
+    Signed-off-by: David Teigland <teigland@redhat.com>
+
+diff --git a/fs/gfs2/lock_dlm.c b/fs/gfs2/lock_dlm.c
+index 98c80d8c2a62..ce85b62bc0a2 100644
+--- a/fs/gfs2/lock_dlm.c
++++ b/fs/gfs2/lock_dlm.c
+@@ -195,10 +195,10 @@ static int gdlm_mount(struct gfs2_sbd *sdp, const char *fsname)
+ 		return -EINVAL;
+ 	}
+ 
+-	error = dlm_new_lockspace(fsname, strlen(fsname), &ls->ls_dlm,
++	error = dlm_new_lockspace(fsname, NULL, 
+ 				  DLM_LSFL_FS | DLM_LSFL_NEWEXCL |
+ 				  (ls->ls_nodir ? DLM_LSFL_NODIR : 0),
+-				  GDLM_LVB_SIZE);
++				  GDLM_LVB_SIZE, NULL, NULL, NULL, &ls->ls_dlm);
+ 	if (error)
+ 		printk(KERN_ERR "dlm_new_lockspace error %d", error);
+ 
+
+commit fc0e38dae645f65424d1fb5d2a938aab8ce48a58
+Author: Steven Whitehouse <swhiteho@redhat.com>
+Date:   Wed Mar 9 10:58:04 2011 +0000
+
+    GFS2: Fix glock deallocation race
+    
+    This patch fixes a race in deallocating glocks which was introduced
+    in the RCU glock patch. We need to ensure that the glock count is
+    kept correct even in the case that there is a race to add a new
+    glock into the hash table. Also, to avoid having to wait for an
+    RCU grace period, the glock counter can be decremented before
+    call_rcu() is called.
+    
+    Signed-off-by: Steven Whitehouse <swhiteho@redhat.com>
+
+diff --git a/fs/gfs2/lock_dlm.c b/fs/gfs2/lock_dlm.c
+index c80485cb6f25..98c80d8c2a62 100644
+--- a/fs/gfs2/lock_dlm.c
++++ b/fs/gfs2/lock_dlm.c
+@@ -30,7 +30,7 @@ static void gdlm_ast(void *arg)
+ 
+ 	switch (gl->gl_lksb.sb_status) {
+ 	case -DLM_EUNLOCK: /* Unlocked, so glock can be freed */
+-		call_rcu(&gl->gl_rcu, gfs2_glock_free);
++		gfs2_glock_free(gl);
+ 		return;
+ 	case -DLM_ECANCEL: /* Cancel while getting lock */
+ 		ret |= LM_OUT_CANCELED;
+@@ -165,7 +165,7 @@ static void gdlm_put_lock(struct gfs2_glock *gl)
+ 	int error;
+ 
+ 	if (gl->gl_lksb.sb_lkid == 0) {
+-		call_rcu(&gl->gl_rcu, gfs2_glock_free);
++		gfs2_glock_free(gl);
+ 		return;
+ 	}
+ 
+
+commit bc015cb84129eb1451913cfebece270bf7a39e0f
+Author: Steven Whitehouse <swhiteho@redhat.com>
+Date:   Wed Jan 19 09:30:01 2011 +0000
+
+    GFS2: Use RCU for glock hash table
+    
+    This has a number of advantages:
+    
+     - Reduces contention on the hash table lock
+     - Makes the code smaller and simpler
+     - Should speed up glock dumps when under load
+     - Removes ref count changing in examine_bucket
+     - No longer need hash chain lock in glock_put() in common case
+    
+    There are some further changes which this enables and which
+    we may do in the future. One is to look at using SLAB_RCU,
+    and another is to look at using a per-cpu counter for the
+    per-sb glock counter, since that is touched twice in the
+    lifetime of each glock (but only used at umount time).
+    
+    Signed-off-by: Steven Whitehouse <swhiteho@redhat.com>
+    Cc: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+
+diff --git a/fs/gfs2/lock_dlm.c b/fs/gfs2/lock_dlm.c
+index 6e493aee28f8..c80485cb6f25 100644
+--- a/fs/gfs2/lock_dlm.c
++++ b/fs/gfs2/lock_dlm.c
+@@ -22,7 +22,6 @@ static void gdlm_ast(void *arg)
+ {
+ 	struct gfs2_glock *gl = arg;
+ 	unsigned ret = gl->gl_state;
+-	struct gfs2_sbd *sdp = gl->gl_sbd;
+ 
+ 	BUG_ON(gl->gl_lksb.sb_flags & DLM_SBF_DEMOTED);
+ 
+@@ -31,12 +30,7 @@ static void gdlm_ast(void *arg)
+ 
+ 	switch (gl->gl_lksb.sb_status) {
+ 	case -DLM_EUNLOCK: /* Unlocked, so glock can be freed */
+-		if (gl->gl_ops->go_flags & GLOF_ASPACE)
+-			kmem_cache_free(gfs2_glock_aspace_cachep, gl);
+-		else
+-			kmem_cache_free(gfs2_glock_cachep, gl);
+-		if (atomic_dec_and_test(&sdp->sd_glock_disposal))
+-			wake_up(&sdp->sd_glock_wait);
++		call_rcu(&gl->gl_rcu, gfs2_glock_free);
+ 		return;
+ 	case -DLM_ECANCEL: /* Cancel while getting lock */
+ 		ret |= LM_OUT_CANCELED;
+@@ -164,16 +158,14 @@ static int gdlm_lock(struct gfs2_glock *gl, unsigned int req_state,
+ 			GDLM_STRNAME_BYTES - 1, 0, gdlm_ast, gl, gdlm_bast);
+ }
+ 
+-static void gdlm_put_lock(struct kmem_cache *cachep, struct gfs2_glock *gl)
++static void gdlm_put_lock(struct gfs2_glock *gl)
+ {
+ 	struct gfs2_sbd *sdp = gl->gl_sbd;
+ 	struct lm_lockstruct *ls = &sdp->sd_lockstruct;
+ 	int error;
+ 
+ 	if (gl->gl_lksb.sb_lkid == 0) {
+-		kmem_cache_free(cachep, gl);
+-		if (atomic_dec_and_test(&sdp->sd_glock_disposal))
+-			wake_up(&sdp->sd_glock_wait);
++		call_rcu(&gl->gl_rcu, gfs2_glock_free);
+ 		return;
+ 	}
+ 
+
+commit 47a25380e37f44db7202093ca92e4af569c34f55
+Author: Steven Whitehouse <swhiteho@redhat.com>
+Date:   Tue Nov 30 15:49:31 2010 +0000
+
+    GFS2: Merge glock state fields into a bitfield
+    
+    We can only merge the fields into a bitfield if the locking
+    rules for them are the same. In this case gl_spin covers all
+    of the fields (write side) but a couple of them are used
+    with GLF_LOCK as the read side lock, which should be ok
+    since we know that the field in question won't be changing
+    at the time.
+    
+    The gl_req setting has to be done earlier (in glock.c) in order
+    to place it under gl_spin. The gl_reply setting also has to be
+    brought under gl_spin in order to comply with the new rules.
+    
+    This saves 4*sizeof(unsigned int) per glock.
+    
+    Signed-off-by: Steven Whitehouse <swhiteho@redhat.com>
+    Cc: Bob Peterson <rpeterso@redhat.com>
+
+diff --git a/fs/gfs2/lock_dlm.c b/fs/gfs2/lock_dlm.c
+index f40ce34c803e..6e493aee28f8 100644
+--- a/fs/gfs2/lock_dlm.c
++++ b/fs/gfs2/lock_dlm.c
+@@ -153,7 +153,6 @@ static int gdlm_lock(struct gfs2_glock *gl, unsigned int req_state,
+ 	int req;
+ 	u32 lkf;
+ 
+-	gl->gl_req = req_state;
+ 	req = make_mode(req_state);
+ 	lkf = make_flags(gl->gl_lksb.sb_lkid, flags, req);
+ 
+
+commit 921169ca2f7c8a0a2ccda2ce33c465dfe3ae30ef
+Author: Steven Whitehouse <swhiteho@redhat.com>
+Date:   Mon Nov 29 12:50:38 2010 +0000
+
+    GFS2: Clean up of gdlm_lock function
+    
+    The DLM never returns -EAGAIN in response to dlm_lock(), and even
+    if it did, the test in gdlm_lock() was wrong anyway. Once that
+    test is removed, it is possible to greatly simplify this code
+    by simply using a "normal" error return code (0 for success).
+    
+    We then no longer need the LM_OUT_ASYNC return code which can
+    be removed.
+    
+    Signed-off-by: Steven Whitehouse <swhiteho@redhat.com>
+
+diff --git a/fs/gfs2/lock_dlm.c b/fs/gfs2/lock_dlm.c
+index 1c09425b45fd..f40ce34c803e 100644
+--- a/fs/gfs2/lock_dlm.c
++++ b/fs/gfs2/lock_dlm.c
+@@ -146,11 +146,10 @@ static u32 make_flags(const u32 lkid, const unsigned int gfs_flags,
+ 	return lkf;
+ }
+ 
+-static unsigned int gdlm_lock(struct gfs2_glock *gl,
+-			      unsigned int req_state, unsigned int flags)
++static int gdlm_lock(struct gfs2_glock *gl, unsigned int req_state,
++		     unsigned int flags)
+ {
+ 	struct lm_lockstruct *ls = &gl->gl_sbd->sd_lockstruct;
+-	int error;
+ 	int req;
+ 	u32 lkf;
+ 
+@@ -162,13 +161,8 @@ static unsigned int gdlm_lock(struct gfs2_glock *gl,
+ 	 * Submit the actual lock request.
+ 	 */
+ 
+-	error = dlm_lock(ls->ls_dlm, req, &gl->gl_lksb, lkf, gl->gl_strname,
+-			 GDLM_STRNAME_BYTES - 1, 0, gdlm_ast, gl, gdlm_bast);
+-	if (error == -EAGAIN)
+-		return 0;
+-	if (error)
+-		return LM_OUT_ERROR;
+-	return LM_OUT_ASYNC;
++	return dlm_lock(ls->ls_dlm, req, &gl->gl_lksb, lkf, gl->gl_strname,
++			GDLM_STRNAME_BYTES - 1, 0, gdlm_ast, gl, gdlm_bast);
+ }
+ 
+ static void gdlm_put_lock(struct kmem_cache *cachep, struct gfs2_glock *gl)
+
+commit 1fea7c25a05d388c0cdbe02cbdaf3a2e70885581
+Author: Steven Whitehouse <swhiteho@redhat.com>
+Date:   Wed Sep 8 10:09:25 2010 +0100
+
+    GFS2: Update handling of DLM return codes to match reality
+    
+    GFS2's idea of which return codes it needs to handle was based
+    upon those listed in dlm.h. Those didn't cover all the possible
+    codes and listed some which never happen. This updates GFS2 to
+    handle all the codes which can actually be returned from the
+    DLM under various circumstances.
+    
+    Signed-off-by: Steven Whitehouse <swhiteho@redhat.com>
+
+diff --git a/fs/gfs2/lock_dlm.c b/fs/gfs2/lock_dlm.c
+index 0e0470ed34c2..1c09425b45fd 100644
+--- a/fs/gfs2/lock_dlm.c
++++ b/fs/gfs2/lock_dlm.c
+@@ -42,9 +42,9 @@ static void gdlm_ast(void *arg)
+ 		ret |= LM_OUT_CANCELED;
+ 		goto out;
+ 	case -EAGAIN: /* Try lock fails */
++	case -EDEADLK: /* Deadlock detected */
+ 		goto out;
+-	case -EINVAL: /* Invalid */
+-	case -ENOMEM: /* Out of memory */
++	case -ETIMEDOUT: /* Canceled due to timeout */
+ 		ret |= LM_OUT_ERROR;
+ 		goto out;
+ 	case 0: /* Success */
+
+commit 5a0e3ad6af8660be21ca98a971cd00f331318c05
+Author: Tejun Heo <tj@kernel.org>
+Date:   Wed Mar 24 17:04:11 2010 +0900
+
+    include cleanup: Update gfp.h and slab.h includes to prepare for breaking implicit slab.h inclusion from percpu.h
+    
+    percpu.h is included by sched.h and module.h and thus ends up being
+    included when building most .c files.  percpu.h includes slab.h which
+    in turn includes gfp.h making everything defined by the two files
+    universally available and complicating inclusion dependencies.
+    
+    percpu.h -> slab.h dependency is about to be removed.  Prepare for
+    this change by updating users of gfp and slab facilities include those
+    headers directly instead of assuming availability.  As this conversion
+    needs to touch large number of source files, the following script is
+    used as the basis of conversion.
+    
+      http://userweb.kernel.org/~tj/misc/slabh-sweep.py
+    
+    The script does the followings.
+    
+    * Scan files for gfp and slab usages and update includes such that
+      only the necessary includes are there.  ie. if only gfp is used,
+      gfp.h, if slab is used, slab.h.
+    
+    * When the script inserts a new include, it looks at the include
+      blocks and try to put the new include such that its order conforms
+      to its surrounding.  It's put in the include block which contains
+      core kernel includes, in the same order that the rest are ordered -
+      alphabetical, Christmas tree, rev-Xmas-tree or at the end if there
+      doesn't seem to be any matching order.
+    
+    * If the script can't find a place to put a new include (mostly
+      because the file doesn't have fitting include block), it prints out
+      an error message indicating which .h file needs to be added to the
+      file.
+    
+    The conversion was done in the following steps.
+    
+    1. The initial automatic conversion of all .c files updated slightly
+       over 4000 files, deleting around 700 includes and adding ~480 gfp.h
+       and ~3000 slab.h inclusions.  The script emitted errors for ~400
+       files.
+    
+    2. Each error was manually checked.  Some didn't need the inclusion,
+       some needed manual addition while adding it to implementation .h or
+       embedding .c file was more appropriate for others.  This step added
+       inclusions to around 150 files.
+    
+    3. The script was run again and the output was compared to the edits
+       from #2 to make sure no file was left behind.
+    
+    4. Several build tests were done and a couple of problems were fixed.
+       e.g. lib/decompress_*.c used malloc/free() wrappers around slab
+       APIs requiring slab.h to be added manually.
+    
+    5. The script was run on all .h files but without automatically
+       editing them as sprinkling gfp.h and slab.h inclusions around .h
+       files could easily lead to inclusion dependency hell.  Most gfp.h
+       inclusion directives were ignored as stuff from gfp.h was usually
+       wildly available and often used in preprocessor macros.  Each
+       slab.h inclusion directive was examined and added manually as
+       necessary.
+    
+    6. percpu.h was updated not to include slab.h.
+    
+    7. Build test were done on the following configurations and failures
+       were fixed.  CONFIG_GCOV_KERNEL was turned off for all tests (as my
+       distributed build env didn't work with gcov compiles) and a few
+       more options had to be turned off depending on archs to make things
+       build (like ipr on powerpc/64 which failed due to missing writeq).
+    
+       * x86 and x86_64 UP and SMP allmodconfig and a custom test config.
+       * powerpc and powerpc64 SMP allmodconfig
+       * sparc and sparc64 SMP allmodconfig
+       * ia64 SMP allmodconfig
+       * s390 SMP allmodconfig
+       * alpha SMP allmodconfig
+       * um on x86_64 SMP allmodconfig
+    
+    8. percpu.h modifications were reverted so that it could be applied as
+       a separate patch and serve as bisection point.
+    
+    Given the fact that I had only a couple of failures from tests on step
+    6, I'm fairly confident about the coverage of this conversion patch.
+    If there is a breakage, it's likely to be something in one of the arch
+    headers which should be easily discoverable easily on most builds of
+    the specific arch.
+    
+    Signed-off-by: Tejun Heo <tj@kernel.org>
+    Guess-its-ok-by: Christoph Lameter <cl@linux-foundation.org>
+    Cc: Ingo Molnar <mingo@redhat.com>
+    Cc: Lee Schermerhorn <Lee.Schermerhorn@hp.com>
+
+diff --git a/fs/gfs2/lock_dlm.c b/fs/gfs2/lock_dlm.c
+index 569b46240f61..0e0470ed34c2 100644
+--- a/fs/gfs2/lock_dlm.c
++++ b/fs/gfs2/lock_dlm.c
+@@ -9,6 +9,7 @@
+ 
+ #include <linux/fs.h>
+ #include <linux/dlm.h>
++#include <linux/slab.h>
+ #include <linux/types.h>
+ #include <linux/gfs2_ondisk.h>
+ 
+
+commit 009d851837ab26cab18adda6169a813f70b0b21b
+Author: Steven Whitehouse <swhiteho@redhat.com>
+Date:   Tue Dec 8 12:12:13 2009 +0000
+
+    GFS2: Metadata address space clean up
+    
+    Since the start of GFS2, an "extra" inode has been used to store
+    the metadata belonging to each inode. The only reason for using
+    this inode was to have an extra address space, the other fields
+    were unused. This means that the memory usage was rather inefficient.
+    
+    The reason for keeping each inode's metadata in a separate address
+    space is that when glocks are requested on remote nodes, we need to
+    be able to efficiently locate the data and metadata which relating
+    to that glock (inode) in order to sync or sync and invalidate it
+    (depending on the remotely requested lock mode).
+    
+    This patch adds a new type of glock, which has in addition to
+    its normal fields, has an address space. This applies to all
+    inode and rgrp glocks (but to no other glock types which remain
+    as before). As a result, we no longer need to have the second
+    inode.
+    
+    This results in three major improvements:
+     1. A saving of approx 25% of memory used in caching inodes
+     2. A removal of the circular dependency between inodes and glocks
+     3. No confusion between "normal" and "metadata" inodes in super.c
+    
+    Although the first of these is the more immediately apparent, the
+    second is just as important as it now enables a number of clean
+    ups at umount time. Those will be the subject of future patches.
+    
+    Signed-off-by: Steven Whitehouse <swhiteho@redhat.com>
+
+diff --git a/fs/gfs2/lock_dlm.c b/fs/gfs2/lock_dlm.c
+index 0e5e0e7022e5..569b46240f61 100644
+--- a/fs/gfs2/lock_dlm.c
++++ b/fs/gfs2/lock_dlm.c
+@@ -30,7 +30,10 @@ static void gdlm_ast(void *arg)
+ 
+ 	switch (gl->gl_lksb.sb_status) {
+ 	case -DLM_EUNLOCK: /* Unlocked, so glock can be freed */
+-		kmem_cache_free(gfs2_glock_cachep, gl);
++		if (gl->gl_ops->go_flags & GLOF_ASPACE)
++			kmem_cache_free(gfs2_glock_aspace_cachep, gl);
++		else
++			kmem_cache_free(gfs2_glock_cachep, gl);
+ 		if (atomic_dec_and_test(&sdp->sd_glock_disposal))
+ 			wake_up(&sdp->sd_glock_wait);
+ 		return;
+
+commit 8f05228ee7c8f409ae3c6f9c3e13d7ccb9c18360
+Author: Steven Whitehouse <swhiteho@redhat.com>
+Date:   Fri Jan 29 15:21:27 2010 +0000
+
+    GFS2: Extend umount wait coverage to full glock lifetime
+    
+    Although all glocks are, by the time of the umount glock wait,
+    scheduled for demotion, some of them haven't made it far
+    enough through the process for the original set of waiting
+    code to wait for them.
+    
+    This extends the ref count to the whole glock lifetime in order
+    to ensure that the waiting does catch all glocks. It does make
+    it a bit more invasive, but it seems the only sensible solution
+    at the moment.
+    
+    Signed-off-by: Steven Whitehouse <swhiteho@redhat.com>
+
+diff --git a/fs/gfs2/lock_dlm.c b/fs/gfs2/lock_dlm.c
+index cdd0755d7823..0e5e0e7022e5 100644
+--- a/fs/gfs2/lock_dlm.c
++++ b/fs/gfs2/lock_dlm.c
+@@ -167,15 +167,16 @@ static unsigned int gdlm_lock(struct gfs2_glock *gl,
+ 	return LM_OUT_ASYNC;
+ }
+ 
+-static void gdlm_put_lock(struct kmem_cache *cachep, void *ptr)
++static void gdlm_put_lock(struct kmem_cache *cachep, struct gfs2_glock *gl)
+ {
+-	struct gfs2_glock *gl = ptr;
+ 	struct gfs2_sbd *sdp = gl->gl_sbd;
+ 	struct lm_lockstruct *ls = &sdp->sd_lockstruct;
+ 	int error;
+ 
+ 	if (gl->gl_lksb.sb_lkid == 0) {
+ 		kmem_cache_free(cachep, gl);
++		if (atomic_dec_and_test(&sdp->sd_glock_disposal))
++			wake_up(&sdp->sd_glock_wait);
+ 		return;
+ 	}
+ 
+@@ -187,7 +188,6 @@ static void gdlm_put_lock(struct kmem_cache *cachep, void *ptr)
+ 		       (unsigned long long)gl->gl_name.ln_number, error);
+ 		return;
+ 	}
+-	atomic_inc(&sdp->sd_glock_disposal);
+ }
+ 
+ static void gdlm_cancel(struct gfs2_glock *gl)
+
+commit e402746a945ceb9d0486a8e3d5917c9228fa4404
+Author: Steven Whitehouse <swhiteho@redhat.com>
+Date:   Mon Jan 25 11:20:19 2010 +0000
+
+    GFS2: Wait for unlock completion on umount
+    
+    This patch adds a wait on umount between the point at which we
+    dispose of all glocks and the point at which we unmount the
+    lock protocol. This ensures that we've received all the replies
+    to our unlock requests before we stop the locking.
+    
+    Signed-off-by: Steven Whitehouse <swhiteho@redhat.com>
+    Reported-by: Fabio M. Di Nitto <fdinitto@redhat.com>
+
+diff --git a/fs/gfs2/lock_dlm.c b/fs/gfs2/lock_dlm.c
+index 46df988323bc..cdd0755d7823 100644
+--- a/fs/gfs2/lock_dlm.c
++++ b/fs/gfs2/lock_dlm.c
+@@ -21,6 +21,7 @@ static void gdlm_ast(void *arg)
+ {
+ 	struct gfs2_glock *gl = arg;
+ 	unsigned ret = gl->gl_state;
++	struct gfs2_sbd *sdp = gl->gl_sbd;
+ 
+ 	BUG_ON(gl->gl_lksb.sb_flags & DLM_SBF_DEMOTED);
+ 
+@@ -30,6 +31,8 @@ static void gdlm_ast(void *arg)
+ 	switch (gl->gl_lksb.sb_status) {
+ 	case -DLM_EUNLOCK: /* Unlocked, so glock can be freed */
+ 		kmem_cache_free(gfs2_glock_cachep, gl);
++		if (atomic_dec_and_test(&sdp->sd_glock_disposal))
++			wake_up(&sdp->sd_glock_wait);
+ 		return;
+ 	case -DLM_ECANCEL: /* Cancel while getting lock */
+ 		ret |= LM_OUT_CANCELED;
+@@ -167,7 +170,8 @@ static unsigned int gdlm_lock(struct gfs2_glock *gl,
+ static void gdlm_put_lock(struct kmem_cache *cachep, void *ptr)
+ {
+ 	struct gfs2_glock *gl = ptr;
+-	struct lm_lockstruct *ls = &gl->gl_sbd->sd_lockstruct;
++	struct gfs2_sbd *sdp = gl->gl_sbd;
++	struct lm_lockstruct *ls = &sdp->sd_lockstruct;
+ 	int error;
+ 
+ 	if (gl->gl_lksb.sb_lkid == 0) {
+@@ -183,6 +187,7 @@ static void gdlm_put_lock(struct kmem_cache *cachep, void *ptr)
+ 		       (unsigned long long)gl->gl_name.ln_number, error);
+ 		return;
+ 	}
++	atomic_inc(&sdp->sd_glock_disposal);
+ }
+ 
+ static void gdlm_cancel(struct gfs2_glock *gl)
+
+commit 02ffad08e838997fad3de05c85560a57e5fd92de
+Author: Benjamin Marzinski <bmarzins@redhat.com>
+Date:   Fri Mar 6 10:03:20 2009 -0600
+
+    GFS2: Fix locking bug in failed shared to exclusive conversion
+    
+    After calling out to the dlm, GFS2 sets the new state of a glock to
+    gl_target in gdlm_ast().  However, gl_target is not always the lock
+    state that was requested. If a conversion from shared to exclusive
+    fails, finish_xmote() will call do_xmote() with LM_ST_UNLOCKED, instead
+    of gl->gl_target, so that it can reacquire the lock in exlusive the next
+    time around.  In this case, setting the lock to gl_target in gdlm_ast()
+    will make GFS2 think that it has the glock in exclusive mode, when
+    really, it doesn't have the glock locked at all.  This patch adds a new
+    field to the gfs2_glock structure, gl_req, to track the mode that was
+    requested.
+    
+    Signed-off-by: Benjamin Marzinski <bmarzins@redhat.com>
+    Signed-off-by: Steven Whitehouse <swhiteho@redhat.com>
+
+diff --git a/fs/gfs2/lock_dlm.c b/fs/gfs2/lock_dlm.c
+index a0bb7d2251a0..46df988323bc 100644
+--- a/fs/gfs2/lock_dlm.c
++++ b/fs/gfs2/lock_dlm.c
+@@ -46,11 +46,11 @@ static void gdlm_ast(void *arg)
+ 		BUG();
+ 	}
+ 
+-	ret = gl->gl_target;
++	ret = gl->gl_req;
+ 	if (gl->gl_lksb.sb_flags & DLM_SBF_ALTMODE) {
+-		if (gl->gl_target == LM_ST_SHARED)
++		if (gl->gl_req == LM_ST_SHARED)
+ 			ret = LM_ST_DEFERRED;
+-		else if (gl->gl_target == LM_ST_DEFERRED)
++		else if (gl->gl_req == LM_ST_DEFERRED)
+ 			ret = LM_ST_SHARED;
+ 		else
+ 			BUG();
+@@ -147,6 +147,7 @@ static unsigned int gdlm_lock(struct gfs2_glock *gl,
+ 	int req;
+ 	u32 lkf;
+ 
++	gl->gl_req = req_state;
+ 	req = make_mode(req_state);
+ 	lkf = make_flags(gl->gl_lksb.sb_lkid, flags, req);
+ 
+
+commit f057f6cdf64175db1151b1f5d110e29904f119a1
+Author: Steven Whitehouse <swhiteho@redhat.com>
+Date:   Mon Jan 12 10:43:39 2009 +0000
+
+    GFS2: Merge lock_dlm module into GFS2
+    
+    This is the big patch that I've been working on for some time
+    now. There are many reasons for wanting to make this change
+    such as:
+     o Reducing overhead by eliminating duplicated fields between structures
+     o Simplifcation of the code (reduces the code size by a fair bit)
+     o The locking interface is now the DLM interface itself as proposed
+       some time ago.
+     o Fewer lookups of glocks when processing replies from the DLM
+     o Fewer memory allocations/deallocations for each glock
+     o Scope to do further optimisations in the future (but this patch is
+       more than big enough for now!)
+    
+    Please note that (a) this patch relates to the lock_dlm module and
+    not the DLM itself, that is still a separate module; and (b) that
+    we retain the ability to build GFS2 as a standalone single node
+    filesystem with out requiring the DLM.
+    
+    This patch needs a lot of testing, hence my keeping it I restarted
+    my -git tree after the last merge window. That way, this has the maximum
+    exposure before its merged. This is (modulo a few minor bug fixes) the
+    same patch that I've been posting on and off the the last three months
+    and its passed a number of different tests so far.
+    
+    Signed-off-by: Steven Whitehouse <swhiteho@redhat.com>
+
+diff --git a/fs/gfs2/lock_dlm.c b/fs/gfs2/lock_dlm.c
+new file mode 100644
+index 000000000000..a0bb7d2251a0
+--- /dev/null
++++ b/fs/gfs2/lock_dlm.c
+@@ -0,0 +1,240 @@
++/*
++ * Copyright (C) Sistina Software, Inc.  1997-2003 All rights reserved.
++ * Copyright (C) 2004-2009 Red Hat, Inc.  All rights reserved.
++ *
++ * This copyrighted material is made available to anyone wishing to use,
++ * modify, copy, or redistribute it subject to the terms and conditions
++ * of the GNU General Public License version 2.
++ */
++
++#include <linux/fs.h>
++#include <linux/dlm.h>
++#include <linux/types.h>
++#include <linux/gfs2_ondisk.h>
++
++#include "incore.h"
++#include "glock.h"
++#include "util.h"
++
++
++static void gdlm_ast(void *arg)
++{
++	struct gfs2_glock *gl = arg;
++	unsigned ret = gl->gl_state;
++
++	BUG_ON(gl->gl_lksb.sb_flags & DLM_SBF_DEMOTED);
++
++	if (gl->gl_lksb.sb_flags & DLM_SBF_VALNOTVALID)
++		memset(gl->gl_lvb, 0, GDLM_LVB_SIZE);
++
++	switch (gl->gl_lksb.sb_status) {
++	case -DLM_EUNLOCK: /* Unlocked, so glock can be freed */
++		kmem_cache_free(gfs2_glock_cachep, gl);
++		return;
++	case -DLM_ECANCEL: /* Cancel while getting lock */
++		ret |= LM_OUT_CANCELED;
++		goto out;
++	case -EAGAIN: /* Try lock fails */
++		goto out;
++	case -EINVAL: /* Invalid */
++	case -ENOMEM: /* Out of memory */
++		ret |= LM_OUT_ERROR;
++		goto out;
++	case 0: /* Success */
++		break;
++	default: /* Something unexpected */
++		BUG();
++	}
++
++	ret = gl->gl_target;
++	if (gl->gl_lksb.sb_flags & DLM_SBF_ALTMODE) {
++		if (gl->gl_target == LM_ST_SHARED)
++			ret = LM_ST_DEFERRED;
++		else if (gl->gl_target == LM_ST_DEFERRED)
++			ret = LM_ST_SHARED;
++		else
++			BUG();
++	}
++
++	set_bit(GLF_INITIAL, &gl->gl_flags);
++	gfs2_glock_complete(gl, ret);
++	return;
++out:
++	if (!test_bit(GLF_INITIAL, &gl->gl_flags))
++		gl->gl_lksb.sb_lkid = 0;
++	gfs2_glock_complete(gl, ret);
++}
++
++static void gdlm_bast(void *arg, int mode)
++{
++	struct gfs2_glock *gl = arg;
++
++	switch (mode) {
++	case DLM_LOCK_EX:
++		gfs2_glock_cb(gl, LM_ST_UNLOCKED);
++		break;
++	case DLM_LOCK_CW:
++		gfs2_glock_cb(gl, LM_ST_DEFERRED);
++		break;
++	case DLM_LOCK_PR:
++		gfs2_glock_cb(gl, LM_ST_SHARED);
++		break;
++	default:
++		printk(KERN_ERR "unknown bast mode %d", mode);
++		BUG();
++	}
++}
++
++/* convert gfs lock-state to dlm lock-mode */
++
++static int make_mode(const unsigned int lmstate)
++{
++	switch (lmstate) {
++	case LM_ST_UNLOCKED:
++		return DLM_LOCK_NL;
++	case LM_ST_EXCLUSIVE:
++		return DLM_LOCK_EX;
++	case LM_ST_DEFERRED:
++		return DLM_LOCK_CW;
++	case LM_ST_SHARED:
++		return DLM_LOCK_PR;
++	}
++	printk(KERN_ERR "unknown LM state %d", lmstate);
++	BUG();
++	return -1;
++}
++
++static u32 make_flags(const u32 lkid, const unsigned int gfs_flags,
++		      const int req)
++{
++	u32 lkf = 0;
++
++	if (gfs_flags & LM_FLAG_TRY)
++		lkf |= DLM_LKF_NOQUEUE;
++
++	if (gfs_flags & LM_FLAG_TRY_1CB) {
++		lkf |= DLM_LKF_NOQUEUE;
++		lkf |= DLM_LKF_NOQUEUEBAST;
++	}
++
++	if (gfs_flags & LM_FLAG_PRIORITY) {
++		lkf |= DLM_LKF_NOORDER;
++		lkf |= DLM_LKF_HEADQUE;
++	}
++
++	if (gfs_flags & LM_FLAG_ANY) {
++		if (req == DLM_LOCK_PR)
++			lkf |= DLM_LKF_ALTCW;
++		else if (req == DLM_LOCK_CW)
++			lkf |= DLM_LKF_ALTPR;
++		else
++			BUG();
++	}
++
++	if (lkid != 0) 
++		lkf |= DLM_LKF_CONVERT;
++
++	lkf |= DLM_LKF_VALBLK;
++
++	return lkf;
++}
++
++static unsigned int gdlm_lock(struct gfs2_glock *gl,
++			      unsigned int req_state, unsigned int flags)
++{
++	struct lm_lockstruct *ls = &gl->gl_sbd->sd_lockstruct;
++	int error;
++	int req;
++	u32 lkf;
++
++	req = make_mode(req_state);
++	lkf = make_flags(gl->gl_lksb.sb_lkid, flags, req);
++
++	/*
++	 * Submit the actual lock request.
++	 */
++
++	error = dlm_lock(ls->ls_dlm, req, &gl->gl_lksb, lkf, gl->gl_strname,
++			 GDLM_STRNAME_BYTES - 1, 0, gdlm_ast, gl, gdlm_bast);
++	if (error == -EAGAIN)
++		return 0;
++	if (error)
++		return LM_OUT_ERROR;
++	return LM_OUT_ASYNC;
++}
++
++static void gdlm_put_lock(struct kmem_cache *cachep, void *ptr)
++{
++	struct gfs2_glock *gl = ptr;
++	struct lm_lockstruct *ls = &gl->gl_sbd->sd_lockstruct;
++	int error;
++
++	if (gl->gl_lksb.sb_lkid == 0) {
++		kmem_cache_free(cachep, gl);
++		return;
++	}
++
++	error = dlm_unlock(ls->ls_dlm, gl->gl_lksb.sb_lkid, DLM_LKF_VALBLK,
++			   NULL, gl);
++	if (error) {
++		printk(KERN_ERR "gdlm_unlock %x,%llx err=%d\n",
++		       gl->gl_name.ln_type,
++		       (unsigned long long)gl->gl_name.ln_number, error);
++		return;
++	}
++}
++
++static void gdlm_cancel(struct gfs2_glock *gl)
++{
++	struct lm_lockstruct *ls = &gl->gl_sbd->sd_lockstruct;
++	dlm_unlock(ls->ls_dlm, gl->gl_lksb.sb_lkid, DLM_LKF_CANCEL, NULL, gl);
++}
++
++static int gdlm_mount(struct gfs2_sbd *sdp, const char *fsname)
++{
++	struct lm_lockstruct *ls = &sdp->sd_lockstruct;
++	int error;
++
++	if (fsname == NULL) {
++		fs_info(sdp, "no fsname found\n");
++		return -EINVAL;
++	}
++
++	error = dlm_new_lockspace(fsname, strlen(fsname), &ls->ls_dlm,
++				  DLM_LSFL_FS | DLM_LSFL_NEWEXCL |
++				  (ls->ls_nodir ? DLM_LSFL_NODIR : 0),
++				  GDLM_LVB_SIZE);
++	if (error)
++		printk(KERN_ERR "dlm_new_lockspace error %d", error);
++
++	return error;
++}
++
++static void gdlm_unmount(struct gfs2_sbd *sdp)
++{
++	struct lm_lockstruct *ls = &sdp->sd_lockstruct;
++
++	if (ls->ls_dlm) {
++		dlm_release_lockspace(ls->ls_dlm, 2);
++		ls->ls_dlm = NULL;
++	}
++}
++
++static const match_table_t dlm_tokens = {
++	{ Opt_jid, "jid=%d"},
++	{ Opt_id, "id=%d"},
++	{ Opt_first, "first=%d"},
++	{ Opt_nodir, "nodir=%d"},
++	{ Opt_err, NULL },
++};
++
++const struct lm_lockops gfs2_dlm_ops = {
++	.lm_proto_name = "lock_dlm",
++	.lm_mount = gdlm_mount,
++	.lm_unmount = gdlm_unmount,
++	.lm_put_lock = gdlm_put_lock,
++	.lm_lock = gdlm_lock,
++	.lm_cancel = gdlm_cancel,
++	.lm_tokens = &dlm_tokens,
++};
++

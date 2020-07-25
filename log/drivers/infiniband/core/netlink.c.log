@@ -1,0 +1,2754 @@
+commit 549af00833028b5803528553a4743e0cd1fdbee9
+Author: Parav Pandit <parav@mellanox.com>
+Date:   Tue Oct 15 11:07:33 2019 +0300
+
+    IB/core: Avoid deadlock during netlink message handling
+    
+    When rdmacm module is not loaded, and when netlink message is received to
+    get char device info, it results into a deadlock due to recursive locking
+    of rdma_nl_mutex with the below call sequence.
+    
+    [..]
+      rdma_nl_rcv()
+      mutex_lock()
+       [..]
+       rdma_nl_rcv_msg()
+          ib_get_client_nl_info()
+             request_module()
+               iw_cm_init()
+                 rdma_nl_register()
+                   mutex_lock(); <- Deadlock, acquiring mutex again
+    
+    Due to above call sequence, following call trace and deadlock is observed.
+    
+      kernel: __mutex_lock+0x35e/0x860
+      kernel: ? __mutex_lock+0x129/0x860
+      kernel: ? rdma_nl_register+0x1a/0x90 [ib_core]
+      kernel: rdma_nl_register+0x1a/0x90 [ib_core]
+      kernel: ? 0xffffffffc029b000
+      kernel: iw_cm_init+0x34/0x1000 [iw_cm]
+      kernel: do_one_initcall+0x67/0x2d4
+      kernel: ? kmem_cache_alloc_trace+0x1ec/0x2a0
+      kernel: do_init_module+0x5a/0x223
+      kernel: load_module+0x1998/0x1e10
+      kernel: ? __symbol_put+0x60/0x60
+      kernel: __do_sys_finit_module+0x94/0xe0
+      kernel: do_syscall_64+0x5a/0x270
+      kernel: entry_SYSCALL_64_after_hwframe+0x49/0xbe
+    
+      process stack trace:
+      [<0>] __request_module+0x1c9/0x460
+      [<0>] ib_get_client_nl_info+0x5e/0xb0 [ib_core]
+      [<0>] nldev_get_chardev+0x1ac/0x320 [ib_core]
+      [<0>] rdma_nl_rcv_msg+0xeb/0x1d0 [ib_core]
+      [<0>] rdma_nl_rcv+0xcd/0x120 [ib_core]
+      [<0>] netlink_unicast+0x179/0x220
+      [<0>] netlink_sendmsg+0x2f6/0x3f0
+      [<0>] sock_sendmsg+0x30/0x40
+      [<0>] ___sys_sendmsg+0x27a/0x290
+      [<0>] __sys_sendmsg+0x58/0xa0
+      [<0>] do_syscall_64+0x5a/0x270
+      [<0>] entry_SYSCALL_64_after_hwframe+0x49/0xbe
+    
+    To overcome this deadlock and to allow multiple netlink messages to
+    progress in parallel, following scheme is implemented.
+    
+    1. Split the lock protecting the cb_table into a per-index lock, and make
+       it a rwlock. This lock is used to ensure no callbacks are running after
+       unregistration returns. Since a module will not be registered once it
+       is already running callbacks, this avoids the deadlock.
+    
+    2. Use smp_store_release() to update the cb_table during registration so
+       that no lock is required. This avoids lockdep problems with thinking
+       all the rwsems are the same lock class.
+    
+    Fixes: 0e2d00eb6fd45 ("RDMA: Add NLDEV_GET_CHARDEV to allow char dev discovery and autoload")
+    Link: https://lore.kernel.org/r/20191015080733.18625-1-leon@kernel.org
+    Signed-off-by: Parav Pandit <parav@mellanox.com>
+    Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+    Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+
+diff --git a/drivers/infiniband/core/netlink.c b/drivers/infiniband/core/netlink.c
+index 81dbd5f41bed..8cd31ef25eff 100644
+--- a/drivers/infiniband/core/netlink.c
++++ b/drivers/infiniband/core/netlink.c
+@@ -42,9 +42,12 @@
+ #include <linux/module.h>
+ #include "core_priv.h"
+ 
+-static DEFINE_MUTEX(rdma_nl_mutex);
+ static struct {
+-	const struct rdma_nl_cbs   *cb_table;
++	const struct rdma_nl_cbs *cb_table;
++	/* Synchronizes between ongoing netlink commands and netlink client
++	 * unregistration.
++	 */
++	struct rw_semaphore sem;
+ } rdma_nl_types[RDMA_NL_NUM_CLIENTS];
+ 
+ bool rdma_nl_chk_listeners(unsigned int group)
+@@ -75,70 +78,53 @@ static bool is_nl_msg_valid(unsigned int type, unsigned int op)
+ 	return (op < max_num_ops[type]) ? true : false;
+ }
+ 
+-static bool
+-is_nl_valid(const struct sk_buff *skb, unsigned int type, unsigned int op)
++static const struct rdma_nl_cbs *
++get_cb_table(const struct sk_buff *skb, unsigned int type, unsigned int op)
+ {
+ 	const struct rdma_nl_cbs *cb_table;
+ 
+-	if (!is_nl_msg_valid(type, op))
+-		return false;
+-
+ 	/*
+ 	 * Currently only NLDEV client is supporting netlink commands in
+ 	 * non init_net net namespace.
+ 	 */
+ 	if (sock_net(skb->sk) != &init_net && type != RDMA_NL_NLDEV)
+-		return false;
++		return NULL;
+ 
+-	if (!rdma_nl_types[type].cb_table) {
+-		mutex_unlock(&rdma_nl_mutex);
+-		request_module("rdma-netlink-subsys-%d", type);
+-		mutex_lock(&rdma_nl_mutex);
+-	}
++	cb_table = READ_ONCE(rdma_nl_types[type].cb_table);
++	if (!cb_table) {
++		/*
++		 * Didn't get valid reference of the table, attempt module
++		 * load once.
++		 */
++		up_read(&rdma_nl_types[type].sem);
+ 
+-	cb_table = rdma_nl_types[type].cb_table;
++		request_module("rdma-netlink-subsys-%d", type);
+ 
++		down_read(&rdma_nl_types[type].sem);
++		cb_table = READ_ONCE(rdma_nl_types[type].cb_table);
++	}
+ 	if (!cb_table || (!cb_table[op].dump && !cb_table[op].doit))
+-		return false;
+-	return true;
++		return NULL;
++	return cb_table;
+ }
+ 
+ void rdma_nl_register(unsigned int index,
+ 		      const struct rdma_nl_cbs cb_table[])
+ {
+-	mutex_lock(&rdma_nl_mutex);
+-	if (!is_nl_msg_valid(index, 0)) {
+-		/*
+-		 * All clients are not interesting in success/failure of
+-		 * this call. They want to see the print to error log and
+-		 * continue their initialization. Print warning for them,
+-		 * because it is programmer's error to be here.
+-		 */
+-		mutex_unlock(&rdma_nl_mutex);
+-		WARN(true,
+-		     "The not-valid %u index was supplied to RDMA netlink\n",
+-		     index);
++	if (WARN_ON(!is_nl_msg_valid(index, 0)) ||
++	    WARN_ON(READ_ONCE(rdma_nl_types[index].cb_table)))
+ 		return;
+-	}
+-
+-	if (rdma_nl_types[index].cb_table) {
+-		mutex_unlock(&rdma_nl_mutex);
+-		WARN(true,
+-		     "The %u index is already registered in RDMA netlink\n",
+-		     index);
+-		return;
+-	}
+ 
+-	rdma_nl_types[index].cb_table = cb_table;
+-	mutex_unlock(&rdma_nl_mutex);
++	/* Pairs with the READ_ONCE in is_nl_valid() */
++	smp_store_release(&rdma_nl_types[index].cb_table, cb_table);
+ }
+ EXPORT_SYMBOL(rdma_nl_register);
+ 
+ void rdma_nl_unregister(unsigned int index)
+ {
+-	mutex_lock(&rdma_nl_mutex);
++	down_write(&rdma_nl_types[index].sem);
+ 	rdma_nl_types[index].cb_table = NULL;
+-	mutex_unlock(&rdma_nl_mutex);
++	up_write(&rdma_nl_types[index].sem);
+ }
+ EXPORT_SYMBOL(rdma_nl_unregister);
+ 
+@@ -170,15 +156,21 @@ static int rdma_nl_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh,
+ 	unsigned int index = RDMA_NL_GET_CLIENT(type);
+ 	unsigned int op = RDMA_NL_GET_OP(type);
+ 	const struct rdma_nl_cbs *cb_table;
++	int err = -EINVAL;
+ 
+-	if (!is_nl_valid(skb, index, op))
++	if (!is_nl_msg_valid(index, op))
+ 		return -EINVAL;
+ 
+-	cb_table = rdma_nl_types[index].cb_table;
++	down_read(&rdma_nl_types[index].sem);
++	cb_table = get_cb_table(skb, index, op);
++	if (!cb_table)
++		goto done;
+ 
+ 	if ((cb_table[op].flags & RDMA_NL_ADMIN_PERM) &&
+-	    !netlink_capable(skb, CAP_NET_ADMIN))
+-		return -EPERM;
++	    !netlink_capable(skb, CAP_NET_ADMIN)) {
++		err = -EPERM;
++		goto done;
++	}
+ 
+ 	/*
+ 	 * LS responses overload the 0x100 (NLM_F_ROOT) flag.  Don't
+@@ -186,8 +178,8 @@ static int rdma_nl_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh,
+ 	 */
+ 	if (index == RDMA_NL_LS) {
+ 		if (cb_table[op].doit)
+-			return cb_table[op].doit(skb, nlh, extack);
+-		return -EINVAL;
++			err = cb_table[op].doit(skb, nlh, extack);
++		goto done;
+ 	}
+ 	/* FIXME: Convert IWCM to properly handle doit callbacks */
+ 	if ((nlh->nlmsg_flags & NLM_F_DUMP) || index == RDMA_NL_IWCM) {
+@@ -195,14 +187,15 @@ static int rdma_nl_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh,
+ 			.dump = cb_table[op].dump,
+ 		};
+ 		if (c.dump)
+-			return netlink_dump_start(skb->sk, skb, nlh, &c);
+-		return -EINVAL;
++			err = netlink_dump_start(skb->sk, skb, nlh, &c);
++		goto done;
+ 	}
+ 
+ 	if (cb_table[op].doit)
+-		return cb_table[op].doit(skb, nlh, extack);
+-
+-	return 0;
++		err = cb_table[op].doit(skb, nlh, extack);
++done:
++	up_read(&rdma_nl_types[index].sem);
++	return err;
+ }
+ 
+ /*
+@@ -263,9 +256,7 @@ static int rdma_nl_rcv_skb(struct sk_buff *skb, int (*cb)(struct sk_buff *,
+ 
+ static void rdma_nl_rcv(struct sk_buff *skb)
+ {
+-	mutex_lock(&rdma_nl_mutex);
+ 	rdma_nl_rcv_skb(skb, &rdma_nl_rcv_msg);
+-	mutex_unlock(&rdma_nl_mutex);
+ }
+ 
+ int rdma_nl_unicast(struct net *net, struct sk_buff *skb, u32 pid)
+@@ -297,6 +288,14 @@ int rdma_nl_multicast(struct net *net, struct sk_buff *skb,
+ }
+ EXPORT_SYMBOL(rdma_nl_multicast);
+ 
++void rdma_nl_init(void)
++{
++	int idx;
++
++	for (idx = 0; idx < RDMA_NL_NUM_CLIENTS; idx++)
++		init_rwsem(&rdma_nl_types[idx].sem);
++}
++
+ void rdma_nl_exit(void)
+ {
+ 	int idx;
+
+commit 1dc558923c5ceab0b4eb78dc0050ea4c4aa1accc
+Author: Colin Ian King <colin.king@canonical.com>
+Date:   Wed Jul 31 09:01:44 2019 +0100
+
+    RDMA/core: fix spelling mistake "Nelink" -> "Netlink"
+    
+    There is a spelling mistake in a warning message, fix it.
+    
+    Signed-off-by: Colin Ian King <colin.king@canonical.com>
+    Reviewed-by: Leon Romanovsky <leonro@mellanox.com>
+    Link: https://lore.kernel.org/r/20190731080144.18327-1-colin.king@canonical.com
+    Signed-off-by: Doug Ledford <dledford@redhat.com>
+
+diff --git a/drivers/infiniband/core/netlink.c b/drivers/infiniband/core/netlink.c
+index 67a76aca2dd6..81dbd5f41bed 100644
+--- a/drivers/infiniband/core/netlink.c
++++ b/drivers/infiniband/core/netlink.c
+@@ -303,7 +303,7 @@ void rdma_nl_exit(void)
+ 
+ 	for (idx = 0; idx < RDMA_NL_NUM_CLIENTS; idx++)
+ 		WARN(rdma_nl_types[idx].cb_table,
+-		     "Nelink client %d wasn't released prior to unloading %s\n",
++		     "Netlink client %d wasn't released prior to unloading %s\n",
+ 		     idx, KBUILD_MODNAME);
+ }
+ 
+
+commit 1d2fedd8561dc469a7503855ee602f4bb3eccfa7
+Author: Parav Pandit <parav@mellanox.com>
+Date:   Tue Jul 23 10:02:05 2019 +0300
+
+    RDMA/core: Support netlink commands in non init_net net namespaces
+    
+    Now that IB core supports RDMA device binding with specific net namespace,
+    enable IB core to accept netlink commands in non init_net namespaces.
+    
+    This is done by having per net namespace netlink socket.
+    
+    At present only netlink device handling client RDMA_NL_NLDEV supports
+    device handling in multiple net namespaces.  Hence do not accept netlink
+    messages for other clients in non init_net net namespaces.
+    
+    Link: https://lore.kernel.org/r/20190723070205.6247-1-leon@kernel.org
+    Signed-off-by: Parav Pandit <parav@mellanox.com>
+    Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+    Reviewed-by: Jason Gunthorpe <jgg@mellanox.com>
+    Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+
+diff --git a/drivers/infiniband/core/netlink.c b/drivers/infiniband/core/netlink.c
+index eecfc0b377c9..67a76aca2dd6 100644
+--- a/drivers/infiniband/core/netlink.c
++++ b/drivers/infiniband/core/netlink.c
+@@ -36,20 +36,22 @@
+ #include <linux/export.h>
+ #include <net/netlink.h>
+ #include <net/net_namespace.h>
++#include <net/netns/generic.h>
+ #include <net/sock.h>
+ #include <rdma/rdma_netlink.h>
+ #include <linux/module.h>
+ #include "core_priv.h"
+ 
+ static DEFINE_MUTEX(rdma_nl_mutex);
+-static struct sock *nls;
+ static struct {
+ 	const struct rdma_nl_cbs   *cb_table;
+ } rdma_nl_types[RDMA_NL_NUM_CLIENTS];
+ 
+ bool rdma_nl_chk_listeners(unsigned int group)
+ {
+-	return netlink_has_listeners(nls, group);
++	struct rdma_dev_net *rnet = rdma_net_to_dev_net(&init_net);
++
++	return netlink_has_listeners(rnet->nl_sock, group);
+ }
+ EXPORT_SYMBOL(rdma_nl_chk_listeners);
+ 
+@@ -73,13 +75,21 @@ static bool is_nl_msg_valid(unsigned int type, unsigned int op)
+ 	return (op < max_num_ops[type]) ? true : false;
+ }
+ 
+-static bool is_nl_valid(unsigned int type, unsigned int op)
++static bool
++is_nl_valid(const struct sk_buff *skb, unsigned int type, unsigned int op)
+ {
+ 	const struct rdma_nl_cbs *cb_table;
+ 
+ 	if (!is_nl_msg_valid(type, op))
+ 		return false;
+ 
++	/*
++	 * Currently only NLDEV client is supporting netlink commands in
++	 * non init_net net namespace.
++	 */
++	if (sock_net(skb->sk) != &init_net && type != RDMA_NL_NLDEV)
++		return false;
++
+ 	if (!rdma_nl_types[type].cb_table) {
+ 		mutex_unlock(&rdma_nl_mutex);
+ 		request_module("rdma-netlink-subsys-%d", type);
+@@ -161,7 +171,7 @@ static int rdma_nl_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh,
+ 	unsigned int op = RDMA_NL_GET_OP(type);
+ 	const struct rdma_nl_cbs *cb_table;
+ 
+-	if (!is_nl_valid(index, op))
++	if (!is_nl_valid(skb, index, op))
+ 		return -EINVAL;
+ 
+ 	cb_table = rdma_nl_types[index].cb_table;
+@@ -185,7 +195,7 @@ static int rdma_nl_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh,
+ 			.dump = cb_table[op].dump,
+ 		};
+ 		if (c.dump)
+-			return netlink_dump_start(nls, skb, nlh, &c);
++			return netlink_dump_start(skb->sk, skb, nlh, &c);
+ 		return -EINVAL;
+ 	}
+ 
+@@ -258,52 +268,65 @@ static void rdma_nl_rcv(struct sk_buff *skb)
+ 	mutex_unlock(&rdma_nl_mutex);
+ }
+ 
+-int rdma_nl_unicast(struct sk_buff *skb, u32 pid)
++int rdma_nl_unicast(struct net *net, struct sk_buff *skb, u32 pid)
+ {
++	struct rdma_dev_net *rnet = rdma_net_to_dev_net(net);
+ 	int err;
+ 
+-	err = netlink_unicast(nls, skb, pid, MSG_DONTWAIT);
++	err = netlink_unicast(rnet->nl_sock, skb, pid, MSG_DONTWAIT);
+ 	return (err < 0) ? err : 0;
+ }
+ EXPORT_SYMBOL(rdma_nl_unicast);
+ 
+-int rdma_nl_unicast_wait(struct sk_buff *skb, __u32 pid)
++int rdma_nl_unicast_wait(struct net *net, struct sk_buff *skb, __u32 pid)
+ {
++	struct rdma_dev_net *rnet = rdma_net_to_dev_net(net);
+ 	int err;
+ 
+-	err = netlink_unicast(nls, skb, pid, 0);
++	err = netlink_unicast(rnet->nl_sock, skb, pid, 0);
+ 	return (err < 0) ? err : 0;
+ }
+ EXPORT_SYMBOL(rdma_nl_unicast_wait);
+ 
+-int rdma_nl_multicast(struct sk_buff *skb, unsigned int group, gfp_t flags)
++int rdma_nl_multicast(struct net *net, struct sk_buff *skb,
++		      unsigned int group, gfp_t flags)
+ {
+-	return nlmsg_multicast(nls, skb, 0, group, flags);
++	struct rdma_dev_net *rnet = rdma_net_to_dev_net(net);
++
++	return nlmsg_multicast(rnet->nl_sock, skb, 0, group, flags);
+ }
+ EXPORT_SYMBOL(rdma_nl_multicast);
+ 
+-int __init rdma_nl_init(void)
++void rdma_nl_exit(void)
++{
++	int idx;
++
++	for (idx = 0; idx < RDMA_NL_NUM_CLIENTS; idx++)
++		WARN(rdma_nl_types[idx].cb_table,
++		     "Nelink client %d wasn't released prior to unloading %s\n",
++		     idx, KBUILD_MODNAME);
++}
++
++int rdma_nl_net_init(struct rdma_dev_net *rnet)
+ {
++	struct net *net = read_pnet(&rnet->net);
+ 	struct netlink_kernel_cfg cfg = {
+ 		.input	= rdma_nl_rcv,
+ 	};
++	struct sock *nls;
+ 
+-	nls = netlink_kernel_create(&init_net, NETLINK_RDMA, &cfg);
++	nls = netlink_kernel_create(net, NETLINK_RDMA, &cfg);
+ 	if (!nls)
+ 		return -ENOMEM;
+ 
+ 	nls->sk_sndtimeo = 10 * HZ;
++	rnet->nl_sock = nls;
+ 	return 0;
+ }
+ 
+-void rdma_nl_exit(void)
++void rdma_nl_net_exit(struct rdma_dev_net *rnet)
+ {
+-	int idx;
+-
+-	for (idx = 0; idx < RDMA_NL_NUM_CLIENTS; idx++)
+-		rdma_nl_unregister(idx);
+-
+-	netlink_kernel_release(nls);
++	netlink_kernel_release(rnet->nl_sock);
+ }
+ 
+ MODULE_ALIAS_NET_PF_PROTO(PF_NETLINK, NETLINK_RDMA);
+
+commit a78e8723a50530d15faa25cc0b6f009bcd251c20
+Author: Leon Romanovsky <leonro@mellanox.com>
+Date:   Wed Jan 16 09:55:41 2019 +0200
+
+    RDMA/cma: Remove CM_ID statistics provided by rdma-cm module
+    
+    Netlink statistics exported by rdma-cm never had any working user space
+    component published to the mailing list or to any open source
+    project. Canvassing various proprietary users, and the original requester,
+    we find that there are no real users of this interface.
+    
+    This patch simply removes all occurrences of RDMA CM netlink in favour of
+    modern nldev implementation, which provides the same information and
+    accompanied by widely used user space component.
+    
+    Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+    Reviewed-by: Steve Wise <swise@opengridcomputing.com>
+    Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+
+diff --git a/drivers/infiniband/core/netlink.c b/drivers/infiniband/core/netlink.c
+index 724f5a62e82f..eecfc0b377c9 100644
+--- a/drivers/infiniband/core/netlink.c
++++ b/drivers/infiniband/core/netlink.c
+@@ -56,7 +56,6 @@ EXPORT_SYMBOL(rdma_nl_chk_listeners);
+ static bool is_nl_msg_valid(unsigned int type, unsigned int op)
+ {
+ 	static const unsigned int max_num_ops[RDMA_NL_NUM_CLIENTS] = {
+-		[RDMA_NL_RDMA_CM] = RDMA_NL_RDMA_CM_NUM_OPS,
+ 		[RDMA_NL_IWCM] = RDMA_NL_IWPM_NUM_OPS,
+ 		[RDMA_NL_LS] = RDMA_NL_LS_NUM_OPS,
+ 		[RDMA_NL_NLDEV] = RDMA_NLDEV_NUM_OPS,
+@@ -181,8 +180,7 @@ static int rdma_nl_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh,
+ 		return -EINVAL;
+ 	}
+ 	/* FIXME: Convert IWCM to properly handle doit callbacks */
+-	if ((nlh->nlmsg_flags & NLM_F_DUMP) || index == RDMA_NL_RDMA_CM ||
+-	    index == RDMA_NL_IWCM) {
++	if ((nlh->nlmsg_flags & NLM_F_DUMP) || index == RDMA_NL_IWCM) {
+ 		struct netlink_dump_control c = {
+ 			.dump = cb_table[op].dump,
+ 		};
+
+commit 38716732f161c3d107c4cc406a287f1201bed752
+Author: Leon Romanovsky <leonro@mellanox.com>
+Date:   Tue Oct 2 11:49:24 2018 +0300
+
+    RDMA/netlink: Simplify netlink listener existence check
+    
+    All users of rdma_nl_chk_listeners() are interested to get boolean answer
+    if netlink socket has listeners, so update all places to boolean function.
+    
+    Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+    Reviewed-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+    Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+
+diff --git a/drivers/infiniband/core/netlink.c b/drivers/infiniband/core/netlink.c
+index 3ccaae18ad75..724f5a62e82f 100644
+--- a/drivers/infiniband/core/netlink.c
++++ b/drivers/infiniband/core/netlink.c
+@@ -47,9 +47,9 @@ static struct {
+ 	const struct rdma_nl_cbs   *cb_table;
+ } rdma_nl_types[RDMA_NL_NUM_CLIENTS];
+ 
+-int rdma_nl_chk_listeners(unsigned int group)
++bool rdma_nl_chk_listeners(unsigned int group)
+ {
+-	return (netlink_has_listeners(nls, group)) ? 0 : -1;
++	return netlink_has_listeners(nls, group);
+ }
+ EXPORT_SYMBOL(rdma_nl_chk_listeners);
+ 
+
+commit b823369b6faa33cc71b65eef9bebcefe622913dc
+Author: Leon Romanovsky <leonro@mellanox.com>
+Date:   Mon Jan 1 13:07:12 2018 +0200
+
+    RDMA/netlink: Simplify code of autoload modules
+    
+    The request_module() call is internally wrapped by CONFIG_MODULE,
+    so there is no need to check it in our RDMA code too.
+    
+    Refactor to simplify the code.
+    
+    Reviewed-by: Mark Bloch <markb@mellanox.com>
+    Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+    Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+
+diff --git a/drivers/infiniband/core/netlink.c b/drivers/infiniband/core/netlink.c
+index 0c7db94cd9b9..3ccaae18ad75 100644
+--- a/drivers/infiniband/core/netlink.c
++++ b/drivers/infiniband/core/netlink.c
+@@ -81,15 +81,13 @@ static bool is_nl_valid(unsigned int type, unsigned int op)
+ 	if (!is_nl_msg_valid(type, op))
+ 		return false;
+ 
+-	cb_table = rdma_nl_types[type].cb_table;
+-#ifdef CONFIG_MODULES
+-	if (!cb_table) {
++	if (!rdma_nl_types[type].cb_table) {
+ 		mutex_unlock(&rdma_nl_mutex);
+ 		request_module("rdma-netlink-subsys-%d", type);
+ 		mutex_lock(&rdma_nl_mutex);
+-		cb_table = rdma_nl_types[type].cb_table;
+ 	}
+-#endif
++
++	cb_table = rdma_nl_types[type].cb_table;
+ 
+ 	if (!cb_table || (!cb_table[op].dump && !cb_table[op].doit))
+ 		return false;
+
+commit 72c7fe90ee7a16a8e350183712b2a639b4054ace
+Author: Pravin Shedge <pravin.shedge4linux@gmail.com>
+Date:   Wed Dec 6 22:19:39 2017 +0530
+
+    drivers: infiniband: remove duplicate includes
+    
+    These duplicate includes have been found with scripts/checkincludes.pl but
+    they have been removed manually to avoid removing false positives.
+    
+    Signed-off-by: Pravin Shedge <pravin.shedge4linux@gmail.com>
+    Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+
+diff --git a/drivers/infiniband/core/netlink.c b/drivers/infiniband/core/netlink.c
+index 1fb72c356e36..0c7db94cd9b9 100644
+--- a/drivers/infiniband/core/netlink.c
++++ b/drivers/infiniband/core/netlink.c
+@@ -41,8 +41,6 @@
+ #include <linux/module.h>
+ #include "core_priv.h"
+ 
+-#include "core_priv.h"
+-
+ static DEFINE_MUTEX(rdma_nl_mutex);
+ static struct sock *nls;
+ static struct {
+
+commit b4d91aeb6e120b7e2f207021c31b914895c69bc4
+Author: Michael J. Ruhl <michael.j.ruhl@intel.com>
+Date:   Tue Oct 24 08:41:01 2017 -0400
+
+    RDMA/netlink: OOPs in rdma_nl_rcv_msg() from misinterpreted flag
+    
+    rdma_nl_rcv_msg() checks to see if it should use the .dump() callback
+    or the .doit() callback.  The check is done with this check:
+    
+    if (flags & NLM_F_DUMP) ...
+    
+    The NLM_F_DUMP flag is two bits (NLM_F_ROOT | NLM_F_MATCH).
+    
+    When an RDMA_NL_LS message (response) is received, the bit used for
+    indicating an error is the same bit as NLM_F_ROOT.
+    
+    NLM_F_ROOT == (0x100) == RDMA_NL_LS_F_ERR.
+    
+    ibacm sends a response with the RDMA_NL_LS_F_ERR bit set if an error
+    occurs in the service.  The current code then misinterprets the
+    NLM_F_DUMP bit and trys to call the .dump() callback.
+    
+    If the .dump() callback for the specified request is not available
+    (which is true for the RDMA_NL_LS messages) the following Oops occurs:
+    
+    [ 4555.960256] BUG: unable to handle kernel NULL pointer dereference at
+       (null)
+    [ 4555.969046] IP:           (null)
+    [ 4555.972664] PGD 10543f1067 P4D 10543f1067 PUD 1033f93067 PMD 0
+    [ 4555.979287] Oops: 0010 [#1] SMP
+    [ 4555.982809] Modules linked in: rpcrdma ib_isert iscsi_target_mod
+    target_core_mod ib_iser libiscsi scsi_transport_iscsi ib_ipoib rdma_ucm ib_ucm
+    ib_uverbs ib_umad rdma_cm ib_cm iw_cm dm_mirror dm_region_hash dm_log dm_mod
+    dax sb_edac x86_pkg_temp_thermal intel_powerclamp coretemp kvm irqbypass
+    crct10dif_pclmul crc32_pclmul ghash_clmulni_intel pcbc aesni_intel crypto_simd
+    glue_helper cryptd hfi1 rdmavt iTCO_wdt iTCO_vendor_support ib_core mei_me
+    lpc_ich pcspkr mei ioatdma sg shpchp i2c_i801 mfd_core wmi ipmi_si ipmi_devintf
+    ipmi_msghandler acpi_power_meter acpi_pad nfsd auth_rpcgss nfs_acl lockd grace
+    sunrpc ip_tables ext4 mbcache jbd2 sd_mod mgag200 drm_kms_helper syscopyarea
+    sysfillrect sysimgblt fb_sys_fops ttm igb ahci crc32c_intel ptp libahci
+    pps_core drm dca libata i2c_algo_bit i2c_core
+    [ 4556.061190] CPU: 54 PID: 9841 Comm: ibacm Tainted: G          I
+    4.14.0-rc2+ #6
+    [ 4556.069667] Hardware name: Intel Corporation S2600WT2/S2600WT2, BIOS
+    SE5C610.86B.01.01.0008.021120151325 02/11/2015
+    [ 4556.081339] task: ffff880855f42d00 task.stack: ffffc900246b4000
+    [ 4556.087967] RIP: 0010:          (null)
+    [ 4556.092166] RSP: 0018:ffffc900246b7bc8 EFLAGS: 00010246
+    [ 4556.098018] RAX: ffffffff81dbe9e0 RBX: ffff881058bb1000 RCX:
+    0000000000000000
+    [ 4556.105997] RDX: 0000000000001100 RSI: ffff881058bb1320 RDI:
+    ffff881056362000
+    [ 4556.113984] RBP: ffffc900246b7bf8 R08: 0000000000000ec0 R09:
+    0000000000001100
+    [ 4556.121971] R10: ffff8810573a5000 R11: 0000000000000000 R12:
+    ffff881056362000
+    [ 4556.129957] R13: 0000000000000ec0 R14: ffff881058bb1320 R15:
+    0000000000000ec0
+    [ 4556.137945] FS:  00007fe0ba5a38c0(0000) GS:ffff88105f080000(0000)
+    knlGS:0000000000000000
+    [ 4556.147000] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+    [ 4556.153433] CR2: 0000000000000000 CR3: 0000001056f5d003 CR4:
+    00000000001606e0
+    [ 4556.161419] Call Trace:
+    [ 4556.164167]  ? netlink_dump+0x12c/0x290
+    [ 4556.168468]  __netlink_dump_start+0x186/0x1f0
+    [ 4556.173357]  rdma_nl_rcv_msg+0x193/0x1b0 [ib_core]
+    [ 4556.178724]  rdma_nl_rcv+0xdc/0x130 [ib_core]
+    [ 4556.183604]  netlink_unicast+0x181/0x240
+    [ 4556.187998]  netlink_sendmsg+0x2c2/0x3b0
+    [ 4556.192392]  sock_sendmsg+0x38/0x50
+    [ 4556.196299]  SYSC_sendto+0x102/0x190
+    [ 4556.200308]  ? __audit_syscall_entry+0xaf/0x100
+    [ 4556.205387]  ? syscall_trace_enter+0x1d0/0x2b0
+    [ 4556.210366]  ? __audit_syscall_exit+0x209/0x290
+    [ 4556.215442]  SyS_sendto+0xe/0x10
+    [ 4556.219060]  do_syscall_64+0x67/0x1b0
+    [ 4556.223165]  entry_SYSCALL64_slow_path+0x25/0x25
+    [ 4556.228328] RIP: 0033:0x7fe0b9db2a63
+    [ 4556.232333] RSP: 002b:00007ffc55edc260 EFLAGS: 00000293 ORIG_RAX:
+    000000000000002c
+    [ 4556.240808] RAX: ffffffffffffffda RBX: 0000000000000010 RCX:
+    00007fe0b9db2a63
+    [ 4556.248796] RDX: 0000000000000010 RSI: 00007ffc55edc280 RDI:
+    000000000000000d
+    [ 4556.256782] RBP: 00007ffc55edc670 R08: 00007ffc55edc270 R09:
+    000000000000000c
+    [ 4556.265321] R10: 0000000000000000 R11: 0000000000000293 R12:
+    00007ffc55edc280
+    [ 4556.273846] R13: 000000000260b400 R14: 000000000000000d R15:
+    0000000000000001
+    [ 4556.282368] Code:  Bad RIP value.
+    [ 4556.286629] RIP:           (null) RSP: ffffc900246b7bc8
+    [ 4556.293013] CR2: 0000000000000000
+    [ 4556.297292] ---[ end trace 8d67abcfd10ec209 ]---
+    [ 4556.305465] Kernel panic - not syncing: Fatal exception
+    [ 4556.313786] Kernel Offset: disabled
+    [ 4556.321563] ---[ end Kernel panic - not syncing: Fatal exception
+    [ 4556.328960] ------------[ cut here ]------------
+    
+    Special case RDMA_NL_LS response messages to call the appropriate
+    callback.
+    
+    Additionally, make sure that the .dump() callback is not NULL
+    before calling it.
+    
+    Fixes: 647c75ac59a48a54 ("RDMA/netlink: Convert LS to doit callback")
+    Reviewed-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+    Reviewed-by: Kaike Wan <kaike.wan@intel.com>
+    Reviewed-by: Alex Estrin <alex.estrin@intel.com>
+    Signed-off-by: Michael J. Ruhl <michael.j.ruhl@intel.com>
+    Reviewed-by: Shiraz Saleem <shiraz.saleem@intel.com>
+    Signed-off-by: Doug Ledford <dledford@redhat.com>
+
+diff --git a/drivers/infiniband/core/netlink.c b/drivers/infiniband/core/netlink.c
+index b12e58787c3d..1fb72c356e36 100644
+--- a/drivers/infiniband/core/netlink.c
++++ b/drivers/infiniband/core/netlink.c
+@@ -175,13 +175,24 @@ static int rdma_nl_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh,
+ 	    !netlink_capable(skb, CAP_NET_ADMIN))
+ 		return -EPERM;
+ 
++	/*
++	 * LS responses overload the 0x100 (NLM_F_ROOT) flag.  Don't
++	 * mistakenly call the .dump() function.
++	 */
++	if (index == RDMA_NL_LS) {
++		if (cb_table[op].doit)
++			return cb_table[op].doit(skb, nlh, extack);
++		return -EINVAL;
++	}
+ 	/* FIXME: Convert IWCM to properly handle doit callbacks */
+ 	if ((nlh->nlmsg_flags & NLM_F_DUMP) || index == RDMA_NL_RDMA_CM ||
+ 	    index == RDMA_NL_IWCM) {
+ 		struct netlink_dump_control c = {
+ 			.dump = cb_table[op].dump,
+ 		};
+-		return netlink_dump_start(nls, skb, nlh, &c);
++		if (c.dump)
++			return netlink_dump_start(nls, skb, nlh, &c);
++		return -EINVAL;
+ 	}
+ 
+ 	if (cb_table[op].doit)
+
+commit 015a9e66b9b8c1f28097ed09bf9350708e26249a
+Author: Linus Torvalds <torvalds@linux-foundation.org>
+Date:   Fri Sep 8 10:17:20 2017 -0700
+
+    RDMA/netlink: clean up message validity array initializer
+    
+    The fix in the parent made me look at that function, and react to how
+    illogical and illegible the array initializer was.
+    
+    Use named array indexes to make it clearer what is going on, and make
+    the initializer not depend silently on the exact index numbers.
+    
+    [ The initializer now also shows an odd inconsistency in the naming:
+      note the IWCM vs IWPM..   - Linus ]
+    
+    Cc: Leon Romanovsky <leonro@mellanox.com>
+    Cc: Doug Ledford <dledford@redhat.com>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/drivers/infiniband/core/netlink.c b/drivers/infiniband/core/netlink.c
+index b66b6d06144b..b12e58787c3d 100644
+--- a/drivers/infiniband/core/netlink.c
++++ b/drivers/infiniband/core/netlink.c
+@@ -58,12 +58,11 @@ EXPORT_SYMBOL(rdma_nl_chk_listeners);
+ static bool is_nl_msg_valid(unsigned int type, unsigned int op)
+ {
+ 	static const unsigned int max_num_ops[RDMA_NL_NUM_CLIENTS] = {
+-				  0,
+-				  RDMA_NL_RDMA_CM_NUM_OPS,
+-				  RDMA_NL_IWPM_NUM_OPS,
+-				  0,
+-				  RDMA_NL_LS_NUM_OPS,
+-				  RDMA_NLDEV_NUM_OPS };
++		[RDMA_NL_RDMA_CM] = RDMA_NL_RDMA_CM_NUM_OPS,
++		[RDMA_NL_IWCM] = RDMA_NL_IWPM_NUM_OPS,
++		[RDMA_NL_LS] = RDMA_NL_LS_NUM_OPS,
++		[RDMA_NL_NLDEV] = RDMA_NLDEV_NUM_OPS,
++	};
+ 
+ 	/*
+ 	 * This BUILD_BUG_ON is intended to catch addition of new
+
+commit 8b2c7e7a3cb2093bf3257c146c5822437fdf3124
+Author: Leon Romanovsky <leon@kernel.org>
+Date:   Fri Sep 8 13:02:26 2017 +0300
+
+    RDAM/netlink: Fix out-of-bound access while checking message validity
+    
+    The netlink message sent with type == 0, which doesn't have any client
+    behind it, caused to the overflow in max_num_ops array.
+    
+    Fix it by declaring zero number of ops for the first client.
+    
+    Fixes: c9901724a2f1 ("RDMA/netlink: Remove netlink clients infrastructure")
+    Signed-off-by: Leon Romanovsky <leon@kernel.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/drivers/infiniband/core/netlink.c b/drivers/infiniband/core/netlink.c
+index e685148dd3e6..b66b6d06144b 100644
+--- a/drivers/infiniband/core/netlink.c
++++ b/drivers/infiniband/core/netlink.c
+@@ -57,7 +57,8 @@ EXPORT_SYMBOL(rdma_nl_chk_listeners);
+ 
+ static bool is_nl_msg_valid(unsigned int type, unsigned int op)
+ {
+-	static const unsigned int max_num_ops[RDMA_NL_NUM_CLIENTS - 1] = {
++	static const unsigned int max_num_ops[RDMA_NL_NUM_CLIENTS] = {
++				  0,
+ 				  RDMA_NL_RDMA_CM_NUM_OPS,
+ 				  RDMA_NL_IWPM_NUM_OPS,
+ 				  0,
+@@ -70,10 +71,10 @@ static bool is_nl_msg_valid(unsigned int type, unsigned int op)
+ 	 */
+ 	BUILD_BUG_ON(RDMA_NL_NUM_CLIENTS != 6);
+ 
+-	if (type > RDMA_NL_NUM_CLIENTS - 1)
++	if (type >= RDMA_NL_NUM_CLIENTS)
+ 		return false;
+ 
+-	return (op < max_num_ops[type - 1]) ? true : false;
++	return (op < max_num_ops[type]) ? true : false;
+ }
+ 
+ static bool is_nl_valid(unsigned int type, unsigned int op)
+
+commit e3bf14bdc17a8e917f337760cc7cacf3232d7dbc
+Author: Jason Gunthorpe <jgunthorpe@obsidianresearch.com>
+Date:   Mon Aug 14 14:57:39 2017 -0600
+
+    rdma: Autoload netlink client modules
+    
+    If a message comes in and we do not have the client in the table, then
+    try to load the module supplying that client using MODULE_ALIAS to find
+    it.
+    
+    This duplicates the scheme seen in other netlink muxes (eg nfnetlink).
+    
+    Signed-off-by: Jason Gunthorpe <jgunthorpe@obsidianresearch.com>
+    Reviewed-by: Leon Romanovsky <leonro@mellanox.com>
+    Signed-off-by: Doug Ledford <dledford@redhat.com>
+
+diff --git a/drivers/infiniband/core/netlink.c b/drivers/infiniband/core/netlink.c
+index f782697cf4d8..e685148dd3e6 100644
+--- a/drivers/infiniband/core/netlink.c
++++ b/drivers/infiniband/core/netlink.c
+@@ -84,6 +84,15 @@ static bool is_nl_valid(unsigned int type, unsigned int op)
+ 		return false;
+ 
+ 	cb_table = rdma_nl_types[type].cb_table;
++#ifdef CONFIG_MODULES
++	if (!cb_table) {
++		mutex_unlock(&rdma_nl_mutex);
++		request_module("rdma-netlink-subsys-%d", type);
++		mutex_lock(&rdma_nl_mutex);
++		cb_table = rdma_nl_types[type].cb_table;
++	}
++#endif
++
+ 	if (!cb_table || (!cb_table[op].dump && !cb_table[op].doit))
+ 		return false;
+ 	return true;
+
+commit 1eb5be0ec79a7b21cd6b5b73d9de294dc1809e0f
+Author: Jason Gunthorpe <jgunthorpe@obsidianresearch.com>
+Date:   Mon Aug 14 14:57:38 2017 -0600
+
+    rdma: Allow demand loading of NETLINK_RDMA
+    
+    Provide a module alias so that if userspace opens a netlink
+    socket for RDMA the kernel support is loaded automatically.
+    
+    Signed-off-by: Jason Gunthorpe <jgunthorpe@obsidianresearch.com>
+    Reviewed-by: Leon Romanovsky <leonro@mellanox.com>
+    Signed-off-by: Doug Ledford <dledford@redhat.com>
+
+diff --git a/drivers/infiniband/core/netlink.c b/drivers/infiniband/core/netlink.c
+index 27352a352770..f782697cf4d8 100644
+--- a/drivers/infiniband/core/netlink.c
++++ b/drivers/infiniband/core/netlink.c
+@@ -38,6 +38,7 @@
+ #include <net/net_namespace.h>
+ #include <net/sock.h>
+ #include <rdma/rdma_netlink.h>
++#include <linux/module.h>
+ #include "core_priv.h"
+ 
+ #include "core_priv.h"
+@@ -290,3 +291,5 @@ void rdma_nl_exit(void)
+ 
+ 	netlink_kernel_release(nls);
+ }
++
++MODULE_ALIAS_NET_PF_PROTO(PF_NETLINK, NETLINK_RDMA);
+
+commit 1a6e7c31d71db34d1b9bc3acc87eaea6c2ecc997
+Author: Leon Romanovsky <leonro@mellanox.com>
+Date:   Tue Jun 20 07:55:53 2017 +0300
+
+    RDMA/netlink: Add netlink device definitions to UAPI
+    
+    Introduce new defines to rdma_netlink.h, so the RDMA configuration tool
+    will be able to communicate with RDMA subsystem by using the shared defines.
+    
+    The addition of new client (NLDEV) revealed the fact that we exposed by
+    mistake the RDMA_NL_I40IW define which is not backed by any RDMA netlink
+    by now and it won't be exposed in the future too. So this patch reuses
+    the value and deletes the old defines.
+    
+    The NLDEV operates with objects. The struct ib_device has two straightforward
+    objects: device itself and ports of that device.
+    
+    This brings us to propose the following commands to work on those objects:
+     * RDMA_NLDEV_CMD_{GET,SET,NEW,DEL} - works on ib_device itself
+     * RDMA_NLDEV_CMD_PORT_{GET,SET,NEW,DEL} - works on ports of specific ib_device
+    
+    Those commands receive/return the device index (RDMA_NLDEV_ATTR_DEV_INDEX)
+    and port index (RDMA_NLDEV_ATTR_PORT_INDEX). For device object accesses,
+    the RDMA_NLDEV_ATTR_PORT_INDEX will return the maximum number of ports
+    for specific ib_device and for port access the actual port index.
+    
+    The port index starts from 1 to follow RDMA/core internal semantics and
+    the sysfs exposed knobs.
+    
+    Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+    Reviewed-by: Steve Wise <swise@opengridcomputing.com>
+
+diff --git a/drivers/infiniband/core/netlink.c b/drivers/infiniband/core/netlink.c
+index cd692bd73793..27352a352770 100644
+--- a/drivers/infiniband/core/netlink.c
++++ b/drivers/infiniband/core/netlink.c
+@@ -61,7 +61,7 @@ static bool is_nl_msg_valid(unsigned int type, unsigned int op)
+ 				  RDMA_NL_IWPM_NUM_OPS,
+ 				  0,
+ 				  RDMA_NL_LS_NUM_OPS,
+-				  0 };
++				  RDMA_NLDEV_NUM_OPS };
+ 
+ 	/*
+ 	 * This BUILD_BUG_ON is intended to catch addition of new
+
+commit 8bc67414f28c995ccfa29a12984b5dae188b3df8
+Author: Leon Romanovsky <leonro@mellanox.com>
+Date:   Sun Jun 18 16:37:27 2017 +0300
+
+    RDMA/netlink: Update copyright
+    
+    Add Mellanox to the copyright header.
+    
+    Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+    Reviewed-by: Steve Wise <swise@opengridcomputing.com>
+
+diff --git a/drivers/infiniband/core/netlink.c b/drivers/infiniband/core/netlink.c
+index 145ad5343780..cd692bd73793 100644
+--- a/drivers/infiniband/core/netlink.c
++++ b/drivers/infiniband/core/netlink.c
+@@ -1,4 +1,5 @@
+ /*
++ * Copyright (c) 2017 Mellanox Technologies Inc.  All rights reserved.
+  * Copyright (c) 2010 Voltaire Inc.  All rights reserved.
+  *
+  * This software is available to you under a choice of one of two
+
+commit 647c75ac59a48a54dafd4475d14a645a0025a4f4
+Author: Leon Romanovsky <leonro@mellanox.com>
+Date:   Thu Jun 15 14:20:39 2017 +0300
+
+    RDMA/netlink: Convert LS to doit callback
+    
+    RDMA_NL_LS protocol is actually does not dump anything,
+    but sets data and it should be handled by doit callback.
+    
+    This patch actually converts RDMA_NL_LS to doit callback, while
+    preserving IWCM and RDMA_CM flows through netlink_dump_start().
+    
+    Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+    Reviewed-by: Steve Wise <swise@opengridcomputing.com>
+
+diff --git a/drivers/infiniband/core/netlink.c b/drivers/infiniband/core/netlink.c
+index e36c39e3cc2b..145ad5343780 100644
+--- a/drivers/infiniband/core/netlink.c
++++ b/drivers/infiniband/core/netlink.c
+@@ -153,38 +153,30 @@ static int rdma_nl_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh,
+ 	int type = nlh->nlmsg_type;
+ 	unsigned int index = RDMA_NL_GET_CLIENT(type);
+ 	unsigned int op = RDMA_NL_GET_OP(type);
+-	struct netlink_callback cb = {};
+-	struct netlink_dump_control c = {};
+ 	const struct rdma_nl_cbs *cb_table;
+-	int ret;
+ 
+ 	if (!is_nl_valid(index, op))
+ 		return -EINVAL;
+ 
+-	cb_table = rdma_nl_types[type].cb_table;
++	cb_table = rdma_nl_types[index].cb_table;
+ 
+ 	if ((cb_table[op].flags & RDMA_NL_ADMIN_PERM) &&
+ 	    !netlink_capable(skb, CAP_NET_ADMIN))
+ 		return -EPERM;
+ 
+-	/*
+-	 * For response or local service set_timeout request,
+-	 * there is no need to use netlink_dump_start.
+-	 */
+-	if (!(nlh->nlmsg_flags & NLM_F_REQUEST) ||
+-	    (index == RDMA_NL_LS && op == RDMA_NL_LS_OP_SET_TIMEOUT)) {
+-		cb.skb = skb;
+-		cb.nlh = nlh;
+-		cb.dump = cb_table[op].dump;
+-		return cb.dump(skb, &cb);
+-	} else {
+-		c.dump = cb_table[op].dump;
++	/* FIXME: Convert IWCM to properly handle doit callbacks */
++	if ((nlh->nlmsg_flags & NLM_F_DUMP) || index == RDMA_NL_RDMA_CM ||
++	    index == RDMA_NL_IWCM) {
++		struct netlink_dump_control c = {
++			.dump = cb_table[op].dump,
++		};
+ 		return netlink_dump_start(nls, skb, nlh, &c);
+ 	}
++
+ 	if (cb_table[op].doit)
+-		ret = cb_table[op].doit(skb, nlh, extack);
+-	return ret;
++		return cb_table[op].doit(skb, nlh, extack);
+ 
++	return 0;
+ }
+ 
+ /*
+
+commit c729943a77c108253c46b2d50c8a15a888facf4c
+Author: Leon Romanovsky <leonro@mellanox.com>
+Date:   Thu Jun 15 13:14:13 2017 +0300
+
+    RDMA/netlink: Reduce indirection access to cb_table
+    
+    Introduce intermediate variable to store access to fields
+    of cb_table.
+    
+    Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+    Reviewed-by: Steve Wise <swise@opengridcomputing.com>
+
+diff --git a/drivers/infiniband/core/netlink.c b/drivers/infiniband/core/netlink.c
+index 484d6a8a2811..e36c39e3cc2b 100644
+--- a/drivers/infiniband/core/netlink.c
++++ b/drivers/infiniband/core/netlink.c
+@@ -155,12 +155,15 @@ static int rdma_nl_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh,
+ 	unsigned int op = RDMA_NL_GET_OP(type);
+ 	struct netlink_callback cb = {};
+ 	struct netlink_dump_control c = {};
++	const struct rdma_nl_cbs *cb_table;
+ 	int ret;
+ 
+ 	if (!is_nl_valid(index, op))
+ 		return -EINVAL;
+ 
+-	if ((rdma_nl_types[index].cb_table[op].flags & RDMA_NL_ADMIN_PERM) &&
++	cb_table = rdma_nl_types[type].cb_table;
++
++	if ((cb_table[op].flags & RDMA_NL_ADMIN_PERM) &&
+ 	    !netlink_capable(skb, CAP_NET_ADMIN))
+ 		return -EPERM;
+ 
+@@ -172,14 +175,14 @@ static int rdma_nl_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh,
+ 	    (index == RDMA_NL_LS && op == RDMA_NL_LS_OP_SET_TIMEOUT)) {
+ 		cb.skb = skb;
+ 		cb.nlh = nlh;
+-		cb.dump = rdma_nl_types[index].cb_table[op].dump;
++		cb.dump = cb_table[op].dump;
+ 		return cb.dump(skb, &cb);
+ 	} else {
+-		c.dump = rdma_nl_types[index].cb_table[op].dump;
++		c.dump = cb_table[op].dump;
+ 		return netlink_dump_start(nls, skb, nlh, &c);
+ 	}
+-	if (rdma_nl_types[index].cb_table[op].doit)
+-		ret = rdma_nl_types[index].cb_table[op].doit(skb, nlh, extack);
++	if (cb_table[op].doit)
++		ret = cb_table[op].doit(skb, nlh, extack);
+ 	return ret;
+ 
+ }
+
+commit 1830ba21b9a475cfc6159e6cfe532c75fe7682a4
+Author: Leon Romanovsky <leonro@mellanox.com>
+Date:   Thu Jun 15 12:46:33 2017 +0300
+
+    RDMA/netlink: Add and implement doit netlink callback
+    
+    The .doit callback is used by netlink core to differentiate
+    between get and set operations. Common convention is to use
+    that call for command operations like (SET, ADD, e.t.c.) and/or
+    access without NLF_M_DUMP flag.
+    
+    This commit adds proper declaration and implementation
+    to RDMA netlink.
+    
+    Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+    Reviewed-by: Steve Wise <swise@opengridcomputing.com>
+
+diff --git a/drivers/infiniband/core/netlink.c b/drivers/infiniband/core/netlink.c
+index a7082adae16b..484d6a8a2811 100644
+--- a/drivers/infiniband/core/netlink.c
++++ b/drivers/infiniband/core/netlink.c
+@@ -76,9 +76,13 @@ static bool is_nl_msg_valid(unsigned int type, unsigned int op)
+ 
+ static bool is_nl_valid(unsigned int type, unsigned int op)
+ {
+-	if (!is_nl_msg_valid(type, op) ||
+-	    !rdma_nl_types[type].cb_table ||
+-	    !rdma_nl_types[type].cb_table[op].dump)
++	const struct rdma_nl_cbs *cb_table;
++
++	if (!is_nl_msg_valid(type, op))
++		return false;
++
++	cb_table = rdma_nl_types[type].cb_table;
++	if (!cb_table || (!cb_table[op].dump && !cb_table[op].doit))
+ 		return false;
+ 	return true;
+ }
+@@ -151,6 +155,7 @@ static int rdma_nl_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh,
+ 	unsigned int op = RDMA_NL_GET_OP(type);
+ 	struct netlink_callback cb = {};
+ 	struct netlink_dump_control c = {};
++	int ret;
+ 
+ 	if (!is_nl_valid(index, op))
+ 		return -EINVAL;
+@@ -169,10 +174,14 @@ static int rdma_nl_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh,
+ 		cb.nlh = nlh;
+ 		cb.dump = rdma_nl_types[index].cb_table[op].dump;
+ 		return cb.dump(skb, &cb);
++	} else {
++		c.dump = rdma_nl_types[index].cb_table[op].dump;
++		return netlink_dump_start(nls, skb, nlh, &c);
+ 	}
++	if (rdma_nl_types[index].cb_table[op].doit)
++		ret = rdma_nl_types[index].cb_table[op].doit(skb, nlh, extack);
++	return ret;
+ 
+-	c.dump = rdma_nl_types[index].cb_table[op].dump;
+-	return netlink_dump_start(nls, skb, nlh, &c);
+ }
+ 
+ /*
+
+commit 3250b4dbd87aa08c21891cabfc6f6b48b36fd7e5
+Author: Leon Romanovsky <leonro@mellanox.com>
+Date:   Mon Jun 19 18:23:45 2017 +0300
+
+    RDMA/netlink: Rename netlink callback struct
+    
+    The RDMA netlink client infrastructure was removed and made obsolete.
+    The old infrastructure defined struct ibnl_client_cbs. Now that all
+    uses of this have been updated to the new infrastructure, rename the
+    struct to be compliant with the current stack naming standards:
+    struct rdma_nl_cbs.
+    
+    Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+    Reviewed-by: Steve Wise <swise@opengridcomputing.com>
+
+diff --git a/drivers/infiniband/core/netlink.c b/drivers/infiniband/core/netlink.c
+index 514959ccaf2d..a7082adae16b 100644
+--- a/drivers/infiniband/core/netlink.c
++++ b/drivers/infiniband/core/netlink.c
+@@ -44,7 +44,7 @@
+ static DEFINE_MUTEX(rdma_nl_mutex);
+ static struct sock *nls;
+ static struct {
+-	const struct ibnl_client_cbs   *cb_table;
++	const struct rdma_nl_cbs   *cb_table;
+ } rdma_nl_types[RDMA_NL_NUM_CLIENTS];
+ 
+ int rdma_nl_chk_listeners(unsigned int group)
+@@ -84,7 +84,7 @@ static bool is_nl_valid(unsigned int type, unsigned int op)
+ }
+ 
+ void rdma_nl_register(unsigned int index,
+-		      const struct ibnl_client_cbs cb_table[])
++		      const struct rdma_nl_cbs cb_table[])
+ {
+ 	mutex_lock(&rdma_nl_mutex);
+ 	if (!is_nl_msg_valid(index, 0)) {
+
+commit ff61c425c1c563f1d688d59caf3b18a395cbf9c4
+Author: Leon Romanovsky <leonro@mellanox.com>
+Date:   Sun Jun 18 15:51:16 2017 +0300
+
+    RDMA/netlink: Simplify and rename ibnl_chk_listeners
+    
+    Make ibnl_chk_listeners function to be one line by removing
+    unneeded comparison.
+    
+    Rename that function to be complaint to other functions in RDMA netlink.
+    
+    Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+    Reviewed-by: Steve Wise <swise@opengridcomputing.com>
+
+diff --git a/drivers/infiniband/core/netlink.c b/drivers/infiniband/core/netlink.c
+index 5c627d1fbaa9..514959ccaf2d 100644
+--- a/drivers/infiniband/core/netlink.c
++++ b/drivers/infiniband/core/netlink.c
+@@ -47,12 +47,11 @@ static struct {
+ 	const struct ibnl_client_cbs   *cb_table;
+ } rdma_nl_types[RDMA_NL_NUM_CLIENTS];
+ 
+-int ibnl_chk_listeners(unsigned int group)
++int rdma_nl_chk_listeners(unsigned int group)
+ {
+-	if (netlink_has_listeners(nls, group) == 0)
+-		return -1;
+-	return 0;
++	return (netlink_has_listeners(nls, group)) ? 0 : -1;
+ }
++EXPORT_SYMBOL(rdma_nl_chk_listeners);
+ 
+ static bool is_nl_msg_valid(unsigned int type, unsigned int op)
+ {
+
+commit 4d7f693af0c9d0d6940ff36f5adca1adfa0e7e6e
+Author: Leon Romanovsky <leonro@mellanox.com>
+Date:   Sun Jun 18 15:44:32 2017 +0300
+
+    RDMA/netlink: Rename and remove redundant parameter from ibnl_multicast
+    
+    The pointer to netlink header was not used in the ibnl_multicast
+    function, so let's remove it and simplify the function
+    signature.
+    
+    Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+    Reviewed-by: Steve Wise <swise@opengridcomputing.com>
+
+diff --git a/drivers/infiniband/core/netlink.c b/drivers/infiniband/core/netlink.c
+index b95a70013f19..5c627d1fbaa9 100644
+--- a/drivers/infiniband/core/netlink.c
++++ b/drivers/infiniband/core/netlink.c
+@@ -257,12 +257,11 @@ int rdma_nl_unicast_wait(struct sk_buff *skb, __u32 pid)
+ }
+ EXPORT_SYMBOL(rdma_nl_unicast_wait);
+ 
+-int ibnl_multicast(struct sk_buff *skb, struct nlmsghdr *nlh,
+-			unsigned int group, gfp_t flags)
++int rdma_nl_multicast(struct sk_buff *skb, unsigned int group, gfp_t flags)
+ {
+ 	return nlmsg_multicast(nls, skb, 0, group, flags);
+ }
+-EXPORT_SYMBOL(ibnl_multicast);
++EXPORT_SYMBOL(rdma_nl_multicast);
+ 
+ int __init rdma_nl_init(void)
+ {
+
+commit f00e64637061876ec7b6383b0bd80197c51e7312
+Author: Leon Romanovsky <leonro@mellanox.com>
+Date:   Sun Jun 18 15:35:20 2017 +0300
+
+    RDMA/netlink: Rename and remove redundant parameter from ibnl_unicast*
+    
+    Netlink message header is not needed for unicast reply, hence remove it.
+    
+    Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+    Reviewed-by: Steve Wise <swise@opengridcomputing.com>
+
+diff --git a/drivers/infiniband/core/netlink.c b/drivers/infiniband/core/netlink.c
+index e2395a1d9f45..b95a70013f19 100644
+--- a/drivers/infiniband/core/netlink.c
++++ b/drivers/infiniband/core/netlink.c
+@@ -239,25 +239,23 @@ static void rdma_nl_rcv(struct sk_buff *skb)
+ 	mutex_unlock(&rdma_nl_mutex);
+ }
+ 
+-int ibnl_unicast(struct sk_buff *skb, struct nlmsghdr *nlh,
+-			__u32 pid)
++int rdma_nl_unicast(struct sk_buff *skb, u32 pid)
+ {
+ 	int err;
+ 
+ 	err = netlink_unicast(nls, skb, pid, MSG_DONTWAIT);
+ 	return (err < 0) ? err : 0;
+ }
+-EXPORT_SYMBOL(ibnl_unicast);
++EXPORT_SYMBOL(rdma_nl_unicast);
+ 
+-int ibnl_unicast_wait(struct sk_buff *skb, struct nlmsghdr *nlh,
+-		      __u32 pid)
++int rdma_nl_unicast_wait(struct sk_buff *skb, __u32 pid)
+ {
+ 	int err;
+ 
+ 	err = netlink_unicast(nls, skb, pid, 0);
+ 	return (err < 0) ? err : 0;
+ }
+-EXPORT_SYMBOL(ibnl_unicast_wait);
++EXPORT_SYMBOL(rdma_nl_unicast_wait);
+ 
+ int ibnl_multicast(struct sk_buff *skb, struct nlmsghdr *nlh,
+ 			unsigned int group, gfp_t flags)
+
+commit 1a1c116f3dcf1658ee1e395bd13a556187d547f2
+Author: Leon Romanovsky <leonro@mellanox.com>
+Date:   Sun Jun 18 16:38:04 2017 +0300
+
+    RDMA/netlink: Simplify the put_msg and put_attr
+    
+    Reuse standard macros to cancel the netlink message
+    in case of error.
+    
+    Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+    Reviewed-by: Steve Wise <swise@opengridcomputing.com>
+
+diff --git a/drivers/infiniband/core/netlink.c b/drivers/infiniband/core/netlink.c
+index c5ee62a24960..e2395a1d9f45 100644
+--- a/drivers/infiniband/core/netlink.c
++++ b/drivers/infiniband/core/netlink.c
+@@ -126,36 +126,21 @@ EXPORT_SYMBOL(rdma_nl_unregister);
+ void *ibnl_put_msg(struct sk_buff *skb, struct nlmsghdr **nlh, int seq,
+ 		   int len, int client, int op, int flags)
+ {
+-	unsigned char *prev_tail;
+-
+-	prev_tail = skb_tail_pointer(skb);
+-	*nlh = nlmsg_put(skb, 0, seq, RDMA_NL_GET_TYPE(client, op),
+-			 len, flags);
++	*nlh = nlmsg_put(skb, 0, seq, RDMA_NL_GET_TYPE(client, op), len, flags);
+ 	if (!*nlh)
+-		goto out_nlmsg_trim;
+-	(*nlh)->nlmsg_len = skb_tail_pointer(skb) - prev_tail;
++		return NULL;
+ 	return nlmsg_data(*nlh);
+-
+-out_nlmsg_trim:
+-	nlmsg_trim(skb, prev_tail);
+-	return NULL;
+ }
+ EXPORT_SYMBOL(ibnl_put_msg);
+ 
+ int ibnl_put_attr(struct sk_buff *skb, struct nlmsghdr *nlh,
+ 		  int len, void *data, int type)
+ {
+-	unsigned char *prev_tail;
+-
+-	prev_tail = skb_tail_pointer(skb);
+-	if (nla_put(skb, type, len, data))
+-		goto nla_put_failure;
+-	nlh->nlmsg_len += skb_tail_pointer(skb) - prev_tail;
++	if (nla_put(skb, type, len, data)) {
++		nlmsg_cancel(skb, nlh);
++		return -EMSGSIZE;
++	}
+ 	return 0;
+-
+-nla_put_failure:
+-	nlmsg_trim(skb, prev_tail - nlh->nlmsg_len);
+-	return -EMSGSIZE;
+ }
+ EXPORT_SYMBOL(ibnl_put_attr);
+ 
+
+commit e3a2b93dddad315f01a4b67faee738954c084072
+Author: Leon Romanovsky <leonro@mellanox.com>
+Date:   Mon Jun 12 16:00:19 2017 +0300
+
+    RDMA/netlink: Add flag to consolidate common handling
+    
+    Add ability to provide flags to control RDMA netlink callbacks
+    and convert addr.c and sa_query.c to be first users of such
+    infrastructure. It allows to move their CAP_NET_ADMIN checks
+    into netlink core.
+    
+    Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+    Reviewed-by: Steve Wise <swise@opengridcomputing.com>
+
+diff --git a/drivers/infiniband/core/netlink.c b/drivers/infiniband/core/netlink.c
+index 826fbd612c7d..c5ee62a24960 100644
+--- a/drivers/infiniband/core/netlink.c
++++ b/drivers/infiniband/core/netlink.c
+@@ -171,6 +171,10 @@ static int rdma_nl_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh,
+ 	if (!is_nl_valid(index, op))
+ 		return -EINVAL;
+ 
++	if ((rdma_nl_types[index].cb_table[op].flags & RDMA_NL_ADMIN_PERM) &&
++	    !netlink_capable(skb, CAP_NET_ADMIN))
++		return -EPERM;
++
+ 	/*
+ 	 * For response or local service set_timeout request,
+ 	 * there is no need to use netlink_dump_start.
+
+commit 3c3e75d5ff75f9a076cac254fd32476ca80fdffc
+Author: Leon Romanovsky <leonro@mellanox.com>
+Date:   Thu Jun 8 09:05:12 2017 +0300
+
+    RDMA/netlink: Avoid double pass for RDMA netlink messages
+    
+    The standard netlink_rcv_skb function skips messages without
+    NLM_F_REQUEST flag in it, while SA netlink client issues them.
+    
+    In commit bc10ed7d3d19 ("IB/core: Add rdma netlink helper functions")
+    the local function was introduced to allow such messages.
+    
+    This led to double pass for every incoming message.
+    
+    In this patch, we unify that local implementation and netlink_rcv_skb
+    functions, so there will be no need for double pass anymore.
+    
+    As a outcome, this combined function gained more strict check
+    for NLM_F_REQUEST flag and it is now allowed for SA pathquery
+    client only.
+    
+    Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+
+diff --git a/drivers/infiniband/core/netlink.c b/drivers/infiniband/core/netlink.c
+index cd9b7e7b7d2c..826fbd612c7d 100644
+--- a/drivers/infiniband/core/netlink.c
++++ b/drivers/infiniband/core/netlink.c
+@@ -159,8 +159,8 @@ int ibnl_put_attr(struct sk_buff *skb, struct nlmsghdr *nlh,
+ }
+ EXPORT_SYMBOL(ibnl_put_attr);
+ 
+-static int ibnl_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh,
+-			struct netlink_ext_ack *extack)
++static int rdma_nl_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh,
++			   struct netlink_ext_ack *extack)
+ {
+ 	int type = nlh->nlmsg_type;
+ 	unsigned int index = RDMA_NL_GET_CLIENT(type);
+@@ -187,40 +187,66 @@ static int ibnl_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh,
+ 	return netlink_dump_start(nls, skb, nlh, &c);
+ }
+ 
+-static void ibnl_rcv_reply_skb(struct sk_buff *skb)
++/*
++ * This function is similar to netlink_rcv_skb with one exception:
++ * It calls to the callback for the netlink messages without NLM_F_REQUEST
++ * flag. These messages are intended for RDMA_NL_LS consumer, so it is allowed
++ * for that consumer only.
++ */
++static int rdma_nl_rcv_skb(struct sk_buff *skb, int (*cb)(struct sk_buff *,
++						   struct nlmsghdr *,
++						   struct netlink_ext_ack *))
+ {
++	struct netlink_ext_ack extack = {};
+ 	struct nlmsghdr *nlh;
+-	int msglen;
++	int err;
+ 
+-	/*
+-	 * Process responses until there is no more message or the first
+-	 * request. Generally speaking, it is not recommended to mix responses
+-	 * with requests.
+-	 */
+ 	while (skb->len >= nlmsg_total_size(0)) {
++		int msglen;
++
+ 		nlh = nlmsg_hdr(skb);
++		err = 0;
+ 
+ 		if (nlh->nlmsg_len < NLMSG_HDRLEN || skb->len < nlh->nlmsg_len)
+-			return;
++			return 0;
+ 
+-		/* Handle response only */
+-		if (nlh->nlmsg_flags & NLM_F_REQUEST)
+-			return;
++		/*
++		 * Generally speaking, the only requests are handled
++		 * by the kernel, but RDMA_NL_LS is different, because it
++		 * runs backward netlink scheme. Kernel initiates messages
++		 * and waits for reply with data to keep pathrecord cache
++		 * in sync.
++		 */
++		if (!(nlh->nlmsg_flags & NLM_F_REQUEST) &&
++		    (RDMA_NL_GET_CLIENT(nlh->nlmsg_type) != RDMA_NL_LS))
++			goto ack;
++
++		/* Skip control messages */
++		if (nlh->nlmsg_type < NLMSG_MIN_TYPE)
++			goto ack;
+ 
+-		ibnl_rcv_msg(skb, nlh, NULL);
++		err = cb(skb, nlh, &extack);
++		if (err == -EINTR)
++			goto skip;
+ 
++ack:
++		if (nlh->nlmsg_flags & NLM_F_ACK || err)
++			netlink_ack(skb, nlh, err, &extack);
++
++skip:
+ 		msglen = NLMSG_ALIGN(nlh->nlmsg_len);
+ 		if (msglen > skb->len)
+ 			msglen = skb->len;
+ 		skb_pull(skb, msglen);
+ 	}
++
++	return 0;
+ }
+ 
+-static void ibnl_rcv(struct sk_buff *skb)
++static void rdma_nl_rcv(struct sk_buff *skb)
+ {
+ 	mutex_lock(&rdma_nl_mutex);
+-	ibnl_rcv_reply_skb(skb);
+-	netlink_rcv_skb(skb, &ibnl_rcv_msg);
++	rdma_nl_rcv_skb(skb, &rdma_nl_rcv_msg);
+ 	mutex_unlock(&rdma_nl_mutex);
+ }
+ 
+@@ -254,7 +280,7 @@ EXPORT_SYMBOL(ibnl_multicast);
+ int __init rdma_nl_init(void)
+ {
+ 	struct netlink_kernel_cfg cfg = {
+-		.input	= ibnl_rcv,
++		.input	= rdma_nl_rcv,
+ 	};
+ 
+ 	nls = netlink_kernel_create(&init_net, NETLINK_RDMA, &cfg);
+
+commit 64401b69b29164c5731018cc44fc9b144ac9c5ae
+Author: Leon Romanovsky <leonro@mellanox.com>
+Date:   Tue May 30 11:29:56 2017 +0300
+
+    RDMA/netlink: Remove redundant owner option for netlink callbacks
+    
+    Owner field is not needed to be set because netlink is part of ib_core
+    which will be unloaded last after all other modules are unloaded.
+    
+    Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+
+diff --git a/drivers/infiniband/core/netlink.c b/drivers/infiniband/core/netlink.c
+index 06f7ba31fbdd..cd9b7e7b7d2c 100644
+--- a/drivers/infiniband/core/netlink.c
++++ b/drivers/infiniband/core/netlink.c
+@@ -180,12 +180,10 @@ static int ibnl_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh,
+ 		cb.skb = skb;
+ 		cb.nlh = nlh;
+ 		cb.dump = rdma_nl_types[index].cb_table[op].dump;
+-		cb.module = rdma_nl_types[index].cb_table[op].module;
+ 		return cb.dump(skb, &cb);
+ 	}
+ 
+ 	c.dump = rdma_nl_types[index].cb_table[op].dump;
+-	c.module = rdma_nl_types[index].cb_table[op].module;
+ 	return netlink_dump_start(nls, skb, nlh, &c);
+ }
+ 
+
+commit c9901724a2f14128ef6a57986babcbfbcf61a257
+Author: Leon Romanovsky <leonro@mellanox.com>
+Date:   Mon Jun 5 10:20:11 2017 +0300
+
+    RDMA/netlink: Remove netlink clients infrastructure
+    
+    RDMA netlink has a complicated infrastructure for dynamically
+    registering and de-registering netlink clients to the NETLINK_RDMA
+    group. The complicated portion of this code is not widely used because
+    2 of the 3 current clients are statically compiled together with
+    netlink.c. The infrastructure, therefore, is deemed overkill.
+    
+    Refactor the code to eliminate the dynamically added clients. Now all
+    clients are pre-registered in a client array at compile time, and at run
+    time they merely check-in with the infrastructure to pass their callback
+    table for inclusion in the pre-sized client array.
+    
+    This also allows for future cleanups and removal of unneeded code in the
+    iwcm* netlink handler.
+    
+    Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+    Reviewed-by: Chien Tin Tung <chien.tin.tung@intel.com>
+
+diff --git a/drivers/infiniband/core/netlink.c b/drivers/infiniband/core/netlink.c
+index 0fc50e15ae22..06f7ba31fbdd 100644
+--- a/drivers/infiniband/core/netlink.c
++++ b/drivers/infiniband/core/netlink.c
+@@ -39,16 +39,13 @@
+ #include <rdma/rdma_netlink.h>
+ #include "core_priv.h"
+ 
+-struct ibnl_client {
+-	struct list_head		list;
+-	int				index;
+-	int				nops;
+-	const struct ibnl_client_cbs   *cb_table;
+-};
++#include "core_priv.h"
+ 
+-static DEFINE_MUTEX(ibnl_mutex);
++static DEFINE_MUTEX(rdma_nl_mutex);
+ static struct sock *nls;
+-static LIST_HEAD(client_list);
++static struct {
++	const struct ibnl_client_cbs   *cb_table;
++} rdma_nl_types[RDMA_NL_NUM_CLIENTS];
+ 
+ int ibnl_chk_listeners(unsigned int group)
+ {
+@@ -57,58 +54,74 @@ int ibnl_chk_listeners(unsigned int group)
+ 	return 0;
+ }
+ 
+-int ibnl_add_client(int index, int nops,
+-		    const struct ibnl_client_cbs cb_table[])
++static bool is_nl_msg_valid(unsigned int type, unsigned int op)
+ {
+-	struct ibnl_client *cur;
+-	struct ibnl_client *nl_client;
++	static const unsigned int max_num_ops[RDMA_NL_NUM_CLIENTS - 1] = {
++				  RDMA_NL_RDMA_CM_NUM_OPS,
++				  RDMA_NL_IWPM_NUM_OPS,
++				  0,
++				  RDMA_NL_LS_NUM_OPS,
++				  0 };
+ 
+-	nl_client = kmalloc(sizeof *nl_client, GFP_KERNEL);
+-	if (!nl_client)
+-		return -ENOMEM;
++	/*
++	 * This BUILD_BUG_ON is intended to catch addition of new
++	 * RDMA netlink protocol without updating the array above.
++	 */
++	BUILD_BUG_ON(RDMA_NL_NUM_CLIENTS != 6);
+ 
+-	nl_client->index	= index;
+-	nl_client->nops		= nops;
+-	nl_client->cb_table	= cb_table;
++	if (type > RDMA_NL_NUM_CLIENTS - 1)
++		return false;
+ 
+-	mutex_lock(&ibnl_mutex);
++	return (op < max_num_ops[type - 1]) ? true : false;
++}
+ 
+-	list_for_each_entry(cur, &client_list, list) {
+-		if (cur->index == index) {
+-			pr_warn("Client for %d already exists\n", index);
+-			mutex_unlock(&ibnl_mutex);
+-			kfree(nl_client);
+-			return -EINVAL;
+-		}
+-	}
++static bool is_nl_valid(unsigned int type, unsigned int op)
++{
++	if (!is_nl_msg_valid(type, op) ||
++	    !rdma_nl_types[type].cb_table ||
++	    !rdma_nl_types[type].cb_table[op].dump)
++		return false;
++	return true;
++}
+ 
+-	list_add_tail(&nl_client->list, &client_list);
++void rdma_nl_register(unsigned int index,
++		      const struct ibnl_client_cbs cb_table[])
++{
++	mutex_lock(&rdma_nl_mutex);
++	if (!is_nl_msg_valid(index, 0)) {
++		/*
++		 * All clients are not interesting in success/failure of
++		 * this call. They want to see the print to error log and
++		 * continue their initialization. Print warning for them,
++		 * because it is programmer's error to be here.
++		 */
++		mutex_unlock(&rdma_nl_mutex);
++		WARN(true,
++		     "The not-valid %u index was supplied to RDMA netlink\n",
++		     index);
++		return;
++	}
+ 
+-	mutex_unlock(&ibnl_mutex);
++	if (rdma_nl_types[index].cb_table) {
++		mutex_unlock(&rdma_nl_mutex);
++		WARN(true,
++		     "The %u index is already registered in RDMA netlink\n",
++		     index);
++		return;
++	}
+ 
+-	return 0;
++	rdma_nl_types[index].cb_table = cb_table;
++	mutex_unlock(&rdma_nl_mutex);
+ }
+-EXPORT_SYMBOL(ibnl_add_client);
++EXPORT_SYMBOL(rdma_nl_register);
+ 
+-int ibnl_remove_client(int index)
++void rdma_nl_unregister(unsigned int index)
+ {
+-	struct ibnl_client *cur, *next;
+-
+-	mutex_lock(&ibnl_mutex);
+-	list_for_each_entry_safe(cur, next, &client_list, list) {
+-		if (cur->index == index) {
+-			list_del(&(cur->list));
+-			mutex_unlock(&ibnl_mutex);
+-			kfree(cur);
+-			return 0;
+-		}
+-	}
+-	pr_warn("Can't remove callback for client idx %d. Not found\n", index);
+-	mutex_unlock(&ibnl_mutex);
+-
+-	return -EINVAL;
++	mutex_lock(&rdma_nl_mutex);
++	rdma_nl_types[index].cb_table = NULL;
++	mutex_unlock(&rdma_nl_mutex);
+ }
+-EXPORT_SYMBOL(ibnl_remove_client);
++EXPORT_SYMBOL(rdma_nl_unregister);
+ 
+ void *ibnl_put_msg(struct sk_buff *skb, struct nlmsghdr **nlh, int seq,
+ 		   int len, int client, int op, int flags)
+@@ -149,45 +162,31 @@ EXPORT_SYMBOL(ibnl_put_attr);
+ static int ibnl_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh,
+ 			struct netlink_ext_ack *extack)
+ {
+-	struct ibnl_client *client;
+ 	int type = nlh->nlmsg_type;
+-	int index = RDMA_NL_GET_CLIENT(type);
++	unsigned int index = RDMA_NL_GET_CLIENT(type);
+ 	unsigned int op = RDMA_NL_GET_OP(type);
++	struct netlink_callback cb = {};
++	struct netlink_dump_control c = {};
+ 
+-	list_for_each_entry(client, &client_list, list) {
+-		if (client->index == index) {
+-			if (op >= client->nops || !client->cb_table[op].dump)
+-				return -EINVAL;
+-
+-			/*
+-			 * For response or local service set_timeout request,
+-			 * there is no need to use netlink_dump_start.
+-			 */
+-			if (!(nlh->nlmsg_flags & NLM_F_REQUEST) ||
+-			    (index == RDMA_NL_LS &&
+-			     op == RDMA_NL_LS_OP_SET_TIMEOUT)) {
+-				struct netlink_callback cb = {
+-					.skb = skb,
+-					.nlh = nlh,
+-					.dump = client->cb_table[op].dump,
+-					.module = client->cb_table[op].module,
+-				};
+-
+-				return cb.dump(skb, &cb);
+-			}
+-
+-			{
+-				struct netlink_dump_control c = {
+-					.dump = client->cb_table[op].dump,
+-					.module = client->cb_table[op].module,
+-				};
+-				return netlink_dump_start(nls, skb, nlh, &c);
+-			}
+-		}
++	if (!is_nl_valid(index, op))
++		return -EINVAL;
++
++	/*
++	 * For response or local service set_timeout request,
++	 * there is no need to use netlink_dump_start.
++	 */
++	if (!(nlh->nlmsg_flags & NLM_F_REQUEST) ||
++	    (index == RDMA_NL_LS && op == RDMA_NL_LS_OP_SET_TIMEOUT)) {
++		cb.skb = skb;
++		cb.nlh = nlh;
++		cb.dump = rdma_nl_types[index].cb_table[op].dump;
++		cb.module = rdma_nl_types[index].cb_table[op].module;
++		return cb.dump(skb, &cb);
+ 	}
+ 
+-	pr_info("Index %d wasn't found in client list\n", index);
+-	return -EINVAL;
++	c.dump = rdma_nl_types[index].cb_table[op].dump;
++	c.module = rdma_nl_types[index].cb_table[op].module;
++	return netlink_dump_start(nls, skb, nlh, &c);
+ }
+ 
+ static void ibnl_rcv_reply_skb(struct sk_buff *skb)
+@@ -221,10 +220,10 @@ static void ibnl_rcv_reply_skb(struct sk_buff *skb)
+ 
+ static void ibnl_rcv(struct sk_buff *skb)
+ {
+-	mutex_lock(&ibnl_mutex);
++	mutex_lock(&rdma_nl_mutex);
+ 	ibnl_rcv_reply_skb(skb);
+ 	netlink_rcv_skb(skb, &ibnl_rcv_msg);
+-	mutex_unlock(&ibnl_mutex);
++	mutex_unlock(&rdma_nl_mutex);
+ }
+ 
+ int ibnl_unicast(struct sk_buff *skb, struct nlmsghdr *nlh,
+@@ -254,32 +253,26 @@ int ibnl_multicast(struct sk_buff *skb, struct nlmsghdr *nlh,
+ }
+ EXPORT_SYMBOL(ibnl_multicast);
+ 
+-int __init ibnl_init(void)
++int __init rdma_nl_init(void)
+ {
+ 	struct netlink_kernel_cfg cfg = {
+ 		.input	= ibnl_rcv,
+ 	};
+ 
+ 	nls = netlink_kernel_create(&init_net, NETLINK_RDMA, &cfg);
+-	if (!nls) {
+-		pr_warn("Failed to create netlink socket\n");
++	if (!nls)
+ 		return -ENOMEM;
+-	}
+ 
+ 	nls->sk_sndtimeo = 10 * HZ;
+ 	return 0;
+ }
+ 
+-void ibnl_cleanup(void)
++void rdma_nl_exit(void)
+ {
+-	struct ibnl_client *cur, *next;
++	int idx;
+ 
+-	mutex_lock(&ibnl_mutex);
+-	list_for_each_entry_safe(cur, next, &client_list, list) {
+-		list_del(&(cur->list));
+-		kfree(cur);
+-	}
+-	mutex_unlock(&ibnl_mutex);
++	for (idx = 0; idx < RDMA_NL_NUM_CLIENTS; idx++)
++		rdma_nl_unregister(idx);
+ 
+ 	netlink_kernel_release(nls);
+ }
+
+commit 9047811b776ce09ba06623dd2a846cc501f0065b
+Author: Ismail, Mustafa <mustafa.ismail@intel.com>
+Date:   Wed Jun 28 09:02:45 2017 -0500
+
+    RDMA/core: Add wait/retry version of ibnl_unicast
+    
+    Add a wait/retry version of ibnl_unicast, ibnl_unicast_wait,
+    and modify ibnl_unicast to not wait/retry.  This eliminates
+    the undesirable wait for future users of ibnl_unicast.
+    
+    Change Portmapper calls originating from kernel to user-space
+    to use ibnl_unicast_wait and take advantage of the wait/retry
+    logic in netlink_unicast.
+    
+    Signed-off-by: Mustafa Ismail <mustafa.ismail@intel.com>
+    Signed-off-by: Chien Tin Tung <chien.tin.tung@intel.com>
+    Signed-off-by: Leon Romanovsky <leon@kernel.org>
+
+diff --git a/drivers/infiniband/core/netlink.c b/drivers/infiniband/core/netlink.c
+index 94931c474d41..0fc50e15ae22 100644
+--- a/drivers/infiniband/core/netlink.c
++++ b/drivers/infiniband/core/netlink.c
+@@ -232,11 +232,21 @@ int ibnl_unicast(struct sk_buff *skb, struct nlmsghdr *nlh,
+ {
+ 	int err;
+ 
+-	err = netlink_unicast(nls, skb, pid, 0);
++	err = netlink_unicast(nls, skb, pid, MSG_DONTWAIT);
+ 	return (err < 0) ? err : 0;
+ }
+ EXPORT_SYMBOL(ibnl_unicast);
+ 
++int ibnl_unicast_wait(struct sk_buff *skb, struct nlmsghdr *nlh,
++		      __u32 pid)
++{
++	int err;
++
++	err = netlink_unicast(nls, skb, pid, 0);
++	return (err < 0) ? err : 0;
++}
++EXPORT_SYMBOL(ibnl_unicast_wait);
++
+ int ibnl_multicast(struct sk_buff *skb, struct nlmsghdr *nlh,
+ 			unsigned int group, gfp_t flags)
+ {
+
+commit 233c1955835bd8649003be9bb3d8e79788b08be1
+Author: Leon Romanovsky <leonro@mellanox.com>
+Date:   Sun May 14 15:49:57 2017 +0300
+
+    RDMA/netlink: Reduce exposure of RDMA netlink functions
+    
+    RDMA netlink is part of ib_core, hence ibnl_chk_listeners(),
+    ibnl_init() and ibnl_cleanup() don't need to be published
+    in public header file.
+    
+    Let's remove EXPORT_SYMBOL from ibnl_chk_listeners() and move all these
+    functions to private header file.
+    
+    CC: Yuval Shaia <yuval.shaia@oracle.com>
+    Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+    Reviewed-by: Yuval Shaia <yuval.shaia@oracle.com>
+    Signed-off-by: Doug Ledford <dledford@redhat.com>
+
+diff --git a/drivers/infiniband/core/netlink.c b/drivers/infiniband/core/netlink.c
+index b784055423c8..94931c474d41 100644
+--- a/drivers/infiniband/core/netlink.c
++++ b/drivers/infiniband/core/netlink.c
+@@ -37,6 +37,7 @@
+ #include <net/net_namespace.h>
+ #include <net/sock.h>
+ #include <rdma/rdma_netlink.h>
++#include "core_priv.h"
+ 
+ struct ibnl_client {
+ 	struct list_head		list;
+@@ -55,7 +56,6 @@ int ibnl_chk_listeners(unsigned int group)
+ 		return -1;
+ 	return 0;
+ }
+-EXPORT_SYMBOL(ibnl_chk_listeners);
+ 
+ int ibnl_add_client(int index, int nops,
+ 		    const struct ibnl_client_cbs cb_table[])
+
+commit 2d4bc93368f5a0ddb57c8c885cdad9c9b7a10ed5
+Author: Johannes Berg <johannes.berg@intel.com>
+Date:   Wed Apr 12 14:34:04 2017 +0200
+
+    netlink: extended ACK reporting
+    
+    Add the base infrastructure and UAPI for netlink extended ACK
+    reporting. All "manual" calls to netlink_ack() pass NULL for now and
+    thus don't get extended ACK reporting.
+    
+    Big thanks goes to Pablo Neira Ayuso for not only bringing up the
+    whole topic at netconf (again) but also coming up with the nlattr
+    passing trick and various other ideas.
+    
+    Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+    Reviewed-by: David Ahern <dsa@cumulusnetworks.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/infiniband/core/netlink.c b/drivers/infiniband/core/netlink.c
+index 10469b0088b5..b784055423c8 100644
+--- a/drivers/infiniband/core/netlink.c
++++ b/drivers/infiniband/core/netlink.c
+@@ -146,7 +146,8 @@ int ibnl_put_attr(struct sk_buff *skb, struct nlmsghdr *nlh,
+ }
+ EXPORT_SYMBOL(ibnl_put_attr);
+ 
+-static int ibnl_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh)
++static int ibnl_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh,
++			struct netlink_ext_ack *extack)
+ {
+ 	struct ibnl_client *client;
+ 	int type = nlh->nlmsg_type;
+@@ -209,7 +210,7 @@ static void ibnl_rcv_reply_skb(struct sk_buff *skb)
+ 		if (nlh->nlmsg_flags & NLM_F_REQUEST)
+ 			return;
+ 
+-		ibnl_rcv_msg(skb, nlh);
++		ibnl_rcv_msg(skb, nlh, NULL);
+ 
+ 		msglen = NLMSG_ALIGN(nlh->nlmsg_len);
+ 		if (msglen > skb->len)
+
+commit cea05eadded0d4eb59f7be6e1f1560eb6bfde2bf
+Author: Mustafa Ismail <mustafa.ismail@intel.com>
+Date:   Thu Jul 28 15:02:26 2016 -0500
+
+    IB/core: Add flow control to the portmapper netlink calls
+    
+    During connection establishment with a large number of
+    connections, it is possible that the connection requests
+    might fail. Adding flow control prevents this failure.
+    Change ibnl_unicast to use blocking to enable flow control.
+    
+    Signed-off-by: Mustafa Ismail <mustafa.ismail@intel.com>
+    Signed-off-by: Faisal Latif <faisal.latif@intel.com>
+    Signed-off-by: Shiraz Saleem <shiraz.saleem@intel.com>
+    Signed-off-by: Doug Ledford <dledford@redhat.com>
+
+diff --git a/drivers/infiniband/core/netlink.c b/drivers/infiniband/core/netlink.c
+index 9b8c20c8209b..10469b0088b5 100644
+--- a/drivers/infiniband/core/netlink.c
++++ b/drivers/infiniband/core/netlink.c
+@@ -229,7 +229,10 @@ static void ibnl_rcv(struct sk_buff *skb)
+ int ibnl_unicast(struct sk_buff *skb, struct nlmsghdr *nlh,
+ 			__u32 pid)
+ {
+-	return nlmsg_unicast(nls, skb, pid);
++	int err;
++
++	err = netlink_unicast(nls, skb, pid, 0);
++	return (err < 0) ? err : 0;
+ }
+ EXPORT_SYMBOL(ibnl_unicast);
+ 
+@@ -252,6 +255,7 @@ int __init ibnl_init(void)
+ 		return -ENOMEM;
+ 	}
+ 
++	nls->sk_sndtimeo = 10 * HZ;
+ 	return 0;
+ }
+ 
+
+commit 1ae5ccc78105490cd1f73bdf4847e7c6d03f0aa1
+Author: Mark Bloch <markb@mellanox.com>
+Date:   Fri May 6 22:45:25 2016 +0300
+
+    IB/core: Remove unnecessary check in ibnl_rcv_msg
+    
+    RDMA_NL_GET_OP is defined like this: (type & ((1 << 10) - 1))
+    which means op (defined as an int) can never be a negative number.
+    
+    Fixes: b2cbae2c2487 ('RDMA: Add netlink infrastructure')
+    Signed-off-by: Mark Bloch <markb@mellanox.com>
+    Reviewed-by: Leon Romanovsky <leonro@mellanox.com>
+    Signed-off-by: Leon Romanovsky <leon@kernel.org>
+    Signed-off-by: Doug Ledford <dledford@redhat.com>
+
+diff --git a/drivers/infiniband/core/netlink.c b/drivers/infiniband/core/netlink.c
+index d47df9356779..9b8c20c8209b 100644
+--- a/drivers/infiniband/core/netlink.c
++++ b/drivers/infiniband/core/netlink.c
+@@ -151,12 +151,11 @@ static int ibnl_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh)
+ 	struct ibnl_client *client;
+ 	int type = nlh->nlmsg_type;
+ 	int index = RDMA_NL_GET_CLIENT(type);
+-	int op = RDMA_NL_GET_OP(type);
++	unsigned int op = RDMA_NL_GET_OP(type);
+ 
+ 	list_for_each_entry(client, &client_list, list) {
+ 		if (client->index == index) {
+-			if (op < 0 || op >= client->nops ||
+-			    !client->cb_table[op].dump)
++			if (op >= client->nops || !client->cb_table[op].dump)
+ 				return -EINVAL;
+ 
+ 			/*
+
+commit bc10ed7d3d19ff61427007b4d7bf98d3e57bb333
+Author: Kaike Wan <kaike.wan@intel.com>
+Date:   Fri Aug 14 08:52:07 2015 -0400
+
+    IB/core: Add rdma netlink helper functions
+    
+    This patch adds a function to check if listeners for a netlink multicast
+    group are present. It also adds a function to receive netlink response
+    messages.
+    
+    Signed-off-by: Kaike Wan <kaike.wan@intel.com>
+    Signed-off-by: John Fleck <john.fleck@intel.com>
+    Signed-off-by: Ira Weiny <ira.weiny@intel.com>
+    Signed-off-by: Doug Ledford <dledford@redhat.com>
+
+diff --git a/drivers/infiniband/core/netlink.c b/drivers/infiniband/core/netlink.c
+index 23dd5a5c7597..d47df9356779 100644
+--- a/drivers/infiniband/core/netlink.c
++++ b/drivers/infiniband/core/netlink.c
+@@ -49,6 +49,14 @@ static DEFINE_MUTEX(ibnl_mutex);
+ static struct sock *nls;
+ static LIST_HEAD(client_list);
+ 
++int ibnl_chk_listeners(unsigned int group)
++{
++	if (netlink_has_listeners(nls, group) == 0)
++		return -1;
++	return 0;
++}
++EXPORT_SYMBOL(ibnl_chk_listeners);
++
+ int ibnl_add_client(int index, int nops,
+ 		    const struct ibnl_client_cbs cb_table[])
+ {
+@@ -151,6 +159,23 @@ static int ibnl_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh)
+ 			    !client->cb_table[op].dump)
+ 				return -EINVAL;
+ 
++			/*
++			 * For response or local service set_timeout request,
++			 * there is no need to use netlink_dump_start.
++			 */
++			if (!(nlh->nlmsg_flags & NLM_F_REQUEST) ||
++			    (index == RDMA_NL_LS &&
++			     op == RDMA_NL_LS_OP_SET_TIMEOUT)) {
++				struct netlink_callback cb = {
++					.skb = skb,
++					.nlh = nlh,
++					.dump = client->cb_table[op].dump,
++					.module = client->cb_table[op].module,
++				};
++
++				return cb.dump(skb, &cb);
++			}
++
+ 			{
+ 				struct netlink_dump_control c = {
+ 					.dump = client->cb_table[op].dump,
+@@ -165,9 +190,39 @@ static int ibnl_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh)
+ 	return -EINVAL;
+ }
+ 
++static void ibnl_rcv_reply_skb(struct sk_buff *skb)
++{
++	struct nlmsghdr *nlh;
++	int msglen;
++
++	/*
++	 * Process responses until there is no more message or the first
++	 * request. Generally speaking, it is not recommended to mix responses
++	 * with requests.
++	 */
++	while (skb->len >= nlmsg_total_size(0)) {
++		nlh = nlmsg_hdr(skb);
++
++		if (nlh->nlmsg_len < NLMSG_HDRLEN || skb->len < nlh->nlmsg_len)
++			return;
++
++		/* Handle response only */
++		if (nlh->nlmsg_flags & NLM_F_REQUEST)
++			return;
++
++		ibnl_rcv_msg(skb, nlh);
++
++		msglen = NLMSG_ALIGN(nlh->nlmsg_len);
++		if (msglen > skb->len)
++			msglen = skb->len;
++		skb_pull(skb, msglen);
++	}
++}
++
+ static void ibnl_rcv(struct sk_buff *skb)
+ {
+ 	mutex_lock(&ibnl_mutex);
++	ibnl_rcv_reply_skb(skb);
+ 	netlink_rcv_skb(skb, &ibnl_rcv_msg);
+ 	mutex_unlock(&ibnl_mutex);
+ }
+
+commit 30dc5e63d6a5ad24894b5512d10b228d73645a44
+Author: Tatyana Nikolova <Tatyana.E.Nikolova@intel.com>
+Date:   Wed Mar 26 17:07:35 2014 -0500
+
+    RDMA/core: Add support for iWARP Port Mapper user space service
+    
+    This patch adds iWARP Port Mapper (IWPM) Version 2 support.  The iWARP
+    Port Mapper implementation is based on the port mapper specification
+    section in the Sockets Direct Protocol paper -
+    http://www.rdmaconsortium.org/home/draft-pinkerton-iwarp-sdp-v1.0.pdf
+    
+    Existing iWARP RDMA providers use the same IP address as the native
+    TCP/IP stack when creating RDMA connections.  They need a mechanism to
+    claim the TCP ports used for RDMA connections to prevent TCP port
+    collisions when other host applications use TCP ports.  The iWARP Port
+    Mapper provides a standard mechanism to accomplish this.  Without this
+    service it is possible for RDMA application to bind/listen on the same
+    port which is already being used by native TCP host application.  If
+    that happens the incoming TCP connection data can be passed to the
+    RDMA stack with error.
+    
+    The iWARP Port Mapper solution doesn't contain any changes to the
+    existing network stack in the kernel space.  All the changes are
+    contained with the infiniband tree and also in user space.
+    
+    The iWARP Port Mapper service is implemented as a user space daemon
+    process.  Source for the IWPM service is located at
+    http://git.openfabrics.org/git?p=~tnikolova/libiwpm-1.0.0/.git;a=summary
+    
+    The iWARP driver (port mapper client) sends to the IWPM service the
+    local IP address and TCP port it has received from the RDMA
+    application, when starting a connection.  The IWPM service performs a
+    socket bind from user space to get an available TCP port, called a
+    mapped port, and communicates it back to the client.  In that sense,
+    the IWPM service is used to map the TCP port, which the RDMA
+    application uses to any port available from the host TCP port
+    space. The mapped ports are used in iWARP RDMA connections to avoid
+    collisions with native TCP stack which is aware that these ports are
+    taken. When an RDMA connection using a mapped port is terminated, the
+    client notifies the IWPM service, which then releases the TCP port.
+    
+    The message exchange between the IWPM service and the iWARP drivers
+    (between user space and kernel space) is implemented using netlink
+    sockets.
+    
+    1) Netlink interface functions are added: ibnl_unicast() and
+       ibnl_mulitcast() for sending netlink messages to user space
+    
+    2) The signature of the existing ibnl_put_msg() is changed to be more
+       generic
+    
+    3) Two netlink clients are added: RDMA_NL_NES, RDMA_NL_C4IW
+       corresponding to the two iWarp drivers - nes and cxgb4 which use
+       the IWPM service
+    
+    4) Enums are added to enumerate the attributes in the netlink
+       messages, which are exchanged between the user space IWPM service
+       and the iWARP drivers
+    
+    Signed-off-by: Tatyana Nikolova <tatyana.e.nikolova@intel.com>
+    Signed-off-by: Steve Wise <swise@opengridcomputing.com>
+    Reviewed-by: PJ Waskiewicz <pj.waskiewicz@solidfire.com>
+    
+    [ Fold in range checking fixes and nlh_next removal as suggested by Dan
+      Carpenter and Steve Wise.  Fix sparse endianness in hash.  - Roland ]
+    
+    Signed-off-by: Roland Dreier <roland@purestorage.com>
+
+diff --git a/drivers/infiniband/core/netlink.c b/drivers/infiniband/core/netlink.c
+index a1e9cba84944..23dd5a5c7597 100644
+--- a/drivers/infiniband/core/netlink.c
++++ b/drivers/infiniband/core/netlink.c
+@@ -103,13 +103,13 @@ int ibnl_remove_client(int index)
+ EXPORT_SYMBOL(ibnl_remove_client);
+ 
+ void *ibnl_put_msg(struct sk_buff *skb, struct nlmsghdr **nlh, int seq,
+-		   int len, int client, int op)
++		   int len, int client, int op, int flags)
+ {
+ 	unsigned char *prev_tail;
+ 
+ 	prev_tail = skb_tail_pointer(skb);
+ 	*nlh = nlmsg_put(skb, 0, seq, RDMA_NL_GET_TYPE(client, op),
+-			 len, NLM_F_MULTI);
++			 len, flags);
+ 	if (!*nlh)
+ 		goto out_nlmsg_trim;
+ 	(*nlh)->nlmsg_len = skb_tail_pointer(skb) - prev_tail;
+@@ -172,6 +172,20 @@ static void ibnl_rcv(struct sk_buff *skb)
+ 	mutex_unlock(&ibnl_mutex);
+ }
+ 
++int ibnl_unicast(struct sk_buff *skb, struct nlmsghdr *nlh,
++			__u32 pid)
++{
++	return nlmsg_unicast(nls, skb, pid);
++}
++EXPORT_SYMBOL(ibnl_unicast);
++
++int ibnl_multicast(struct sk_buff *skb, struct nlmsghdr *nlh,
++			unsigned int group, gfp_t flags)
++{
++	return nlmsg_multicast(nls, skb, 0, group, flags);
++}
++EXPORT_SYMBOL(ibnl_multicast);
++
+ int __init ibnl_init(void)
+ {
+ 	struct netlink_kernel_cfg cfg = {
+
+commit 5476781bb9e273d81a4192be47101811e987114f
+Author: Mathias Krause <minipli@googlemail.com>
+Date:   Mon Sep 30 22:03:54 2013 +0200
+
+    IB/netlink: Remove superfluous RDMA_NL_GET_OP() masking
+    
+    'op' is the already RDMA_NL_GET_OP() masked 'type'.  No need to mask it again.
+    
+    Signed-off-by: Mathias Krause <minipli@googlemail.com>
+    Reviewed-by: Yann Droneaud <ydroneaud@opteya.com>
+    Acked-by: Sean Hefty <sean.hefty@intel.com>
+    Signed-off-by: Roland Dreier <roland@purestorage.com>
+
+diff --git a/drivers/infiniband/core/netlink.c b/drivers/infiniband/core/netlink.c
+index da06abde9e0d..a1e9cba84944 100644
+--- a/drivers/infiniband/core/netlink.c
++++ b/drivers/infiniband/core/netlink.c
+@@ -148,7 +148,7 @@ static int ibnl_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh)
+ 	list_for_each_entry(client, &client_list, list) {
+ 		if (client->index == index) {
+ 			if (op < 0 || op >= client->nops ||
+-			    !client->cb_table[RDMA_NL_GET_OP(op)].dump)
++			    !client->cb_table[op].dump)
+ 				return -EINVAL;
+ 
+ 			{
+
+commit 809d5fc9bf6589276a12bd4fd611e4c7ff9940c3
+Author: Gao feng <gaofeng@cn.fujitsu.com>
+Date:   Thu Oct 4 20:15:49 2012 +0000
+
+    infiniband: pass rdma_cm module to netlink_dump_start
+    
+    set netlink_dump_control.module to avoid panic.
+    
+    Signed-off-by: Gao feng <gaofeng@cn.fujitsu.com>
+    Cc: Roland Dreier <roland@kernel.org>
+    Cc: Sean Hefty <sean.hefty@intel.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/infiniband/core/netlink.c b/drivers/infiniband/core/netlink.c
+index fe10a949aef9..da06abde9e0d 100644
+--- a/drivers/infiniband/core/netlink.c
++++ b/drivers/infiniband/core/netlink.c
+@@ -154,6 +154,7 @@ static int ibnl_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh)
+ 			{
+ 				struct netlink_dump_control c = {
+ 					.dump = client->cb_table[op].dump,
++					.module = client->cb_table[op].module,
+ 				};
+ 				return netlink_dump_start(nls, skb, nlh, &c);
+ 			}
+
+commit 9f00d9776bc5beb92e8bfc884a7e96ddc5589e2e
+Author: Pablo Neira Ayuso <pablo@netfilter.org>
+Date:   Sat Sep 8 02:53:54 2012 +0000
+
+    netlink: hide struct module parameter in netlink_kernel_create
+    
+    This patch defines netlink_kernel_create as a wrapper function of
+    __netlink_kernel_create to hide the struct module *me parameter
+    (which seems to be THIS_MODULE in all existing netlink subsystems).
+    
+    Suggested by David S. Miller.
+    
+    Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/infiniband/core/netlink.c b/drivers/infiniband/core/netlink.c
+index 3ae2bfd31015..fe10a949aef9 100644
+--- a/drivers/infiniband/core/netlink.c
++++ b/drivers/infiniband/core/netlink.c
+@@ -177,7 +177,7 @@ int __init ibnl_init(void)
+ 		.input	= ibnl_rcv,
+ 	};
+ 
+-	nls = netlink_kernel_create(&init_net, NETLINK_RDMA, THIS_MODULE, &cfg);
++	nls = netlink_kernel_create(&init_net, NETLINK_RDMA, &cfg);
+ 	if (!nls) {
+ 		pr_warn("Failed to create netlink socket\n");
+ 		return -ENOMEM;
+
+commit a31f2d17b331db970259e875b7223d3aba7e3821
+Author: Pablo Neira Ayuso <pablo@netfilter.org>
+Date:   Fri Jun 29 06:15:21 2012 +0000
+
+    netlink: add netlink_kernel_cfg parameter to netlink_kernel_create
+    
+    This patch adds the following structure:
+    
+    struct netlink_kernel_cfg {
+            unsigned int    groups;
+            void            (*input)(struct sk_buff *skb);
+            struct mutex    *cb_mutex;
+    };
+    
+    That can be passed to netlink_kernel_create to set optional configurations
+    for netlink kernel sockets.
+    
+    I've populated this structure by looking for NULL and zero parameters at the
+    existing code. The remaining parameters that always need to be set are still
+    left in the original interface.
+    
+    That includes optional parameters for the netlink socket creation. This allows
+    easy extensibility of this interface in the future.
+    
+    This patch also adapts all callers to use this new interface.
+    
+    Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/infiniband/core/netlink.c b/drivers/infiniband/core/netlink.c
+index 1e691dca1820..3ae2bfd31015 100644
+--- a/drivers/infiniband/core/netlink.c
++++ b/drivers/infiniband/core/netlink.c
+@@ -173,8 +173,11 @@ static void ibnl_rcv(struct sk_buff *skb)
+ 
+ int __init ibnl_init(void)
+ {
+-	nls = netlink_kernel_create(&init_net, NETLINK_RDMA, 0, ibnl_rcv,
+-				    NULL, THIS_MODULE);
++	struct netlink_kernel_cfg cfg = {
++		.input	= ibnl_rcv,
++	};
++
++	nls = netlink_kernel_create(&init_net, NETLINK_RDMA, THIS_MODULE, &cfg);
+ 	if (!nls) {
+ 		pr_warn("Failed to create netlink socket\n");
+ 		return -ENOMEM;
+
+commit e05273341c573f7b543f45c06e4a232c5b7c5a59
+Author: David S. Miller <davem@davemloft.net>
+Date:   Tue Jun 26 21:43:19 2012 -0700
+
+    infiniband: netlink: Move away from NLMSG_NEW().
+    
+    And use nlmsg_data() while we're here too.
+    
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/infiniband/core/netlink.c b/drivers/infiniband/core/netlink.c
+index e497dfbee435..1e691dca1820 100644
+--- a/drivers/infiniband/core/netlink.c
++++ b/drivers/infiniband/core/netlink.c
+@@ -108,12 +108,14 @@ void *ibnl_put_msg(struct sk_buff *skb, struct nlmsghdr **nlh, int seq,
+ 	unsigned char *prev_tail;
+ 
+ 	prev_tail = skb_tail_pointer(skb);
+-	*nlh = NLMSG_NEW(skb, 0, seq, RDMA_NL_GET_TYPE(client, op),
+-			len, NLM_F_MULTI);
++	*nlh = nlmsg_put(skb, 0, seq, RDMA_NL_GET_TYPE(client, op),
++			 len, NLM_F_MULTI);
++	if (!*nlh)
++		goto out_nlmsg_trim;
+ 	(*nlh)->nlmsg_len = skb_tail_pointer(skb) - prev_tail;
+-	return NLMSG_DATA(*nlh);
++	return nlmsg_data(*nlh);
+ 
+-nlmsg_failure:
++out_nlmsg_trim:
+ 	nlmsg_trim(skb, prev_tail);
+ 	return NULL;
+ }
+
+commit 4e24ffa4d9fed762147c954755f8cb124e85740a
+Author: David S. Miller <davem@davemloft.net>
+Date:   Sun Apr 1 20:19:38 2012 -0400
+
+    infiniband: Stop using NLA_PUT*().
+    
+    These macros contain a hidden goto, and are thus extremely error
+    prone and make code hard to audit.
+    
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/infiniband/core/netlink.c b/drivers/infiniband/core/netlink.c
+index 396e29370304..e497dfbee435 100644
+--- a/drivers/infiniband/core/netlink.c
++++ b/drivers/infiniband/core/netlink.c
+@@ -125,7 +125,8 @@ int ibnl_put_attr(struct sk_buff *skb, struct nlmsghdr *nlh,
+ 	unsigned char *prev_tail;
+ 
+ 	prev_tail = skb_tail_pointer(skb);
+-	NLA_PUT(skb, type, len, data);
++	if (nla_put(skb, type, len, data))
++		goto nla_put_failure;
+ 	nlh->nlmsg_len += skb_tail_pointer(skb) - prev_tail;
+ 	return 0;
+ 
+
+commit 80d326fab534a5380e8f6e509a0b9076655a9670
+Author: Pablo Neira Ayuso <pablo@netfilter.org>
+Date:   Fri Feb 24 14:30:15 2012 +0000
+
+    netlink: add netlink_dump_control structure for netlink_dump_start()
+    
+    Davem considers that the argument list of this interface is getting
+    out of control. This patch tries to address this issue following
+    his proposal:
+    
+    struct netlink_dump_control c = { .dump = dump, .done = done, ... };
+    
+    netlink_dump_start(..., &c);
+    
+    Suggested by David S. Miller.
+    
+    Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/infiniband/core/netlink.c b/drivers/infiniband/core/netlink.c
+index d1c8196d15d7..396e29370304 100644
+--- a/drivers/infiniband/core/netlink.c
++++ b/drivers/infiniband/core/netlink.c
+@@ -147,9 +147,13 @@ static int ibnl_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh)
+ 			if (op < 0 || op >= client->nops ||
+ 			    !client->cb_table[RDMA_NL_GET_OP(op)].dump)
+ 				return -EINVAL;
+-			return netlink_dump_start(nls, skb, nlh,
+-						  client->cb_table[op].dump,
+-						  NULL, 0);
++
++			{
++				struct netlink_dump_control c = {
++					.dump = client->cb_table[op].dump,
++				};
++				return netlink_dump_start(nls, skb, nlh, &c);
++			}
+ 		}
+ 	}
+ 
+
+commit b108d9764cff25262bf764542ed1998d3e568962
+Author: Paul Gortmaker <paul.gortmaker@windriver.com>
+Date:   Fri May 27 15:29:33 2011 -0400
+
+    infiniband: add in export.h for files using EXPORT_SYMBOL/THIS_MODULE
+    
+    These were getting it implicitly via device.h --> module.h but
+    we are going to stop that when we clean up the headers.
+    
+    Fix these in advance so the tree remains biscect-clean.
+    
+    Signed-off-by: Paul Gortmaker <paul.gortmaker@windriver.com>
+
+diff --git a/drivers/infiniband/core/netlink.c b/drivers/infiniband/core/netlink.c
+index 9227f4acd79c..d1c8196d15d7 100644
+--- a/drivers/infiniband/core/netlink.c
++++ b/drivers/infiniband/core/netlink.c
+@@ -32,6 +32,7 @@
+ 
+ #define pr_fmt(fmt) "%s:%s: " fmt, KBUILD_MODNAME, __func__
+ 
++#include <linux/export.h>
+ #include <net/netlink.h>
+ #include <net/net_namespace.h>
+ #include <net/sock.h>
+
+commit c7ac8679bec9397afe8918f788cbcef88c38da54
+Author: Greg Rose <gregory.v.rose@intel.com>
+Date:   Fri Jun 10 01:27:09 2011 +0000
+
+    rtnetlink: Compute and store minimum ifinfo dump size
+    
+    The message size allocated for rtnl ifinfo dumps was limited to
+    a single page.  This is not enough for additional interface info
+    available with devices that support SR-IOV and caused a bug in
+    which VF info would not be displayed if more than approximately
+    40 VFs were created per interface.
+    
+    Implement a new function pointer for the rtnl_register service that will
+    calculate the amount of data required for the ifinfo dump and allocate
+    enough data to satisfy the request.
+    
+    Signed-off-by: Greg Rose <gregory.v.rose@intel.com>
+    Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+
+diff --git a/drivers/infiniband/core/netlink.c b/drivers/infiniband/core/netlink.c
+index 4a5abaf0a25c..9227f4acd79c 100644
+--- a/drivers/infiniband/core/netlink.c
++++ b/drivers/infiniband/core/netlink.c
+@@ -148,7 +148,7 @@ static int ibnl_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh)
+ 				return -EINVAL;
+ 			return netlink_dump_start(nls, skb, nlh,
+ 						  client->cb_table[op].dump,
+-						  NULL);
++						  NULL, 0);
+ 		}
+ 	}
+ 
+
+commit b2cbae2c248776d81cc265ff7d48405b6a4cc463
+Author: Roland Dreier <roland@purestorage.com>
+Date:   Fri May 20 11:46:11 2011 -0700
+
+    RDMA: Add netlink infrastructure
+    
+    Add basic RDMA netlink infrastructure that allows for registration of
+    RDMA clients for which data is to be exported and supplies message
+    construction callbacks.
+    
+    Signed-off-by: Nir Muchtar <nirm@voltaire.com>
+    
+    [ Reorganize a few things, add CONFIG_NET dependency.  - Roland ]
+    
+    Signed-off-by: Roland Dreier <roland@purestorage.com>
+
+diff --git a/drivers/infiniband/core/netlink.c b/drivers/infiniband/core/netlink.c
+new file mode 100644
+index 000000000000..4a5abaf0a25c
+--- /dev/null
++++ b/drivers/infiniband/core/netlink.c
+@@ -0,0 +1,190 @@
++/*
++ * Copyright (c) 2010 Voltaire Inc.  All rights reserved.
++ *
++ * This software is available to you under a choice of one of two
++ * licenses.  You may choose to be licensed under the terms of the GNU
++ * General Public License (GPL) Version 2, available from the file
++ * COPYING in the main directory of this source tree, or the
++ * OpenIB.org BSD license below:
++ *
++ *     Redistribution and use in source and binary forms, with or
++ *     without modification, are permitted provided that the following
++ *     conditions are met:
++ *
++ *      - Redistributions of source code must retain the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer.
++ *
++ *      - Redistributions in binary form must reproduce the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer in the documentation and/or other materials
++ *        provided with the distribution.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
++ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
++ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++#define pr_fmt(fmt) "%s:%s: " fmt, KBUILD_MODNAME, __func__
++
++#include <net/netlink.h>
++#include <net/net_namespace.h>
++#include <net/sock.h>
++#include <rdma/rdma_netlink.h>
++
++struct ibnl_client {
++	struct list_head		list;
++	int				index;
++	int				nops;
++	const struct ibnl_client_cbs   *cb_table;
++};
++
++static DEFINE_MUTEX(ibnl_mutex);
++static struct sock *nls;
++static LIST_HEAD(client_list);
++
++int ibnl_add_client(int index, int nops,
++		    const struct ibnl_client_cbs cb_table[])
++{
++	struct ibnl_client *cur;
++	struct ibnl_client *nl_client;
++
++	nl_client = kmalloc(sizeof *nl_client, GFP_KERNEL);
++	if (!nl_client)
++		return -ENOMEM;
++
++	nl_client->index	= index;
++	nl_client->nops		= nops;
++	nl_client->cb_table	= cb_table;
++
++	mutex_lock(&ibnl_mutex);
++
++	list_for_each_entry(cur, &client_list, list) {
++		if (cur->index == index) {
++			pr_warn("Client for %d already exists\n", index);
++			mutex_unlock(&ibnl_mutex);
++			kfree(nl_client);
++			return -EINVAL;
++		}
++	}
++
++	list_add_tail(&nl_client->list, &client_list);
++
++	mutex_unlock(&ibnl_mutex);
++
++	return 0;
++}
++EXPORT_SYMBOL(ibnl_add_client);
++
++int ibnl_remove_client(int index)
++{
++	struct ibnl_client *cur, *next;
++
++	mutex_lock(&ibnl_mutex);
++	list_for_each_entry_safe(cur, next, &client_list, list) {
++		if (cur->index == index) {
++			list_del(&(cur->list));
++			mutex_unlock(&ibnl_mutex);
++			kfree(cur);
++			return 0;
++		}
++	}
++	pr_warn("Can't remove callback for client idx %d. Not found\n", index);
++	mutex_unlock(&ibnl_mutex);
++
++	return -EINVAL;
++}
++EXPORT_SYMBOL(ibnl_remove_client);
++
++void *ibnl_put_msg(struct sk_buff *skb, struct nlmsghdr **nlh, int seq,
++		   int len, int client, int op)
++{
++	unsigned char *prev_tail;
++
++	prev_tail = skb_tail_pointer(skb);
++	*nlh = NLMSG_NEW(skb, 0, seq, RDMA_NL_GET_TYPE(client, op),
++			len, NLM_F_MULTI);
++	(*nlh)->nlmsg_len = skb_tail_pointer(skb) - prev_tail;
++	return NLMSG_DATA(*nlh);
++
++nlmsg_failure:
++	nlmsg_trim(skb, prev_tail);
++	return NULL;
++}
++EXPORT_SYMBOL(ibnl_put_msg);
++
++int ibnl_put_attr(struct sk_buff *skb, struct nlmsghdr *nlh,
++		  int len, void *data, int type)
++{
++	unsigned char *prev_tail;
++
++	prev_tail = skb_tail_pointer(skb);
++	NLA_PUT(skb, type, len, data);
++	nlh->nlmsg_len += skb_tail_pointer(skb) - prev_tail;
++	return 0;
++
++nla_put_failure:
++	nlmsg_trim(skb, prev_tail - nlh->nlmsg_len);
++	return -EMSGSIZE;
++}
++EXPORT_SYMBOL(ibnl_put_attr);
++
++static int ibnl_rcv_msg(struct sk_buff *skb, struct nlmsghdr *nlh)
++{
++	struct ibnl_client *client;
++	int type = nlh->nlmsg_type;
++	int index = RDMA_NL_GET_CLIENT(type);
++	int op = RDMA_NL_GET_OP(type);
++
++	list_for_each_entry(client, &client_list, list) {
++		if (client->index == index) {
++			if (op < 0 || op >= client->nops ||
++			    !client->cb_table[RDMA_NL_GET_OP(op)].dump)
++				return -EINVAL;
++			return netlink_dump_start(nls, skb, nlh,
++						  client->cb_table[op].dump,
++						  NULL);
++		}
++	}
++
++	pr_info("Index %d wasn't found in client list\n", index);
++	return -EINVAL;
++}
++
++static void ibnl_rcv(struct sk_buff *skb)
++{
++	mutex_lock(&ibnl_mutex);
++	netlink_rcv_skb(skb, &ibnl_rcv_msg);
++	mutex_unlock(&ibnl_mutex);
++}
++
++int __init ibnl_init(void)
++{
++	nls = netlink_kernel_create(&init_net, NETLINK_RDMA, 0, ibnl_rcv,
++				    NULL, THIS_MODULE);
++	if (!nls) {
++		pr_warn("Failed to create netlink socket\n");
++		return -ENOMEM;
++	}
++
++	return 0;
++}
++
++void ibnl_cleanup(void)
++{
++	struct ibnl_client *cur, *next;
++
++	mutex_lock(&ibnl_mutex);
++	list_for_each_entry_safe(cur, next, &client_list, list) {
++		list_del(&(cur->list));
++		kfree(cur);
++	}
++	mutex_unlock(&ibnl_mutex);
++
++	netlink_kernel_release(nls);
++}

@@ -1,0 +1,1371 @@
+commit 3ec6efa703cf65887e681d1f97d38a63261d907e
+Author: Darrick J. Wong <darrick.wong@oracle.com>
+Date:   Fri May 1 16:00:48 2020 -0700
+
+    xfs: refactor log recovery icreate item dispatch for pass2 commit functions
+    
+    Move the log icreate item pass2 commit code into the per-item source code
+    files and use the dispatch function to call it.  We do these one at a
+    time because there's a lot of code to move.  No functional changes.
+    
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Reviewed-by: Chandan Babu R <chandanrlinux@gmail.com>
+    Reviewed-by: Christoph Hellwig <hch@lst.de>
+
+diff --git a/fs/xfs/xfs_icreate_item.c b/fs/xfs/xfs_icreate_item.c
+index 366c1e722a29..287a9e5c7d75 100644
+--- a/fs/xfs/xfs_icreate_item.c
++++ b/fs/xfs/xfs_icreate_item.c
+@@ -6,13 +6,19 @@
+ #include "xfs.h"
+ #include "xfs_fs.h"
+ #include "xfs_shared.h"
++#include "xfs_format.h"
+ #include "xfs_log_format.h"
++#include "xfs_trans_resv.h"
++#include "xfs_mount.h"
++#include "xfs_inode.h"
+ #include "xfs_trans.h"
+ #include "xfs_trans_priv.h"
+ #include "xfs_icreate_item.h"
+ #include "xfs_log.h"
+ #include "xfs_log_priv.h"
+ #include "xfs_log_recover.h"
++#include "xfs_ialloc.h"
++#include "xfs_trace.h"
+ 
+ kmem_zone_t	*xfs_icreate_zone;		/* inode create item zone */
+ 
+@@ -123,7 +129,133 @@ xlog_recover_icreate_reorder(
+ 	return XLOG_REORDER_BUFFER_LIST;
+ }
+ 
++/*
++ * This routine is called when an inode create format structure is found in a
++ * committed transaction in the log.  It's purpose is to initialise the inodes
++ * being allocated on disk. This requires us to get inode cluster buffers that
++ * match the range to be initialised, stamped with inode templates and written
++ * by delayed write so that subsequent modifications will hit the cached buffer
++ * and only need writing out at the end of recovery.
++ */
++STATIC int
++xlog_recover_icreate_commit_pass2(
++	struct xlog			*log,
++	struct list_head		*buffer_list,
++	struct xlog_recover_item	*item,
++	xfs_lsn_t			lsn)
++{
++	struct xfs_mount		*mp = log->l_mp;
++	struct xfs_icreate_log		*icl;
++	struct xfs_ino_geometry		*igeo = M_IGEO(mp);
++	xfs_agnumber_t			agno;
++	xfs_agblock_t			agbno;
++	unsigned int			count;
++	unsigned int			isize;
++	xfs_agblock_t			length;
++	int				bb_per_cluster;
++	int				cancel_count;
++	int				nbufs;
++	int				i;
++
++	icl = (struct xfs_icreate_log *)item->ri_buf[0].i_addr;
++	if (icl->icl_type != XFS_LI_ICREATE) {
++		xfs_warn(log->l_mp, "xlog_recover_do_icreate_trans: bad type");
++		return -EINVAL;
++	}
++
++	if (icl->icl_size != 1) {
++		xfs_warn(log->l_mp, "xlog_recover_do_icreate_trans: bad icl size");
++		return -EINVAL;
++	}
++
++	agno = be32_to_cpu(icl->icl_ag);
++	if (agno >= mp->m_sb.sb_agcount) {
++		xfs_warn(log->l_mp, "xlog_recover_do_icreate_trans: bad agno");
++		return -EINVAL;
++	}
++	agbno = be32_to_cpu(icl->icl_agbno);
++	if (!agbno || agbno == NULLAGBLOCK || agbno >= mp->m_sb.sb_agblocks) {
++		xfs_warn(log->l_mp, "xlog_recover_do_icreate_trans: bad agbno");
++		return -EINVAL;
++	}
++	isize = be32_to_cpu(icl->icl_isize);
++	if (isize != mp->m_sb.sb_inodesize) {
++		xfs_warn(log->l_mp, "xlog_recover_do_icreate_trans: bad isize");
++		return -EINVAL;
++	}
++	count = be32_to_cpu(icl->icl_count);
++	if (!count) {
++		xfs_warn(log->l_mp, "xlog_recover_do_icreate_trans: bad count");
++		return -EINVAL;
++	}
++	length = be32_to_cpu(icl->icl_length);
++	if (!length || length >= mp->m_sb.sb_agblocks) {
++		xfs_warn(log->l_mp, "xlog_recover_do_icreate_trans: bad length");
++		return -EINVAL;
++	}
++
++	/*
++	 * The inode chunk is either full or sparse and we only support
++	 * m_ino_geo.ialloc_min_blks sized sparse allocations at this time.
++	 */
++	if (length != igeo->ialloc_blks &&
++	    length != igeo->ialloc_min_blks) {
++		xfs_warn(log->l_mp,
++			 "%s: unsupported chunk length", __FUNCTION__);
++		return -EINVAL;
++	}
++
++	/* verify inode count is consistent with extent length */
++	if ((count >> mp->m_sb.sb_inopblog) != length) {
++		xfs_warn(log->l_mp,
++			 "%s: inconsistent inode count and chunk length",
++			 __FUNCTION__);
++		return -EINVAL;
++	}
++
++	/*
++	 * The icreate transaction can cover multiple cluster buffers and these
++	 * buffers could have been freed and reused. Check the individual
++	 * buffers for cancellation so we don't overwrite anything written after
++	 * a cancellation.
++	 */
++	bb_per_cluster = XFS_FSB_TO_BB(mp, igeo->blocks_per_cluster);
++	nbufs = length / igeo->blocks_per_cluster;
++	for (i = 0, cancel_count = 0; i < nbufs; i++) {
++		xfs_daddr_t	daddr;
++
++		daddr = XFS_AGB_TO_DADDR(mp, agno,
++				agbno + i * igeo->blocks_per_cluster);
++		if (xlog_is_buffer_cancelled(log, daddr, bb_per_cluster))
++			cancel_count++;
++	}
++
++	/*
++	 * We currently only use icreate for a single allocation at a time. This
++	 * means we should expect either all or none of the buffers to be
++	 * cancelled. Be conservative and skip replay if at least one buffer is
++	 * cancelled, but warn the user that something is awry if the buffers
++	 * are not consistent.
++	 *
++	 * XXX: This must be refined to only skip cancelled clusters once we use
++	 * icreate for multiple chunk allocations.
++	 */
++	ASSERT(!cancel_count || cancel_count == nbufs);
++	if (cancel_count) {
++		if (cancel_count != nbufs)
++			xfs_warn(mp,
++	"WARNING: partial inode chunk cancellation, skipped icreate.");
++		trace_xfs_log_recover_icreate_cancel(log, icl);
++		return 0;
++	}
++
++	trace_xfs_log_recover_icreate_recover(log, icl);
++	return xfs_ialloc_inode_init(mp, NULL, buffer_list, count, agno, agbno,
++				     length, be32_to_cpu(icl->icl_gen));
++}
++
+ const struct xlog_recover_item_ops xlog_icreate_item_ops = {
+ 	.item_type		= XFS_LI_ICREATE,
+ 	.reorder		= xlog_recover_icreate_reorder,
++	.commit_pass2		= xlog_recover_icreate_commit_pass2,
+ };
+
+commit 86ffa471d9ce6ac3fda66f704c3143c3d55181f5
+Author: Darrick J. Wong <darrick.wong@oracle.com>
+Date:   Fri May 1 16:00:45 2020 -0700
+
+    xfs: refactor log recovery item sorting into a generic dispatch structure
+    
+    Create a generic dispatch structure to delegate recovery of different
+    log item types into various code modules.  This will enable us to move
+    code specific to a particular log item type out of xfs_log_recover.c and
+    into the log item source.
+    
+    The first operation we virtualize is the log item sorting.
+    
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Reviewed-by: Chandan Babu R <chandanrlinux@gmail.com>
+    Reviewed-by: Christoph Hellwig <hch@lst.de>
+
+diff --git a/fs/xfs/xfs_icreate_item.c b/fs/xfs/xfs_icreate_item.c
+index 490fee22b878..366c1e722a29 100644
+--- a/fs/xfs/xfs_icreate_item.c
++++ b/fs/xfs/xfs_icreate_item.c
+@@ -11,6 +11,8 @@
+ #include "xfs_trans_priv.h"
+ #include "xfs_icreate_item.h"
+ #include "xfs_log.h"
++#include "xfs_log_priv.h"
++#include "xfs_log_recover.h"
+ 
+ kmem_zone_t	*xfs_icreate_zone;		/* inode create item zone */
+ 
+@@ -107,3 +109,21 @@ xfs_icreate_log(
+ 	tp->t_flags |= XFS_TRANS_DIRTY;
+ 	set_bit(XFS_LI_DIRTY, &icp->ic_item.li_flags);
+ }
++
++static enum xlog_recover_reorder
++xlog_recover_icreate_reorder(
++		struct xlog_recover_item *item)
++{
++	/*
++	 * Inode allocation buffers must be replayed before subsequent inode
++	 * items try to modify those buffers.  ICREATE items are the logical
++	 * equivalent of logging a newly initialized inode buffer, so recover
++	 * these at the same time that we recover logged buffers.
++	 */
++	return XLOG_REORDER_BUFFER_LIST;
++}
++
++const struct xlog_recover_item_ops xlog_icreate_item_ops = {
++	.item_type		= XFS_LI_ICREATE,
++	.reorder		= xlog_recover_icreate_reorder,
++};
+
+commit 377bcd5f3b7f46f50fdad1fed639c07f8c9f68cb
+Author: Carlos Maiolino <cmaiolino@redhat.com>
+Date:   Thu Nov 14 12:43:04 2019 -0800
+
+    xfs: Remove kmem_zone_free() wrapper
+    
+    We can remove it now, without needing to rework the KM_ flags.
+    
+    Use kmem_cache_free() directly.
+    
+    Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Signed-off-by: Carlos Maiolino <cmaiolino@redhat.com>
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+
+diff --git a/fs/xfs/xfs_icreate_item.c b/fs/xfs/xfs_icreate_item.c
+index 3ebd1b7f49d8..490fee22b878 100644
+--- a/fs/xfs/xfs_icreate_item.c
++++ b/fs/xfs/xfs_icreate_item.c
+@@ -55,7 +55,7 @@ STATIC void
+ xfs_icreate_item_release(
+ 	struct xfs_log_item	*lip)
+ {
+-	kmem_zone_free(xfs_icreate_zone, ICR_ITEM(lip));
++	kmem_cache_free(xfs_icreate_zone, ICR_ITEM(lip));
+ }
+ 
+ static const struct xfs_item_ops xfs_icreate_item_ops = {
+
+commit 707e0ddaf67e8942448ebdd16b523e409ebe40ce
+Author: Tetsuo Handa <penguin-kernel@I-love.SAKURA.ne.jp>
+Date:   Mon Aug 26 12:06:22 2019 -0700
+
+    fs: xfs: Remove KM_NOSLEEP and KM_SLEEP.
+    
+    Since no caller is using KM_NOSLEEP and no callee branches on KM_SLEEP,
+    we can remove KM_NOSLEEP and replace KM_SLEEP with 0.
+    
+    Signed-off-by: Tetsuo Handa <penguin-kernel@I-love.SAKURA.ne.jp>
+    Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+
+diff --git a/fs/xfs/xfs_icreate_item.c b/fs/xfs/xfs_icreate_item.c
+index d99a0a3e5f40..3ebd1b7f49d8 100644
+--- a/fs/xfs/xfs_icreate_item.c
++++ b/fs/xfs/xfs_icreate_item.c
+@@ -89,7 +89,7 @@ xfs_icreate_log(
+ {
+ 	struct xfs_icreate_item	*icp;
+ 
+-	icp = kmem_zone_zalloc(xfs_icreate_zone, KM_SLEEP);
++	icp = kmem_zone_zalloc(xfs_icreate_zone, 0);
+ 
+ 	xfs_log_item_init(tp->t_mountp, &icp->ic_item, XFS_LI_ICREATE,
+ 			  &xfs_icreate_item_ops);
+
+commit 250d4b4c409778bc44577dfc59909935c92fd006
+Author: Eric Sandeen <sandeen@sandeen.net>
+Date:   Fri Jun 28 19:30:43 2019 -0700
+
+    xfs: remove unused header files
+    
+    There are many, many xfs header files which are included but
+    unneeded (or included twice) in the xfs code, so remove them.
+    
+    nb: xfs_linux.h includes about 9 headers for everyone, so those
+    explicit includes get removed by this.  I'm not sure what the
+    preference is, but if we wanted explicit includes everywhere,
+    a followup patch could remove those xfs_*.h includes from
+    xfs_linux.h and move them into the files that need them.
+    Or it could be left as-is.
+    
+    Signed-off-by: Eric Sandeen <sandeen@redhat.com>
+    Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+
+diff --git a/fs/xfs/xfs_icreate_item.c b/fs/xfs/xfs_icreate_item.c
+index c0376135889d..d99a0a3e5f40 100644
+--- a/fs/xfs/xfs_icreate_item.c
++++ b/fs/xfs/xfs_icreate_item.c
+@@ -6,14 +6,9 @@
+ #include "xfs.h"
+ #include "xfs_fs.h"
+ #include "xfs_shared.h"
+-#include "xfs_format.h"
+ #include "xfs_log_format.h"
+-#include "xfs_trans_resv.h"
+-#include "xfs_bit.h"
+-#include "xfs_mount.h"
+ #include "xfs_trans.h"
+ #include "xfs_trans_priv.h"
+-#include "xfs_error.h"
+ #include "xfs_icreate_item.h"
+ #include "xfs_log.h"
+ 
+
+commit 95cf0e4a0ddc59f17eacfb4d06e0950ea5f624ca
+Author: Christoph Hellwig <hch@lst.de>
+Date:   Fri Jun 28 19:27:34 2019 -0700
+
+    xfs: remove a pointless comment duplicated above all xfs_item_ops instances
+    
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Reviewed-by: Brian Foster <bfoster@redhat.com>
+    Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+
+diff --git a/fs/xfs/xfs_icreate_item.c b/fs/xfs/xfs_icreate_item.c
+index ac9918da5f4a..c0376135889d 100644
+--- a/fs/xfs/xfs_icreate_item.c
++++ b/fs/xfs/xfs_icreate_item.c
+@@ -63,9 +63,6 @@ xfs_icreate_item_release(
+ 	kmem_zone_free(xfs_icreate_zone, ICR_ITEM(lip));
+ }
+ 
+-/*
+- * This is the ops vector shared by all buf log items.
+- */
+ static const struct xfs_item_ops xfs_icreate_item_ops = {
+ 	.flags		= XFS_ITEM_RELEASE_WHEN_COMMITTED,
+ 	.iop_size	= xfs_icreate_item_size,
+
+commit 9ce632a28a41bd9aeeaa3913d95b23648a82c2ee
+Author: Christoph Hellwig <hch@lst.de>
+Date:   Fri Jun 28 19:27:32 2019 -0700
+
+    xfs: add a flag to release log items on commit
+    
+    We have various items that are released from ->iop_comitting.  Add a
+    flag to just call ->iop_release from the commit path to avoid tons
+    of boilerplate code.
+    
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Reviewed-by: Brian Foster <bfoster@redhat.com>
+    Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+
+diff --git a/fs/xfs/xfs_icreate_item.c b/fs/xfs/xfs_icreate_item.c
+index 9aceb35dce24..ac9918da5f4a 100644
+--- a/fs/xfs/xfs_icreate_item.c
++++ b/fs/xfs/xfs_icreate_item.c
+@@ -63,30 +63,14 @@ xfs_icreate_item_release(
+ 	kmem_zone_free(xfs_icreate_zone, ICR_ITEM(lip));
+ }
+ 
+-/*
+- * Because we have ordered buffers being tracked in the AIL for the inode
+- * creation, we don't need the create item after this. Hence we can free
+- * the log item and return -1 to tell the caller we're done with the item.
+- */
+-STATIC xfs_lsn_t
+-xfs_icreate_item_committed(
+-	struct xfs_log_item	*lip,
+-	xfs_lsn_t		lsn)
+-{
+-	struct xfs_icreate_item	*icp = ICR_ITEM(lip);
+-
+-	kmem_zone_free(xfs_icreate_zone, icp);
+-	return (xfs_lsn_t)-1;
+-}
+-
+ /*
+  * This is the ops vector shared by all buf log items.
+  */
+ static const struct xfs_item_ops xfs_icreate_item_ops = {
++	.flags		= XFS_ITEM_RELEASE_WHEN_COMMITTED,
+ 	.iop_size	= xfs_icreate_item_size,
+ 	.iop_format	= xfs_icreate_item_format,
+ 	.iop_release	= xfs_icreate_item_release,
+-	.iop_committed	= xfs_icreate_item_committed,
+ };
+ 
+ 
+
+commit ddf92053e45c0e07dcb031b56512d52f98cde517
+Author: Christoph Hellwig <hch@lst.de>
+Date:   Fri Jun 28 19:27:32 2019 -0700
+
+    xfs: split iop_unlock
+    
+    The iop_unlock method is called when comitting or cancelling a
+    transaction.  In the latter case, the transaction may or may not be
+    aborted.  While there is no known problem with the current code in
+    practice, this implementation is limited in that any log item
+    implementation that might want to differentiate between a commit and a
+    cancellation must rely on the aborted state.  The aborted bit is only
+    set when the cancelled transaction is dirty, however.  This means that
+    there is no way to distinguish between a commit and a clean transaction
+    cancellation.
+    
+    For example, intent log items currently rely on this distinction.  The
+    log item is either transferred to the CIL on commit or released on
+    transaction cancel. There is currently no possibility for a clean intent
+    log item in a transaction, but if that state is ever introduced a cancel
+    of such a transaction will immediately result in memory leaks of the
+    associated log item(s).  This is an interface deficiency and landmine.
+    
+    To clean this up, replace the iop_unlock method with an iop_release
+    method that is specific to transaction cancel.  The existing
+    iop_committing method occurs at the same time as iop_unlock in the
+    commit path and there is no need for two separate callbacks here.
+    Overload the iop_committing method with the current commit time
+    iop_unlock implementations to eliminate the need for the latter and
+    further simplify the interface.
+    
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Reviewed-by: Brian Foster <bfoster@redhat.com>
+    Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+
+diff --git a/fs/xfs/xfs_icreate_item.c b/fs/xfs/xfs_icreate_item.c
+index cbaabc55f0c9..9aceb35dce24 100644
+--- a/fs/xfs/xfs_icreate_item.c
++++ b/fs/xfs/xfs_icreate_item.c
+@@ -57,14 +57,10 @@ xfs_icreate_item_format(
+ }
+ 
+ STATIC void
+-xfs_icreate_item_unlock(
++xfs_icreate_item_release(
+ 	struct xfs_log_item	*lip)
+ {
+-	struct xfs_icreate_item	*icp = ICR_ITEM(lip);
+-
+-	if (test_bit(XFS_LI_ABORTED, &lip->li_flags))
+-		kmem_zone_free(xfs_icreate_zone, icp);
+-	return;
++	kmem_zone_free(xfs_icreate_zone, ICR_ITEM(lip));
+ }
+ 
+ /*
+@@ -89,7 +85,7 @@ xfs_icreate_item_committed(
+ static const struct xfs_item_ops xfs_icreate_item_ops = {
+ 	.iop_size	= xfs_icreate_item_size,
+ 	.iop_format	= xfs_icreate_item_format,
+-	.iop_unlock	= xfs_icreate_item_unlock,
++	.iop_release	= xfs_icreate_item_release,
+ 	.iop_committed	= xfs_icreate_item_committed,
+ };
+ 
+
+commit 8e4b20ea83c27501352316757ccf08e897018a26
+Author: Christoph Hellwig <hch@lst.de>
+Date:   Fri Jun 28 19:27:31 2019 -0700
+
+    xfs: remove the dummy iop_push implementation for inode creation items
+    
+    This method should never be called, so don't waste code on it.
+    
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Reviewed-by: Brian Foster <bfoster@redhat.com>
+    Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+
+diff --git a/fs/xfs/xfs_icreate_item.c b/fs/xfs/xfs_icreate_item.c
+index 03c174ff1ab3..cbaabc55f0c9 100644
+--- a/fs/xfs/xfs_icreate_item.c
++++ b/fs/xfs/xfs_icreate_item.c
+@@ -83,23 +83,12 @@ xfs_icreate_item_committed(
+ 	return (xfs_lsn_t)-1;
+ }
+ 
+-/* item can never get into the AIL */
+-STATIC uint
+-xfs_icreate_item_push(
+-	struct xfs_log_item	*lip,
+-	struct list_head	*buffer_list)
+-{
+-	ASSERT(0);
+-	return XFS_ITEM_SUCCESS;
+-}
+-
+ /*
+  * This is the ops vector shared by all buf log items.
+  */
+ static const struct xfs_item_ops xfs_icreate_item_ops = {
+ 	.iop_size	= xfs_icreate_item_size,
+ 	.iop_format	= xfs_icreate_item_format,
+-	.iop_push	= xfs_icreate_item_push,
+ 	.iop_unlock	= xfs_icreate_item_unlock,
+ 	.iop_committed	= xfs_icreate_item_committed,
+ };
+
+commit e8b78db77d48fddd13fd249e88ab7bfffa0661fe
+Author: Christoph Hellwig <hch@lst.de>
+Date:   Fri Jun 28 19:27:30 2019 -0700
+
+    xfs: don't require log items to implement optional methods
+    
+    Just check if they are present first.
+    
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Reviewed-by: Brian Foster <bfoster@redhat.com>
+    Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+
+diff --git a/fs/xfs/xfs_icreate_item.c b/fs/xfs/xfs_icreate_item.c
+index 8381d34cb102..03c174ff1ab3 100644
+--- a/fs/xfs/xfs_icreate_item.c
++++ b/fs/xfs/xfs_icreate_item.c
+@@ -56,23 +56,6 @@ xfs_icreate_item_format(
+ 			sizeof(struct xfs_icreate_log));
+ }
+ 
+-
+-/* Pinning has no meaning for the create item, so just return. */
+-STATIC void
+-xfs_icreate_item_pin(
+-	struct xfs_log_item	*lip)
+-{
+-}
+-
+-
+-/* pinning has no meaning for the create item, so just return. */
+-STATIC void
+-xfs_icreate_item_unpin(
+-	struct xfs_log_item	*lip,
+-	int			remove)
+-{
+-}
+-
+ STATIC void
+ xfs_icreate_item_unlock(
+ 	struct xfs_log_item	*lip)
+@@ -110,26 +93,15 @@ xfs_icreate_item_push(
+ 	return XFS_ITEM_SUCCESS;
+ }
+ 
+-/* Ordered buffers do the dependency tracking here, so this does nothing. */
+-STATIC void
+-xfs_icreate_item_committing(
+-	struct xfs_log_item	*lip,
+-	xfs_lsn_t		lsn)
+-{
+-}
+-
+ /*
+  * This is the ops vector shared by all buf log items.
+  */
+ static const struct xfs_item_ops xfs_icreate_item_ops = {
+ 	.iop_size	= xfs_icreate_item_size,
+ 	.iop_format	= xfs_icreate_item_format,
+-	.iop_pin	= xfs_icreate_item_pin,
+-	.iop_unpin	= xfs_icreate_item_unpin,
+ 	.iop_push	= xfs_icreate_item_push,
+ 	.iop_unlock	= xfs_icreate_item_unlock,
+ 	.iop_committed	= xfs_icreate_item_committed,
+-	.iop_committing = xfs_icreate_item_committing,
+ };
+ 
+ 
+
+commit 0b61f8a4079d904b1b1d47946cca898313de8c26
+Author: Dave Chinner <dchinner@redhat.com>
+Date:   Tue Jun 5 19:42:14 2018 -0700
+
+    xfs: convert to SPDX license tags
+    
+    Remove the verbose license text from XFS files and replace them
+    with SPDX tags. This does not change the license of any of the code,
+    merely refers to the common, up-to-date license files in LICENSES/
+    
+    This change was mostly scripted. fs/xfs/Makefile and
+    fs/xfs/libxfs/xfs_fs.h were modified by hand, the rest were detected
+    and modified by the following command:
+    
+    for f in `git grep -l "GNU General" fs/xfs/` ; do
+            echo $f
+            cat $f | awk -f hdr.awk > $f.new
+            mv -f $f.new $f
+    done
+    
+    And the hdr.awk script that did the modification (including
+    detecting the difference between GPL-2.0 and GPL-2.0+ licenses)
+    is as follows:
+    
+    $ cat hdr.awk
+    BEGIN {
+            hdr = 1.0
+            tag = "GPL-2.0"
+            str = ""
+    }
+    
+    /^ \* This program is free software/ {
+            hdr = 2.0;
+            next
+    }
+    
+    /any later version./ {
+            tag = "GPL-2.0+"
+            next
+    }
+    
+    /^ \*\// {
+            if (hdr > 0.0) {
+                    print "// SPDX-License-Identifier: " tag
+                    print str
+                    print $0
+                    str=""
+                    hdr = 0.0
+                    next
+            }
+            print $0
+            next
+    }
+    
+    /^ \* / {
+            if (hdr > 1.0)
+                    next
+            if (hdr > 0.0) {
+                    if (str != "")
+                            str = str "\n"
+                    str = str $0
+                    next
+            }
+            print $0
+            next
+    }
+    
+    /^ \*/ {
+            if (hdr > 0.0)
+                    next
+            print $0
+            next
+    }
+    
+    // {
+            if (hdr > 0.0) {
+                    if (str != "")
+                            str = str "\n"
+                    str = str $0
+                    next
+            }
+            print $0
+    }
+    
+    END { }
+    $
+    
+    Signed-off-by: Dave Chinner <dchinner@redhat.com>
+    Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+
+diff --git a/fs/xfs/xfs_icreate_item.c b/fs/xfs/xfs_icreate_item.c
+index 5da9599156ed..8381d34cb102 100644
+--- a/fs/xfs/xfs_icreate_item.c
++++ b/fs/xfs/xfs_icreate_item.c
+@@ -1,19 +1,7 @@
++// SPDX-License-Identifier: GPL-2.0
+ /*
+  * Copyright (c) 2008-2010, 2013 Dave Chinner
+  * All Rights Reserved.
+- *
+- * This program is free software; you can redistribute it and/or
+- * modify it under the terms of the GNU General Public License as
+- * published by the Free Software Foundation.
+- *
+- * This program is distributed in the hope that it would be useful,
+- * but WITHOUT ANY WARRANTY; without even the implied warranty of
+- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+- * GNU General Public License for more details.
+- *
+- * You should have received a copy of the GNU General Public License
+- * along with this program; if not, write the Free Software Foundation,
+- * Inc.,  51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+  */
+ #include "xfs.h"
+ #include "xfs_fs.h"
+
+commit e6631f85546c8ff8842f62c73be44ff502d4287a
+Author: Dave Chinner <dchinner@redhat.com>
+Date:   Wed May 9 07:49:37 2018 -0700
+
+    xfs: get rid of the log item descriptor
+    
+    It's just a connector between a transaction and a log item. There's
+    a 1:1 relationship between a log item descriptor and a log item,
+    and a 1:1 relationship between a log item descriptor and a
+    transaction. Both relationships are created and terminated at the
+    same time, so why do we even have the descriptor?
+    
+    Replace it with a specific list_head in the log item and a new
+    log item dirtied flag to replace the XFS_LID_DIRTY flag.
+    
+    Signed-Off-By: Dave Chinner <dchinner@redhat.com>
+    Reviewed-by: Brian Foster <bfoster@redhat.com>
+    Reviewed-by: Christoph Hellwig <hch@lst.de>
+    [darrick: fix up deferred agfl intent finish_item use of LID_DIRTY]
+    Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+
+diff --git a/fs/xfs/xfs_icreate_item.c b/fs/xfs/xfs_icreate_item.c
+index a99a0f8aa528..5da9599156ed 100644
+--- a/fs/xfs/xfs_icreate_item.c
++++ b/fs/xfs/xfs_icreate_item.c
+@@ -184,5 +184,5 @@ xfs_icreate_log(
+ 
+ 	xfs_trans_add_item(tp, &icp->ic_item);
+ 	tp->t_flags |= XFS_TRANS_DIRTY;
+-	icp->ic_item.li_desc->lid_flags |= XFS_LID_DIRTY;
++	set_bit(XFS_LI_DIRTY, &icp->ic_item.li_flags);
+ }
+
+commit 22525c17ed133202088f6f05acd9c53790a7121d
+Author: Dave Chinner <dchinner@redhat.com>
+Date:   Wed May 9 07:47:34 2018 -0700
+
+    xfs: log item flags are racy
+    
+    The log item flags contain a field that is protected by the AIL
+    lock - the XFS_LI_IN_AIL flag. We use non-atomic RMW operations to
+    set and clear these flags, but most of the updates and checks are
+    not done with the AIL lock held and so are susceptible to update
+    races.
+    
+    Fix this by changing the log item flags to use atomic bitops rather
+    than be reliant on the AIL lock for update serialisation.
+    
+    Signed-Off-By: Dave Chinner <dchinner@redhat.com>
+    Reviewed-by: Christoph Hellwig <hch@lst.de>
+    Reviewed-by: Brian Foster <bfoster@redhat.com>
+    Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+
+diff --git a/fs/xfs/xfs_icreate_item.c b/fs/xfs/xfs_icreate_item.c
+index 865ad1373e5e..a99a0f8aa528 100644
+--- a/fs/xfs/xfs_icreate_item.c
++++ b/fs/xfs/xfs_icreate_item.c
+@@ -91,7 +91,7 @@ xfs_icreate_item_unlock(
+ {
+ 	struct xfs_icreate_item	*icp = ICR_ITEM(lip);
+ 
+-	if (icp->ic_item.li_flags & XFS_LI_ABORTED)
++	if (test_bit(XFS_LI_ABORTED, &lip->li_flags))
+ 		kmem_zone_free(xfs_icreate_zone, icp);
+ 	return;
+ }
+
+commit bb6e0ebed7f7474e0e44cf6b778ee2fda759ddd6
+Author: Bhumika Goyal <bhumirks@gmail.com>
+Date:   Mon Nov 28 14:57:42 2016 +1100
+
+    fs: xfs: xfs_icreate_item: constify xfs_item_ops structure
+    
+    Declare the structure xfs_item_ops as const as it is only passed as an
+    argument to the function xfs_log_item_init. As this argument is of type
+    const struct xfs_item_ops *, so xfs_item_ops structures having this
+    property can be declared as const.
+    Done using Coccinelle:
+    
+    @r1 disable optional_qualifier @
+    identifier i;
+    position p;
+    @@
+    static struct xfs_item_ops i@p = {...};
+    
+    @ok1@
+    identifier r1.i;
+    position p;
+    expression e1,e2,e3;
+    @@
+    xfs_log_item_init(e1,e2,e3,&i@p)
+    
+    @bad@
+    position p!={r1.p,ok1.p};
+    identifier r1.i;
+    @@
+    i@p
+    
+    @depends on !bad disable optional_qualifier@
+    identifier r1.i;
+    @@
+    static
+    +const
+    struct xfs_item_ops i={...};
+    
+    @depends on !bad disable optional_qualifier@
+    identifier r1.i;
+    @@
+    +const
+    struct xfs_item_ops i;
+    
+    File size before:
+       text    data     bss     dec     hex filename
+        737      64       8     809     329 fs/xfs/xfs_icreate_item.o
+    
+    File size after:
+       text    data     bss     dec     hex filename
+        801       0       8     809     329 fs/xfs/xfs_icreate_item.o
+    
+    Signed-off-by: Bhumika Goyal <bhumirks@gmail.com>
+    Reviewed-by: Eric Sandeen <sandeen@redhat.com>
+    Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+diff --git a/fs/xfs/xfs_icreate_item.c b/fs/xfs/xfs_icreate_item.c
+index d45ca72af6fb..865ad1373e5e 100644
+--- a/fs/xfs/xfs_icreate_item.c
++++ b/fs/xfs/xfs_icreate_item.c
+@@ -133,7 +133,7 @@ xfs_icreate_item_committing(
+ /*
+  * This is the ops vector shared by all buf log items.
+  */
+-static struct xfs_item_ops xfs_icreate_item_ops = {
++static const struct xfs_item_ops xfs_icreate_item_ops = {
+ 	.iop_size	= xfs_icreate_item_size,
+ 	.iop_format	= xfs_icreate_item_format,
+ 	.iop_pin	= xfs_icreate_item_pin,
+
+commit bb58e6188a10f06dc65612a59ce3815da62ca3c1
+Author: Christoph Hellwig <hch@lst.de>
+Date:   Fri Nov 28 14:27:09 2014 +1100
+
+    xfs: move most of xfs_sb.h to xfs_format.h
+    
+    More on-disk format consolidation.
+    
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Reviewed-by: Dave Chinner <dchinner@redhat.com>
+    Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+diff --git a/fs/xfs/xfs_icreate_item.c b/fs/xfs/xfs_icreate_item.c
+index 131b0432f77e..d45ca72af6fb 100644
+--- a/fs/xfs/xfs_icreate_item.c
++++ b/fs/xfs/xfs_icreate_item.c
+@@ -22,7 +22,6 @@
+ #include "xfs_log_format.h"
+ #include "xfs_trans_resv.h"
+ #include "xfs_bit.h"
+-#include "xfs_sb.h"
+ #include "xfs_mount.h"
+ #include "xfs_trans.h"
+ #include "xfs_trans_priv.h"
+
+commit 4fb6e8ade2c70ef1a13f358963b3298fd8b72bcc
+Author: Christoph Hellwig <hch@lst.de>
+Date:   Fri Nov 28 14:25:04 2014 +1100
+
+    xfs: merge xfs_ag.h into xfs_format.h
+    
+    More on-disk format consolidation.  A few declarations that weren't on-disk
+    format related move into better suitable spots.
+    
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Reviewed-by: Dave Chinner <dchinner@redhat.com>
+    Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+diff --git a/fs/xfs/xfs_icreate_item.c b/fs/xfs/xfs_icreate_item.c
+index 7e4549233251..131b0432f77e 100644
+--- a/fs/xfs/xfs_icreate_item.c
++++ b/fs/xfs/xfs_icreate_item.c
+@@ -18,11 +18,11 @@
+ #include "xfs.h"
+ #include "xfs_fs.h"
+ #include "xfs_shared.h"
++#include "xfs_format.h"
+ #include "xfs_log_format.h"
+ #include "xfs_trans_resv.h"
+ #include "xfs_bit.h"
+ #include "xfs_sb.h"
+-#include "xfs_ag.h"
+ #include "xfs_mount.h"
+ #include "xfs_trans.h"
+ #include "xfs_trans_priv.h"
+
+commit bde7cff67c39227c6ad503394e19e58debdbc5e3
+Author: Christoph Hellwig <hch@infradead.org>
+Date:   Fri Dec 13 11:34:02 2013 +1100
+
+    xfs: format log items write directly into the linear CIL buffer
+    
+    Instead of setting up pointers to memory locations in iop_format which then
+    get copied into the CIL linear buffer after return move the copy into
+    the individual inode items.  This avoids the need to always have a memory
+    block in the exact same layout that gets written into the log around, and
+    allow the log items to be much more flexible in their in-memory layouts.
+    
+    The only caveat is that we need to properly align the data for each
+    iovec so that don't have structures misaligned in subsequent iovecs.
+    
+    Note that all log item format routines now need to be careful to modify
+    the copy of the item that was placed into the CIL after calls to
+    xlog_copy_iovec instead of the in-memory copy.
+    
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Reviewed-by: Dave Chinner <dchinner@redhat.com>
+    Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+diff --git a/fs/xfs/xfs_icreate_item.c b/fs/xfs/xfs_icreate_item.c
+index 5751fa8580ee..7e4549233251 100644
+--- a/fs/xfs/xfs_icreate_item.c
++++ b/fs/xfs/xfs_icreate_item.c
+@@ -59,11 +59,12 @@ xfs_icreate_item_size(
+ STATIC void
+ xfs_icreate_item_format(
+ 	struct xfs_log_item	*lip,
+-	struct xfs_log_iovec	*vecp)
++	struct xfs_log_vec	*lv)
+ {
+ 	struct xfs_icreate_item	*icp = ICR_ITEM(lip);
++	struct xfs_log_iovec	*vecp = NULL;
+ 
+-	xlog_copy_iovec(&vecp, XLOG_REG_TYPE_ICREATE,
++	xlog_copy_iovec(lv, &vecp, XLOG_REG_TYPE_ICREATE,
+ 			&icp->ic_format,
+ 			sizeof(struct xfs_icreate_log));
+ }
+
+commit 1234351cba958cd5d4338172ccfc869a687cd736
+Author: Christoph Hellwig <hch@infradead.org>
+Date:   Fri Dec 13 11:00:43 2013 +1100
+
+    xfs: introduce xlog_copy_iovec
+    
+    Add a helper to abstract out filling the log iovecs in the log item
+    format handlers.  This will allow us to change the way we do the log
+    item formatting more easily.
+    
+    The copy in the name is a bit confusing for now as it just assigns a
+    pointer and lets the CIL code perform the copy, but that will change
+    soon.
+    
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Reviewed-by: Dave Chinner <dchinner@redhat.com>
+    Signed-off-by: Dave Chinner <david@fromorbit.com>
+
+diff --git a/fs/xfs/xfs_icreate_item.c b/fs/xfs/xfs_icreate_item.c
+index d2eaccfa73f4..5751fa8580ee 100644
+--- a/fs/xfs/xfs_icreate_item.c
++++ b/fs/xfs/xfs_icreate_item.c
+@@ -28,6 +28,7 @@
+ #include "xfs_trans_priv.h"
+ #include "xfs_error.h"
+ #include "xfs_icreate_item.h"
++#include "xfs_log.h"
+ 
+ kmem_zone_t	*xfs_icreate_zone;		/* inode create item zone */
+ 
+@@ -58,13 +59,13 @@ xfs_icreate_item_size(
+ STATIC void
+ xfs_icreate_item_format(
+ 	struct xfs_log_item	*lip,
+-	struct xfs_log_iovec	*log_vector)
++	struct xfs_log_iovec	*vecp)
+ {
+ 	struct xfs_icreate_item	*icp = ICR_ITEM(lip);
+ 
+-	log_vector->i_addr = (xfs_caddr_t)&icp->ic_format;
+-	log_vector->i_len  = sizeof(struct xfs_icreate_log);
+-	log_vector->i_type = XLOG_REG_TYPE_ICREATE;
++	xlog_copy_iovec(&vecp, XLOG_REG_TYPE_ICREATE,
++			&icp->ic_format,
++			sizeof(struct xfs_icreate_log));
+ }
+ 
+ 
+
+commit 239880ef6454ccff2ba8d762c3f86e8278f0ce1c
+Author: Dave Chinner <dchinner@redhat.com>
+Date:   Wed Oct 23 10:50:10 2013 +1100
+
+    xfs: decouple log and transaction headers
+    
+    xfs_trans.h has a dependency on xfs_log.h for a couple of
+    structures. Most code that does transactions doesn't need to know
+    anything about the log, but this dependency means that they have to
+    include xfs_log.h. Decouple the xfs_trans.h and xfs_log.h header
+    files and clean up the includes to be in dependency order.
+    
+    In doing this, remove the direct include of xfs_trans_reserve.h from
+    xfs_trans.h so that we remove the dependency between xfs_trans.h and
+    xfs_mount.h. Hence the xfs_trans.h include can be moved to the
+    indicate the actual dependencies other header files have on it.
+    
+    Note that these are kernel only header files, so this does not
+    translate to any userspace changes at all.
+    
+    Signed-off-by: Dave Chinner <dchinner@redhat.com>
+    Reviewed-by: Ben Myers <bpm@sgi.com>
+    Signed-off-by: Ben Myers <bpm@sgi.com>
+
+diff --git a/fs/xfs/xfs_icreate_item.c b/fs/xfs/xfs_icreate_item.c
+index df8baf38eb85..d2eaccfa73f4 100644
+--- a/fs/xfs/xfs_icreate_item.c
++++ b/fs/xfs/xfs_icreate_item.c
+@@ -18,12 +18,13 @@
+ #include "xfs.h"
+ #include "xfs_fs.h"
+ #include "xfs_shared.h"
++#include "xfs_log_format.h"
++#include "xfs_trans_resv.h"
+ #include "xfs_bit.h"
+-#include "xfs_log.h"
+-#include "xfs_trans.h"
+ #include "xfs_sb.h"
+ #include "xfs_ag.h"
+ #include "xfs_mount.h"
++#include "xfs_trans.h"
+ #include "xfs_trans_priv.h"
+ #include "xfs_error.h"
+ #include "xfs_icreate_item.h"
+
+commit 70a9883c5f34b215b8a77665cefd0398edc5a9ef
+Author: Dave Chinner <dchinner@redhat.com>
+Date:   Wed Oct 23 10:36:05 2013 +1100
+
+    xfs: create a shared header file for format-related information
+    
+    All of the buffer operations structures are needed to be exported
+    for xfs_db, so move them all to a common location rather than
+    spreading them all over the place. They are verifying the on-disk
+    format, so while xfs_format.h might be a good place, it is not part
+    of the on disk format.
+    
+    Hence we need to create a new header file that we centralise these
+    related definitions. Start by moving the bffer operations
+    structures, and then also move all the other definitions that have
+    crept into xfs_log_format.h and xfs_format.h as there was no other
+    shared header file to put them in.
+    
+    Signed-off-by: Dave Chinner <dchinner@redhat.com>
+    Reviewed-by: Christoph Hellwig <hch@lst.de>
+    Signed-off-by: Ben Myers <bpm@sgi.com>
+
+diff --git a/fs/xfs/xfs_icreate_item.c b/fs/xfs/xfs_icreate_item.c
+index 5a5a593994d4..df8baf38eb85 100644
+--- a/fs/xfs/xfs_icreate_item.c
++++ b/fs/xfs/xfs_icreate_item.c
+@@ -17,7 +17,7 @@
+  */
+ #include "xfs.h"
+ #include "xfs_fs.h"
+-#include "xfs_types.h"
++#include "xfs_shared.h"
+ #include "xfs_bit.h"
+ #include "xfs_log.h"
+ #include "xfs_trans.h"
+
+commit 166d13688a0e2d0aa379e259af8e2ee6a401de9a
+Author: Dave Chinner <dchinner@redhat.com>
+Date:   Mon Aug 12 20:50:04 2013 +1000
+
+    xfs: return log item size in IOP_SIZE
+    
+    To begin optimising the CIL commit process, we need to have IOP_SIZE
+    return both the number of vectors and the size of the data pointed
+    to by the vectors. This enables us to calculate the size ofthe
+    memory allocation needed before the formatting step and reduces the
+    number of memory allocations per item by one.
+    
+    While there, kill the IOP_SIZE macro.
+    
+    Signed-off-by: Dave Chinner <dchinner@redhat.com>
+    Reviewed-by: Mark Tinguely <tinguely@sgi.com>
+    Signed-off-by: Ben Myers <bpm@sgi.com>
+
+diff --git a/fs/xfs/xfs_icreate_item.c b/fs/xfs/xfs_icreate_item.c
+index 441a78a89901..5a5a593994d4 100644
+--- a/fs/xfs/xfs_icreate_item.c
++++ b/fs/xfs/xfs_icreate_item.c
+@@ -40,11 +40,14 @@ static inline struct xfs_icreate_item *ICR_ITEM(struct xfs_log_item *lip)
+  *
+  * We only need one iovec for the icreate log structure.
+  */
+-STATIC uint
++STATIC void
+ xfs_icreate_item_size(
+-	struct xfs_log_item	*lip)
++	struct xfs_log_item	*lip,
++	int			*nvecs,
++	int			*nbytes)
+ {
+-	return 1;
++	*nvecs += 1;
++	*nbytes += sizeof(struct xfs_icreate_log);
+ }
+ 
+ /*
+
+commit 2b9ab5ab9c4a1f16f11ad883bfd21d5eb55e5bcc
+Author: Dave Chinner <dchinner@redhat.com>
+Date:   Mon Aug 12 20:49:37 2013 +1000
+
+    xfs: reshuffle dir2 definitions around for userspace
+    
+    Many of the definitions within xfs_dir2_priv.h are needed in
+    userspace outside libxfs. Definitions within xfs_dir2_priv.h are
+    wholly contained within libxfs, so we need to shuffle some of the
+    definitions around to keep consistency across files shared between
+    user and kernel space.
+    
+    Signed-off-by: Dave Chinner <dchinner@redhat.com>
+    Reviewed-by: Brian Foster <bfoster@redhat.com>
+    Reviewed-by: Mark Tinguely <tinguely@sgi.com>
+    Signed-off-by: Ben Myers <bpm@sgi.com>
+
+diff --git a/fs/xfs/xfs_icreate_item.c b/fs/xfs/xfs_icreate_item.c
+index 7716a4e7375e..441a78a89901 100644
+--- a/fs/xfs/xfs_icreate_item.c
++++ b/fs/xfs/xfs_icreate_item.c
+@@ -20,23 +20,11 @@
+ #include "xfs_types.h"
+ #include "xfs_bit.h"
+ #include "xfs_log.h"
+-#include "xfs_inum.h"
+ #include "xfs_trans.h"
+-#include "xfs_buf_item.h"
+ #include "xfs_sb.h"
+ #include "xfs_ag.h"
+-#include "xfs_dir2.h"
+ #include "xfs_mount.h"
+ #include "xfs_trans_priv.h"
+-#include "xfs_bmap_btree.h"
+-#include "xfs_alloc_btree.h"
+-#include "xfs_ialloc_btree.h"
+-#include "xfs_attr_sf.h"
+-#include "xfs_dinode.h"
+-#include "xfs_inode.h"
+-#include "xfs_inode_item.h"
+-#include "xfs_btree.h"
+-#include "xfs_ialloc.h"
+ #include "xfs_error.h"
+ #include "xfs_icreate_item.h"
+ 
+
+commit 3ebe7d2d73179c4874aee4f32e043eb5acd9fa0f
+Author: Dave Chinner <david@fromorbit.com>
+Date:   Thu Jun 27 16:04:53 2013 +1000
+
+    xfs: Inode create log items
+    
+    Introduce the inode create log item type for logical inode create logging.
+    Instead of logging the changes in buffers, pass the range to be
+    initialised through the log by a new transaction type.  This reduces
+    the amount of log space required to record initialisation during
+    allocation from about 128 bytes per inode to a small fixed amount
+    per inode extent to be initialised.
+    
+    This requires a new log item type to track it through the log
+    and the AIL. This is a relatively simple item - most callbacks are
+    noops as this item has the same life cycle as the transaction.
+    
+    Signed-off-by: Dave Chinner <david@fromorbit.com>
+    Reviewed-by: Mark Tinguely <tinguely@sgi.com>
+    Signed-off-by: Ben Myers <bpm@sgi.com>
+
+diff --git a/fs/xfs/xfs_icreate_item.c b/fs/xfs/xfs_icreate_item.c
+new file mode 100644
+index 000000000000..7716a4e7375e
+--- /dev/null
++++ b/fs/xfs/xfs_icreate_item.c
+@@ -0,0 +1,195 @@
++/*
++ * Copyright (c) 2008-2010, 2013 Dave Chinner
++ * All Rights Reserved.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it would be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write the Free Software Foundation,
++ * Inc.,  51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
++ */
++#include "xfs.h"
++#include "xfs_fs.h"
++#include "xfs_types.h"
++#include "xfs_bit.h"
++#include "xfs_log.h"
++#include "xfs_inum.h"
++#include "xfs_trans.h"
++#include "xfs_buf_item.h"
++#include "xfs_sb.h"
++#include "xfs_ag.h"
++#include "xfs_dir2.h"
++#include "xfs_mount.h"
++#include "xfs_trans_priv.h"
++#include "xfs_bmap_btree.h"
++#include "xfs_alloc_btree.h"
++#include "xfs_ialloc_btree.h"
++#include "xfs_attr_sf.h"
++#include "xfs_dinode.h"
++#include "xfs_inode.h"
++#include "xfs_inode_item.h"
++#include "xfs_btree.h"
++#include "xfs_ialloc.h"
++#include "xfs_error.h"
++#include "xfs_icreate_item.h"
++
++kmem_zone_t	*xfs_icreate_zone;		/* inode create item zone */
++
++static inline struct xfs_icreate_item *ICR_ITEM(struct xfs_log_item *lip)
++{
++	return container_of(lip, struct xfs_icreate_item, ic_item);
++}
++
++/*
++ * This returns the number of iovecs needed to log the given inode item.
++ *
++ * We only need one iovec for the icreate log structure.
++ */
++STATIC uint
++xfs_icreate_item_size(
++	struct xfs_log_item	*lip)
++{
++	return 1;
++}
++
++/*
++ * This is called to fill in the vector of log iovecs for the
++ * given inode create log item.
++ */
++STATIC void
++xfs_icreate_item_format(
++	struct xfs_log_item	*lip,
++	struct xfs_log_iovec	*log_vector)
++{
++	struct xfs_icreate_item	*icp = ICR_ITEM(lip);
++
++	log_vector->i_addr = (xfs_caddr_t)&icp->ic_format;
++	log_vector->i_len  = sizeof(struct xfs_icreate_log);
++	log_vector->i_type = XLOG_REG_TYPE_ICREATE;
++}
++
++
++/* Pinning has no meaning for the create item, so just return. */
++STATIC void
++xfs_icreate_item_pin(
++	struct xfs_log_item	*lip)
++{
++}
++
++
++/* pinning has no meaning for the create item, so just return. */
++STATIC void
++xfs_icreate_item_unpin(
++	struct xfs_log_item	*lip,
++	int			remove)
++{
++}
++
++STATIC void
++xfs_icreate_item_unlock(
++	struct xfs_log_item	*lip)
++{
++	struct xfs_icreate_item	*icp = ICR_ITEM(lip);
++
++	if (icp->ic_item.li_flags & XFS_LI_ABORTED)
++		kmem_zone_free(xfs_icreate_zone, icp);
++	return;
++}
++
++/*
++ * Because we have ordered buffers being tracked in the AIL for the inode
++ * creation, we don't need the create item after this. Hence we can free
++ * the log item and return -1 to tell the caller we're done with the item.
++ */
++STATIC xfs_lsn_t
++xfs_icreate_item_committed(
++	struct xfs_log_item	*lip,
++	xfs_lsn_t		lsn)
++{
++	struct xfs_icreate_item	*icp = ICR_ITEM(lip);
++
++	kmem_zone_free(xfs_icreate_zone, icp);
++	return (xfs_lsn_t)-1;
++}
++
++/* item can never get into the AIL */
++STATIC uint
++xfs_icreate_item_push(
++	struct xfs_log_item	*lip,
++	struct list_head	*buffer_list)
++{
++	ASSERT(0);
++	return XFS_ITEM_SUCCESS;
++}
++
++/* Ordered buffers do the dependency tracking here, so this does nothing. */
++STATIC void
++xfs_icreate_item_committing(
++	struct xfs_log_item	*lip,
++	xfs_lsn_t		lsn)
++{
++}
++
++/*
++ * This is the ops vector shared by all buf log items.
++ */
++static struct xfs_item_ops xfs_icreate_item_ops = {
++	.iop_size	= xfs_icreate_item_size,
++	.iop_format	= xfs_icreate_item_format,
++	.iop_pin	= xfs_icreate_item_pin,
++	.iop_unpin	= xfs_icreate_item_unpin,
++	.iop_push	= xfs_icreate_item_push,
++	.iop_unlock	= xfs_icreate_item_unlock,
++	.iop_committed	= xfs_icreate_item_committed,
++	.iop_committing = xfs_icreate_item_committing,
++};
++
++
++/*
++ * Initialize the inode log item for a newly allocated (in-core) inode.
++ *
++ * Inode extents can only reside within an AG. Hence specify the starting
++ * block for the inode chunk by offset within an AG as well as the
++ * length of the allocated extent.
++ *
++ * This joins the item to the transaction and marks it dirty so
++ * that we don't need a separate call to do this, nor does the
++ * caller need to know anything about the icreate item.
++ */
++void
++xfs_icreate_log(
++	struct xfs_trans	*tp,
++	xfs_agnumber_t		agno,
++	xfs_agblock_t		agbno,
++	unsigned int		count,
++	unsigned int		inode_size,
++	xfs_agblock_t		length,
++	unsigned int		generation)
++{
++	struct xfs_icreate_item	*icp;
++
++	icp = kmem_zone_zalloc(xfs_icreate_zone, KM_SLEEP);
++
++	xfs_log_item_init(tp->t_mountp, &icp->ic_item, XFS_LI_ICREATE,
++			  &xfs_icreate_item_ops);
++
++	icp->ic_format.icl_type = XFS_LI_ICREATE;
++	icp->ic_format.icl_size = 1;	/* single vector */
++	icp->ic_format.icl_ag = cpu_to_be32(agno);
++	icp->ic_format.icl_agbno = cpu_to_be32(agbno);
++	icp->ic_format.icl_count = cpu_to_be32(count);
++	icp->ic_format.icl_isize = cpu_to_be32(inode_size);
++	icp->ic_format.icl_length = cpu_to_be32(length);
++	icp->ic_format.icl_gen = cpu_to_be32(generation);
++
++	xfs_trans_add_item(tp, &icp->ic_item);
++	tp->t_flags |= XFS_TRANS_DIRTY;
++	icp->ic_item.li_desc->lid_flags |= XFS_LID_DIRTY;
++}

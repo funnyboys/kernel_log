@@ -1,0 +1,2721 @@
+commit 457f44363a8894135c85b7a9afd2bd8196db24ab
+Author: Andrii Nakryiko <andriin@fb.com>
+Date:   Fri May 29 00:54:20 2020 -0700
+
+    bpf: Implement BPF ring buffer and verifier support for it
+    
+    This commit adds a new MPSC ring buffer implementation into BPF ecosystem,
+    which allows multiple CPUs to submit data to a single shared ring buffer. On
+    the consumption side, only single consumer is assumed.
+    
+    Motivation
+    ----------
+    There are two distinctive motivators for this work, which are not satisfied by
+    existing perf buffer, which prompted creation of a new ring buffer
+    implementation.
+      - more efficient memory utilization by sharing ring buffer across CPUs;
+      - preserving ordering of events that happen sequentially in time, even
+      across multiple CPUs (e.g., fork/exec/exit events for a task).
+    
+    These two problems are independent, but perf buffer fails to satisfy both.
+    Both are a result of a choice to have per-CPU perf ring buffer.  Both can be
+    also solved by having an MPSC implementation of ring buffer. The ordering
+    problem could technically be solved for perf buffer with some in-kernel
+    counting, but given the first one requires an MPSC buffer, the same solution
+    would solve the second problem automatically.
+    
+    Semantics and APIs
+    ------------------
+    Single ring buffer is presented to BPF programs as an instance of BPF map of
+    type BPF_MAP_TYPE_RINGBUF. Two other alternatives considered, but ultimately
+    rejected.
+    
+    One way would be to, similar to BPF_MAP_TYPE_PERF_EVENT_ARRAY, make
+    BPF_MAP_TYPE_RINGBUF could represent an array of ring buffers, but not enforce
+    "same CPU only" rule. This would be more familiar interface compatible with
+    existing perf buffer use in BPF, but would fail if application needed more
+    advanced logic to lookup ring buffer by arbitrary key. HASH_OF_MAPS addresses
+    this with current approach. Additionally, given the performance of BPF
+    ringbuf, many use cases would just opt into a simple single ring buffer shared
+    among all CPUs, for which current approach would be an overkill.
+    
+    Another approach could introduce a new concept, alongside BPF map, to
+    represent generic "container" object, which doesn't necessarily have key/value
+    interface with lookup/update/delete operations. This approach would add a lot
+    of extra infrastructure that has to be built for observability and verifier
+    support. It would also add another concept that BPF developers would have to
+    familiarize themselves with, new syntax in libbpf, etc. But then would really
+    provide no additional benefits over the approach of using a map.
+    BPF_MAP_TYPE_RINGBUF doesn't support lookup/update/delete operations, but so
+    doesn't few other map types (e.g., queue and stack; array doesn't support
+    delete, etc).
+    
+    The approach chosen has an advantage of re-using existing BPF map
+    infrastructure (introspection APIs in kernel, libbpf support, etc), being
+    familiar concept (no need to teach users a new type of object in BPF program),
+    and utilizing existing tooling (bpftool). For common scenario of using
+    a single ring buffer for all CPUs, it's as simple and straightforward, as
+    would be with a dedicated "container" object. On the other hand, by being
+    a map, it can be combined with ARRAY_OF_MAPS and HASH_OF_MAPS map-in-maps to
+    implement a wide variety of topologies, from one ring buffer for each CPU
+    (e.g., as a replacement for perf buffer use cases), to a complicated
+    application hashing/sharding of ring buffers (e.g., having a small pool of
+    ring buffers with hashed task's tgid being a look up key to preserve order,
+    but reduce contention).
+    
+    Key and value sizes are enforced to be zero. max_entries is used to specify
+    the size of ring buffer and has to be a power of 2 value.
+    
+    There are a bunch of similarities between perf buffer
+    (BPF_MAP_TYPE_PERF_EVENT_ARRAY) and new BPF ring buffer semantics:
+      - variable-length records;
+      - if there is no more space left in ring buffer, reservation fails, no
+        blocking;
+      - memory-mappable data area for user-space applications for ease of
+        consumption and high performance;
+      - epoll notifications for new incoming data;
+      - but still the ability to do busy polling for new data to achieve the
+        lowest latency, if necessary.
+    
+    BPF ringbuf provides two sets of APIs to BPF programs:
+      - bpf_ringbuf_output() allows to *copy* data from one place to a ring
+        buffer, similarly to bpf_perf_event_output();
+      - bpf_ringbuf_reserve()/bpf_ringbuf_commit()/bpf_ringbuf_discard() APIs
+        split the whole process into two steps. First, a fixed amount of space is
+        reserved. If successful, a pointer to a data inside ring buffer data area
+        is returned, which BPF programs can use similarly to a data inside
+        array/hash maps. Once ready, this piece of memory is either committed or
+        discarded. Discard is similar to commit, but makes consumer ignore the
+        record.
+    
+    bpf_ringbuf_output() has disadvantage of incurring extra memory copy, because
+    record has to be prepared in some other place first. But it allows to submit
+    records of the length that's not known to verifier beforehand. It also closely
+    matches bpf_perf_event_output(), so will simplify migration significantly.
+    
+    bpf_ringbuf_reserve() avoids the extra copy of memory by providing a memory
+    pointer directly to ring buffer memory. In a lot of cases records are larger
+    than BPF stack space allows, so many programs have use extra per-CPU array as
+    a temporary heap for preparing sample. bpf_ringbuf_reserve() avoid this needs
+    completely. But in exchange, it only allows a known constant size of memory to
+    be reserved, such that verifier can verify that BPF program can't access
+    memory outside its reserved record space. bpf_ringbuf_output(), while slightly
+    slower due to extra memory copy, covers some use cases that are not suitable
+    for bpf_ringbuf_reserve().
+    
+    The difference between commit and discard is very small. Discard just marks
+    a record as discarded, and such records are supposed to be ignored by consumer
+    code. Discard is useful for some advanced use-cases, such as ensuring
+    all-or-nothing multi-record submission, or emulating temporary malloc()/free()
+    within single BPF program invocation.
+    
+    Each reserved record is tracked by verifier through existing
+    reference-tracking logic, similar to socket ref-tracking. It is thus
+    impossible to reserve a record, but forget to submit (or discard) it.
+    
+    bpf_ringbuf_query() helper allows to query various properties of ring buffer.
+    Currently 4 are supported:
+      - BPF_RB_AVAIL_DATA returns amount of unconsumed data in ring buffer;
+      - BPF_RB_RING_SIZE returns the size of ring buffer;
+      - BPF_RB_CONS_POS/BPF_RB_PROD_POS returns current logical possition of
+        consumer/producer, respectively.
+    Returned values are momentarily snapshots of ring buffer state and could be
+    off by the time helper returns, so this should be used only for
+    debugging/reporting reasons or for implementing various heuristics, that take
+    into account highly-changeable nature of some of those characteristics.
+    
+    One such heuristic might involve more fine-grained control over poll/epoll
+    notifications about new data availability in ring buffer. Together with
+    BPF_RB_NO_WAKEUP/BPF_RB_FORCE_WAKEUP flags for output/commit/discard helpers,
+    it allows BPF program a high degree of control and, e.g., more efficient
+    batched notifications. Default self-balancing strategy, though, should be
+    adequate for most applications and will work reliable and efficiently already.
+    
+    Design and implementation
+    -------------------------
+    This reserve/commit schema allows a natural way for multiple producers, either
+    on different CPUs or even on the same CPU/in the same BPF program, to reserve
+    independent records and work with them without blocking other producers. This
+    means that if BPF program was interruped by another BPF program sharing the
+    same ring buffer, they will both get a record reserved (provided there is
+    enough space left) and can work with it and submit it independently. This
+    applies to NMI context as well, except that due to using a spinlock during
+    reservation, in NMI context, bpf_ringbuf_reserve() might fail to get a lock,
+    in which case reservation will fail even if ring buffer is not full.
+    
+    The ring buffer itself internally is implemented as a power-of-2 sized
+    circular buffer, with two logical and ever-increasing counters (which might
+    wrap around on 32-bit architectures, that's not a problem):
+      - consumer counter shows up to which logical position consumer consumed the
+        data;
+      - producer counter denotes amount of data reserved by all producers.
+    
+    Each time a record is reserved, producer that "owns" the record will
+    successfully advance producer counter. At that point, data is still not yet
+    ready to be consumed, though. Each record has 8 byte header, which contains
+    the length of reserved record, as well as two extra bits: busy bit to denote
+    that record is still being worked on, and discard bit, which might be set at
+    commit time if record is discarded. In the latter case, consumer is supposed
+    to skip the record and move on to the next one. Record header also encodes
+    record's relative offset from the beginning of ring buffer data area (in
+    pages). This allows bpf_ringbuf_commit()/bpf_ringbuf_discard() to accept only
+    the pointer to the record itself, without requiring also the pointer to ring
+    buffer itself. Ring buffer memory location will be restored from record
+    metadata header. This significantly simplifies verifier, as well as improving
+    API usability.
+    
+    Producer counter increments are serialized under spinlock, so there is
+    a strict ordering between reservations. Commits, on the other hand, are
+    completely lockless and independent. All records become available to consumer
+    in the order of reservations, but only after all previous records where
+    already committed. It is thus possible for slow producers to temporarily hold
+    off submitted records, that were reserved later.
+    
+    Reservation/commit/consumer protocol is verified by litmus tests in
+    Documentation/litmus-test/bpf-rb.
+    
+    One interesting implementation bit, that significantly simplifies (and thus
+    speeds up as well) implementation of both producers and consumers is how data
+    area is mapped twice contiguously back-to-back in the virtual memory. This
+    allows to not take any special measures for samples that have to wrap around
+    at the end of the circular buffer data area, because the next page after the
+    last data page would be first data page again, and thus the sample will still
+    appear completely contiguous in virtual memory. See comment and a simple ASCII
+    diagram showing this visually in bpf_ringbuf_area_alloc().
+    
+    Another feature that distinguishes BPF ringbuf from perf ring buffer is
+    a self-pacing notifications of new data being availability.
+    bpf_ringbuf_commit() implementation will send a notification of new record
+    being available after commit only if consumer has already caught up right up
+    to the record being committed. If not, consumer still has to catch up and thus
+    will see new data anyways without needing an extra poll notification.
+    Benchmarks (see tools/testing/selftests/bpf/benchs/bench_ringbuf.c) show that
+    this allows to achieve a very high throughput without having to resort to
+    tricks like "notify only every Nth sample", which are necessary with perf
+    buffer. For extreme cases, when BPF program wants more manual control of
+    notifications, commit/discard/output helpers accept BPF_RB_NO_WAKEUP and
+    BPF_RB_FORCE_WAKEUP flags, which give full control over notifications of data
+    availability, but require extra caution and diligence in using this API.
+    
+    Comparison to alternatives
+    --------------------------
+    Before considering implementing BPF ring buffer from scratch existing
+    alternatives in kernel were evaluated, but didn't seem to meet the needs. They
+    largely fell into few categores:
+      - per-CPU buffers (perf, ftrace, etc), which don't satisfy two motivations
+        outlined above (ordering and memory consumption);
+      - linked list-based implementations; while some were multi-producer designs,
+        consuming these from user-space would be very complicated and most
+        probably not performant; memory-mapping contiguous piece of memory is
+        simpler and more performant for user-space consumers;
+      - io_uring is SPSC, but also requires fixed-sized elements. Naively turning
+        SPSC queue into MPSC w/ lock would have subpar performance compared to
+        locked reserve + lockless commit, as with BPF ring buffer. Fixed sized
+        elements would be too limiting for BPF programs, given existing BPF
+        programs heavily rely on variable-sized perf buffer already;
+      - specialized implementations (like a new printk ring buffer, [0]) with lots
+        of printk-specific limitations and implications, that didn't seem to fit
+        well for intended use with BPF programs.
+    
+      [0] https://lwn.net/Articles/779550/
+    
+    Signed-off-by: Andrii Nakryiko <andriin@fb.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+    Link: https://lore.kernel.org/bpf/20200529075424.3139988-2-andriin@fb.com
+    Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+
+diff --git a/kernel/bpf/helpers.c b/kernel/bpf/helpers.c
+index bb4fb634275e..be43ab3e619f 100644
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -635,6 +635,16 @@ bpf_base_func_proto(enum bpf_func_id func_id)
+ 		return &bpf_ktime_get_ns_proto;
+ 	case BPF_FUNC_ktime_get_boot_ns:
+ 		return &bpf_ktime_get_boot_ns_proto;
++	case BPF_FUNC_ringbuf_output:
++		return &bpf_ringbuf_output_proto;
++	case BPF_FUNC_ringbuf_reserve:
++		return &bpf_ringbuf_reserve_proto;
++	case BPF_FUNC_ringbuf_submit:
++		return &bpf_ringbuf_submit_proto;
++	case BPF_FUNC_ringbuf_discard:
++		return &bpf_ringbuf_discard_proto;
++	case BPF_FUNC_ringbuf_query:
++		return &bpf_ringbuf_query_proto;
+ 	default:
+ 		break;
+ 	}
+
+commit f470378c7562a2818b45ed11c98973f2b89eedd3
+Author: John Fastabend <john.fastabend@gmail.com>
+Date:   Sun May 24 09:50:55 2020 -0700
+
+    bpf: Extend bpf_base_func_proto helpers with probe_* and *current_task*
+    
+    Often it is useful when applying policy to know something about the
+    task. If the administrator has CAP_SYS_ADMIN rights then they can
+    use kprobe + networking hook and link the two programs together to
+    accomplish this. However, this is a bit clunky and also means we have
+    to call both the network program and kprobe program when we could just
+    use a single program and avoid passing metadata through sk_msg/skb->cb,
+    socket, maps, etc.
+    
+    To accomplish this add probe_* helpers to bpf_base_func_proto programs
+    guarded by a perfmon_capable() check. New supported helpers are the
+    following,
+    
+     BPF_FUNC_get_current_task
+     BPF_FUNC_probe_read_user
+     BPF_FUNC_probe_read_kernel
+     BPF_FUNC_probe_read_user_str
+     BPF_FUNC_probe_read_kernel_str
+    
+    Signed-off-by: John Fastabend <john.fastabend@gmail.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+    Acked-by: Yonghong Song <yhs@fb.com>
+    Link: https://lore.kernel.org/bpf/159033905529.12355.4368381069655254932.stgit@john-Precision-5820-Tower
+    Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+
+diff --git a/kernel/bpf/helpers.c b/kernel/bpf/helpers.c
+index 886949fdcece..bb4fb634275e 100644
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -601,6 +601,12 @@ const struct bpf_func_proto bpf_event_output_data_proto =  {
+ 	.arg5_type      = ARG_CONST_SIZE_OR_ZERO,
+ };
+ 
++const struct bpf_func_proto bpf_get_current_task_proto __weak;
++const struct bpf_func_proto bpf_probe_read_user_proto __weak;
++const struct bpf_func_proto bpf_probe_read_user_str_proto __weak;
++const struct bpf_func_proto bpf_probe_read_kernel_proto __weak;
++const struct bpf_func_proto bpf_probe_read_kernel_str_proto __weak;
++
+ const struct bpf_func_proto *
+ bpf_base_func_proto(enum bpf_func_id func_id)
+ {
+@@ -647,6 +653,24 @@ bpf_base_func_proto(enum bpf_func_id func_id)
+ 		return bpf_get_trace_printk_proto();
+ 	case BPF_FUNC_jiffies64:
+ 		return &bpf_jiffies64_proto;
++	default:
++		break;
++	}
++
++	if (!perfmon_capable())
++		return NULL;
++
++	switch (func_id) {
++	case BPF_FUNC_get_current_task:
++		return &bpf_get_current_task_proto;
++	case BPF_FUNC_probe_read_user:
++		return &bpf_probe_read_user_proto;
++	case BPF_FUNC_probe_read_kernel:
++		return &bpf_probe_read_kernel_proto;
++	case BPF_FUNC_probe_read_user_str:
++		return &bpf_probe_read_user_str_proto;
++	case BPF_FUNC_probe_read_kernel_str:
++		return &bpf_probe_read_kernel_str_proto;
+ 	default:
+ 		return NULL;
+ 	}
+
+commit 2c78ee898d8f10ae6fb2fa23a3fbaec96b1b7366
+Author: Alexei Starovoitov <ast@kernel.org>
+Date:   Wed May 13 16:03:54 2020 -0700
+
+    bpf: Implement CAP_BPF
+    
+    Implement permissions as stated in uapi/linux/capability.h
+    In order to do that the verifier allow_ptr_leaks flag is split
+    into four flags and they are set as:
+      env->allow_ptr_leaks = bpf_allow_ptr_leaks();
+      env->bypass_spec_v1 = bpf_bypass_spec_v1();
+      env->bypass_spec_v4 = bpf_bypass_spec_v4();
+      env->bpf_capable = bpf_capable();
+    
+    The first three currently equivalent to perfmon_capable(), since leaking kernel
+    pointers and reading kernel memory via side channel attacks is roughly
+    equivalent to reading kernel memory with cap_perfmon.
+    
+    'bpf_capable' enables bounded loops, precision tracking, bpf to bpf calls and
+    other verifier features. 'allow_ptr_leaks' enable ptr leaks, ptr conversions,
+    subtraction of pointers. 'bypass_spec_v1' disables speculative analysis in the
+    verifier, run time mitigations in bpf array, and enables indirect variable
+    access in bpf programs. 'bypass_spec_v4' disables emission of sanitation code
+    by the verifier.
+    
+    That means that the networking BPF program loaded with CAP_BPF + CAP_NET_ADMIN
+    will have speculative checks done by the verifier and other spectre mitigation
+    applied. Such networking BPF program will not be able to leak kernel pointers
+    and will not be able to access arbitrary kernel memory.
+    
+    Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+    Link: https://lore.kernel.org/bpf/20200513230355.7858-3-alexei.starovoitov@gmail.com
+
+diff --git a/kernel/bpf/helpers.c b/kernel/bpf/helpers.c
+index 5c0290e0696e..886949fdcece 100644
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -633,7 +633,7 @@ bpf_base_func_proto(enum bpf_func_id func_id)
+ 		break;
+ 	}
+ 
+-	if (!capable(CAP_SYS_ADMIN))
++	if (!bpf_capable())
+ 		return NULL;
+ 
+ 	switch (func_id) {
+@@ -642,6 +642,8 @@ bpf_base_func_proto(enum bpf_func_id func_id)
+ 	case BPF_FUNC_spin_unlock:
+ 		return &bpf_spin_unlock_proto;
+ 	case BPF_FUNC_trace_printk:
++		if (!perfmon_capable())
++			return NULL;
+ 		return bpf_get_trace_printk_proto();
+ 	case BPF_FUNC_jiffies64:
+ 		return &bpf_jiffies64_proto;
+
+commit 71d19214776e61b33da48f7c1b46e522c7f78221
+Author: Maciej Żenczykowski <maze@google.com>
+Date:   Sun Apr 26 09:15:25 2020 -0700
+
+    bpf: add bpf_ktime_get_boot_ns()
+    
+    On a device like a cellphone which is constantly suspending
+    and resuming CLOCK_MONOTONIC is not particularly useful for
+    keeping track of or reacting to external network events.
+    Instead you want to use CLOCK_BOOTTIME.
+    
+    Hence add bpf_ktime_get_boot_ns() as a mirror of bpf_ktime_get_ns()
+    based around CLOCK_BOOTTIME instead of CLOCK_MONOTONIC.
+    
+    Signed-off-by: Maciej Żenczykowski <maze@google.com>
+    Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+
+diff --git a/kernel/bpf/helpers.c b/kernel/bpf/helpers.c
+index 9a6b23387d02..5c0290e0696e 100644
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -155,6 +155,18 @@ const struct bpf_func_proto bpf_ktime_get_ns_proto = {
+ 	.ret_type	= RET_INTEGER,
+ };
+ 
++BPF_CALL_0(bpf_ktime_get_boot_ns)
++{
++	/* NMI safe access to clock boottime */
++	return ktime_get_boot_fast_ns();
++}
++
++const struct bpf_func_proto bpf_ktime_get_boot_ns_proto = {
++	.func		= bpf_ktime_get_boot_ns,
++	.gpl_only	= false,
++	.ret_type	= RET_INTEGER,
++};
++
+ BPF_CALL_0(bpf_get_current_pid_tgid)
+ {
+ 	struct task_struct *task = current;
+@@ -615,6 +627,8 @@ bpf_base_func_proto(enum bpf_func_id func_id)
+ 		return &bpf_tail_call_proto;
+ 	case BPF_FUNC_ktime_get_ns:
+ 		return &bpf_ktime_get_ns_proto;
++	case BPF_FUNC_ktime_get_boot_ns:
++		return &bpf_ktime_get_boot_ns_proto;
+ 	default:
+ 		break;
+ 	}
+
+commit 082b57e3eb09810d357083cca5ee2df02c16aec9
+Author: Maciej Żenczykowski <maze@google.com>
+Date:   Mon Apr 20 11:47:50 2020 -0700
+
+    net: bpf: Make bpf_ktime_get_ns() available to non GPL programs
+    
+    The entire implementation is in kernel/bpf/helpers.c:
+    
+    BPF_CALL_0(bpf_ktime_get_ns) {
+           /* NMI safe access to clock monotonic */
+           return ktime_get_mono_fast_ns();
+    }
+    
+    const struct bpf_func_proto bpf_ktime_get_ns_proto = {
+           .func           = bpf_ktime_get_ns,
+           .gpl_only       = false,
+           .ret_type       = RET_INTEGER,
+    };
+    
+    and this was presumably marked GPL due to kernel/time/timekeeping.c:
+      EXPORT_SYMBOL_GPL(ktime_get_mono_fast_ns);
+    
+    and while that may make sense for kernel modules (although even that
+    is doubtful), there is currently AFAICT no other source of time
+    available to ebpf.
+    
+    Furthermore this is really just equivalent to clock_gettime(CLOCK_MONOTONIC)
+    which is exposed to userspace (via vdso even to make it performant)...
+    
+    As such, I see no reason to keep the GPL restriction.
+    (In the future I'd like to have access to time from Apache licensed ebpf code)
+    
+    Signed-off-by: Maciej Żenczykowski <maze@google.com>
+    Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+
+diff --git a/kernel/bpf/helpers.c b/kernel/bpf/helpers.c
+index dbba4f41d508..9a6b23387d02 100644
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -151,7 +151,7 @@ BPF_CALL_0(bpf_ktime_get_ns)
+ 
+ const struct bpf_func_proto bpf_ktime_get_ns_proto = {
+ 	.func		= bpf_ktime_get_ns,
+-	.gpl_only	= true,
++	.gpl_only	= false,
+ 	.ret_type	= RET_INTEGER,
+ };
+ 
+
+commit 6890896bd765b0504761c61901c9804fca23bfb2
+Author: Stanislav Fomichev <sdf@google.com>
+Date:   Fri Apr 24 16:59:41 2020 -0700
+
+    bpf: Fix missing bpf_base_func_proto in cgroup_base_func_proto for CGROUP_NET=n
+    
+    linux-next build bot reported compile issue [1] with one of its
+    configs. It looks like when we have CONFIG_NET=n and
+    CONFIG_BPF{,_SYSCALL}=y, we are missing the bpf_base_func_proto
+    definition (from net/core/filter.c) in cgroup_base_func_proto.
+    
+    I'm reshuffling the code a bit to make it work. The common helpers
+    are moved into kernel/bpf/helpers.c and the bpf_base_func_proto is
+    exported from there.
+    Also, bpf_get_raw_cpu_id goes into kernel/bpf/core.c akin to existing
+    bpf_user_rnd_u32.
+    
+    [1] https://lore.kernel.org/linux-next/CAKH8qBsBvKHswiX1nx40LgO+BGeTmb1NX8tiTttt_0uu6T3dCA@mail.gmail.com/T/#mff8b0c083314c68c2e2ef0211cb11bc20dc13c72
+    
+    Fixes: 0456ea170cd6 ("bpf: Enable more helpers for BPF_PROG_TYPE_CGROUP_{DEVICE,SYSCTL,SOCKOPT}")
+    Signed-off-by: Stanislav Fomichev <sdf@google.com>
+    Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+    Cc: Andrii Nakryiko <andriin@fb.com>
+    Link: https://lore.kernel.org/bpf/20200424235941.58382-1-sdf@google.com
+
+diff --git a/kernel/bpf/helpers.c b/kernel/bpf/helpers.c
+index bafc53ddd350..dbba4f41d508 100644
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -562,3 +562,76 @@ const struct bpf_func_proto bpf_get_ns_current_pid_tgid_proto = {
+ 	.arg3_type      = ARG_PTR_TO_UNINIT_MEM,
+ 	.arg4_type      = ARG_CONST_SIZE,
+ };
++
++static const struct bpf_func_proto bpf_get_raw_smp_processor_id_proto = {
++	.func		= bpf_get_raw_cpu_id,
++	.gpl_only	= false,
++	.ret_type	= RET_INTEGER,
++};
++
++BPF_CALL_5(bpf_event_output_data, void *, ctx, struct bpf_map *, map,
++	   u64, flags, void *, data, u64, size)
++{
++	if (unlikely(flags & ~(BPF_F_INDEX_MASK)))
++		return -EINVAL;
++
++	return bpf_event_output(map, flags, data, size, NULL, 0, NULL);
++}
++
++const struct bpf_func_proto bpf_event_output_data_proto =  {
++	.func		= bpf_event_output_data,
++	.gpl_only       = true,
++	.ret_type       = RET_INTEGER,
++	.arg1_type      = ARG_PTR_TO_CTX,
++	.arg2_type      = ARG_CONST_MAP_PTR,
++	.arg3_type      = ARG_ANYTHING,
++	.arg4_type      = ARG_PTR_TO_MEM,
++	.arg5_type      = ARG_CONST_SIZE_OR_ZERO,
++};
++
++const struct bpf_func_proto *
++bpf_base_func_proto(enum bpf_func_id func_id)
++{
++	switch (func_id) {
++	case BPF_FUNC_map_lookup_elem:
++		return &bpf_map_lookup_elem_proto;
++	case BPF_FUNC_map_update_elem:
++		return &bpf_map_update_elem_proto;
++	case BPF_FUNC_map_delete_elem:
++		return &bpf_map_delete_elem_proto;
++	case BPF_FUNC_map_push_elem:
++		return &bpf_map_push_elem_proto;
++	case BPF_FUNC_map_pop_elem:
++		return &bpf_map_pop_elem_proto;
++	case BPF_FUNC_map_peek_elem:
++		return &bpf_map_peek_elem_proto;
++	case BPF_FUNC_get_prandom_u32:
++		return &bpf_get_prandom_u32_proto;
++	case BPF_FUNC_get_smp_processor_id:
++		return &bpf_get_raw_smp_processor_id_proto;
++	case BPF_FUNC_get_numa_node_id:
++		return &bpf_get_numa_node_id_proto;
++	case BPF_FUNC_tail_call:
++		return &bpf_tail_call_proto;
++	case BPF_FUNC_ktime_get_ns:
++		return &bpf_ktime_get_ns_proto;
++	default:
++		break;
++	}
++
++	if (!capable(CAP_SYS_ADMIN))
++		return NULL;
++
++	switch (func_id) {
++	case BPF_FUNC_spin_lock:
++		return &bpf_spin_lock_proto;
++	case BPF_FUNC_spin_unlock:
++		return &bpf_spin_unlock_proto;
++	case BPF_FUNC_trace_printk:
++		return bpf_get_trace_printk_proto();
++	case BPF_FUNC_jiffies64:
++		return &bpf_jiffies64_proto;
++	default:
++		return NULL;
++	}
++}
+
+commit 0f09abd105da6c37713d2b253730a86cb45e127a
+Author: Daniel Borkmann <daniel@iogearbox.net>
+Date:   Fri Mar 27 16:58:54 2020 +0100
+
+    bpf: Enable bpf cgroup hooks to retrieve cgroup v2 and ancestor id
+    
+    Enable the bpf_get_current_cgroup_id() helper for connect(), sendmsg(),
+    recvmsg() and bind-related hooks in order to retrieve the cgroup v2
+    context which can then be used as part of the key for BPF map lookups,
+    for example. Given these hooks operate in process context 'current' is
+    always valid and pointing to the app that is performing mentioned
+    syscalls if it's subject to a v2 cgroup. Also with same motivation of
+    commit 7723628101aa ("bpf: Introduce bpf_skb_ancestor_cgroup_id helper")
+    enable retrieval of ancestor from current so the cgroup id can be used
+    for policy lookups which can then forbid connect() / bind(), for example.
+    
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+    Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+    Link: https://lore.kernel.org/bpf/d2a7ef42530ad299e3cbb245e6c12374b72145ef.1585323121.git.daniel@iogearbox.net
+
+diff --git a/kernel/bpf/helpers.c b/kernel/bpf/helpers.c
+index 01878db15eaf..bafc53ddd350 100644
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -340,6 +340,24 @@ const struct bpf_func_proto bpf_get_current_cgroup_id_proto = {
+ 	.ret_type	= RET_INTEGER,
+ };
+ 
++BPF_CALL_1(bpf_get_current_ancestor_cgroup_id, int, ancestor_level)
++{
++	struct cgroup *cgrp = task_dfl_cgroup(current);
++	struct cgroup *ancestor;
++
++	ancestor = cgroup_ancestor(cgrp, ancestor_level);
++	if (!ancestor)
++		return 0;
++	return cgroup_id(ancestor);
++}
++
++const struct bpf_func_proto bpf_get_current_ancestor_cgroup_id_proto = {
++	.func		= bpf_get_current_ancestor_cgroup_id,
++	.gpl_only	= false,
++	.ret_type	= RET_INTEGER,
++	.arg1_type	= ARG_ANYTHING,
++};
++
+ #ifdef CONFIG_CGROUP_BPF
+ DECLARE_PER_CPU(struct bpf_cgroup_storage*,
+ 		bpf_cgroup_storage[MAX_BPF_CGROUP_STORAGE_TYPE]);
+
+commit b4490c5c4e023f09b7d27c9a9d3e7ad7d09ea6bf
+Author: Carlos Neira <cneirabustos@gmail.com>
+Date:   Wed Mar 4 17:41:56 2020 -0300
+
+    bpf: Added new helper bpf_get_ns_current_pid_tgid
+    
+    New bpf helper bpf_get_ns_current_pid_tgid,
+    This helper will return pid and tgid from current task
+    which namespace matches dev_t and inode number provided,
+    this will allows us to instrument a process inside a container.
+    
+    Signed-off-by: Carlos Neira <cneirabustos@gmail.com>
+    Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+    Acked-by: Yonghong Song <yhs@fb.com>
+    Link: https://lore.kernel.org/bpf/20200304204157.58695-3-cneirabustos@gmail.com
+
+diff --git a/kernel/bpf/helpers.c b/kernel/bpf/helpers.c
+index d8b7b110a1c5..01878db15eaf 100644
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -12,6 +12,8 @@
+ #include <linux/filter.h>
+ #include <linux/ctype.h>
+ #include <linux/jiffies.h>
++#include <linux/pid_namespace.h>
++#include <linux/proc_ns.h>
+ 
+ #include "../../lib/kstrtox.h"
+ 
+@@ -499,3 +501,46 @@ const struct bpf_func_proto bpf_strtoul_proto = {
+ 	.arg4_type	= ARG_PTR_TO_LONG,
+ };
+ #endif
++
++BPF_CALL_4(bpf_get_ns_current_pid_tgid, u64, dev, u64, ino,
++	   struct bpf_pidns_info *, nsdata, u32, size)
++{
++	struct task_struct *task = current;
++	struct pid_namespace *pidns;
++	int err = -EINVAL;
++
++	if (unlikely(size != sizeof(struct bpf_pidns_info)))
++		goto clear;
++
++	if (unlikely((u64)(dev_t)dev != dev))
++		goto clear;
++
++	if (unlikely(!task))
++		goto clear;
++
++	pidns = task_active_pid_ns(task);
++	if (unlikely(!pidns)) {
++		err = -ENOENT;
++		goto clear;
++	}
++
++	if (!ns_match(&pidns->ns, (dev_t)dev, ino))
++		goto clear;
++
++	nsdata->pid = task_pid_nr_ns(task, pidns);
++	nsdata->tgid = task_tgid_nr_ns(task, pidns);
++	return 0;
++clear:
++	memset((void *)nsdata, 0, (size_t) size);
++	return err;
++}
++
++const struct bpf_func_proto bpf_get_ns_current_pid_tgid_proto = {
++	.func		= bpf_get_ns_current_pid_tgid,
++	.gpl_only	= false,
++	.ret_type	= RET_INTEGER,
++	.arg1_type	= ARG_ANYTHING,
++	.arg2_type	= ARG_ANYTHING,
++	.arg3_type      = ARG_PTR_TO_UNINIT_MEM,
++	.arg4_type      = ARG_CONST_SIZE,
++};
+
+commit 5576b991e9c1a11d2cc21c4b94fc75ec27603896
+Author: Martin KaFai Lau <kafai@fb.com>
+Date:   Wed Jan 22 15:36:46 2020 -0800
+
+    bpf: Add BPF_FUNC_jiffies64
+    
+    This patch adds a helper to read the 64bit jiffies.  It will be used
+    in a later patch to implement the bpf_cubic.c.
+    
+    The helper is inlined for jit_requested and 64 BITS_PER_LONG
+    as the map_gen_lookup().  Other cases could be considered together
+    with map_gen_lookup() if needed.
+    
+    Signed-off-by: Martin KaFai Lau <kafai@fb.com>
+    Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+    Link: https://lore.kernel.org/bpf/20200122233646.903260-1-kafai@fb.com
+
+diff --git a/kernel/bpf/helpers.c b/kernel/bpf/helpers.c
+index cada974c9f4e..d8b7b110a1c5 100644
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -11,6 +11,7 @@
+ #include <linux/uidgid.h>
+ #include <linux/filter.h>
+ #include <linux/ctype.h>
++#include <linux/jiffies.h>
+ 
+ #include "../../lib/kstrtox.h"
+ 
+@@ -312,6 +313,17 @@ void copy_map_value_locked(struct bpf_map *map, void *dst, void *src,
+ 	preempt_enable();
+ }
+ 
++BPF_CALL_0(bpf_jiffies64)
++{
++	return get_jiffies_64();
++}
++
++const struct bpf_func_proto bpf_jiffies64_proto = {
++	.func		= bpf_jiffies64,
++	.gpl_only	= false,
++	.ret_type	= RET_INTEGER,
++};
++
+ #ifdef CONFIG_CGROUPS
+ BPF_CALL_0(bpf_get_current_cgroup_id)
+ {
+
+commit 743210386c0354a2f8ef3d697353c7d8477fa81d
+Author: Tejun Heo <tj@kernel.org>
+Date:   Mon Nov 4 15:54:30 2019 -0800
+
+    cgroup: use cgrp->kn->id as the cgroup ID
+    
+    cgroup ID is currently allocated using a dedicated per-hierarchy idr
+    and used internally and exposed through tracepoints and bpf.  This is
+    confusing because there are tracepoints and other interfaces which use
+    the cgroupfs ino as IDs.
+    
+    The preceding changes made kn->id exposed as ino as 64bit ino on
+    supported archs or ino+gen (low 32bits as ino, high gen).  There's no
+    reason for cgroup to use different IDs.  The kernfs IDs are unique and
+    userland can easily discover them and map them back to paths using
+    standard file operations.
+    
+    This patch replaces cgroup IDs with kernfs IDs.
+    
+    * cgroup_id() is added and all cgroup ID users are converted to use it.
+    
+    * kernfs_node creation is moved to earlier during cgroup init so that
+      cgroup_id() is available during init.
+    
+    * While at it, s/cgroup/cgrp/ in psi helpers for consistency.
+    
+    * Fallback ID value is changed to 1 to be consistent with root cgroup
+      ID.
+    
+    Signed-off-by: Tejun Heo <tj@kernel.org>
+    Reviewed-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+    Cc: Namhyung Kim <namhyung@kernel.org>
+
+diff --git a/kernel/bpf/helpers.c b/kernel/bpf/helpers.c
+index 912e761cd17a..cada974c9f4e 100644
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -317,7 +317,7 @@ BPF_CALL_0(bpf_get_current_cgroup_id)
+ {
+ 	struct cgroup *cgrp = task_dfl_cgroup(current);
+ 
+-	return cgrp->kn->id;
++	return cgroup_id(cgrp);
+ }
+ 
+ const struct bpf_func_proto bpf_get_current_cgroup_id_proto = {
+
+commit 67c0496e87d193b8356d2af49ab95e8a1b954b3c
+Author: Tejun Heo <tj@kernel.org>
+Date:   Mon Nov 4 15:54:30 2019 -0800
+
+    kernfs: convert kernfs_node->id from union kernfs_node_id to u64
+    
+    kernfs_node->id is currently a union kernfs_node_id which represents
+    either a 32bit (ino, gen) pair or u64 value.  I can't see much value
+    in the usage of the union - all that's needed is a 64bit ID which the
+    current code is already limited to.  Using a union makes the code
+    unnecessarily complicated and prevents using 64bit ino without adding
+    practical benefits.
+    
+    This patch drops union kernfs_node_id and makes kernfs_node->id a u64.
+    ino is stored in the lower 32bits and gen upper.  Accessors -
+    kernfs[_id]_ino() and kernfs[_id]_gen() - are added to retrieve the
+    ino and gen.  This simplifies ID handling less cumbersome and will
+    allow using 64bit inos on supported archs.
+    
+    This patch doesn't make any functional changes.
+    
+    Signed-off-by: Tejun Heo <tj@kernel.org>
+    Reviewed-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+    Cc: Namhyung Kim <namhyung@kernel.org>
+    Cc: Jens Axboe <axboe@kernel.dk>
+    Cc: Alexei Starovoitov <ast@kernel.org>
+
+diff --git a/kernel/bpf/helpers.c b/kernel/bpf/helpers.c
+index 5e28718928ca..912e761cd17a 100644
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -317,7 +317,7 @@ BPF_CALL_0(bpf_get_current_cgroup_id)
+ {
+ 	struct cgroup *cgrp = task_dfl_cgroup(current);
+ 
+-	return cgrp->kn->id.id;
++	return cgrp->kn->id;
+ }
+ 
+ const struct bpf_func_proto bpf_get_current_cgroup_id_proto = {
+
+commit 5b497af42fab12cadc0e29bcb7052cf9963603f5
+Author: Thomas Gleixner <tglx@linutronix.de>
+Date:   Wed May 29 07:18:09 2019 -0700
+
+    treewide: Replace GPLv2 boilerplate/reference with SPDX - rule 295
+    
+    Based on 1 normalized pattern(s):
+    
+      this program is free software you can redistribute it and or modify
+      it under the terms of version 2 of the gnu general public license as
+      published by the free software foundation this program is
+      distributed in the hope that it will be useful but without any
+      warranty without even the implied warranty of merchantability or
+      fitness for a particular purpose see the gnu general public license
+      for more details
+    
+    extracted by the scancode license scanner the SPDX license identifier
+    
+      GPL-2.0-only
+    
+    has been chosen to replace the boilerplate/reference in 64 file(s).
+    
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Reviewed-by: Alexios Zavras <alexios.zavras@intel.com>
+    Reviewed-by: Allison Randal <allison@lohutok.net>
+    Cc: linux-spdx@vger.kernel.org
+    Link: https://lkml.kernel.org/r/20190529141901.894819585@linutronix.de
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/kernel/bpf/helpers.c b/kernel/bpf/helpers.c
+index 4266ffde07ca..5e28718928ca 100644
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -1,13 +1,5 @@
++// SPDX-License-Identifier: GPL-2.0-only
+ /* Copyright (c) 2011-2014 PLUMgrid, http://plumgrid.com
+- *
+- * This program is free software; you can redistribute it and/or
+- * modify it under the terms of version 2 of the GNU General Public
+- * License as published by the Free Software Foundation.
+- *
+- * This program is distributed in the hope that it will be useful, but
+- * WITHOUT ANY WARRANTY; without even the implied warranty of
+- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+- * General Public License for more details.
+  */
+ #include <linux/bpf.h>
+ #include <linux/rcupdate.h>
+
+commit d7a4cb9b6705a89937d12c8158a35a3145dc967a
+Author: Andrey Ignatov <rdna@fb.com>
+Date:   Mon Mar 18 17:55:26 2019 -0700
+
+    bpf: Introduce bpf_strtol and bpf_strtoul helpers
+    
+    Add bpf_strtol and bpf_strtoul to convert a string to long and unsigned
+    long correspondingly. It's similar to user space strtol(3) and
+    strtoul(3) with a few changes to the API:
+    
+    * instead of NUL-terminated C string the helpers expect buffer and
+      buffer length;
+    
+    * resulting long or unsigned long is returned in a separate
+      result-argument;
+    
+    * return value is used to indicate success or failure, on success number
+      of consumed bytes is returned that can be used to identify position to
+      read next if the buffer is expected to contain multiple integers;
+    
+    * instead of *base* argument, *flags* is used that provides base in 5
+      LSB, other bits are reserved for future use;
+    
+    * number of supported bases is limited.
+    
+    Documentation for the new helpers is provided in bpf.h UAPI.
+    
+    The helpers are made available to BPF_PROG_TYPE_CGROUP_SYSCTL programs to
+    be able to convert string input to e.g. "ulongvec" output.
+    
+    E.g. "net/ipv4/tcp_mem" consists of three ulong integers. They can be
+    parsed by calling to bpf_strtoul three times.
+    
+    Implementation notes:
+    
+    Implementation includes "../../lib/kstrtox.h" to reuse integer parsing
+    functions. It's done exactly same way as fs/proc/base.c already does.
+    
+    Unfortunately existing kstrtoX function can't be used directly since
+    they fail if any invalid character is present right after integer in the
+    string. Existing simple_strtoX functions can't be used either since
+    they're obsolete and don't handle overflow properly.
+    
+    Signed-off-by: Andrey Ignatov <rdna@fb.com>
+    Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+
+diff --git a/kernel/bpf/helpers.c b/kernel/bpf/helpers.c
+index a411fc17d265..4266ffde07ca 100644
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -18,6 +18,9 @@
+ #include <linux/sched.h>
+ #include <linux/uidgid.h>
+ #include <linux/filter.h>
++#include <linux/ctype.h>
++
++#include "../../lib/kstrtox.h"
+ 
+ /* If kernel subsystem is allowing eBPF programs to call this function,
+  * inside its own verifier_ops->get_func_proto() callback it should return
+@@ -363,4 +366,132 @@ const struct bpf_func_proto bpf_get_local_storage_proto = {
+ 	.arg2_type	= ARG_ANYTHING,
+ };
+ #endif
++
++#define BPF_STRTOX_BASE_MASK 0x1F
++
++static int __bpf_strtoull(const char *buf, size_t buf_len, u64 flags,
++			  unsigned long long *res, bool *is_negative)
++{
++	unsigned int base = flags & BPF_STRTOX_BASE_MASK;
++	const char *cur_buf = buf;
++	size_t cur_len = buf_len;
++	unsigned int consumed;
++	size_t val_len;
++	char str[64];
++
++	if (!buf || !buf_len || !res || !is_negative)
++		return -EINVAL;
++
++	if (base != 0 && base != 8 && base != 10 && base != 16)
++		return -EINVAL;
++
++	if (flags & ~BPF_STRTOX_BASE_MASK)
++		return -EINVAL;
++
++	while (cur_buf < buf + buf_len && isspace(*cur_buf))
++		++cur_buf;
++
++	*is_negative = (cur_buf < buf + buf_len && *cur_buf == '-');
++	if (*is_negative)
++		++cur_buf;
++
++	consumed = cur_buf - buf;
++	cur_len -= consumed;
++	if (!cur_len)
++		return -EINVAL;
++
++	cur_len = min(cur_len, sizeof(str) - 1);
++	memcpy(str, cur_buf, cur_len);
++	str[cur_len] = '\0';
++	cur_buf = str;
++
++	cur_buf = _parse_integer_fixup_radix(cur_buf, &base);
++	val_len = _parse_integer(cur_buf, base, res);
++
++	if (val_len & KSTRTOX_OVERFLOW)
++		return -ERANGE;
++
++	if (val_len == 0)
++		return -EINVAL;
++
++	cur_buf += val_len;
++	consumed += cur_buf - str;
++
++	return consumed;
++}
++
++static int __bpf_strtoll(const char *buf, size_t buf_len, u64 flags,
++			 long long *res)
++{
++	unsigned long long _res;
++	bool is_negative;
++	int err;
++
++	err = __bpf_strtoull(buf, buf_len, flags, &_res, &is_negative);
++	if (err < 0)
++		return err;
++	if (is_negative) {
++		if ((long long)-_res > 0)
++			return -ERANGE;
++		*res = -_res;
++	} else {
++		if ((long long)_res < 0)
++			return -ERANGE;
++		*res = _res;
++	}
++	return err;
++}
++
++BPF_CALL_4(bpf_strtol, const char *, buf, size_t, buf_len, u64, flags,
++	   long *, res)
++{
++	long long _res;
++	int err;
++
++	err = __bpf_strtoll(buf, buf_len, flags, &_res);
++	if (err < 0)
++		return err;
++	if (_res != (long)_res)
++		return -ERANGE;
++	*res = _res;
++	return err;
++}
++
++const struct bpf_func_proto bpf_strtol_proto = {
++	.func		= bpf_strtol,
++	.gpl_only	= false,
++	.ret_type	= RET_INTEGER,
++	.arg1_type	= ARG_PTR_TO_MEM,
++	.arg2_type	= ARG_CONST_SIZE,
++	.arg3_type	= ARG_ANYTHING,
++	.arg4_type	= ARG_PTR_TO_LONG,
++};
++
++BPF_CALL_4(bpf_strtoul, const char *, buf, size_t, buf_len, u64, flags,
++	   unsigned long *, res)
++{
++	unsigned long long _res;
++	bool is_negative;
++	int err;
++
++	err = __bpf_strtoull(buf, buf_len, flags, &_res, &is_negative);
++	if (err < 0)
++		return err;
++	if (is_negative)
++		return -EINVAL;
++	if (_res != (unsigned long)_res)
++		return -ERANGE;
++	*res = _res;
++	return err;
++}
++
++const struct bpf_func_proto bpf_strtoul_proto = {
++	.func		= bpf_strtoul,
++	.gpl_only	= false,
++	.ret_type	= RET_INTEGER,
++	.arg1_type	= ARG_PTR_TO_MEM,
++	.arg2_type	= ARG_CONST_SIZE,
++	.arg3_type	= ARG_ANYTHING,
++	.arg4_type	= ARG_PTR_TO_LONG,
++};
+ #endif
+
+commit 96049f3afd50fe8db69fa0068cdca822e747b1e4
+Author: Alexei Starovoitov <ast@kernel.org>
+Date:   Thu Jan 31 15:40:09 2019 -0800
+
+    bpf: introduce BPF_F_LOCK flag
+    
+    Introduce BPF_F_LOCK flag for map_lookup and map_update syscall commands
+    and for map_update() helper function.
+    In all these cases take a lock of existing element (which was provided
+    in BTF description) before copying (in or out) the rest of map value.
+    
+    Implementation details that are part of uapi:
+    
+    Array:
+    The array map takes the element lock for lookup/update.
+    
+    Hash:
+    hash map also takes the lock for lookup/update and tries to avoid the bucket lock.
+    If old element exists it takes the element lock and updates the element in place.
+    If element doesn't exist it allocates new one and inserts into hash table
+    while holding the bucket lock.
+    In rare case the hashmap has to take both the bucket lock and the element lock
+    to update old value in place.
+    
+    Cgroup local storage:
+    It is similar to array. update in place and lookup are done with lock taken.
+    
+    Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/kernel/bpf/helpers.c b/kernel/bpf/helpers.c
+index fbe544761628..a411fc17d265 100644
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -301,6 +301,22 @@ const struct bpf_func_proto bpf_spin_unlock_proto = {
+ 	.arg1_type	= ARG_PTR_TO_SPIN_LOCK,
+ };
+ 
++void copy_map_value_locked(struct bpf_map *map, void *dst, void *src,
++			   bool lock_src)
++{
++	struct bpf_spin_lock *lock;
++
++	if (lock_src)
++		lock = src + map->spin_lock_off;
++	else
++		lock = dst + map->spin_lock_off;
++	preempt_disable();
++	____bpf_spin_lock(lock);
++	copy_map_value(map, dst, src);
++	____bpf_spin_unlock(lock);
++	preempt_enable();
++}
++
+ #ifdef CONFIG_CGROUPS
+ BPF_CALL_0(bpf_get_current_cgroup_id)
+ {
+
+commit d83525ca62cf8ebe3271d14c36fb900c294274a2
+Author: Alexei Starovoitov <ast@kernel.org>
+Date:   Thu Jan 31 15:40:04 2019 -0800
+
+    bpf: introduce bpf_spin_lock
+    
+    Introduce 'struct bpf_spin_lock' and bpf_spin_lock/unlock() helpers to let
+    bpf program serialize access to other variables.
+    
+    Example:
+    struct hash_elem {
+        int cnt;
+        struct bpf_spin_lock lock;
+    };
+    struct hash_elem * val = bpf_map_lookup_elem(&hash_map, &key);
+    if (val) {
+        bpf_spin_lock(&val->lock);
+        val->cnt++;
+        bpf_spin_unlock(&val->lock);
+    }
+    
+    Restrictions and safety checks:
+    - bpf_spin_lock is only allowed inside HASH and ARRAY maps.
+    - BTF description of the map is mandatory for safety analysis.
+    - bpf program can take one bpf_spin_lock at a time, since two or more can
+      cause dead locks.
+    - only one 'struct bpf_spin_lock' is allowed per map element.
+      It drastically simplifies implementation yet allows bpf program to use
+      any number of bpf_spin_locks.
+    - when bpf_spin_lock is taken the calls (either bpf2bpf or helpers) are not allowed.
+    - bpf program must bpf_spin_unlock() before return.
+    - bpf program can access 'struct bpf_spin_lock' only via
+      bpf_spin_lock()/bpf_spin_unlock() helpers.
+    - load/store into 'struct bpf_spin_lock lock;' field is not allowed.
+    - to use bpf_spin_lock() helper the BTF description of map value must be
+      a struct and have 'struct bpf_spin_lock anyname;' field at the top level.
+      Nested lock inside another struct is not allowed.
+    - syscall map_lookup doesn't copy bpf_spin_lock field to user space.
+    - syscall map_update and program map_update do not update bpf_spin_lock field.
+    - bpf_spin_lock cannot be on the stack or inside networking packet.
+      bpf_spin_lock can only be inside HASH or ARRAY map value.
+    - bpf_spin_lock is available to root only and to all program types.
+    - bpf_spin_lock is not allowed in inner maps of map-in-map.
+    - ld_abs is not allowed inside spin_lock-ed region.
+    - tracing progs and socket filter progs cannot use bpf_spin_lock due to
+      insufficient preemption checks
+    
+    Implementation details:
+    - cgroup-bpf class of programs can nest with xdp/tc programs.
+      Hence bpf_spin_lock is equivalent to spin_lock_irqsave.
+      Other solutions to avoid nested bpf_spin_lock are possible.
+      Like making sure that all networking progs run with softirq disabled.
+      spin_lock_irqsave is the simplest and doesn't add overhead to the
+      programs that don't use it.
+    - arch_spinlock_t is used when its implemented as queued_spin_lock
+    - archs can force their own arch_spinlock_t
+    - on architectures where queued_spin_lock is not available and
+      sizeof(arch_spinlock_t) != sizeof(__u32) trivial lock is used.
+    - presence of bpf_spin_lock inside map value could have been indicated via
+      extra flag during map_create, but specifying it via BTF is cleaner.
+      It provides introspection for map key/value and reduces user mistakes.
+    
+    Next steps:
+    - allow bpf_spin_lock in other map types (like cgroup local storage)
+    - introduce BPF_F_LOCK flag for bpf_map_update() syscall and helper
+      to request kernel to grab bpf_spin_lock before rewriting the value.
+      That will serialize access to map elements.
+    
+    Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+    Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/kernel/bpf/helpers.c b/kernel/bpf/helpers.c
+index a74972b07e74..fbe544761628 100644
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -221,6 +221,86 @@ const struct bpf_func_proto bpf_get_current_comm_proto = {
+ 	.arg2_type	= ARG_CONST_SIZE,
+ };
+ 
++#if defined(CONFIG_QUEUED_SPINLOCKS) || defined(CONFIG_BPF_ARCH_SPINLOCK)
++
++static inline void __bpf_spin_lock(struct bpf_spin_lock *lock)
++{
++	arch_spinlock_t *l = (void *)lock;
++	union {
++		__u32 val;
++		arch_spinlock_t lock;
++	} u = { .lock = __ARCH_SPIN_LOCK_UNLOCKED };
++
++	compiletime_assert(u.val == 0, "__ARCH_SPIN_LOCK_UNLOCKED not 0");
++	BUILD_BUG_ON(sizeof(*l) != sizeof(__u32));
++	BUILD_BUG_ON(sizeof(*lock) != sizeof(__u32));
++	arch_spin_lock(l);
++}
++
++static inline void __bpf_spin_unlock(struct bpf_spin_lock *lock)
++{
++	arch_spinlock_t *l = (void *)lock;
++
++	arch_spin_unlock(l);
++}
++
++#else
++
++static inline void __bpf_spin_lock(struct bpf_spin_lock *lock)
++{
++	atomic_t *l = (void *)lock;
++
++	BUILD_BUG_ON(sizeof(*l) != sizeof(*lock));
++	do {
++		atomic_cond_read_relaxed(l, !VAL);
++	} while (atomic_xchg(l, 1));
++}
++
++static inline void __bpf_spin_unlock(struct bpf_spin_lock *lock)
++{
++	atomic_t *l = (void *)lock;
++
++	atomic_set_release(l, 0);
++}
++
++#endif
++
++static DEFINE_PER_CPU(unsigned long, irqsave_flags);
++
++notrace BPF_CALL_1(bpf_spin_lock, struct bpf_spin_lock *, lock)
++{
++	unsigned long flags;
++
++	local_irq_save(flags);
++	__bpf_spin_lock(lock);
++	__this_cpu_write(irqsave_flags, flags);
++	return 0;
++}
++
++const struct bpf_func_proto bpf_spin_lock_proto = {
++	.func		= bpf_spin_lock,
++	.gpl_only	= false,
++	.ret_type	= RET_VOID,
++	.arg1_type	= ARG_PTR_TO_SPIN_LOCK,
++};
++
++notrace BPF_CALL_1(bpf_spin_unlock, struct bpf_spin_lock *, lock)
++{
++	unsigned long flags;
++
++	flags = __this_cpu_read(irqsave_flags);
++	__bpf_spin_unlock(lock);
++	local_irq_restore(flags);
++	return 0;
++}
++
++const struct bpf_func_proto bpf_spin_unlock_proto = {
++	.func		= bpf_spin_unlock,
++	.gpl_only	= false,
++	.ret_type	= RET_VOID,
++	.arg1_type	= ARG_PTR_TO_SPIN_LOCK,
++};
++
+ #ifdef CONFIG_CGROUPS
+ BPF_CALL_0(bpf_get_current_cgroup_id)
+ {
+
+commit 80b0d86a176cab6201719b8dfd806902b0c6e046
+Author: Daniel Borkmann <daniel@iogearbox.net>
+Date:   Wed Oct 24 22:05:47 2018 +0200
+
+    bpf: fix direct packet write into pop/peek helpers
+    
+    Commit f1a2e44a3aec ("bpf: add queue and stack maps") probably just
+    copy-pasted .pkt_access for bpf_map_{pop,peek}_elem() helpers, but
+    this is buggy in this context since it would allow writes into cloned
+    skbs which is invalid. Therefore, disable .pkt_access for the two.
+    
+    Fixes: f1a2e44a3aec ("bpf: add queue and stack maps")
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+    Acked-by: Alexei Starovoitov <ast@kernel.org>
+    Cc: Mauricio Vasquez B <mauricio.vasquez@polito.it>
+    Acked-by: Mauricio Vasquez B<mauricio.vasquez@polito.it>
+    Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+
+diff --git a/kernel/bpf/helpers.c b/kernel/bpf/helpers.c
+index ab0d5e3f9892..a74972b07e74 100644
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -99,7 +99,6 @@ BPF_CALL_2(bpf_map_pop_elem, struct bpf_map *, map, void *, value)
+ const struct bpf_func_proto bpf_map_pop_elem_proto = {
+ 	.func		= bpf_map_pop_elem,
+ 	.gpl_only	= false,
+-	.pkt_access	= true,
+ 	.ret_type	= RET_INTEGER,
+ 	.arg1_type	= ARG_CONST_MAP_PTR,
+ 	.arg2_type	= ARG_PTR_TO_UNINIT_MAP_VALUE,
+@@ -113,7 +112,6 @@ BPF_CALL_2(bpf_map_peek_elem, struct bpf_map *, map, void *, value)
+ const struct bpf_func_proto bpf_map_peek_elem_proto = {
+ 	.func		= bpf_map_pop_elem,
+ 	.gpl_only	= false,
+-	.pkt_access	= true,
+ 	.ret_type	= RET_INTEGER,
+ 	.arg1_type	= ARG_CONST_MAP_PTR,
+ 	.arg2_type	= ARG_PTR_TO_UNINIT_MAP_VALUE,
+
+commit f1a2e44a3aeccb3ff18d3ccc0b0203e70b95bd92
+Author: Mauricio Vasquez B <mauricio.vasquez@polito.it>
+Date:   Thu Oct 18 15:16:25 2018 +0200
+
+    bpf: add queue and stack maps
+    
+    Queue/stack maps implement a FIFO/LIFO data storage for ebpf programs.
+    These maps support peek, pop and push operations that are exposed to eBPF
+    programs through the new bpf_map[peek/pop/push] helpers.  Those operations
+    are exposed to userspace applications through the already existing
+    syscalls in the following way:
+    
+    BPF_MAP_LOOKUP_ELEM            -> peek
+    BPF_MAP_LOOKUP_AND_DELETE_ELEM -> pop
+    BPF_MAP_UPDATE_ELEM            -> push
+    
+    Queue/stack maps are implemented using a buffer, tail and head indexes,
+    hence BPF_F_NO_PREALLOC is not supported.
+    
+    As opposite to other maps, queue and stack do not use RCU for protecting
+    maps values, the bpf_map[peek/pop] have a ARG_PTR_TO_UNINIT_MAP_VALUE
+    argument that is a pointer to a memory zone where to save the value of a
+    map.  Basically the same as ARG_PTR_TO_UNINIT_MEM, but the size has not
+    be passed as an extra argument.
+    
+    Our main motivation for implementing queue/stack maps was to keep track
+    of a pool of elements, like network ports in a SNAT, however we forsee
+    other use cases, like for exampling saving last N kernel events in a map
+    and then analysing from userspace.
+    
+    Signed-off-by: Mauricio Vasquez B <mauricio.vasquez@polito.it>
+    Acked-by: Song Liu <songliubraving@fb.com>
+    Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+
+diff --git a/kernel/bpf/helpers.c b/kernel/bpf/helpers.c
+index 6502115e8f55..ab0d5e3f9892 100644
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -76,6 +76,49 @@ const struct bpf_func_proto bpf_map_delete_elem_proto = {
+ 	.arg2_type	= ARG_PTR_TO_MAP_KEY,
+ };
+ 
++BPF_CALL_3(bpf_map_push_elem, struct bpf_map *, map, void *, value, u64, flags)
++{
++	return map->ops->map_push_elem(map, value, flags);
++}
++
++const struct bpf_func_proto bpf_map_push_elem_proto = {
++	.func		= bpf_map_push_elem,
++	.gpl_only	= false,
++	.pkt_access	= true,
++	.ret_type	= RET_INTEGER,
++	.arg1_type	= ARG_CONST_MAP_PTR,
++	.arg2_type	= ARG_PTR_TO_MAP_VALUE,
++	.arg3_type	= ARG_ANYTHING,
++};
++
++BPF_CALL_2(bpf_map_pop_elem, struct bpf_map *, map, void *, value)
++{
++	return map->ops->map_pop_elem(map, value);
++}
++
++const struct bpf_func_proto bpf_map_pop_elem_proto = {
++	.func		= bpf_map_pop_elem,
++	.gpl_only	= false,
++	.pkt_access	= true,
++	.ret_type	= RET_INTEGER,
++	.arg1_type	= ARG_CONST_MAP_PTR,
++	.arg2_type	= ARG_PTR_TO_UNINIT_MAP_VALUE,
++};
++
++BPF_CALL_2(bpf_map_peek_elem, struct bpf_map *, map, void *, value)
++{
++	return map->ops->map_peek_elem(map, value);
++}
++
++const struct bpf_func_proto bpf_map_peek_elem_proto = {
++	.func		= bpf_map_pop_elem,
++	.gpl_only	= false,
++	.pkt_access	= true,
++	.ret_type	= RET_INTEGER,
++	.arg1_type	= ARG_CONST_MAP_PTR,
++	.arg2_type	= ARG_PTR_TO_UNINIT_MAP_VALUE,
++};
++
+ const struct bpf_func_proto bpf_get_prandom_u32_proto = {
+ 	.func		= bpf_user_rnd_u32,
+ 	.gpl_only	= false,
+
+commit b741f1630346defcbc8cc60f1a2bdae8b3b0036f
+Author: Roman Gushchin <guro@fb.com>
+Date:   Fri Sep 28 14:45:43 2018 +0000
+
+    bpf: introduce per-cpu cgroup local storage
+    
+    This commit introduced per-cpu cgroup local storage.
+    
+    Per-cpu cgroup local storage is very similar to simple cgroup storage
+    (let's call it shared), except all the data is per-cpu.
+    
+    The main goal of per-cpu variant is to implement super fast
+    counters (e.g. packet counters), which don't require neither
+    lookups, neither atomic operations.
+    
+    >From userspace's point of view, accessing a per-cpu cgroup storage
+    is similar to other per-cpu map types (e.g. per-cpu hashmaps and
+    arrays).
+    
+    Writing to a per-cpu cgroup storage is not atomic, but is performed
+    by copying longs, so some minimal atomicity is here, exactly
+    as with other per-cpu maps.
+    
+    Signed-off-by: Roman Gushchin <guro@fb.com>
+    Cc: Daniel Borkmann <daniel@iogearbox.net>
+    Cc: Alexei Starovoitov <ast@kernel.org>
+    Acked-by: Song Liu <songliubraving@fb.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/kernel/bpf/helpers.c b/kernel/bpf/helpers.c
+index e42f8789b7ea..6502115e8f55 100644
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -206,10 +206,16 @@ BPF_CALL_2(bpf_get_local_storage, struct bpf_map *, map, u64, flags)
+ 	 */
+ 	enum bpf_cgroup_storage_type stype = cgroup_storage_type(map);
+ 	struct bpf_cgroup_storage *storage;
++	void *ptr;
+ 
+ 	storage = this_cpu_read(bpf_cgroup_storage[stype]);
+ 
+-	return (unsigned long)&READ_ONCE(storage->buf)->data[0];
++	if (stype == BPF_CGROUP_STORAGE_SHARED)
++		ptr = &READ_ONCE(storage->buf)->data[0];
++	else
++		ptr = this_cpu_ptr(storage->percpu_buf);
++
++	return (unsigned long)ptr;
+ }
+ 
+ const struct bpf_func_proto bpf_get_local_storage_proto = {
+
+commit f294b37ec7b24a574884cd157497a3748081c0f0
+Author: Roman Gushchin <guro@fb.com>
+Date:   Fri Sep 28 14:45:40 2018 +0000
+
+    bpf: rework cgroup storage pointer passing
+    
+    To simplify the following introduction of per-cpu cgroup storage,
+    let's rework a bit a mechanism of passing a pointer to a cgroup
+    storage into the bpf_get_local_storage(). Let's save a pointer
+    to the corresponding bpf_cgroup_storage structure, instead of
+    a pointer to the actual buffer.
+    
+    It will help us to handle per-cpu storage later, which has
+    a different way of accessing to the actual data.
+    
+    Signed-off-by: Roman Gushchin <guro@fb.com>
+    Acked-by: Song Liu <songliubraving@fb.com>
+    Cc: Daniel Borkmann <daniel@iogearbox.net>
+    Cc: Alexei Starovoitov <ast@kernel.org>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/kernel/bpf/helpers.c b/kernel/bpf/helpers.c
+index 9070b2ace6aa..e42f8789b7ea 100644
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -195,7 +195,8 @@ const struct bpf_func_proto bpf_get_current_cgroup_id_proto = {
+ };
+ 
+ #ifdef CONFIG_CGROUP_BPF
+-DECLARE_PER_CPU(void*, bpf_cgroup_storage[MAX_BPF_CGROUP_STORAGE_TYPE]);
++DECLARE_PER_CPU(struct bpf_cgroup_storage*,
++		bpf_cgroup_storage[MAX_BPF_CGROUP_STORAGE_TYPE]);
+ 
+ BPF_CALL_2(bpf_get_local_storage, struct bpf_map *, map, u64, flags)
+ {
+@@ -204,8 +205,11 @@ BPF_CALL_2(bpf_get_local_storage, struct bpf_map *, map, u64, flags)
+ 	 * verifier checks that its value is correct.
+ 	 */
+ 	enum bpf_cgroup_storage_type stype = cgroup_storage_type(map);
++	struct bpf_cgroup_storage *storage;
+ 
+-	return (unsigned long) this_cpu_read(bpf_cgroup_storage[stype]);
++	storage = this_cpu_read(bpf_cgroup_storage[stype]);
++
++	return (unsigned long)&READ_ONCE(storage->buf)->data[0];
+ }
+ 
+ const struct bpf_func_proto bpf_get_local_storage_proto = {
+
+commit 8bad74f9840f87661f20ced3dc80c84ab4fd55a1
+Author: Roman Gushchin <guro@fb.com>
+Date:   Fri Sep 28 14:45:36 2018 +0000
+
+    bpf: extend cgroup bpf core to allow multiple cgroup storage types
+    
+    In order to introduce per-cpu cgroup storage, let's generalize
+    bpf cgroup core to support multiple cgroup storage types.
+    Potentially, per-node cgroup storage can be added later.
+    
+    This commit is mostly a formal change that replaces
+    cgroup_storage pointer with a array of cgroup_storage pointers.
+    It doesn't actually introduce a new storage type,
+    it will be done later.
+    
+    Each bpf program is now able to have one cgroup storage of each type.
+    
+    Signed-off-by: Roman Gushchin <guro@fb.com>
+    Acked-by: Song Liu <songliubraving@fb.com>
+    Cc: Daniel Borkmann <daniel@iogearbox.net>
+    Cc: Alexei Starovoitov <ast@kernel.org>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/kernel/bpf/helpers.c b/kernel/bpf/helpers.c
+index 1991466b8327..9070b2ace6aa 100644
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -194,16 +194,18 @@ const struct bpf_func_proto bpf_get_current_cgroup_id_proto = {
+ 	.ret_type	= RET_INTEGER,
+ };
+ 
+-DECLARE_PER_CPU(void*, bpf_cgroup_storage);
++#ifdef CONFIG_CGROUP_BPF
++DECLARE_PER_CPU(void*, bpf_cgroup_storage[MAX_BPF_CGROUP_STORAGE_TYPE]);
+ 
+ BPF_CALL_2(bpf_get_local_storage, struct bpf_map *, map, u64, flags)
+ {
+-	/* map and flags arguments are not used now,
+-	 * but provide an ability to extend the API
+-	 * for other types of local storages.
+-	 * verifier checks that their values are correct.
++	/* flags argument is not used now,
++	 * but provides an ability to extend the API.
++	 * verifier checks that its value is correct.
+ 	 */
+-	return (unsigned long) this_cpu_read(bpf_cgroup_storage);
++	enum bpf_cgroup_storage_type stype = cgroup_storage_type(map);
++
++	return (unsigned long) this_cpu_read(bpf_cgroup_storage[stype]);
+ }
+ 
+ const struct bpf_func_proto bpf_get_local_storage_proto = {
+@@ -214,3 +216,4 @@ const struct bpf_func_proto bpf_get_local_storage_proto = {
+ 	.arg2_type	= ARG_ANYTHING,
+ };
+ #endif
++#endif
+
+commit cd3394317653837e2eb5c5d0904a8996102af9fc
+Author: Roman Gushchin <guro@fb.com>
+Date:   Thu Aug 2 14:27:24 2018 -0700
+
+    bpf: introduce the bpf_get_local_storage() helper function
+    
+    The bpf_get_local_storage() helper function is used
+    to get a pointer to the bpf local storage from a bpf program.
+    
+    It takes a pointer to a storage map and flags as arguments.
+    Right now it accepts only cgroup storage maps, and flags
+    argument has to be 0. Further it can be extended to support
+    other types of local storage: e.g. thread local storage etc.
+    
+    Signed-off-by: Roman Gushchin <guro@fb.com>
+    Cc: Alexei Starovoitov <ast@kernel.org>
+    Cc: Daniel Borkmann <daniel@iogearbox.net>
+    Acked-by: Martin KaFai Lau <kafai@fb.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+
+diff --git a/kernel/bpf/helpers.c b/kernel/bpf/helpers.c
+index 73065e2d23c2..1991466b8327 100644
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -193,4 +193,24 @@ const struct bpf_func_proto bpf_get_current_cgroup_id_proto = {
+ 	.gpl_only	= false,
+ 	.ret_type	= RET_INTEGER,
+ };
++
++DECLARE_PER_CPU(void*, bpf_cgroup_storage);
++
++BPF_CALL_2(bpf_get_local_storage, struct bpf_map *, map, u64, flags)
++{
++	/* map and flags arguments are not used now,
++	 * but provide an ability to extend the API
++	 * for other types of local storages.
++	 * verifier checks that their values are correct.
++	 */
++	return (unsigned long) this_cpu_read(bpf_cgroup_storage);
++}
++
++const struct bpf_func_proto bpf_get_local_storage_proto = {
++	.func		= bpf_get_local_storage,
++	.gpl_only	= false,
++	.ret_type	= RET_PTR_TO_MAP_VALUE,
++	.arg1_type	= ARG_CONST_MAP_PTR,
++	.arg2_type	= ARG_ANYTHING,
++};
+ #endif
+
+commit bf6fa2c893c5237b48569a13fa3c673041430b6c
+Author: Yonghong Song <yhs@fb.com>
+Date:   Sun Jun 3 15:59:41 2018 -0700
+
+    bpf: implement bpf_get_current_cgroup_id() helper
+    
+    bpf has been used extensively for tracing. For example, bcc
+    contains an almost full set of bpf-based tools to trace kernel
+    and user functions/events. Most tracing tools are currently
+    either filtered based on pid or system-wide.
+    
+    Containers have been used quite extensively in industry and
+    cgroup is often used together to provide resource isolation
+    and protection. Several processes may run inside the same
+    container. It is often desirable to get container-level tracing
+    results as well, e.g. syscall count, function count, I/O
+    activity, etc.
+    
+    This patch implements a new helper, bpf_get_current_cgroup_id(),
+    which will return cgroup id based on the cgroup within which
+    the current task is running.
+    
+    The later patch will provide an example to show that
+    userspace can get the same cgroup id so it could
+    configure a filter or policy in the bpf program based on
+    task cgroup id.
+    
+    The helper is currently implemented for tracing. It can
+    be added to other program types as well when needed.
+    
+    Acked-by: Alexei Starovoitov <ast@kernel.org>
+    Signed-off-by: Yonghong Song <yhs@fb.com>
+    Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+
+diff --git a/kernel/bpf/helpers.c b/kernel/bpf/helpers.c
+index 3d24e238221e..73065e2d23c2 100644
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -179,3 +179,18 @@ const struct bpf_func_proto bpf_get_current_comm_proto = {
+ 	.arg1_type	= ARG_PTR_TO_UNINIT_MEM,
+ 	.arg2_type	= ARG_CONST_SIZE,
+ };
++
++#ifdef CONFIG_CGROUPS
++BPF_CALL_0(bpf_get_current_cgroup_id)
++{
++	struct cgroup *cgrp = task_dfl_cgroup(current);
++
++	return cgrp->kn->id.id;
++}
++
++const struct bpf_func_proto bpf_get_current_cgroup_id_proto = {
++	.func		= bpf_get_current_cgroup_id,
++	.gpl_only	= false,
++	.ret_type	= RET_INTEGER,
++};
++#endif
+
+commit 39f19ebbf57b403695f7b5f9cf322fe1ddb5d7fb
+Author: Alexei Starovoitov <ast@fb.com>
+Date:   Mon Jan 9 10:19:50 2017 -0800
+
+    bpf: rename ARG_PTR_TO_STACK
+    
+    since ARG_PTR_TO_STACK is no longer just pointer to stack
+    rename it to ARG_PTR_TO_MEM and adjust comment.
+    
+    Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+    Acked-by: Daniel Borkmann <daniel@iogearbox.net>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/kernel/bpf/helpers.c b/kernel/bpf/helpers.c
+index 045cbe673356..3d24e238221e 100644
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -176,6 +176,6 @@ const struct bpf_func_proto bpf_get_current_comm_proto = {
+ 	.func		= bpf_get_current_comm,
+ 	.gpl_only	= false,
+ 	.ret_type	= RET_INTEGER,
+-	.arg1_type	= ARG_PTR_TO_RAW_STACK,
+-	.arg2_type	= ARG_CONST_STACK_SIZE,
++	.arg1_type	= ARG_PTR_TO_UNINIT_MEM,
++	.arg2_type	= ARG_CONST_SIZE,
+ };
+
+commit 2d0e30c30f84d08dc16f0f2af41f1b8a85f0755e
+Author: Daniel Borkmann <daniel@iogearbox.net>
+Date:   Fri Oct 21 12:46:33 2016 +0200
+
+    bpf: add helper for retrieving current numa node id
+    
+    Use case is mainly for soreuseport to select sockets for the local
+    numa node, but since generic, lets also add this for other networking
+    and tracing program types.
+    
+    Suggested-by: Eric Dumazet <edumazet@google.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+    Acked-by: Alexei Starovoitov <ast@kernel.org>
+    Acked-by: Eric Dumazet <edumazet@google.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/kernel/bpf/helpers.c b/kernel/bpf/helpers.c
+index 39918402e6e9..045cbe673356 100644
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -13,6 +13,7 @@
+ #include <linux/rcupdate.h>
+ #include <linux/random.h>
+ #include <linux/smp.h>
++#include <linux/topology.h>
+ #include <linux/ktime.h>
+ #include <linux/sched.h>
+ #include <linux/uidgid.h>
+@@ -92,6 +93,17 @@ const struct bpf_func_proto bpf_get_smp_processor_id_proto = {
+ 	.ret_type	= RET_INTEGER,
+ };
+ 
++BPF_CALL_0(bpf_get_numa_node_id)
++{
++	return numa_node_id();
++}
++
++const struct bpf_func_proto bpf_get_numa_node_id_proto = {
++	.func		= bpf_get_numa_node_id,
++	.gpl_only	= false,
++	.ret_type	= RET_INTEGER,
++};
++
+ BPF_CALL_0(bpf_ktime_get_ns)
+ {
+ 	/* NMI safe access to clock monotonic */
+
+commit 36bbef52c7eb646ed6247055a2acd3851e317857
+Author: Daniel Borkmann <daniel@iogearbox.net>
+Date:   Tue Sep 20 00:26:13 2016 +0200
+
+    bpf: direct packet write and access for helpers for clsact progs
+    
+    This work implements direct packet access for helpers and direct packet
+    write in a similar fashion as already available for XDP types via commits
+    4acf6c0b84c9 ("bpf: enable direct packet data write for xdp progs") and
+    6841de8b0d03 ("bpf: allow helpers access the packet directly"), and as a
+    complementary feature to the already available direct packet read for tc
+    (cls/act) programs.
+    
+    For enabling this, we need to introduce two helpers, bpf_skb_pull_data()
+    and bpf_csum_update(). The first is generally needed for both, read and
+    write, because they would otherwise only be limited to the current linear
+    skb head. Usually, when the data_end test fails, programs just bail out,
+    or, in the direct read case, use bpf_skb_load_bytes() as an alternative
+    to overcome this limitation. If such data sits in non-linear parts, we
+    can just pull them in once with the new helper, retest and eventually
+    access them.
+    
+    At the same time, this also makes sure the skb is uncloned, which is, of
+    course, a necessary condition for direct write. As this needs to be an
+    invariant for the write part only, the verifier detects writes and adds
+    a prologue that is calling bpf_skb_pull_data() to effectively unclone the
+    skb from the very beginning in case it is indeed cloned. The heuristic
+    makes use of a similar trick that was done in 233577a22089 ("net: filter:
+    constify detection of pkt_type_offset"). This comes at zero cost for other
+    programs that do not use the direct write feature. Should a program use
+    this feature only sparsely and has read access for the most parts with,
+    for example, drop return codes, then such write action can be delegated
+    to a tail called program for mitigating this cost of potential uncloning
+    to a late point in time where it would have been paid similarly with the
+    bpf_skb_store_bytes() as well. Advantage of direct write is that the
+    writes are inlined whereas the helper cannot make any length assumptions
+    and thus needs to generate a call to memcpy() also for small sizes, as well
+    as cost of helper call itself with sanity checks are avoided. Plus, when
+    direct read is already used, we don't need to cache or perform rechecks
+    on the data boundaries (due to verifier invalidating previous checks for
+    helpers that change skb->data), so more complex programs using rewrites
+    can benefit from switching to direct read plus write.
+    
+    For direct packet access to helpers, we save the otherwise needed copy into
+    a temp struct sitting on stack memory when use-case allows. Both facilities
+    are enabled via may_access_direct_pkt_data() in verifier. For now, we limit
+    this to map helpers and csum_diff, and can successively enable other helpers
+    where we find it makes sense. Helpers that definitely cannot be allowed for
+    this are those part of bpf_helper_changes_skb_data() since they can change
+    underlying data, and those that write into memory as this could happen for
+    packet typed args when still cloned. bpf_csum_update() helper accommodates
+    for the fact that we need to fixup checksum_complete when using direct write
+    instead of bpf_skb_store_bytes(), meaning the programs can use available
+    helpers like bpf_csum_diff(), and implement csum_add(), csum_sub(),
+    csum_block_add(), csum_block_sub() equivalents in eBPF together with the
+    new helper. A usage example will be provided for iproute2's examples/bpf/
+    directory.
+    
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+    Acked-by: Alexei Starovoitov <ast@kernel.org>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/kernel/bpf/helpers.c b/kernel/bpf/helpers.c
+index a5b8bf8cfcfd..39918402e6e9 100644
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -36,6 +36,7 @@ BPF_CALL_2(bpf_map_lookup_elem, struct bpf_map *, map, void *, key)
+ const struct bpf_func_proto bpf_map_lookup_elem_proto = {
+ 	.func		= bpf_map_lookup_elem,
+ 	.gpl_only	= false,
++	.pkt_access	= true,
+ 	.ret_type	= RET_PTR_TO_MAP_VALUE_OR_NULL,
+ 	.arg1_type	= ARG_CONST_MAP_PTR,
+ 	.arg2_type	= ARG_PTR_TO_MAP_KEY,
+@@ -51,6 +52,7 @@ BPF_CALL_4(bpf_map_update_elem, struct bpf_map *, map, void *, key,
+ const struct bpf_func_proto bpf_map_update_elem_proto = {
+ 	.func		= bpf_map_update_elem,
+ 	.gpl_only	= false,
++	.pkt_access	= true,
+ 	.ret_type	= RET_INTEGER,
+ 	.arg1_type	= ARG_CONST_MAP_PTR,
+ 	.arg2_type	= ARG_PTR_TO_MAP_KEY,
+@@ -67,6 +69,7 @@ BPF_CALL_2(bpf_map_delete_elem, struct bpf_map *, map, void *, key)
+ const struct bpf_func_proto bpf_map_delete_elem_proto = {
+ 	.func		= bpf_map_delete_elem,
+ 	.gpl_only	= false,
++	.pkt_access	= true,
+ 	.ret_type	= RET_INTEGER,
+ 	.arg1_type	= ARG_CONST_MAP_PTR,
+ 	.arg2_type	= ARG_PTR_TO_MAP_KEY,
+
+commit f3694e00123802d688180e7ae90b240669910e3c
+Author: Daniel Borkmann <daniel@iogearbox.net>
+Date:   Fri Sep 9 02:45:31 2016 +0200
+
+    bpf: add BPF_CALL_x macros for declaring helpers
+    
+    This work adds BPF_CALL_<n>() macros and converts all the eBPF helper functions
+    to use them, in a similar fashion like we do with SYSCALL_DEFINE<n>() macros
+    that are used today. Motivation for this is to hide all the register handling
+    and all necessary casts from the user, so that it is done automatically in the
+    background when adding a BPF_CALL_<n>() call.
+    
+    This makes current helpers easier to review, eases to write future helpers,
+    avoids getting the casting mess wrong, and allows for extending all helpers at
+    once (f.e. build time checks, etc). It also helps detecting more easily in
+    code reviews that unused registers are not instrumented in the code by accident,
+    breaking compatibility with existing programs.
+    
+    BPF_CALL_<n>() internals are quite similar to SYSCALL_DEFINE<n>() ones with some
+    fundamental differences, for example, for generating the actual helper function
+    that carries all u64 regs, we need to fill unused regs, so that we always end up
+    with 5 u64 regs as an argument.
+    
+    I reviewed several 0-5 generated BPF_CALL_<n>() variants of the .i results and
+    they look all as expected. No sparse issue spotted. We let this also sit for a
+    few days with Fengguang's kbuild test robot, and there were no issues seen. On
+    s390, it barked on the "uses dynamic stack allocation" notice, which is an old
+    one from bpf_perf_event_output{,_tp}() reappearing here due to the conversion
+    to the call wrapper, just telling that the perf raw record/frag sits on stack
+    (gcc with s390's -mwarn-dynamicstack), but that's all. Did various runtime tests
+    and they were fine as well. All eBPF helpers are now converted to use these
+    macros, getting rid of a good chunk of all the raw castings.
+    
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+    Acked-by: Alexei Starovoitov <ast@kernel.org>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/kernel/bpf/helpers.c b/kernel/bpf/helpers.c
+index 6df73bd1ba34..a5b8bf8cfcfd 100644
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -16,6 +16,7 @@
+ #include <linux/ktime.h>
+ #include <linux/sched.h>
+ #include <linux/uidgid.h>
++#include <linux/filter.h>
+ 
+ /* If kernel subsystem is allowing eBPF programs to call this function,
+  * inside its own verifier_ops->get_func_proto() callback it should return
+@@ -26,24 +27,10 @@
+  * if program is allowed to access maps, so check rcu_read_lock_held in
+  * all three functions.
+  */
+-static u64 bpf_map_lookup_elem(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5)
++BPF_CALL_2(bpf_map_lookup_elem, struct bpf_map *, map, void *, key)
+ {
+-	/* verifier checked that R1 contains a valid pointer to bpf_map
+-	 * and R2 points to a program stack and map->key_size bytes were
+-	 * initialized
+-	 */
+-	struct bpf_map *map = (struct bpf_map *) (unsigned long) r1;
+-	void *key = (void *) (unsigned long) r2;
+-	void *value;
+-
+ 	WARN_ON_ONCE(!rcu_read_lock_held());
+-
+-	value = map->ops->map_lookup_elem(map, key);
+-
+-	/* lookup() returns either pointer to element value or NULL
+-	 * which is the meaning of PTR_TO_MAP_VALUE_OR_NULL type
+-	 */
+-	return (unsigned long) value;
++	return (unsigned long) map->ops->map_lookup_elem(map, key);
+ }
+ 
+ const struct bpf_func_proto bpf_map_lookup_elem_proto = {
+@@ -54,15 +41,11 @@ const struct bpf_func_proto bpf_map_lookup_elem_proto = {
+ 	.arg2_type	= ARG_PTR_TO_MAP_KEY,
+ };
+ 
+-static u64 bpf_map_update_elem(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5)
++BPF_CALL_4(bpf_map_update_elem, struct bpf_map *, map, void *, key,
++	   void *, value, u64, flags)
+ {
+-	struct bpf_map *map = (struct bpf_map *) (unsigned long) r1;
+-	void *key = (void *) (unsigned long) r2;
+-	void *value = (void *) (unsigned long) r3;
+-
+ 	WARN_ON_ONCE(!rcu_read_lock_held());
+-
+-	return map->ops->map_update_elem(map, key, value, r4);
++	return map->ops->map_update_elem(map, key, value, flags);
+ }
+ 
+ const struct bpf_func_proto bpf_map_update_elem_proto = {
+@@ -75,13 +58,9 @@ const struct bpf_func_proto bpf_map_update_elem_proto = {
+ 	.arg4_type	= ARG_ANYTHING,
+ };
+ 
+-static u64 bpf_map_delete_elem(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5)
++BPF_CALL_2(bpf_map_delete_elem, struct bpf_map *, map, void *, key)
+ {
+-	struct bpf_map *map = (struct bpf_map *) (unsigned long) r1;
+-	void *key = (void *) (unsigned long) r2;
+-
+ 	WARN_ON_ONCE(!rcu_read_lock_held());
+-
+ 	return map->ops->map_delete_elem(map, key);
+ }
+ 
+@@ -99,7 +78,7 @@ const struct bpf_func_proto bpf_get_prandom_u32_proto = {
+ 	.ret_type	= RET_INTEGER,
+ };
+ 
+-static u64 bpf_get_smp_processor_id(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5)
++BPF_CALL_0(bpf_get_smp_processor_id)
+ {
+ 	return smp_processor_id();
+ }
+@@ -110,7 +89,7 @@ const struct bpf_func_proto bpf_get_smp_processor_id_proto = {
+ 	.ret_type	= RET_INTEGER,
+ };
+ 
+-static u64 bpf_ktime_get_ns(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5)
++BPF_CALL_0(bpf_ktime_get_ns)
+ {
+ 	/* NMI safe access to clock monotonic */
+ 	return ktime_get_mono_fast_ns();
+@@ -122,7 +101,7 @@ const struct bpf_func_proto bpf_ktime_get_ns_proto = {
+ 	.ret_type	= RET_INTEGER,
+ };
+ 
+-static u64 bpf_get_current_pid_tgid(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5)
++BPF_CALL_0(bpf_get_current_pid_tgid)
+ {
+ 	struct task_struct *task = current;
+ 
+@@ -138,7 +117,7 @@ const struct bpf_func_proto bpf_get_current_pid_tgid_proto = {
+ 	.ret_type	= RET_INTEGER,
+ };
+ 
+-static u64 bpf_get_current_uid_gid(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5)
++BPF_CALL_0(bpf_get_current_uid_gid)
+ {
+ 	struct task_struct *task = current;
+ 	kuid_t uid;
+@@ -158,10 +137,9 @@ const struct bpf_func_proto bpf_get_current_uid_gid_proto = {
+ 	.ret_type	= RET_INTEGER,
+ };
+ 
+-static u64 bpf_get_current_comm(u64 r1, u64 size, u64 r3, u64 r4, u64 r5)
++BPF_CALL_2(bpf_get_current_comm, char *, buf, u32, size)
+ {
+ 	struct task_struct *task = current;
+-	char *buf = (char *) (long) r1;
+ 
+ 	if (unlikely(!task))
+ 		goto err_clear;
+
+commit 6088b5823b4cb132a838878747384cbfb5ce6646
+Author: Daniel Borkmann <daniel@iogearbox.net>
+Date:   Fri Sep 9 02:45:28 2016 +0200
+
+    bpf: minor cleanups in helpers
+    
+    Some minor misc cleanups, f.e. use sizeof(__u32) instead of hardcoding
+    and in __bpf_skb_max_len(), I missed that we always have skb->dev valid
+    anyway, so we can drop the unneeded test for dev; also few more other
+    misc bits addressed here.
+    
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+    Acked-by: Alexei Starovoitov <ast@kernel.org>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/kernel/bpf/helpers.c b/kernel/bpf/helpers.c
+index 1ea3afba1a4f..6df73bd1ba34 100644
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -126,7 +126,7 @@ static u64 bpf_get_current_pid_tgid(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5)
+ {
+ 	struct task_struct *task = current;
+ 
+-	if (!task)
++	if (unlikely(!task))
+ 		return -EINVAL;
+ 
+ 	return (u64) task->tgid << 32 | task->pid;
+@@ -144,12 +144,12 @@ static u64 bpf_get_current_uid_gid(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5)
+ 	kuid_t uid;
+ 	kgid_t gid;
+ 
+-	if (!task)
++	if (unlikely(!task))
+ 		return -EINVAL;
+ 
+ 	current_uid_gid(&uid, &gid);
+ 	return (u64) from_kgid(&init_user_ns, gid) << 32 |
+-		from_kuid(&init_user_ns, uid);
++		     from_kuid(&init_user_ns, uid);
+ }
+ 
+ const struct bpf_func_proto bpf_get_current_uid_gid_proto = {
+
+commit 80b48c445797a634d869c7e5a53e182ba2688931
+Author: Daniel Borkmann <daniel@iogearbox.net>
+Date:   Tue Jun 28 12:18:26 2016 +0200
+
+    bpf: don't use raw processor id in generic helper
+    
+    Use smp_processor_id() for the generic helper bpf_get_smp_processor_id()
+    instead of the raw variant. This allows for preemption checks when we
+    have DEBUG_PREEMPT, and otherwise uses the raw variant anyway. We only
+    need to keep the raw variant for socket filters, but we can reuse the
+    helper that is already there from cBPF side.
+    
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+    Acked-by: Alexei Starovoitov <ast@kernel.org>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/kernel/bpf/helpers.c b/kernel/bpf/helpers.c
+index ad7a0573f71b..1ea3afba1a4f 100644
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -101,7 +101,7 @@ const struct bpf_func_proto bpf_get_prandom_u32_proto = {
+ 
+ static u64 bpf_get_smp_processor_id(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5)
+ {
+-	return raw_smp_processor_id();
++	return smp_processor_id();
+ }
+ 
+ const struct bpf_func_proto bpf_get_smp_processor_id_proto = {
+
+commit 074f528eed408b467516e142fa4c45e5b0d2ba16
+Author: Daniel Borkmann <daniel@iogearbox.net>
+Date:   Wed Apr 13 00:10:52 2016 +0200
+
+    bpf: convert relevant helper args to ARG_PTR_TO_RAW_STACK
+    
+    This patch converts all helpers that can use ARG_PTR_TO_RAW_STACK as argument
+    type. For tc programs this is bpf_skb_load_bytes(), bpf_skb_get_tunnel_key(),
+    bpf_skb_get_tunnel_opt(). For tracing, this optimizes bpf_get_current_comm()
+    and bpf_probe_read(). The check in bpf_skb_load_bytes() for MAX_BPF_STACK can
+    also be removed since the verifier already makes sure we stay within bounds
+    on stack buffers.
+    
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+    Acked-by: Alexei Starovoitov <ast@kernel.org>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/kernel/bpf/helpers.c b/kernel/bpf/helpers.c
+index 50da680c479f..ad7a0573f71b 100644
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -163,17 +163,26 @@ static u64 bpf_get_current_comm(u64 r1, u64 size, u64 r3, u64 r4, u64 r5)
+ 	struct task_struct *task = current;
+ 	char *buf = (char *) (long) r1;
+ 
+-	if (!task)
+-		return -EINVAL;
++	if (unlikely(!task))
++		goto err_clear;
+ 
+-	strlcpy(buf, task->comm, min_t(size_t, size, sizeof(task->comm)));
++	strncpy(buf, task->comm, size);
++
++	/* Verifier guarantees that size > 0. For task->comm exceeding
++	 * size, guarantee that buf is %NUL-terminated. Unconditionally
++	 * done here to save the size test.
++	 */
++	buf[size - 1] = 0;
+ 	return 0;
++err_clear:
++	memset(buf, 0, size);
++	return -EINVAL;
+ }
+ 
+ const struct bpf_func_proto bpf_get_current_comm_proto = {
+ 	.func		= bpf_get_current_comm,
+ 	.gpl_only	= false,
+ 	.ret_type	= RET_INTEGER,
+-	.arg1_type	= ARG_PTR_TO_STACK,
++	.arg1_type	= ARG_PTR_TO_RAW_STACK,
+ 	.arg2_type	= ARG_CONST_STACK_SIZE,
+ };
+
+commit cdc4e47da8f4c32eeb6b2061a8a834f4362a12b7
+Author: Alexei Starovoitov <ast@fb.com>
+Date:   Wed Mar 9 20:02:33 2016 -0800
+
+    bpf: avoid copying junk bytes in bpf_get_current_comm()
+    
+    Lots of places in the kernel use memcpy(buf, comm, TASK_COMM_LEN); but
+    the result is typically passed to print("%s", buf) and extra bytes
+    after zero don't cause any harm.
+    In bpf the result of bpf_get_current_comm() is used as the part of
+    map key and was causing spurious hash map mismatches.
+    Use strlcpy() to guarantee zero-terminated string.
+    bpf verifier checks that output buffer is zero-initialized,
+    so even for short task names the output buffer don't have junk bytes.
+    Note it's not a security concern, since kprobe+bpf is root only.
+    
+    Fixes: ffeedafbf023 ("bpf: introduce current->pid, tgid, uid, gid, comm accessors")
+    Reported-by: Tobias Waldekranz <tobias@waldekranz.com>
+    Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/kernel/bpf/helpers.c b/kernel/bpf/helpers.c
+index 4504ca66118d..50da680c479f 100644
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -166,7 +166,7 @@ static u64 bpf_get_current_comm(u64 r1, u64 size, u64 r3, u64 r4, u64 r5)
+ 	if (!task)
+ 		return -EINVAL;
+ 
+-	memcpy(buf, task->comm, min_t(size_t, size, sizeof(task->comm)));
++	strlcpy(buf, task->comm, min_t(size_t, size, sizeof(task->comm)));
+ 	return 0;
+ }
+ 
+
+commit 3ad0040573b0c00f88488bc31958acd07a55ee2e
+Author: Daniel Borkmann <daniel@iogearbox.net>
+Date:   Thu Oct 8 01:20:39 2015 +0200
+
+    bpf: split state from prandom_u32() and consolidate {c, e}BPF prngs
+    
+    While recently arguing on a seccomp discussion that raw prandom_u32()
+    access shouldn't be exposed to unpriviledged user space, I forgot the
+    fact that SKF_AD_RANDOM extension actually already does it for some time
+    in cBPF via commit 4cd3675ebf74 ("filter: added BPF random opcode").
+    
+    Since prandom_u32() is being used in a lot of critical networking code,
+    lets be more conservative and split their states. Furthermore, consolidate
+    eBPF and cBPF prandom handlers to use the new internal PRNG. For eBPF,
+    bpf_get_prandom_u32() was only accessible for priviledged users, but
+    should that change one day, we also don't want to leak raw sequences
+    through things like eBPF maps.
+    
+    One thought was also to have own per bpf_prog states, but due to ABI
+    reasons this is not easily possible, i.e. the program code currently
+    cannot access bpf_prog itself, and copying the rnd_state to/from the
+    stack scratch space whenever a program uses the prng seems not really
+    worth the trouble and seems too hacky. If needed, taus113 could in such
+    cases be implemented within eBPF using a map entry to keep the state
+    space, or get_random_bytes() could become a second helper in cases where
+    performance would not be critical.
+    
+    Both sides can trigger a one-time late init via prandom_init_once() on
+    the shared state. Performance-wise, there should even be a tiny gain
+    as bpf_user_rnd_u32() saves one function call. The PRNG needs to live
+    inside the BPF core since kernels could have a NET-less config as well.
+    
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+    Acked-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+    Acked-by: Alexei Starovoitov <ast@plumgrid.com>
+    Cc: Chema Gonzalez <chema@google.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/kernel/bpf/helpers.c b/kernel/bpf/helpers.c
+index 1447ec09421e..4504ca66118d 100644
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -93,13 +93,8 @@ const struct bpf_func_proto bpf_map_delete_elem_proto = {
+ 	.arg2_type	= ARG_PTR_TO_MAP_KEY,
+ };
+ 
+-static u64 bpf_get_prandom_u32(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5)
+-{
+-	return prandom_u32();
+-}
+-
+ const struct bpf_func_proto bpf_get_prandom_u32_proto = {
+-	.func		= bpf_get_prandom_u32,
++	.func		= bpf_user_rnd_u32,
+ 	.gpl_only	= false,
+ 	.ret_type	= RET_INTEGER,
+ };
+
+commit ffeedafbf0236f03aeb2e8db273b3e5ae5f5bc89
+Author: Alexei Starovoitov <ast@plumgrid.com>
+Date:   Fri Jun 12 19:39:12 2015 -0700
+
+    bpf: introduce current->pid, tgid, uid, gid, comm accessors
+    
+    eBPF programs attached to kprobes need to filter based on
+    current->pid, uid and other fields, so introduce helper functions:
+    
+    u64 bpf_get_current_pid_tgid(void)
+    Return: current->tgid << 32 | current->pid
+    
+    u64 bpf_get_current_uid_gid(void)
+    Return: current_gid << 32 | current_uid
+    
+    bpf_get_current_comm(char *buf, int size_of_buf)
+    stores current->comm into buf
+    
+    They can be used from the programs attached to TC as well to classify packets
+    based on current task fields.
+    
+    Update tracex2 example to print histogram of write syscalls for each process
+    instead of aggregated for all.
+    
+    Signed-off-by: Alexei Starovoitov <ast@plumgrid.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/kernel/bpf/helpers.c b/kernel/bpf/helpers.c
+index 7ad5d8842d5b..1447ec09421e 100644
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -14,6 +14,8 @@
+ #include <linux/random.h>
+ #include <linux/smp.h>
+ #include <linux/ktime.h>
++#include <linux/sched.h>
++#include <linux/uidgid.h>
+ 
+ /* If kernel subsystem is allowing eBPF programs to call this function,
+  * inside its own verifier_ops->get_func_proto() callback it should return
+@@ -124,3 +126,59 @@ const struct bpf_func_proto bpf_ktime_get_ns_proto = {
+ 	.gpl_only	= true,
+ 	.ret_type	= RET_INTEGER,
+ };
++
++static u64 bpf_get_current_pid_tgid(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5)
++{
++	struct task_struct *task = current;
++
++	if (!task)
++		return -EINVAL;
++
++	return (u64) task->tgid << 32 | task->pid;
++}
++
++const struct bpf_func_proto bpf_get_current_pid_tgid_proto = {
++	.func		= bpf_get_current_pid_tgid,
++	.gpl_only	= false,
++	.ret_type	= RET_INTEGER,
++};
++
++static u64 bpf_get_current_uid_gid(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5)
++{
++	struct task_struct *task = current;
++	kuid_t uid;
++	kgid_t gid;
++
++	if (!task)
++		return -EINVAL;
++
++	current_uid_gid(&uid, &gid);
++	return (u64) from_kgid(&init_user_ns, gid) << 32 |
++		from_kuid(&init_user_ns, uid);
++}
++
++const struct bpf_func_proto bpf_get_current_uid_gid_proto = {
++	.func		= bpf_get_current_uid_gid,
++	.gpl_only	= false,
++	.ret_type	= RET_INTEGER,
++};
++
++static u64 bpf_get_current_comm(u64 r1, u64 size, u64 r3, u64 r4, u64 r5)
++{
++	struct task_struct *task = current;
++	char *buf = (char *) (long) r1;
++
++	if (!task)
++		return -EINVAL;
++
++	memcpy(buf, task->comm, min_t(size_t, size, sizeof(task->comm)));
++	return 0;
++}
++
++const struct bpf_func_proto bpf_get_current_comm_proto = {
++	.func		= bpf_get_current_comm,
++	.gpl_only	= false,
++	.ret_type	= RET_INTEGER,
++	.arg1_type	= ARG_PTR_TO_STACK,
++	.arg2_type	= ARG_CONST_STACK_SIZE,
++};
+
+commit 3324b584b6f633a24550691c194600bcab7fc899
+Author: Daniel Borkmann <daniel@iogearbox.net>
+Date:   Fri May 29 23:23:07 2015 +0200
+
+    ebpf: misc core cleanup
+    
+    Besides others, move bpf_tail_call_proto to the remaining definitions
+    of other protos, improve comments a bit (i.e. remove some obvious ones,
+    where the code is already self-documenting, add objectives for others),
+    simplify bpf_prog_array_compatible() a bit.
+    
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+    Acked-by: Alexei Starovoitov <ast@plumgrid.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/kernel/bpf/helpers.c b/kernel/bpf/helpers.c
+index b3aaabdf9a50..7ad5d8842d5b 100644
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -45,11 +45,11 @@ static u64 bpf_map_lookup_elem(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5)
+ }
+ 
+ const struct bpf_func_proto bpf_map_lookup_elem_proto = {
+-	.func = bpf_map_lookup_elem,
+-	.gpl_only = false,
+-	.ret_type = RET_PTR_TO_MAP_VALUE_OR_NULL,
+-	.arg1_type = ARG_CONST_MAP_PTR,
+-	.arg2_type = ARG_PTR_TO_MAP_KEY,
++	.func		= bpf_map_lookup_elem,
++	.gpl_only	= false,
++	.ret_type	= RET_PTR_TO_MAP_VALUE_OR_NULL,
++	.arg1_type	= ARG_CONST_MAP_PTR,
++	.arg2_type	= ARG_PTR_TO_MAP_KEY,
+ };
+ 
+ static u64 bpf_map_update_elem(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5)
+@@ -64,13 +64,13 @@ static u64 bpf_map_update_elem(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5)
+ }
+ 
+ const struct bpf_func_proto bpf_map_update_elem_proto = {
+-	.func = bpf_map_update_elem,
+-	.gpl_only = false,
+-	.ret_type = RET_INTEGER,
+-	.arg1_type = ARG_CONST_MAP_PTR,
+-	.arg2_type = ARG_PTR_TO_MAP_KEY,
+-	.arg3_type = ARG_PTR_TO_MAP_VALUE,
+-	.arg4_type = ARG_ANYTHING,
++	.func		= bpf_map_update_elem,
++	.gpl_only	= false,
++	.ret_type	= RET_INTEGER,
++	.arg1_type	= ARG_CONST_MAP_PTR,
++	.arg2_type	= ARG_PTR_TO_MAP_KEY,
++	.arg3_type	= ARG_PTR_TO_MAP_VALUE,
++	.arg4_type	= ARG_ANYTHING,
+ };
+ 
+ static u64 bpf_map_delete_elem(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5)
+@@ -84,11 +84,11 @@ static u64 bpf_map_delete_elem(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5)
+ }
+ 
+ const struct bpf_func_proto bpf_map_delete_elem_proto = {
+-	.func = bpf_map_delete_elem,
+-	.gpl_only = false,
+-	.ret_type = RET_INTEGER,
+-	.arg1_type = ARG_CONST_MAP_PTR,
+-	.arg2_type = ARG_PTR_TO_MAP_KEY,
++	.func		= bpf_map_delete_elem,
++	.gpl_only	= false,
++	.ret_type	= RET_INTEGER,
++	.arg1_type	= ARG_CONST_MAP_PTR,
++	.arg2_type	= ARG_PTR_TO_MAP_KEY,
+ };
+ 
+ static u64 bpf_get_prandom_u32(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5)
+
+commit 17ca8cbf49be3aa94bb1c2b7ee6545fd70094eb4
+Author: Daniel Borkmann <daniel@iogearbox.net>
+Date:   Fri May 29 23:23:06 2015 +0200
+
+    ebpf: allow bpf_ktime_get_ns_proto also for networking
+    
+    As this is already exported from tracing side via commit d9847d310ab4
+    ("tracing: Allow BPF programs to call bpf_ktime_get_ns()"), we might
+    as well want to move it to the core, so also networking users can make
+    use of it, e.g. to measure diffs for certain flows from ingress/egress.
+    
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+    Cc: Alexei Starovoitov <ast@plumgrid.com>
+    Cc: Ingo Molnar <mingo@kernel.org>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/kernel/bpf/helpers.c b/kernel/bpf/helpers.c
+index bd7f5988ed9c..b3aaabdf9a50 100644
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -13,6 +13,7 @@
+ #include <linux/rcupdate.h>
+ #include <linux/random.h>
+ #include <linux/smp.h>
++#include <linux/ktime.h>
+ 
+ /* If kernel subsystem is allowing eBPF programs to call this function,
+  * inside its own verifier_ops->get_func_proto() callback it should return
+@@ -111,3 +112,15 @@ const struct bpf_func_proto bpf_get_smp_processor_id_proto = {
+ 	.gpl_only	= false,
+ 	.ret_type	= RET_INTEGER,
+ };
++
++static u64 bpf_ktime_get_ns(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5)
++{
++	/* NMI safe access to clock monotonic */
++	return ktime_get_mono_fast_ns();
++}
++
++const struct bpf_func_proto bpf_ktime_get_ns_proto = {
++	.func		= bpf_ktime_get_ns,
++	.gpl_only	= true,
++	.ret_type	= RET_INTEGER,
++};
+
+commit c04167ce2ca0ecaeaafef006cb0d65cf01b68e42
+Author: Daniel Borkmann <daniel@iogearbox.net>
+Date:   Sat Mar 14 02:27:17 2015 +0100
+
+    ebpf: add helper for obtaining current processor id
+    
+    This patch adds the possibility to obtain raw_smp_processor_id() in
+    eBPF. Currently, this is only possible in classic BPF where commit
+    da2033c28226 ("filter: add SKF_AD_RXHASH and SKF_AD_CPU") has added
+    facilities for this.
+    
+    Perhaps most importantly, this would also allow us to track per CPU
+    statistics with eBPF maps, or to implement a poor-man's per CPU data
+    structure through eBPF maps.
+    
+    Example function proto-type looks like:
+    
+      u32 (*smp_processor_id)(void) = (void *)BPF_FUNC_get_smp_processor_id;
+    
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/kernel/bpf/helpers.c b/kernel/bpf/helpers.c
+index 95eb59a045ea..bd7f5988ed9c 100644
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -12,6 +12,7 @@
+ #include <linux/bpf.h>
+ #include <linux/rcupdate.h>
+ #include <linux/random.h>
++#include <linux/smp.h>
+ 
+ /* If kernel subsystem is allowing eBPF programs to call this function,
+  * inside its own verifier_ops->get_func_proto() callback it should return
+@@ -99,3 +100,14 @@ const struct bpf_func_proto bpf_get_prandom_u32_proto = {
+ 	.gpl_only	= false,
+ 	.ret_type	= RET_INTEGER,
+ };
++
++static u64 bpf_get_smp_processor_id(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5)
++{
++	return raw_smp_processor_id();
++}
++
++const struct bpf_func_proto bpf_get_smp_processor_id_proto = {
++	.func		= bpf_get_smp_processor_id,
++	.gpl_only	= false,
++	.ret_type	= RET_INTEGER,
++};
+
+commit 03e69b508b6f7c51743055c9f61d1dfeadf4b635
+Author: Daniel Borkmann <daniel@iogearbox.net>
+Date:   Sat Mar 14 02:27:16 2015 +0100
+
+    ebpf: add prandom helper for packet sampling
+    
+    This work is similar to commit 4cd3675ebf74 ("filter: added BPF
+    random opcode") and adds a possibility for packet sampling in eBPF.
+    
+    Currently, this is only possible in classic BPF and useful to
+    combine sampling with f.e. packet sockets, possible also with tc.
+    
+    Example function proto-type looks like:
+    
+      u32 (*prandom_u32)(void) = (void *)BPF_FUNC_get_prandom_u32;
+    
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/kernel/bpf/helpers.c b/kernel/bpf/helpers.c
+index a3c7701a8b5e..95eb59a045ea 100644
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -11,6 +11,7 @@
+  */
+ #include <linux/bpf.h>
+ #include <linux/rcupdate.h>
++#include <linux/random.h>
+ 
+ /* If kernel subsystem is allowing eBPF programs to call this function,
+  * inside its own verifier_ops->get_func_proto() callback it should return
+@@ -87,3 +88,14 @@ const struct bpf_func_proto bpf_map_delete_elem_proto = {
+ 	.arg1_type = ARG_CONST_MAP_PTR,
+ 	.arg2_type = ARG_PTR_TO_MAP_KEY,
+ };
++
++static u64 bpf_get_prandom_u32(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5)
++{
++	return prandom_u32();
++}
++
++const struct bpf_func_proto bpf_get_prandom_u32_proto = {
++	.func		= bpf_get_prandom_u32,
++	.gpl_only	= false,
++	.ret_type	= RET_INTEGER,
++};
+
+commit a2c83fff582ae133d9f5bb187404ea9ce4da1f96
+Author: Daniel Borkmann <daniel@iogearbox.net>
+Date:   Sun Mar 1 12:31:42 2015 +0100
+
+    ebpf: constify various function pointer structs
+    
+    We can move bpf_map_ops and bpf_verifier_ops and other structs into ro
+    section, bpf_map_type_list and bpf_prog_type_list into read mostly.
+    
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+    Acked-by: Alexei Starovoitov <ast@plumgrid.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/kernel/bpf/helpers.c b/kernel/bpf/helpers.c
+index 9e3414d85459..a3c7701a8b5e 100644
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -41,7 +41,7 @@ static u64 bpf_map_lookup_elem(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5)
+ 	return (unsigned long) value;
+ }
+ 
+-struct bpf_func_proto bpf_map_lookup_elem_proto = {
++const struct bpf_func_proto bpf_map_lookup_elem_proto = {
+ 	.func = bpf_map_lookup_elem,
+ 	.gpl_only = false,
+ 	.ret_type = RET_PTR_TO_MAP_VALUE_OR_NULL,
+@@ -60,7 +60,7 @@ static u64 bpf_map_update_elem(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5)
+ 	return map->ops->map_update_elem(map, key, value, r4);
+ }
+ 
+-struct bpf_func_proto bpf_map_update_elem_proto = {
++const struct bpf_func_proto bpf_map_update_elem_proto = {
+ 	.func = bpf_map_update_elem,
+ 	.gpl_only = false,
+ 	.ret_type = RET_INTEGER,
+@@ -80,7 +80,7 @@ static u64 bpf_map_delete_elem(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5)
+ 	return map->ops->map_delete_elem(map, key);
+ }
+ 
+-struct bpf_func_proto bpf_map_delete_elem_proto = {
++const struct bpf_func_proto bpf_map_delete_elem_proto = {
+ 	.func = bpf_map_delete_elem,
+ 	.gpl_only = false,
+ 	.ret_type = RET_INTEGER,
+
+commit d0003ec01c667b731c139e23de3306a8b328ccf5
+Author: Alexei Starovoitov <ast@plumgrid.com>
+Date:   Thu Nov 13 17:36:49 2014 -0800
+
+    bpf: allow eBPF programs to use maps
+    
+    expose bpf_map_lookup_elem(), bpf_map_update_elem(), bpf_map_delete_elem()
+    map accessors to eBPF programs
+    
+    Signed-off-by: Alexei Starovoitov <ast@plumgrid.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/kernel/bpf/helpers.c b/kernel/bpf/helpers.c
+new file mode 100644
+index 000000000000..9e3414d85459
+--- /dev/null
++++ b/kernel/bpf/helpers.c
+@@ -0,0 +1,89 @@
++/* Copyright (c) 2011-2014 PLUMgrid, http://plumgrid.com
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of version 2 of the GNU General Public
++ * License as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
++ * General Public License for more details.
++ */
++#include <linux/bpf.h>
++#include <linux/rcupdate.h>
++
++/* If kernel subsystem is allowing eBPF programs to call this function,
++ * inside its own verifier_ops->get_func_proto() callback it should return
++ * bpf_map_lookup_elem_proto, so that verifier can properly check the arguments
++ *
++ * Different map implementations will rely on rcu in map methods
++ * lookup/update/delete, therefore eBPF programs must run under rcu lock
++ * if program is allowed to access maps, so check rcu_read_lock_held in
++ * all three functions.
++ */
++static u64 bpf_map_lookup_elem(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5)
++{
++	/* verifier checked that R1 contains a valid pointer to bpf_map
++	 * and R2 points to a program stack and map->key_size bytes were
++	 * initialized
++	 */
++	struct bpf_map *map = (struct bpf_map *) (unsigned long) r1;
++	void *key = (void *) (unsigned long) r2;
++	void *value;
++
++	WARN_ON_ONCE(!rcu_read_lock_held());
++
++	value = map->ops->map_lookup_elem(map, key);
++
++	/* lookup() returns either pointer to element value or NULL
++	 * which is the meaning of PTR_TO_MAP_VALUE_OR_NULL type
++	 */
++	return (unsigned long) value;
++}
++
++struct bpf_func_proto bpf_map_lookup_elem_proto = {
++	.func = bpf_map_lookup_elem,
++	.gpl_only = false,
++	.ret_type = RET_PTR_TO_MAP_VALUE_OR_NULL,
++	.arg1_type = ARG_CONST_MAP_PTR,
++	.arg2_type = ARG_PTR_TO_MAP_KEY,
++};
++
++static u64 bpf_map_update_elem(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5)
++{
++	struct bpf_map *map = (struct bpf_map *) (unsigned long) r1;
++	void *key = (void *) (unsigned long) r2;
++	void *value = (void *) (unsigned long) r3;
++
++	WARN_ON_ONCE(!rcu_read_lock_held());
++
++	return map->ops->map_update_elem(map, key, value, r4);
++}
++
++struct bpf_func_proto bpf_map_update_elem_proto = {
++	.func = bpf_map_update_elem,
++	.gpl_only = false,
++	.ret_type = RET_INTEGER,
++	.arg1_type = ARG_CONST_MAP_PTR,
++	.arg2_type = ARG_PTR_TO_MAP_KEY,
++	.arg3_type = ARG_PTR_TO_MAP_VALUE,
++	.arg4_type = ARG_ANYTHING,
++};
++
++static u64 bpf_map_delete_elem(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5)
++{
++	struct bpf_map *map = (struct bpf_map *) (unsigned long) r1;
++	void *key = (void *) (unsigned long) r2;
++
++	WARN_ON_ONCE(!rcu_read_lock_held());
++
++	return map->ops->map_delete_elem(map, key);
++}
++
++struct bpf_func_proto bpf_map_delete_elem_proto = {
++	.func = bpf_map_delete_elem,
++	.gpl_only = false,
++	.ret_type = RET_INTEGER,
++	.arg1_type = ARG_CONST_MAP_PTR,
++	.arg2_type = ARG_PTR_TO_MAP_KEY,
++};

@@ -1,0 +1,571 @@
+commit b05e75d611380881e73edc58a20fd8c6bb71720b
+Author: Johannes Weiner <hannes@cmpxchg.org>
+Date:   Mon Mar 16 15:13:31 2020 -0400
+
+    psi: Fix cpu.pressure for cpu.max and competing cgroups
+    
+    For simplicity, cpu pressure is defined as having more than one
+    runnable task on a given CPU. This works on the system-level, but it
+    has limitations in a cgrouped reality: When cpu.max is in use, it
+    doesn't capture the time in which a task is not executing on the CPU
+    due to throttling. Likewise, it doesn't capture the time in which a
+    competing cgroup is occupying the CPU - meaning it only reflects
+    cgroup-internal competitive pressure, not outside pressure.
+    
+    Enable tracking of currently executing tasks, and then change the
+    definition of cpu pressure in a cgroup from
+    
+            NR_RUNNING > 1
+    
+    to
+    
+            NR_RUNNING > ON_CPU
+    
+    which will capture the effects of cpu.max as well as competition from
+    outside the cgroup.
+    
+    After this patch, a cgroup running `stress -c 1` with a cpu.max
+    setting of 5000 10000 shows ~50% continuous CPU pressure.
+    
+    Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+    Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+    Link: https://lkml.kernel.org/r/20200316191333.115523-2-hannes@cmpxchg.org
+
+diff --git a/include/linux/psi_types.h b/include/linux/psi_types.h
+index 07aaf9b82241..4b7258495a04 100644
+--- a/include/linux/psi_types.h
++++ b/include/linux/psi_types.h
+@@ -14,13 +14,21 @@ enum psi_task_count {
+ 	NR_IOWAIT,
+ 	NR_MEMSTALL,
+ 	NR_RUNNING,
+-	NR_PSI_TASK_COUNTS = 3,
++	/*
++	 * This can't have values other than 0 or 1 and could be
++	 * implemented as a bit flag. But for now we still have room
++	 * in the first cacheline of psi_group_cpu, and this way we
++	 * don't have to special case any state tracking for it.
++	 */
++	NR_ONCPU,
++	NR_PSI_TASK_COUNTS = 4,
+ };
+ 
+ /* Task state bitmasks */
+ #define TSK_IOWAIT	(1 << NR_IOWAIT)
+ #define TSK_MEMSTALL	(1 << NR_MEMSTALL)
+ #define TSK_RUNNING	(1 << NR_RUNNING)
++#define TSK_ONCPU	(1 << NR_ONCPU)
+ 
+ /* Resources that workloads could be stalled on */
+ enum psi_res {
+
+commit 0e94682b73bfa6c44c98af7a26771c9c08c055d5
+Author: Suren Baghdasaryan <surenb@google.com>
+Date:   Tue May 14 15:41:15 2019 -0700
+
+    psi: introduce psi monitor
+    
+    Psi monitor aims to provide a low-latency short-term pressure detection
+    mechanism configurable by users.  It allows users to monitor psi metrics
+    growth and trigger events whenever a metric raises above user-defined
+    threshold within user-defined time window.
+    
+    Time window and threshold are both expressed in usecs.  Multiple psi
+    resources with different thresholds and window sizes can be monitored
+    concurrently.
+    
+    Psi monitors activate when system enters stall state for the monitored
+    psi metric and deactivate upon exit from the stall state.  While system
+    is in the stall state psi signal growth is monitored at a rate of 10
+    times per tracking window.  Min window size is 500ms, therefore the min
+    monitoring interval is 50ms.  Max window size is 10s with monitoring
+    interval of 1s.
+    
+    When activated psi monitor stays active for at least the duration of one
+    tracking window to avoid repeated activations/deactivations when psi
+    signal is bouncing.
+    
+    Notifications to the users are rate-limited to one per tracking window.
+    
+    Link: http://lkml.kernel.org/r/20190319235619.260832-8-surenb@google.com
+    Signed-off-by: Suren Baghdasaryan <surenb@google.com>
+    Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+    Cc: Dennis Zhou <dennis@kernel.org>
+    Cc: Ingo Molnar <mingo@redhat.com>
+    Cc: Jens Axboe <axboe@kernel.dk>
+    Cc: Li Zefan <lizefan@huawei.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Tejun Heo <tj@kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/include/linux/psi_types.h b/include/linux/psi_types.h
+index 4d1c1f67be18..07aaf9b82241 100644
+--- a/include/linux/psi_types.h
++++ b/include/linux/psi_types.h
+@@ -1,8 +1,11 @@
+ #ifndef _LINUX_PSI_TYPES_H
+ #define _LINUX_PSI_TYPES_H
+ 
++#include <linux/kthread.h>
+ #include <linux/seqlock.h>
+ #include <linux/types.h>
++#include <linux/kref.h>
++#include <linux/wait.h>
+ 
+ #ifdef CONFIG_PSI
+ 
+@@ -44,6 +47,12 @@ enum psi_states {
+ 	NR_PSI_STATES = 6,
+ };
+ 
++enum psi_aggregators {
++	PSI_AVGS = 0,
++	PSI_POLL,
++	NR_PSI_AGGREGATORS,
++};
++
+ struct psi_group_cpu {
+ 	/* 1st cacheline updated by the scheduler */
+ 
+@@ -65,7 +74,55 @@ struct psi_group_cpu {
+ 	/* 2nd cacheline updated by the aggregator */
+ 
+ 	/* Delta detection against the sampling buckets */
+-	u32 times_prev[NR_PSI_STATES] ____cacheline_aligned_in_smp;
++	u32 times_prev[NR_PSI_AGGREGATORS][NR_PSI_STATES]
++			____cacheline_aligned_in_smp;
++};
++
++/* PSI growth tracking window */
++struct psi_window {
++	/* Window size in ns */
++	u64 size;
++
++	/* Start time of the current window in ns */
++	u64 start_time;
++
++	/* Value at the start of the window */
++	u64 start_value;
++
++	/* Value growth in the previous window */
++	u64 prev_growth;
++};
++
++struct psi_trigger {
++	/* PSI state being monitored by the trigger */
++	enum psi_states state;
++
++	/* User-spacified threshold in ns */
++	u64 threshold;
++
++	/* List node inside triggers list */
++	struct list_head node;
++
++	/* Backpointer needed during trigger destruction */
++	struct psi_group *group;
++
++	/* Wait queue for polling */
++	wait_queue_head_t event_wait;
++
++	/* Pending event flag */
++	int event;
++
++	/* Tracking window */
++	struct psi_window win;
++
++	/*
++	 * Time last event was generated. Used for rate-limiting
++	 * events to one per window
++	 */
++	u64 last_event_time;
++
++	/* Refcounting to prevent premature destruction */
++	struct kref refcount;
+ };
+ 
+ struct psi_group {
+@@ -79,11 +136,32 @@ struct psi_group {
+ 	u64 avg_total[NR_PSI_STATES - 1];
+ 	u64 avg_last_update;
+ 	u64 avg_next_update;
++
++	/* Aggregator work control */
+ 	struct delayed_work avgs_work;
+ 
+ 	/* Total stall times and sampled pressure averages */
+-	u64 total[NR_PSI_STATES - 1];
++	u64 total[NR_PSI_AGGREGATORS][NR_PSI_STATES - 1];
+ 	unsigned long avg[NR_PSI_STATES - 1][3];
++
++	/* Monitor work control */
++	atomic_t poll_scheduled;
++	struct kthread_worker __rcu *poll_kworker;
++	struct kthread_delayed_work poll_work;
++
++	/* Protects data used by the monitor */
++	struct mutex trigger_lock;
++
++	/* Configured polling triggers */
++	struct list_head triggers;
++	u32 nr_triggers[NR_PSI_STATES - 1];
++	u32 poll_states;
++	u64 poll_min_period;
++
++	/* Total stall times at the start of monitor activation */
++	u64 polling_total[NR_PSI_STATES - 1];
++	u64 polling_next_update;
++	u64 polling_until;
+ };
+ 
+ #else /* CONFIG_PSI */
+
+commit bcc78db64168eb6dede056fed2999f75f7ace309
+Author: Suren Baghdasaryan <surenb@google.com>
+Date:   Tue May 14 15:41:02 2019 -0700
+
+    psi: rename psi fields in preparation for psi trigger addition
+    
+    Rename psi_group structure member fields used for calculating psi totals
+    and averages for clear distinction between them and for trigger-related
+    fields that will be added by "psi: introduce psi monitor".
+    
+    [surenb@google.com: v6]
+      Link: http://lkml.kernel.org/r/20190319235619.260832-4-surenb@google.com
+    Link: http://lkml.kernel.org/r/20190124211518.244221-5-surenb@google.com
+    Signed-off-by: Suren Baghdasaryan <surenb@google.com>
+    Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+    Cc: Dennis Zhou <dennis@kernel.org>
+    Cc: Ingo Molnar <mingo@redhat.com>
+    Cc: Jens Axboe <axboe@kernel.dk>
+    Cc: Li Zefan <lizefan@huawei.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Tejun Heo <tj@kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/include/linux/psi_types.h b/include/linux/psi_types.h
+index 762c6bb16f3c..4d1c1f67be18 100644
+--- a/include/linux/psi_types.h
++++ b/include/linux/psi_types.h
+@@ -69,17 +69,17 @@ struct psi_group_cpu {
+ };
+ 
+ struct psi_group {
+-	/* Protects data updated during an aggregation */
+-	struct mutex stat_lock;
++	/* Protects data used by the aggregator */
++	struct mutex avgs_lock;
+ 
+ 	/* Per-cpu task state & time tracking */
+ 	struct psi_group_cpu __percpu *pcpu;
+ 
+-	/* Periodic aggregation state */
+-	u64 total_prev[NR_PSI_STATES - 1];
+-	u64 last_update;
+-	u64 next_update;
+-	struct delayed_work clock_work;
++	/* Running pressure averages */
++	u64 avg_total[NR_PSI_STATES - 1];
++	u64 avg_last_update;
++	u64 avg_next_update;
++	struct delayed_work avgs_work;
+ 
+ 	/* Total stall times and sampled pressure averages */
+ 	u64 total[NR_PSI_STATES - 1];
+
+commit 33b2d6302abc4ccea1d9b3f095e2e27b02ca264e
+Author: Suren Baghdasaryan <surenb@google.com>
+Date:   Tue May 14 15:40:56 2019 -0700
+
+    psi: introduce state_mask to represent stalled psi states
+    
+    Patch series "psi: pressure stall monitors", v6.
+    
+    This is a respin of:
+      https://lwn.net/ml/linux-kernel/20190308184311.144521-1-surenb%40google.com/
+    
+    Android is adopting psi to detect and remedy memory pressure that
+    results in stuttering and decreased responsiveness on mobile devices.
+    
+    Psi gives us the stall information, but because we're dealing with
+    latencies in the millisecond range, periodically reading the pressure
+    files to detect stalls in a timely fashion is not feasible.  Psi also
+    doesn't aggregate its averages at a high-enough frequency right now.
+    
+    This patch series extends the psi interface such that users can
+    configure sensitive latency thresholds and use poll() and friends to be
+    notified when these are breached.
+    
+    As high-frequency aggregation is costly, it implements an aggregation
+    method that is optimized for fast, short-interval averaging, and makes
+    the aggregation frequency adaptive, such that high-frequency updates
+    only happen while monitored stall events are actively occurring.
+    
+    With these patches applied, Android can monitor for, and ward off,
+    mounting memory shortages before they cause problems for the user.  For
+    example, using memory stall monitors in userspace low memory killer
+    daemon (lmkd) we can detect mounting pressure and kill less important
+    processes before device becomes visibly sluggish.  In our memory stress
+    testing psi memory monitors produce roughly 10x less false positives
+    compared to vmpressure signals.  Having ability to specify multiple
+    triggers for the same psi metric allows other parts of Android framework
+    to monitor memory state of the device and act accordingly.
+    
+    The new interface is straight-forward.  The user opens one of the
+    pressure files for writing and writes a trigger description into the
+    file descriptor that defines the stall state - some or full, and the
+    maximum stall time over a given window of time.  E.g.:
+    
+            /* Signal when stall time exceeds 100ms of a 1s window */
+            char trigger[] = "full 100000 1000000"
+            fd = open("/proc/pressure/memory")
+            write(fd, trigger, sizeof(trigger))
+            while (poll() >= 0) {
+                    ...
+            };
+            close(fd);
+    
+    When the monitored stall state is entered, psi adapts its aggregation
+    frequency according to what the configured time window requires in order
+    to emit event signals in a timely fashion.  Once the stalling subsides,
+    aggregation reverts back to normal.
+    
+    The trigger is associated with the open file descriptor.  To stop
+    monitoring, the user only needs to close the file descriptor and the
+    trigger is discarded.
+    
+    Patches 1-6 prepare the psi code for polling support.  Patch 7
+    implements the adaptive polling logic, the pressure growth detection
+    optimized for short intervals, and hooks up write() and poll() on the
+    pressure files.
+    
+    The patches were developed in collaboration with Johannes Weiner.
+    
+    This patch (of 7):
+    
+    The psi monitoring patches will need to determine the same states as
+    record_times().  To avoid calculating them twice, maintain a state mask
+    that can be consulted cheaply.  Do this in a separate patch to keep the
+    churn in the main feature patch at a minimum.
+    
+    This adds 4-byte state_mask member into psi_group_cpu struct which
+    results in its first cacheline-aligned part becoming 52 bytes long.  Add
+    explicit values to enumeration element counters that affect
+    psi_group_cpu struct size.
+    
+    Link: http://lkml.kernel.org/r/20190124211518.244221-4-surenb@google.com
+    Signed-off-by: Suren Baghdasaryan <surenb@google.com>
+    Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+    Cc: Dennis Zhou <dennis@kernel.org>
+    Cc: Ingo Molnar <mingo@redhat.com>
+    Cc: Jens Axboe <axboe@kernel.dk>
+    Cc: Li Zefan <lizefan@huawei.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Tejun Heo <tj@kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/include/linux/psi_types.h b/include/linux/psi_types.h
+index 2cf422db5d18..762c6bb16f3c 100644
+--- a/include/linux/psi_types.h
++++ b/include/linux/psi_types.h
+@@ -11,7 +11,7 @@ enum psi_task_count {
+ 	NR_IOWAIT,
+ 	NR_MEMSTALL,
+ 	NR_RUNNING,
+-	NR_PSI_TASK_COUNTS,
++	NR_PSI_TASK_COUNTS = 3,
+ };
+ 
+ /* Task state bitmasks */
+@@ -24,7 +24,7 @@ enum psi_res {
+ 	PSI_IO,
+ 	PSI_MEM,
+ 	PSI_CPU,
+-	NR_PSI_RESOURCES,
++	NR_PSI_RESOURCES = 3,
+ };
+ 
+ /*
+@@ -41,7 +41,7 @@ enum psi_states {
+ 	PSI_CPU_SOME,
+ 	/* Only per-CPU, to weigh the CPU in the global average: */
+ 	PSI_NONIDLE,
+-	NR_PSI_STATES,
++	NR_PSI_STATES = 6,
+ };
+ 
+ struct psi_group_cpu {
+@@ -53,6 +53,9 @@ struct psi_group_cpu {
+ 	/* States of the tasks belonging to this group */
+ 	unsigned int tasks[NR_PSI_TASK_COUNTS];
+ 
++	/* Aggregate pressure state derived from the tasks */
++	u32 state_mask;
++
+ 	/* Period time sampling buckets for each state of interest (ns) */
+ 	u32 times[NR_PSI_STATES];
+ 
+
+commit eb414681d5a07d28d2ff90dc05f69ec6b232ebd2
+Author: Johannes Weiner <hannes@cmpxchg.org>
+Date:   Fri Oct 26 15:06:27 2018 -0700
+
+    psi: pressure stall information for CPU, memory, and IO
+    
+    When systems are overcommitted and resources become contended, it's hard
+    to tell exactly the impact this has on workload productivity, or how close
+    the system is to lockups and OOM kills.  In particular, when machines work
+    multiple jobs concurrently, the impact of overcommit in terms of latency
+    and throughput on the individual job can be enormous.
+    
+    In order to maximize hardware utilization without sacrificing individual
+    job health or risk complete machine lockups, this patch implements a way
+    to quantify resource pressure in the system.
+    
+    A kernel built with CONFIG_PSI=y creates files in /proc/pressure/ that
+    expose the percentage of time the system is stalled on CPU, memory, or IO,
+    respectively.  Stall states are aggregate versions of the per-task delay
+    accounting delays:
+    
+           cpu: some tasks are runnable but not executing on a CPU
+           memory: tasks are reclaiming, or waiting for swapin or thrashing cache
+           io: tasks are waiting for io completions
+    
+    These percentages of walltime can be thought of as pressure percentages,
+    and they give a general sense of system health and productivity loss
+    incurred by resource overcommit.  They can also indicate when the system
+    is approaching lockup scenarios and OOMs.
+    
+    To do this, psi keeps track of the task states associated with each CPU
+    and samples the time they spend in stall states.  Every 2 seconds, the
+    samples are averaged across CPUs - weighted by the CPUs' non-idle time to
+    eliminate artifacts from unused CPUs - and translated into percentages of
+    walltime.  A running average of those percentages is maintained over 10s,
+    1m, and 5m periods (similar to the loadaverage).
+    
+    [hannes@cmpxchg.org: doc fixlet, per Randy]
+      Link: http://lkml.kernel.org/r/20180828205625.GA14030@cmpxchg.org
+    [hannes@cmpxchg.org: code optimization]
+      Link: http://lkml.kernel.org/r/20180907175015.GA8479@cmpxchg.org
+    [hannes@cmpxchg.org: rename psi_clock() to psi_update_work(), per Peter]
+      Link: http://lkml.kernel.org/r/20180907145404.GB11088@cmpxchg.org
+    [hannes@cmpxchg.org: fix build]
+      Link: http://lkml.kernel.org/r/20180913014222.GA2370@cmpxchg.org
+    Link: http://lkml.kernel.org/r/20180828172258.3185-9-hannes@cmpxchg.org
+    Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+    Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+    Tested-by: Daniel Drake <drake@endlessm.com>
+    Tested-by: Suren Baghdasaryan <surenb@google.com>
+    Cc: Christopher Lameter <cl@linux.com>
+    Cc: Ingo Molnar <mingo@redhat.com>
+    Cc: Johannes Weiner <jweiner@fb.com>
+    Cc: Mike Galbraith <efault@gmx.de>
+    Cc: Peter Enderborg <peter.enderborg@sony.com>
+    Cc: Randy Dunlap <rdunlap@infradead.org>
+    Cc: Shakeel Butt <shakeelb@google.com>
+    Cc: Tejun Heo <tj@kernel.org>
+    Cc: Vinayak Menon <vinmenon@codeaurora.org>
+    Cc: Randy Dunlap <rdunlap@infradead.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/include/linux/psi_types.h b/include/linux/psi_types.h
+new file mode 100644
+index 000000000000..2cf422db5d18
+--- /dev/null
++++ b/include/linux/psi_types.h
+@@ -0,0 +1,92 @@
++#ifndef _LINUX_PSI_TYPES_H
++#define _LINUX_PSI_TYPES_H
++
++#include <linux/seqlock.h>
++#include <linux/types.h>
++
++#ifdef CONFIG_PSI
++
++/* Tracked task states */
++enum psi_task_count {
++	NR_IOWAIT,
++	NR_MEMSTALL,
++	NR_RUNNING,
++	NR_PSI_TASK_COUNTS,
++};
++
++/* Task state bitmasks */
++#define TSK_IOWAIT	(1 << NR_IOWAIT)
++#define TSK_MEMSTALL	(1 << NR_MEMSTALL)
++#define TSK_RUNNING	(1 << NR_RUNNING)
++
++/* Resources that workloads could be stalled on */
++enum psi_res {
++	PSI_IO,
++	PSI_MEM,
++	PSI_CPU,
++	NR_PSI_RESOURCES,
++};
++
++/*
++ * Pressure states for each resource:
++ *
++ * SOME: Stalled tasks & working tasks
++ * FULL: Stalled tasks & no working tasks
++ */
++enum psi_states {
++	PSI_IO_SOME,
++	PSI_IO_FULL,
++	PSI_MEM_SOME,
++	PSI_MEM_FULL,
++	PSI_CPU_SOME,
++	/* Only per-CPU, to weigh the CPU in the global average: */
++	PSI_NONIDLE,
++	NR_PSI_STATES,
++};
++
++struct psi_group_cpu {
++	/* 1st cacheline updated by the scheduler */
++
++	/* Aggregator needs to know of concurrent changes */
++	seqcount_t seq ____cacheline_aligned_in_smp;
++
++	/* States of the tasks belonging to this group */
++	unsigned int tasks[NR_PSI_TASK_COUNTS];
++
++	/* Period time sampling buckets for each state of interest (ns) */
++	u32 times[NR_PSI_STATES];
++
++	/* Time of last task change in this group (rq_clock) */
++	u64 state_start;
++
++	/* 2nd cacheline updated by the aggregator */
++
++	/* Delta detection against the sampling buckets */
++	u32 times_prev[NR_PSI_STATES] ____cacheline_aligned_in_smp;
++};
++
++struct psi_group {
++	/* Protects data updated during an aggregation */
++	struct mutex stat_lock;
++
++	/* Per-cpu task state & time tracking */
++	struct psi_group_cpu __percpu *pcpu;
++
++	/* Periodic aggregation state */
++	u64 total_prev[NR_PSI_STATES - 1];
++	u64 last_update;
++	u64 next_update;
++	struct delayed_work clock_work;
++
++	/* Total stall times and sampled pressure averages */
++	u64 total[NR_PSI_STATES - 1];
++	unsigned long avg[NR_PSI_STATES - 1][3];
++};
++
++#else /* CONFIG_PSI */
++
++struct psi_group { };
++
++#endif /* CONFIG_PSI */
++
++#endif /* _LINUX_PSI_TYPES_H */

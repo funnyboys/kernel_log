@@ -1,0 +1,3216 @@
+commit c8790d657b0a8d42801fb4536f6f106b4b6306e8
+Author: Paul Burton <paul.burton@mips.com>
+Date:   Sat Feb 2 01:43:28 2019 +0000
+
+    MIPS: MemoryMapID (MMID) Support
+    
+    Introduce support for using MemoryMapIDs (MMIDs) as an alternative to
+    Address Space IDs (ASIDs). The major difference between the two is that
+    MMIDs are global - ie. an MMID uniquely identifies an address space
+    across all coherent CPUs. In contrast ASIDs are non-global per-CPU IDs,
+    wherein each address space is allocated a separate ASID for each CPU
+    upon which it is used. This global namespace allows a new GINVT
+    instruction be used to globally invalidate TLB entries associated with a
+    particular MMID across all coherent CPUs in the system, removing the
+    need for IPIs to invalidate entries with separate ASIDs on each CPU.
+    
+    The allocation scheme used here is largely borrowed from arm64 (see
+    arch/arm64/mm/context.c). In essence we maintain a bitmap to track
+    available MMIDs, and MMIDs in active use at the time of a rollover to a
+    new MMID version are preserved in the new version. The allocation scheme
+    requires efficient 64 bit atomics in order to perform reasonably, so
+    this support depends upon CONFIG_GENERIC_ATOMIC64=n (ie. currently it
+    will only be included in MIPS64 kernels).
+    
+    The first, and currently only, available CPU with support for MMIDs is
+    the MIPS I6500. This CPU supports 16 bit MMIDs, and so for now we cap
+    our MMIDs to 16 bits wide in order to prevent the bitmap growing to
+    absurd sizes if any future CPU does implement 32 bit MMIDs as the
+    architecture manuals suggest is recommended.
+    
+    When MMIDs are in use we also make use of GINVT instruction which is
+    available due to the global nature of MMIDs. By executing a sequence of
+    GINVT & SYNC 0x14 instructions we can avoid the overhead of an IPI to
+    each remote CPU in many cases. One complication is that GINVT will
+    invalidate wired entries (in all cases apart from type 0, which targets
+    the entire TLB). In order to avoid GINVT invalidating any wired TLB
+    entries we set up, we make sure to create those entries using a reserved
+    MMID (0) that we never associate with any address space.
+    
+    Also of note is that KVM will require further work in order to support
+    MMIDs & GINVT, since KVM is involved in allocating IDs for guests & in
+    configuring the MMU. That work is not part of this patch, so for now
+    when MMIDs are in use KVM is disabled.
+    
+    Signed-off-by: Paul Burton <paul.burton@mips.com>
+    Cc: linux-mips@vger.kernel.org
+
+diff --git a/arch/mips/include/asm/mmu_context.h b/arch/mips/include/asm/mmu_context.h
+index a0f29df8ced8..cddead91acd4 100644
+--- a/arch/mips/include/asm/mmu_context.h
++++ b/arch/mips/include/asm/mmu_context.h
+@@ -17,8 +17,10 @@
+ #include <linux/smp.h>
+ #include <linux/slab.h>
+ 
++#include <asm/barrier.h>
+ #include <asm/cacheflush.h>
+ #include <asm/dsemul.h>
++#include <asm/ginvt.h>
+ #include <asm/hazards.h>
+ #include <asm/tlbflush.h>
+ #include <asm-generic/mm_hooks.h>
+@@ -72,6 +74,19 @@ extern unsigned long pgd_current[];
+ 	TLBMISS_HANDLER_SETUP_PGD(swapper_pg_dir)
+ #endif /* CONFIG_MIPS_PGD_C0_CONTEXT*/
+ 
++/*
++ * The ginvt instruction will invalidate wired entries when its type field
++ * targets anything other than the entire TLB. That means that if we were to
++ * allow the kernel to create wired entries with the MMID of current->active_mm
++ * then those wired entries could be invalidated when we later use ginvt to
++ * invalidate TLB entries with that MMID.
++ *
++ * In order to prevent ginvt from trashing wired entries, we reserve one MMID
++ * for use by the kernel when creating wired entries. This MMID will never be
++ * assigned to a struct mm, and we'll never target it with a ginvt instruction.
++ */
++#define MMID_KERNEL_WIRED	0
++
+ /*
+  *  All unused by hardware upper bits will be considered
+  *  as a software asid extension.
+@@ -90,13 +105,19 @@ static inline u64 asid_first_version(unsigned int cpu)
+ 
+ static inline u64 cpu_context(unsigned int cpu, const struct mm_struct *mm)
+ {
++	if (cpu_has_mmid)
++		return atomic64_read(&mm->context.mmid);
++
+ 	return mm->context.asid[cpu];
+ }
+ 
+ static inline void set_cpu_context(unsigned int cpu,
+ 				   struct mm_struct *mm, u64 ctx)
+ {
+-	mm->context.asid[cpu] = ctx;
++	if (cpu_has_mmid)
++		atomic64_set(&mm->context.mmid, ctx);
++	else
++		mm->context.asid[cpu] = ctx;
+ }
+ 
+ #define asid_cache(cpu)		(cpu_data[cpu].asid_cache)
+@@ -120,8 +141,12 @@ init_new_context(struct task_struct *tsk, struct mm_struct *mm)
+ {
+ 	int i;
+ 
+-	for_each_possible_cpu(i)
+-		set_cpu_context(i, mm, 0);
++	if (cpu_has_mmid) {
++		set_cpu_context(0, mm, 0);
++	} else {
++		for_each_possible_cpu(i)
++			set_cpu_context(i, mm, 0);
++	}
+ 
+ 	mm->context.bd_emupage_allocmap = NULL;
+ 	spin_lock_init(&mm->context.bd_emupage_lock);
+@@ -168,12 +193,33 @@ drop_mmu_context(struct mm_struct *mm)
+ {
+ 	unsigned long flags;
+ 	unsigned int cpu;
++	u32 old_mmid;
++	u64 ctx;
+ 
+ 	local_irq_save(flags);
+ 
+ 	cpu = smp_processor_id();
+-	if (!cpu_context(cpu, mm)) {
++	ctx = cpu_context(cpu, mm);
++
++	if (!ctx) {
+ 		/* no-op */
++	} else if (cpu_has_mmid) {
++		/*
++		 * Globally invalidating TLB entries associated with the MMID
++		 * is pretty cheap using the GINVT instruction, so we'll do
++		 * that rather than incur the overhead of allocating a new
++		 * MMID. The latter would be especially difficult since MMIDs
++		 * are global & other CPUs may be actively using ctx.
++		 */
++		htw_stop();
++		old_mmid = read_c0_memorymapid();
++		write_c0_memorymapid(ctx & cpu_asid_mask(&cpu_data[cpu]));
++		mtc0_tlbw_hazard();
++		ginvt_mmid();
++		sync_ginv();
++		write_c0_memorymapid(old_mmid);
++		instruction_hazard();
++		htw_start();
+ 	} else if (cpumask_test_cpu(cpu, mm_cpumask(mm))) {
+ 		/*
+ 		 * mm is currently active, so we can't really drop it.
+
+commit 0b317c389c6771cbe1c5a12fe9322285a808a9bd
+Author: Paul Burton <paul.burton@mips.com>
+Date:   Sat Feb 2 01:43:25 2019 +0000
+
+    MIPS: mm: Add set_cpu_context() for ASID assignments
+    
+    When we gain MMID support we'll be storing MMIDs as atomic64_t values
+    and accessing them via atomic64_* functions. This necessitates that we
+    don't use cpu_context() as the left hand side of an assignment, ie. as a
+    modifiable lvalue. In preparation for this introduce a new
+    set_cpu_context() function & replace all assignments with cpu_context()
+    on their left hand side with an equivalent call to set_cpu_context().
+    
+    To enforce that cpu_context() should not be used for assignments, we
+    rewrite it as a static inline function.
+    
+    Signed-off-by: Paul Burton <paul.burton@mips.com>
+    Cc: linux-mips@vger.kernel.org
+
+diff --git a/arch/mips/include/asm/mmu_context.h b/arch/mips/include/asm/mmu_context.h
+index 336682fb48de..a0f29df8ced8 100644
+--- a/arch/mips/include/asm/mmu_context.h
++++ b/arch/mips/include/asm/mmu_context.h
+@@ -88,7 +88,17 @@ static inline u64 asid_first_version(unsigned int cpu)
+ 	return ~asid_version_mask(cpu) + 1;
+ }
+ 
+-#define cpu_context(cpu, mm)	((mm)->context.asid[cpu])
++static inline u64 cpu_context(unsigned int cpu, const struct mm_struct *mm)
++{
++	return mm->context.asid[cpu];
++}
++
++static inline void set_cpu_context(unsigned int cpu,
++				   struct mm_struct *mm, u64 ctx)
++{
++	mm->context.asid[cpu] = ctx;
++}
++
+ #define asid_cache(cpu)		(cpu_data[cpu].asid_cache)
+ #define cpu_asid(cpu, mm) \
+ 	(cpu_context((cpu), (mm)) & cpu_asid_mask(&cpu_data[cpu]))
+@@ -111,7 +121,7 @@ init_new_context(struct task_struct *tsk, struct mm_struct *mm)
+ 	int i;
+ 
+ 	for_each_possible_cpu(i)
+-		cpu_context(i, mm) = 0;
++		set_cpu_context(i, mm, 0);
+ 
+ 	mm->context.bd_emupage_allocmap = NULL;
+ 	spin_lock_init(&mm->context.bd_emupage_lock);
+@@ -175,7 +185,7 @@ drop_mmu_context(struct mm_struct *mm)
+ 		htw_start();
+ 	} else {
+ 		/* will get a new context next time */
+-		cpu_context(cpu, mm) = 0;
++		set_cpu_context(cpu, mm, 0);
+ 	}
+ 
+ 	local_irq_restore(flags);
+
+commit 42d5b846574f0904dbaf9dbdea4f19402589cddf
+Author: Paul Burton <paul.burton@mips.com>
+Date:   Sat Feb 2 01:43:25 2019 +0000
+
+    MIPS: mm: Unify ASID version checks
+    
+    Introduce a new check_mmu_context() function to check an mm's ASID
+    version & get a new one if it's outdated, and a
+    check_switch_mmu_context() function which additionally sets up the new
+    ASID & page directory. Simplify switch_mm() & various
+    get_new_mmu_context() callsites in MIPS KVM by making use of the new
+    functions, which will help reduce the amount of code that requires
+    modification to gain MMID support.
+    
+    Signed-off-by: Paul Burton <paul.burton@mips.com>
+    Cc: linux-mips@vger.kernel.org
+
+diff --git a/arch/mips/include/asm/mmu_context.h b/arch/mips/include/asm/mmu_context.h
+index cb39a39d02f6..336682fb48de 100644
+--- a/arch/mips/include/asm/mmu_context.h
++++ b/arch/mips/include/asm/mmu_context.h
+@@ -98,6 +98,8 @@ static inline void enter_lazy_tlb(struct mm_struct *mm, struct task_struct *tsk)
+ }
+ 
+ extern void get_new_mmu_context(struct mm_struct *mm);
++extern void check_mmu_context(struct mm_struct *mm);
++extern void check_switch_mmu_context(struct mm_struct *mm);
+ 
+ /*
+  * Initialize the context related info for a new mm_struct
+@@ -126,11 +128,7 @@ static inline void switch_mm(struct mm_struct *prev, struct mm_struct *next,
+ 	local_irq_save(flags);
+ 
+ 	htw_stop();
+-	/* Check if our ASID is of an older version and thus invalid */
+-	if ((cpu_context(cpu, next) ^ asid_cache(cpu)) & asid_version_mask(cpu))
+-		get_new_mmu_context(next);
+-	write_c0_entryhi(cpu_asid(cpu, next));
+-	TLBMISS_HANDLER_SETUP_PGD(next->pgd);
++	check_switch_mmu_context(next);
+ 
+ 	/*
+ 	 * Mark current->active_mm as not "active" anymore.
+
+commit 4ebea49ce233ce76421250f113a75d6d33c90e22
+Author: Paul Burton <paul.burton@mips.com>
+Date:   Sat Feb 2 01:43:24 2019 +0000
+
+    MIPS: mm: Un-inline get_new_mmu_context
+    
+    In preparation for adding MMID support to get_new_mmu_context() which
+    will increase the size of the function somewhat, move it from
+    asm/mmu_context.h into a C file.
+    
+    Signed-off-by: Paul Burton <paul.burton@mips.com>
+    Cc: linux-mips@vger.kernel.org
+
+diff --git a/arch/mips/include/asm/mmu_context.h b/arch/mips/include/asm/mmu_context.h
+index 752ebda82cdd..cb39a39d02f6 100644
+--- a/arch/mips/include/asm/mmu_context.h
++++ b/arch/mips/include/asm/mmu_context.h
+@@ -97,25 +97,7 @@ static inline void enter_lazy_tlb(struct mm_struct *mm, struct task_struct *tsk)
+ {
+ }
+ 
+-
+-/* Normal, classic MIPS get_new_mmu_context */
+-static inline void
+-get_new_mmu_context(struct mm_struct *mm)
+-{
+-	unsigned int cpu;
+-	u64 asid;
+-
+-	cpu = smp_processor_id();
+-	asid = asid_cache(cpu);
+-
+-	if (!((asid += cpu_asid_inc()) & cpu_asid_mask(&cpu_data[cpu]))) {
+-		if (cpu_has_vtag_icache)
+-			flush_icache_all();
+-		local_flush_tlb_all();	/* start new asid cycle */
+-	}
+-
+-	cpu_context(cpu, mm) = asid_cache(cpu) = asid;
+-}
++extern void get_new_mmu_context(struct mm_struct *mm);
+ 
+ /*
+  * Initialize the context related info for a new mm_struct
+
+commit 6067d47e36f4a3aa691f7b1f91e438cd289ecb8f
+Author: Paul Burton <paul.burton@mips.com>
+Date:   Sat Feb 2 01:43:20 2019 +0000
+
+    MIPS: mm: Move drop_mmu_context() comment into appropriate block
+    
+    drop_mmu_context() is preceded by a comment indicating what happens if
+    the mm provided is currently active on the local CPU. Move that comment
+    into the block that executes in this case, adjusting slightly to reflect
+    its new location.
+    
+    Signed-off-by: Paul Burton <paul.burton@mips.com>
+    Cc: linux-mips@vger.kernel.org
+
+diff --git a/arch/mips/include/asm/mmu_context.h b/arch/mips/include/asm/mmu_context.h
+index 1b8392dcd354..752ebda82cdd 100644
+--- a/arch/mips/include/asm/mmu_context.h
++++ b/arch/mips/include/asm/mmu_context.h
+@@ -173,10 +173,6 @@ static inline void destroy_context(struct mm_struct *mm)
+ #define activate_mm(prev, next)	switch_mm(prev, next, current)
+ #define deactivate_mm(tsk, mm)	do { } while (0)
+ 
+-/*
+- * If mm is currently active_mm, we can't really drop it.  Instead,
+- * we will get a new one for it.
+- */
+ static inline void
+ drop_mmu_context(struct mm_struct *mm)
+ {
+@@ -188,7 +184,11 @@ drop_mmu_context(struct mm_struct *mm)
+ 	cpu = smp_processor_id();
+ 	if (!cpu_context(cpu, mm)) {
+ 		/* no-op */
+-	} else if (cpumask_test_cpu(cpu, mm_cpumask(mm)))  {
++	} else if (cpumask_test_cpu(cpu, mm_cpumask(mm))) {
++		/*
++		 * mm is currently active, so we can't really drop it.
++		 * Instead we bump the ASID.
++		 */
+ 		htw_stop();
+ 		get_new_mmu_context(mm);
+ 		write_c0_entryhi(cpu_asid(cpu, mm));
+
+commit c9b2a3dc240c444b4f7b556e2cce756828720856
+Author: Paul Burton <paul.burton@mips.com>
+Date:   Sat Feb 2 01:43:19 2019 +0000
+
+    MIPS: mm: Consolidate drop_mmu_context() has-ASID checks
+    
+    If an mm does not have an ASID on the local CPU then drop_mmu_context()
+    is always redundant, since there's no context to "drop". Various callers
+    of drop_mmu_context() check whether the mm has been allocated an ASID
+    before making the call. Move that check into drop_mmu_context() and
+    remove it from callers to simplify them.
+    
+    Signed-off-by: Paul Burton <paul.burton@mips.com>
+    Cc: linux-mips@vger.kernel.org
+
+diff --git a/arch/mips/include/asm/mmu_context.h b/arch/mips/include/asm/mmu_context.h
+index 5d0a73a5cf40..1b8392dcd354 100644
+--- a/arch/mips/include/asm/mmu_context.h
++++ b/arch/mips/include/asm/mmu_context.h
+@@ -186,7 +186,9 @@ drop_mmu_context(struct mm_struct *mm)
+ 	local_irq_save(flags);
+ 
+ 	cpu = smp_processor_id();
+-	if (cpumask_test_cpu(cpu, mm_cpumask(mm)))  {
++	if (!cpu_context(cpu, mm)) {
++		/* no-op */
++	} else if (cpumask_test_cpu(cpu, mm_cpumask(mm)))  {
+ 		htw_stop();
+ 		get_new_mmu_context(mm);
+ 		write_c0_entryhi(cpu_asid(cpu, mm));
+
+commit 67741ba3ba006558ac3541488c1db9dff9507e73
+Author: Paul Burton <paul.burton@mips.com>
+Date:   Sat Feb 2 01:43:18 2019 +0000
+
+    MIPS: mm: Avoid HTW stop/start when dropping an inactive mm
+    
+    If drop_mmu_context() is called with an mm that is not currently active
+    on the local CPU then there's no need for us to stop & start a hardware
+    page table walker because it can't be fetching entries for the ASID
+    corresponding to the mm we're operating on.
+    
+    Move the htw_stop() & htw_start() calls into the block which we run only
+    if the mm is currently active, in order to avoid the redundant work.
+    
+    Signed-off-by: Paul Burton <paul.burton@mips.com>
+    Cc: linux-mips@vger.kernel.org
+
+diff --git a/arch/mips/include/asm/mmu_context.h b/arch/mips/include/asm/mmu_context.h
+index 0d050d781737..5d0a73a5cf40 100644
+--- a/arch/mips/include/asm/mmu_context.h
++++ b/arch/mips/include/asm/mmu_context.h
+@@ -184,17 +184,18 @@ drop_mmu_context(struct mm_struct *mm)
+ 	unsigned int cpu;
+ 
+ 	local_irq_save(flags);
+-	htw_stop();
+ 
+ 	cpu = smp_processor_id();
+ 	if (cpumask_test_cpu(cpu, mm_cpumask(mm)))  {
++		htw_stop();
+ 		get_new_mmu_context(mm);
+ 		write_c0_entryhi(cpu_asid(cpu, mm));
++		htw_start();
+ 	} else {
+ 		/* will get a new context next time */
+ 		cpu_context(cpu, mm) = 0;
+ 	}
+-	htw_start();
++
+ 	local_irq_restore(flags);
+ }
+ 
+
+commit 4739f7dd99d757fb719e1173b4d2bcfc0f93e52d
+Author: Paul Burton <paul.burton@mips.com>
+Date:   Sat Feb 2 01:43:17 2019 +0000
+
+    MIPS: mm: Remove redundant get_new_mmu_context() cpu argument
+    
+    get_new_mmu_context() accepts a cpu argument, but implicitly assumes
+    that this is always equal to smp_processor_id() by operating on the
+    local CPU's TLB & icache.
+    
+    Remove the cpu argument and have get_new_mmu_context() call
+    smp_processor_id() instead.
+    
+    Signed-off-by: Paul Burton <paul.burton@mips.com>
+    Cc: linux-mips@vger.kernel.org
+
+diff --git a/arch/mips/include/asm/mmu_context.h b/arch/mips/include/asm/mmu_context.h
+index dc45690cbbf5..0d050d781737 100644
+--- a/arch/mips/include/asm/mmu_context.h
++++ b/arch/mips/include/asm/mmu_context.h
+@@ -100,9 +100,13 @@ static inline void enter_lazy_tlb(struct mm_struct *mm, struct task_struct *tsk)
+ 
+ /* Normal, classic MIPS get_new_mmu_context */
+ static inline void
+-get_new_mmu_context(struct mm_struct *mm, unsigned long cpu)
++get_new_mmu_context(struct mm_struct *mm)
+ {
+-	u64 asid = asid_cache(cpu);
++	unsigned int cpu;
++	u64 asid;
++
++	cpu = smp_processor_id();
++	asid = asid_cache(cpu);
+ 
+ 	if (!((asid += cpu_asid_inc()) & cpu_asid_mask(&cpu_data[cpu]))) {
+ 		if (cpu_has_vtag_icache)
+@@ -142,7 +146,7 @@ static inline void switch_mm(struct mm_struct *prev, struct mm_struct *next,
+ 	htw_stop();
+ 	/* Check if our ASID is of an older version and thus invalid */
+ 	if ((cpu_context(cpu, next) ^ asid_cache(cpu)) & asid_version_mask(cpu))
+-		get_new_mmu_context(next, cpu);
++		get_new_mmu_context(next);
+ 	write_c0_entryhi(cpu_asid(cpu, next));
+ 	TLBMISS_HANDLER_SETUP_PGD(next->pgd);
+ 
+@@ -184,7 +188,7 @@ drop_mmu_context(struct mm_struct *mm)
+ 
+ 	cpu = smp_processor_id();
+ 	if (cpumask_test_cpu(cpu, mm_cpumask(mm)))  {
+-		get_new_mmu_context(mm, cpu);
++		get_new_mmu_context(mm);
+ 		write_c0_entryhi(cpu_asid(cpu, mm));
+ 	} else {
+ 		/* will get a new context next time */
+
+commit 9a27324fde5d67cbadafff8f24ad65c49376f1f0
+Author: Paul Burton <paul.burton@mips.com>
+Date:   Sat Feb 2 01:43:16 2019 +0000
+
+    MIPS: mm: Remove redundant drop_mmu_context() cpu argument
+    
+    The drop_mmu_context() function accepts a cpu argument, but it
+    implicitly expects that this is always equal to smp_processor_id() by
+    allocating & configuring an ASID on the local CPU when the mm is active
+    on the CPU indicated by the cpu argument.
+    
+    All callers do provide the value of smp_processor_id() to the cpu
+    argument.
+    
+    Remove the redundant argument and have drop_mmu_context() call
+    smp_processor_id() itself, making it clearer that the cpu variable
+    always represents the local CPU.
+    
+    Signed-off-by: Paul Burton <paul.burton@mips.com>
+    Cc: linux-mips@vger.kernel.org
+
+diff --git a/arch/mips/include/asm/mmu_context.h b/arch/mips/include/asm/mmu_context.h
+index 6731fa5ec4b9..dc45690cbbf5 100644
+--- a/arch/mips/include/asm/mmu_context.h
++++ b/arch/mips/include/asm/mmu_context.h
+@@ -174,13 +174,15 @@ static inline void destroy_context(struct mm_struct *mm)
+  * we will get a new one for it.
+  */
+ static inline void
+-drop_mmu_context(struct mm_struct *mm, unsigned cpu)
++drop_mmu_context(struct mm_struct *mm)
+ {
+ 	unsigned long flags;
++	unsigned int cpu;
+ 
+ 	local_irq_save(flags);
+ 	htw_stop();
+ 
++	cpu = smp_processor_id();
+ 	if (cpumask_test_cpu(cpu, mm_cpumask(mm)))  {
+ 		get_new_mmu_context(mm, cpu);
+ 		write_c0_entryhi(cpu_asid(cpu, mm));
+
+commit c653bd04f76dd4435c09097a82adc2a5be672292
+Author: Paul Burton <paul.burton@mips.com>
+Date:   Sat Feb 2 01:43:15 2019 +0000
+
+    MIPS: mm: Define activate_mm() using switch_mm()
+    
+    MIPS has separate definitions of activate_mm() & switch_mm() which are
+    identical apart from switch_mm() checking that the ASID is valid before
+    acquiring a new one.
+    
+    We know that when activate_mm() is called cpu_context(X, mm) will be
+    zero, and this will never be considered a valid ASID because we never
+    allow the ASID version number to be zero, instead beginning with version
+    1 using asid_first_version(). Therefore switch_mm() will always allocate
+    a new ASID when called for a new task, meaning that it will behave
+    identically to activate_mm().
+    
+    Take advantage of this to remove the duplication & define activate_mm()
+    using switch_mm() just like many other architectures do.
+    
+    Signed-off-by: Paul Burton <paul.burton@mips.com>
+    Cc: linux-mips@vger.kernel.org
+
+diff --git a/arch/mips/include/asm/mmu_context.h b/arch/mips/include/asm/mmu_context.h
+index a589585be21b..6731fa5ec4b9 100644
+--- a/arch/mips/include/asm/mmu_context.h
++++ b/arch/mips/include/asm/mmu_context.h
+@@ -166,35 +166,9 @@ static inline void destroy_context(struct mm_struct *mm)
+ 	dsemul_mm_cleanup(mm);
+ }
+ 
++#define activate_mm(prev, next)	switch_mm(prev, next, current)
+ #define deactivate_mm(tsk, mm)	do { } while (0)
+ 
+-/*
+- * After we have set current->mm to a new value, this activates
+- * the context for the new mm so we see the new mappings.
+- */
+-static inline void
+-activate_mm(struct mm_struct *prev, struct mm_struct *next)
+-{
+-	unsigned long flags;
+-	unsigned int cpu = smp_processor_id();
+-
+-	local_irq_save(flags);
+-
+-	htw_stop();
+-	/* Unconditionally get a new ASID.  */
+-	get_new_mmu_context(next, cpu);
+-
+-	write_c0_entryhi(cpu_asid(cpu, next));
+-	TLBMISS_HANDLER_SETUP_PGD(next->pgd);
+-
+-	/* mark mmu ownership change */
+-	cpumask_clear_cpu(cpu, mm_cpumask(prev));
+-	cpumask_set_cpu(cpu, mm_cpumask(next));
+-	htw_start();
+-
+-	local_irq_restore(flags);
+-}
+-
+ /*
+  * If mm is currently active_mm, we can't really drop it.  Instead,
+  * we will get a new one for it.
+
+commit ff4dd232ec45a0e45ea69f28f069f2ab22b4908a
+Author: Paul Burton <paul.burton@mips.com>
+Date:   Tue Dec 4 23:44:12 2018 +0000
+
+    MIPS: Expand MIPS32 ASIDs to 64 bits
+    
+    ASIDs have always been stored as unsigned longs, ie. 32 bits on MIPS32
+    kernels. This is problematic because it is feasible for the ASID version
+    to overflow & wrap around to zero.
+    
+    We currently attempt to handle this overflow by simply setting the ASID
+    version to 1, using asid_first_version(), but we make no attempt to
+    account for the fact that there may be mm_structs with stale ASIDs that
+    have versions which we now reuse due to the overflow & wrap around.
+    
+    Encountering this requires that:
+    
+      1) A struct mm_struct X is active on CPU A using ASID (V,n).
+    
+      2) That mm is not used on CPU A for the length of time that it takes
+         for CPU A's asid_cache to overflow & wrap around to the same
+         version V that the mm had in step 1. During this time tasks using
+         the mm could either be sleeping or only scheduled on other CPUs.
+    
+      3) Some other mm Y becomes active on CPU A and is allocated the same
+         ASID (V,n).
+    
+      4) mm X now becomes active on CPU A again, and now incorrectly has the
+         same ASID as mm Y.
+    
+    Where struct mm_struct ASIDs are represented above in the format
+    (version, EntryHi.ASID), and on a typical MIPS32 system version will be
+    24 bits wide & EntryHi.ASID will be 8 bits wide.
+    
+    The length of time required in step 2 is highly dependent upon the CPU &
+    workload, but for a hypothetical 2GHz CPU running a workload which
+    generates a new ASID every 10000 cycles this period is around 248 days.
+    Due to this long period of time & the fact that tasks need to be
+    scheduled in just the right (or wrong, depending upon your inclination)
+    way, this is obviously a difficult bug to encounter but it's entirely
+    possible as evidenced by reports.
+    
+    In order to fix this, simply extend ASIDs to 64 bits even on MIPS32
+    builds. This will extend the period of time required for the
+    hypothetical system above to encounter the problem from 28 days to
+    around 3 trillion years, which feels safely outside of the realms of
+    possibility.
+    
+    The cost of this is slightly more generated code in some commonly
+    executed paths, but this is pretty minimal:
+    
+                             | Code Size Gain | Percentage
+      -----------------------|----------------|-------------
+        decstation_defconfig |           +270 | +0.00%
+            32r2el_defconfig |           +652 | +0.01%
+            32r6el_defconfig |          +1000 | +0.01%
+    
+    I have been unable to measure any change in performance of the LMbench
+    lat_ctx or lat_proc tests resulting from the 64b ASIDs on either
+    32r2el_defconfig+interAptiv or 32r6el_defconfig+I6500 systems.
+    
+    Signed-off-by: Paul Burton <paul.burton@mips.com>
+    Suggested-by: James Hogan <jhogan@kernel.org>
+    References: https://lore.kernel.org/linux-mips/80B78A8B8FEE6145A87579E8435D78C30205D5F3@fzex.ruijie.com.cn/
+    References: https://lore.kernel.org/linux-mips/1488684260-18867-1-git-send-email-jiwei.sun@windriver.com/
+    Cc: Jiwei Sun <jiwei.sun@windriver.com>
+    Cc: Yu Huabing <yhb@ruijie.com.cn>
+    Cc: stable@vger.kernel.org # 2.6.12+
+    Cc: linux-mips@vger.kernel.org
+
+diff --git a/arch/mips/include/asm/mmu_context.h b/arch/mips/include/asm/mmu_context.h
+index 94414561de0e..a589585be21b 100644
+--- a/arch/mips/include/asm/mmu_context.h
++++ b/arch/mips/include/asm/mmu_context.h
+@@ -76,14 +76,14 @@ extern unsigned long pgd_current[];
+  *  All unused by hardware upper bits will be considered
+  *  as a software asid extension.
+  */
+-static unsigned long asid_version_mask(unsigned int cpu)
++static inline u64 asid_version_mask(unsigned int cpu)
+ {
+ 	unsigned long asid_mask = cpu_asid_mask(&cpu_data[cpu]);
+ 
+-	return ~(asid_mask | (asid_mask - 1));
++	return ~(u64)(asid_mask | (asid_mask - 1));
+ }
+ 
+-static unsigned long asid_first_version(unsigned int cpu)
++static inline u64 asid_first_version(unsigned int cpu)
+ {
+ 	return ~asid_version_mask(cpu) + 1;
+ }
+@@ -102,14 +102,12 @@ static inline void enter_lazy_tlb(struct mm_struct *mm, struct task_struct *tsk)
+ static inline void
+ get_new_mmu_context(struct mm_struct *mm, unsigned long cpu)
+ {
+-	unsigned long asid = asid_cache(cpu);
++	u64 asid = asid_cache(cpu);
+ 
+ 	if (!((asid += cpu_asid_inc()) & cpu_asid_mask(&cpu_data[cpu]))) {
+ 		if (cpu_has_vtag_icache)
+ 			flush_icache_all();
+ 		local_flush_tlb_all();	/* start new asid cycle */
+-		if (!asid)		/* fix version if needed */
+-			asid = asid_first_version(cpu);
+ 	}
+ 
+ 	cpu_context(cpu, mm) = asid_cache(cpu) = asid;
+
+commit 4bcb4ad6634ea1084faa630fe35d72f75b5e80fa
+Author: Paul Burton <paul.burton@mips.com>
+Date:   Fri Aug 10 16:03:31 2018 -0700
+
+    MIPS: Consistently declare TLB functions
+    
+    Since at least the beginning of the git era we've declared our TLB
+    exception handling functions inconsistently. They're actually functions,
+    but we declare them as arrays of u32 where each u32 is an encoded
+    instruction. This has always been the case for arch/mips/mm/tlbex.c, and
+    has also been true for arch/mips/kernel/traps.c since commit
+    86a1708a9d54 ("MIPS: Make tlb exception handler definitions and
+    declarations match.") which aimed for consistency but did so by
+    consistently making the our C code inconsistent with our assembly.
+    
+    This is all usually harmless, but when using GCC 7 or newer to build a
+    kernel targeting microMIPS (ie. CONFIG_CPU_MICROMIPS=y) it becomes
+    problematic. With microMIPS bit 0 of the program counter indicates the
+    ISA mode. When bit 0 is zero instructions are decoded using the standard
+    MIPS32 or MIPS64 ISA. When bit 0 is one instructions are decoded using
+    microMIPS. This means that function pointers become odd - their least
+    significant bit is one for microMIPS code. We work around this in cases
+    where we need to access code using loads & stores with our
+    msk_isa16_mode() macro which simply clears bit 0 of the value it is
+    given:
+    
+      #define msk_isa16_mode(x) ((x) & ~0x1)
+    
+    For example we do this for our TLB load handler in
+    build_r4000_tlb_load_handler():
+    
+      u32 *p = (u32 *)msk_isa16_mode((ulong)handle_tlbl);
+    
+    We then write code to p, expecting it to be suitably aligned (our LEAF
+    macro aligns functions on 4 byte boundaries, so (ulong)handle_tlbl will
+    give a value one greater than a multiple of 4 - ie. the start of a
+    function on a 4 byte boundary, with the ISA mode bit 0 set).
+    
+    This worked fine up to GCC 6, but GCC 7 & onwards is smart enough to
+    presume that handle_tlbl which we declared as an array of u32s must be
+    aligned sufficiently that bit 0 of its address will never be set, and as
+    a result optimize out msk_isa16_mode(). This leads to p having an
+    address with bit 0 set, and when we go on to attempt to store code at
+    that address we take an address error exception due to the unaligned
+    memory access.
+    
+    This leads to an exception prior to the kernel having configured its own
+    exception handlers, so we jump to whatever handlers the bootloader
+    configured. In the case of QEMU this results in a silent hang, since it
+    has no useful general exception vector.
+    
+    Fix this by consistently declaring our TLB-related functions as
+    functions. For handle_tlbl(), handle_tlbs() & handle_tlbm() we do this
+    in asm/tlbex.h & we make use of the existing declaration of
+    tlbmiss_handler_setup_pgd() in asm/mmu_context.h. Our TLB handler
+    generation code in arch/mips/mm/tlbex.c is adjusted to deal with these
+    definitions, in most cases simply by casting the function pointers to
+    u32 pointers.
+    
+    This allows us to include asm/mmu_context.h in arch/mips/mm/tlbex.c to
+    get the definitions of tlbmiss_handler_setup_pgd & pgd_current, removing
+    some needless duplication. Consistently using msk_isa16_mode() on
+    function pointers means we no longer need the
+    tlbmiss_handler_setup_pgd_start symbol so that is removed entirely.
+    
+    Now that we're declaring our functions as functions GCC stops optimizing
+    out msk_isa16_mode() & a microMIPS kernel built with either GCC 7.3.0 or
+    8.1.0 boots successfully.
+    
+    Signed-off-by: Paul Burton <paul.burton@mips.com>
+
+diff --git a/arch/mips/include/asm/mmu_context.h b/arch/mips/include/asm/mmu_context.h
+index b509371a6b0c..94414561de0e 100644
+--- a/arch/mips/include/asm/mmu_context.h
++++ b/arch/mips/include/asm/mmu_context.h
+@@ -32,6 +32,7 @@ do {									\
+ } while (0)
+ 
+ extern void tlbmiss_handler_setup_pgd(unsigned long);
++extern char tlbmiss_handler_setup_pgd_end[];
+ 
+ /* Note: This is also implemented with uasm in arch/mips/kvm/entry.c */
+ #define TLBMISS_HANDLER_SETUP_PGD(pgd)					\
+
+commit 8c8d953c28000045e5e823f3398319f04d49a7f1
+Author: Paul Burton <paul.burton@mips.com>
+Date:   Tue Dec 19 15:11:08 2017 -0800
+
+    MIPS: Schedule on CPUs we need to lose FPU for a mode switch
+    
+    Commit 6b8322576e9d ("MIPS: Force CPUs to lose FP context during mode
+    switches") ensures that we react to PR_SET_FP_MODE prctl syscalls
+    quickly by broadcasting an IPI in order to cause CPUs to lose FPU access
+    when necessary. Whilst it achieves that, unfortunately it causes all
+    sorts of strange race conditions because:
+    
+     1) The IPI may arrive at a point where the FPU is in the process of
+        being enabled, but that process is not yet complete leading to a
+        state we aren't prepared to handle. For example:
+    
+        [  370.215903] do_cpu invoked from kernel context![#1]:
+        [  370.221064] CPU: 0 PID: 963 Comm: fp-prctl Not tainted 4.9.0-rc5-00323-g210db32-dirty #226
+        [  370.229420] task: a8000000fd672e00 task.stack: a8000000fd630000
+        [  370.235399] $ 0   : 0000000000000000 0000000000000001 0000000000000001 a8000000fd630000
+        [  370.243882] $ 4   : a8000000fd672e00 0000000000000000 0000000000000453 0000000000000000
+        [  370.252317] $ 8   : 0000000000000000 a8000000fd637c28 1000000000000000 0000000000000010
+        [  370.260753] $12   : 00000000140084e0 ffffffff80109c00 0000000000000000 0000000000000002
+        [  370.269179] $16   : ffffffff8092f080 a8000000fd672e00 ffffffff80107fe8 a8000000fd485000
+        [  370.277612] $20   : ffffffff8084d328 ffffffff80940000 0000000000000009 ffffffff80930000
+        [  370.286038] $24   : 0000000000000000 900000001612048c
+        [  370.294476] $28   : a8000000fd630000 a8000000fd637ac0 ffffffff80937300 ffffffff8010807c
+        [  370.302909] Hi    : 0000000000000000
+        [  370.306595] Lo    : 0000000000000200
+        [  370.310376] epc   : ffffffff80115d38 _save_fp+0x10/0xa0
+        [  370.315784] ra    : ffffffff8010807c prepare_for_fp_mode_switch+0x94/0x1b0
+        [  370.322707] Status: 140084e2 KX SX UX KERNEL EXL
+        [  370.327980] Cause : 1080002c (ExcCode 0b)
+        [  370.332091] PrId  : 0001a428 (MIPS P6600)
+        [  370.336179] Modules linked in:
+        [  370.339486] Process fp-prctl (pid: 963, threadinfo=a8000000fd630000, task=a8000000fd672e00, tls=00000000756e67d0)
+        [  370.349724] Stack : 0000000000000000 a8000000fd557dc0 0000000000000000 ffffffff801ca8e0
+        [  370.358161]         0000000000000000 a8000000fd637b9c 0000000000000009 ffffffff80923780
+        [  370.366575]         ffffffff80850000 ffffffff8011610c 00000000000000b8 ffffffff801a5084
+        [  370.374989]         ffffffff8084a370 ffffffff8084a388 ffffffff80923780 ffffffff80923828
+        [  370.383395]         0000000000010000 ffffffff809237a8 0000000000020000 ffffffff80a40000
+        [  370.391817]         000000000000007c 00000000004a0000 00000000756dedd0 ffffffff801a5188
+        [  370.400230]         a800000002014900 0000000000000001 ffffffff80923780 0000000080923828
+        [  370.408644]         ffffffff80923780 ffffffff80923780 ffffffff80923828 ffffffff801a521c
+        [  370.417066]         ffffffff80923780 ffffffff80923828 0000000000010000 ffffffff801a8f84
+        [  370.425472]         ffffffff80a40000 a8000000fd637c20 ffffffff80a39240 0000000000000001
+        [  370.433885]         ...
+        [  370.436562] Call Trace:
+        [  370.439222] [<ffffffff80115d38>] _save_fp+0x10/0xa0
+        [  370.444305] [<ffffffff8010807c>] prepare_for_fp_mode_switch+0x94/0x1b0
+        [  370.451035] [<ffffffff801ca8e0>] flush_smp_call_function_queue+0xf8/0x230
+        [  370.457991] [<ffffffff8011610c>] ipi_call_interrupt+0xc/0x20
+        [  370.463814] [<ffffffff801a5084>] __handle_irq_event_percpu+0xc4/0x1a8
+        [  370.470404] [<ffffffff801a5188>] handle_irq_event_percpu+0x20/0x68
+        [  370.476734] [<ffffffff801a521c>] handle_irq_event+0x4c/0x88
+        [  370.482486] [<ffffffff801a8f84>] handle_edge_irq+0x12c/0x210
+        [  370.488316] [<ffffffff801a47a0>] generic_handle_irq+0x38/0x48
+        [  370.494280] [<ffffffff804a2dbc>] gic_handle_shared_int+0x194/0x268
+        [  370.500616] [<ffffffff801a47a0>] generic_handle_irq+0x38/0x48
+        [  370.506529] [<ffffffff80107e60>] do_IRQ+0x18/0x28
+        [  370.511445] [<ffffffff804a1524>] plat_irq_dispatch+0xc4/0x140
+        [  370.517339] [<ffffffff80106230>] ret_from_irq+0x0/0x4
+        [  370.522583] [<ffffffff8010fad4>] do_ri+0x4fc/0x7e8
+        [  370.527546] [<ffffffff80106220>] ret_from_exception+0x0/0x10
+    
+     2) The IPI may arrive during kernel use of the FPU, since we generally
+        only disable preemption around use of the FPU & leave interrupts
+        enabled. This can lead to us unexpectedly losing access to the FPU
+        in places where it previously had not been possible. For example:
+    
+        do_cpu invoked from kernel context![#2]:
+        CPU: 2 PID: 7338 Comm: fp-prctl Tainted: G      D         4.7.0-00424-g49b0c82
+        #2
+        task: 838e4000 ti: 88d38000 task.ti: 88d38000
+        $ 0   : 00000000 00000001 ffffffff 88d3fef8
+        $ 4   : 838e4000 88d38004 00000000 00000001
+        $ 8   : 3400fc01 801f8020 808e9100 24000000
+        $12   : dbffffff 807b69d8 807b0000 00000000
+        $16   : 00000000 80786150 00400fc4 809c0398
+        $20   : 809c0338 0040273c 88d3ff28 808e9d30
+        $24   : 808e9d30 00400fb4
+        $28   : 88d38000 88d3fe88 00000000 8011a2ac
+        Hi    : 0040273c
+        Lo    : 88d3ff28
+        epc   : 80114178 _restore_fp+0x10/0xa0
+        ra    : 8011a2ac mipsr2_decoder+0xd5c/0x1660
+        Status: 1400fc03    KERNEL EXL IE
+        Cause : 1080002c (ExcCode 0b)
+        PrId  : 0001a920 (MIPS I6400)
+        Modules linked in:
+        Process fp-prctl (pid: 7338, threadinfo=88d38000, task=838e4000, tls=766527d0)
+        Stack : 00000000 00000000 00000000 88d3fe98 00000000 00000000 809c0398 809c0338
+              808e9100 00000000 88d3ff28 00400fc4 00400fc4 0040273c 7fb69e18 004a0000
+              004a0000 004a0000 7664add0 8010de18 00000000 00000000 88d3fef8 88d3ff28
+              808e9100 00000000 766527d0 8010e534 000c0000 85755000 8181d580 00000000
+              00000000 00000000 004a0000 00000000 766527d0 7fb69e18 004a0000 80105c20
+              ...
+        Call Trace:
+        [<80114178>] _restore_fp+0x10/0xa0
+        [<8011a2ac>] mipsr2_decoder+0xd5c/0x1660
+        [<8010de18>] do_ri+0x90/0x6b8
+        [<80105c20>] ret_from_exception+0x0/0x10
+    
+    At first glance a simple fix may seem to be to disable interrupts around
+    kernel use of the FPU rather than merely preemption, however this would
+    introduce further overhead outside of the mode switch path & doesn't
+    solve the third problem:
+    
+     3) The IPI may arrive whilst the kernel is running code that will lead
+        to a preempt_disable() call & FPU usage soon. If this happens then
+        the IPI will be serviced & we'll proceed to enable an FPU whilst the
+        mode switch is in progress, leading to strange & inconsistent
+        behaviour.
+    
+    Further to all of this is a separate but related problem:
+    
+     4) There are various paths through which we may enable the FPU without
+        the user having triggered a coprocessor 1 disabled exception. These
+        paths are those in which we emulate instructions & then enable the
+        FPU with the expectation that the user might execute an FP
+        instruction shortly afterwards. However these paths have not
+        previously checked whether an FP mode switch is underway for the
+        task, and therefore could enable the FPU whilst such a mode switch
+        is in progress leading to strange & inconsistent behaviour for user
+        code.
+    
+    This patch fixes all of the above by taking a step back & re-examining
+    our approach to FP mode switches. Up until now we have taken these basic
+    steps:
+    
+     a) Prevent any threads that are part of the affected process from being
+        able to obtain ownership of the FPU.
+    
+     b) Cause any threads that are part of the affected process and already
+        have ownership of an FPU to lose it.
+    
+     c) Set the thread flags for each thread that is part of the affected
+        process to reflect the new FP mode.
+    
+     d) Allow threads to obtain ownership of the FPU again.
+    
+    This approach is however more complex than necessary. All that we really
+    require is that the mode switch has occurred for all threads that are
+    part of the affected process before mips_set_process_fp_mode(), and thus
+    the PR_SET_FP_MODE prctl() syscall, returns. This doesn't require that
+    we stop threads from owning or using an FPU whilst a mode switch occurs,
+    only that we force them to relinquish it after the mode switch has
+    occurred such that they next own an FPU with the correct mode
+    configured. Our basic steps therefore simplify to:
+    
+     A) Set the thread flags for each thread that is part of the affected
+        process to reflect the new FP mode.
+    
+     B) Cause any threads that are part of the affected process and already
+        have ownership of an FPU to lose it.
+    
+    We implement B) by forcing each CPU which might be running a thread
+    which is part of the affected process to schedule a no-op function,
+    which causes the affected thread to lose its FPU ownership when it is
+    descheduled.
+    
+    The end result is simpler FP mode switching with less overhead in the
+    FPU enable path (ie. enable_restore_fp_context()) and fewer moving
+    parts.
+    
+    Signed-off-by: Paul Burton <paul.burton@mips.com>
+    Fixes: 9791554b45a2 ("MIPS,prctl: add PR_[GS]ET_FP_MODE prctl options for MIPS")
+    Fixes: 6b8322576e9d ("MIPS: Force CPUs to lose FP context during mode switches")
+    Cc: James Hogan <jhogan@kernel.org>
+    Cc: Ralf Baechle <ralf@linux-mips.org>
+    Cc: linux-mips@linux-mips.org
+    Cc: stable <stable@vger.kernel.org> # v4.0+
+
+diff --git a/arch/mips/include/asm/mmu_context.h b/arch/mips/include/asm/mmu_context.h
+index da2004cef2d5..b509371a6b0c 100644
+--- a/arch/mips/include/asm/mmu_context.h
++++ b/arch/mips/include/asm/mmu_context.h
+@@ -126,8 +126,6 @@ init_new_context(struct task_struct *tsk, struct mm_struct *mm)
+ 	for_each_possible_cpu(i)
+ 		cpu_context(i, mm) = 0;
+ 
+-	atomic_set(&mm->context.fp_mode_switching, 0);
+-
+ 	mm->context.bd_emupage_allocmap = NULL;
+ 	spin_lock_init(&mm->context.bd_emupage_lock);
+ 	init_waitqueue_head(&mm->context.bd_emupage_queue);
+
+commit 589ee62844e042b0b7d19ef57fb4cff77f3ca294
+Author: Ingo Molnar <mingo@kernel.org>
+Date:   Sat Feb 4 00:16:44 2017 +0100
+
+    sched/headers: Prepare to remove the <linux/mm_types.h> dependency from <linux/sched.h>
+    
+    Update code that relied on sched.h including various MM types for them.
+    
+    This will allow us to remove the <linux/mm_types.h> include from <linux/sched.h>.
+    
+    Acked-by: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Mike Galbraith <efault@gmx.de>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: linux-kernel@vger.kernel.org
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/arch/mips/include/asm/mmu_context.h b/arch/mips/include/asm/mmu_context.h
+index 2abf94f72c0a..da2004cef2d5 100644
+--- a/arch/mips/include/asm/mmu_context.h
++++ b/arch/mips/include/asm/mmu_context.h
+@@ -13,8 +13,10 @@
+ 
+ #include <linux/errno.h>
+ #include <linux/sched.h>
++#include <linux/mm_types.h>
+ #include <linux/smp.h>
+ #include <linux/slab.h>
++
+ #include <asm/cacheflush.h>
+ #include <asm/dsemul.h>
+ #include <asm/hazards.h>
+
+commit 49ec508e3bd0b11aaf534af0d63e4a17e05594e4
+Author: James Hogan <james.hogan@imgtec.com>
+Date:   Fri Oct 7 22:32:13 2016 +0100
+
+    KVM: MIPS/TLB: Drop kvm_local_flush_tlb_all()
+    
+    Now that KVM no longer uses wired entries we can safely use
+    local_flush_tlb_all() when we need to flush the entire TLB (on the start
+    of a new ASID cycle). This doesn't flush wired entries, which allows
+    other code to use them without KVM clobbering them all the time. It also
+    is more up to date, knowing about the tlbinv architectural feature,
+    flushing of micro TLB on cores where that is necessary (Loongson I
+    believe), and knows to stop the HTW while doing so.
+    
+    Signed-off-by: James Hogan <james.hogan@imgtec.com>
+    Cc: Paolo Bonzini <pbonzini@redhat.com>
+    Cc: "Radim Krčmář" <rkrcmar@redhat.com>
+    Cc: Ralf Baechle <ralf@linux-mips.org>
+    Cc: linux-mips@linux-mips.org
+    Cc: kvm@vger.kernel.org
+
+diff --git a/arch/mips/include/asm/mmu_context.h b/arch/mips/include/asm/mmu_context.h
+index 16eb8521398e..2abf94f72c0a 100644
+--- a/arch/mips/include/asm/mmu_context.h
++++ b/arch/mips/include/asm/mmu_context.h
+@@ -99,17 +99,12 @@ static inline void enter_lazy_tlb(struct mm_struct *mm, struct task_struct *tsk)
+ static inline void
+ get_new_mmu_context(struct mm_struct *mm, unsigned long cpu)
+ {
+-	extern void kvm_local_flush_tlb_all(void);
+ 	unsigned long asid = asid_cache(cpu);
+ 
+ 	if (!((asid += cpu_asid_inc()) & cpu_asid_mask(&cpu_data[cpu]))) {
+ 		if (cpu_has_vtag_icache)
+ 			flush_icache_all();
+-#ifdef CONFIG_KVM
+-		kvm_local_flush_tlb_all();      /* start new asid cycle */
+-#else
+ 		local_flush_tlb_all();	/* start new asid cycle */
+-#endif
+ 		if (!asid)		/* fix version if needed */
+ 			asid = asid_first_version(cpu);
+ 	}
+
+commit 7faa6eec6991715d6c1d85c192738dcac405ab89
+Author: James Hogan <james.hogan@imgtec.com>
+Date:   Fri Oct 7 23:58:53 2016 +0100
+
+    KVM: MIPS/T&E: Activate GVA page tables in guest context
+    
+    Activate the GVA page tables when in guest context. This will allow the
+    normal Linux TLB refill handler to fill from it when guest memory is
+    read, as well as preventing accidental reading from user memory.
+    
+    Signed-off-by: James Hogan <james.hogan@imgtec.com>
+    Cc: Paolo Bonzini <pbonzini@redhat.com>
+    Cc: "Radim Krčmář" <rkrcmar@redhat.com>
+    Cc: Ralf Baechle <ralf@linux-mips.org>
+    Cc: linux-mips@linux-mips.org
+    Cc: kvm@vger.kernel.org
+
+diff --git a/arch/mips/include/asm/mmu_context.h b/arch/mips/include/asm/mmu_context.h
+index ddd57ade1aa8..16eb8521398e 100644
+--- a/arch/mips/include/asm/mmu_context.h
++++ b/arch/mips/include/asm/mmu_context.h
+@@ -29,9 +29,11 @@ do {									\
+ 	}								\
+ } while (0)
+ 
++extern void tlbmiss_handler_setup_pgd(unsigned long);
++
++/* Note: This is also implemented with uasm in arch/mips/kvm/entry.c */
+ #define TLBMISS_HANDLER_SETUP_PGD(pgd)					\
+ do {									\
+-	extern void tlbmiss_handler_setup_pgd(unsigned long);		\
+ 	tlbmiss_handler_setup_pgd((unsigned long)(pgd));		\
+ 	htw_set_pwbase((unsigned long)pgd);				\
+ } while (0)
+
+commit 432c6bacbd0c16ec210c43da411ccc3855c4c010
+Author: Paul Burton <paul.burton@imgtec.com>
+Date:   Fri Jul 8 11:06:19 2016 +0100
+
+    MIPS: Use per-mm page to execute branch delay slot instructions
+    
+    In some cases the kernel needs to execute an instruction from the delay
+    slot of an emulated branch instruction. These cases include:
+    
+      - Emulated floating point branch instructions (bc1[ft]l?) for systems
+        which don't include an FPU, or upon which the kernel is run with the
+        "nofpu" parameter.
+    
+      - MIPSr6 systems running binaries targeting older revisions of the
+        architecture, which may include branch instructions whose encodings
+        are no longer valid in MIPSr6.
+    
+    Executing instructions from such delay slots is done by writing the
+    instruction to memory followed by a trap, as part of an "emuframe", and
+    executing it. This avoids the requirement of an emulator for the entire
+    MIPS instruction set. Prior to this patch such emuframes are written to
+    the user stack and executed from there.
+    
+    This patch moves FP branch delay emuframes off of the user stack and
+    into a per-mm page. Allocating a page per-mm leaves userland with access
+    to only what it had access to previously, and compared to other
+    solutions is relatively simple.
+    
+    When a thread requires a delay slot emulation, it is allocated a frame.
+    A thread may only have one frame allocated at any one time, since it may
+    only ever be executing one instruction at any one time. In order to
+    ensure that we can free up allocated frame later, its index is recorded
+    in struct thread_struct. In the typical case, after executing the delay
+    slot instruction we'll execute a break instruction with the BRK_MEMU
+    code. This traps back to the kernel & leads to a call to do_dsemulret
+    which frees the allocated frame & moves the user PC back to the
+    instruction that would have executed following the emulated branch.
+    In some cases the delay slot instruction may be invalid, such as a
+    branch, or may trigger an exception. In these cases the BRK_MEMU break
+    instruction will not be hit. In order to ensure that frames are freed
+    this patch introduces dsemul_thread_cleanup() and calls it to free any
+    allocated frame upon thread exit. If the instruction generated an
+    exception & leads to a signal being delivered to the thread, or indeed
+    if a signal simply happens to be delivered to the thread whilst it is
+    executing from the struct emuframe, then we need to take care to exit
+    the frame appropriately. This is done by either rolling back the user PC
+    to the branch or advancing it to the continuation PC prior to signal
+    delivery, using dsemul_thread_rollback(). If this were not done then a
+    sigreturn would return to the struct emuframe, and if that frame had
+    meanwhile been used in response to an emulated branch instruction within
+    the signal handler then we would execute the wrong user code.
+    
+    Whilst a user could theoretically place something like a compact branch
+    to self in a delay slot and cause their thread to become stuck in an
+    infinite loop with the frame never being deallocated, this would:
+    
+      - Only affect the users single process.
+    
+      - Be architecturally invalid since there would be a branch in the
+        delay slot, which is forbidden.
+    
+      - Be extremely unlikely to happen by mistake, and provide a program
+        with no more ability to harm the system than a simple infinite loop
+        would.
+    
+    If a thread requires a delay slot emulation & no frame is available to
+    it (ie. the process has enough other threads that all frames are
+    currently in use) then the thread joins a waitqueue. It will sleep until
+    a frame is freed by another thread in the process.
+    
+    Since we now know whether a thread has an allocated frame due to our
+    tracking of its index, the cookie field of struct emuframe is removed as
+    we can be more certain whether we have a valid frame. Since a thread may
+    only ever have a single frame at any given time, the epc field of struct
+    emuframe is also removed & the PC to continue from is instead stored in
+    struct thread_struct. Together these changes simplify & shrink struct
+    emuframe somewhat, allowing twice as many frames to fit into the page
+    allocated for them.
+    
+    The primary benefit of this patch is that we are now free to mark the
+    user stack non-executable where that is possible.
+    
+    Signed-off-by: Paul Burton <paul.burton@imgtec.com>
+    Cc: Leonid Yegoshin <leonid.yegoshin@imgtec.com>
+    Cc: Maciej Rozycki <maciej.rozycki@imgtec.com>
+    Cc: Faraz Shahbazker <faraz.shahbazker@imgtec.com>
+    Cc: Raghu Gandham <raghu.gandham@imgtec.com>
+    Cc: Matthew Fortune <matthew.fortune@imgtec.com>
+    Cc: linux-mips@linux-mips.org
+    Patchwork: https://patchwork.linux-mips.org/patch/13764/
+    Signed-off-by: Ralf Baechle <ralf@linux-mips.org>
+
+diff --git a/arch/mips/include/asm/mmu_context.h b/arch/mips/include/asm/mmu_context.h
+index fc57e135cb0a..ddd57ade1aa8 100644
+--- a/arch/mips/include/asm/mmu_context.h
++++ b/arch/mips/include/asm/mmu_context.h
+@@ -16,6 +16,7 @@
+ #include <linux/smp.h>
+ #include <linux/slab.h>
+ #include <asm/cacheflush.h>
++#include <asm/dsemul.h>
+ #include <asm/hazards.h>
+ #include <asm/tlbflush.h>
+ #include <asm-generic/mm_hooks.h>
+@@ -128,6 +129,10 @@ init_new_context(struct task_struct *tsk, struct mm_struct *mm)
+ 
+ 	atomic_set(&mm->context.fp_mode_switching, 0);
+ 
++	mm->context.bd_emupage_allocmap = NULL;
++	spin_lock_init(&mm->context.bd_emupage_lock);
++	init_waitqueue_head(&mm->context.bd_emupage_queue);
++
+ 	return 0;
+ }
+ 
+@@ -162,6 +167,7 @@ static inline void switch_mm(struct mm_struct *prev, struct mm_struct *next,
+  */
+ static inline void destroy_context(struct mm_struct *mm)
+ {
++	dsemul_mm_cleanup(mm);
+ }
+ 
+ #define deactivate_mm(tsk, mm)	do { } while (0)
+
+commit 4edf00a46bee692f62578b5280c5774f9b65a08f
+Author: Paul Burton <paul.burton@imgtec.com>
+Date:   Fri May 6 14:36:23 2016 +0100
+
+    MIPS: Retrieve ASID masks using function accepting struct cpuinfo_mips
+    
+    In preparation for supporting variable ASID masks, retrieve ASID masks
+    using functions in asm/cpu-info.h which accept struct cpuinfo_mips. This
+    will allow those functions to determine the ASID mask based upon the CPU
+    in a later patch. This also allows for the r3k & r8k cases to be handled
+    in Kconfig, which is arguably cleaner than the previous #ifdefs.
+    
+    Signed-off-by: Paul Burton <paul.burton@imgtec.com>
+    Signed-off-by: James Hogan <james.hogan@imgtec.com>
+    Cc: Paolo Bonzini <pbonzini@redhat.com>
+    Cc: Radim Krčmář <rkrcmar@redhat.com>
+    Cc: linux-mips@linux-mips.org
+    Cc: kvm@vger.kernel.org
+    Patchwork: https://patchwork.linux-mips.org/patch/13210/
+    Signed-off-by: Ralf Baechle <ralf@linux-mips.org>
+
+diff --git a/arch/mips/include/asm/mmu_context.h b/arch/mips/include/asm/mmu_context.h
+index 45914b59824c..fc57e135cb0a 100644
+--- a/arch/mips/include/asm/mmu_context.h
++++ b/arch/mips/include/asm/mmu_context.h
+@@ -65,37 +65,32 @@ extern unsigned long pgd_current[];
+ 	back_to_back_c0_hazard();					\
+ 	TLBMISS_HANDLER_SETUP_PGD(swapper_pg_dir)
+ #endif /* CONFIG_MIPS_PGD_C0_CONTEXT*/
+-#if defined(CONFIG_CPU_R3000) || defined(CONFIG_CPU_TX39XX)
+ 
+-#define ASID_INC	0x40
+-#define ASID_MASK	0xfc0
+-
+-#elif defined(CONFIG_CPU_R8000)
+-
+-#define ASID_INC	0x10
+-#define ASID_MASK	0xff0
+-
+-#else /* FIXME: not correct for R6000 */
++/*
++ *  All unused by hardware upper bits will be considered
++ *  as a software asid extension.
++ */
++static unsigned long asid_version_mask(unsigned int cpu)
++{
++	unsigned long asid_mask = cpu_asid_mask(&cpu_data[cpu]);
+ 
+-#define ASID_INC	0x1
+-#define ASID_MASK	0xff
++	return ~(asid_mask | (asid_mask - 1));
++}
+ 
+-#endif
++static unsigned long asid_first_version(unsigned int cpu)
++{
++	return ~asid_version_mask(cpu) + 1;
++}
+ 
+ #define cpu_context(cpu, mm)	((mm)->context.asid[cpu])
+-#define cpu_asid(cpu, mm)	(cpu_context((cpu), (mm)) & ASID_MASK)
+ #define asid_cache(cpu)		(cpu_data[cpu].asid_cache)
++#define cpu_asid(cpu, mm) \
++	(cpu_context((cpu), (mm)) & cpu_asid_mask(&cpu_data[cpu]))
+ 
+ static inline void enter_lazy_tlb(struct mm_struct *mm, struct task_struct *tsk)
+ {
+ }
+ 
+-/*
+- *  All unused by hardware upper bits will be considered
+- *  as a software asid extension.
+- */
+-#define ASID_VERSION_MASK  ((unsigned long)~(ASID_MASK|(ASID_MASK-1)))
+-#define ASID_FIRST_VERSION ((unsigned long)(~ASID_VERSION_MASK) + 1)
+ 
+ /* Normal, classic MIPS get_new_mmu_context */
+ static inline void
+@@ -104,7 +99,7 @@ get_new_mmu_context(struct mm_struct *mm, unsigned long cpu)
+ 	extern void kvm_local_flush_tlb_all(void);
+ 	unsigned long asid = asid_cache(cpu);
+ 
+-	if (! ((asid += ASID_INC) & ASID_MASK) ) {
++	if (!((asid += cpu_asid_inc()) & cpu_asid_mask(&cpu_data[cpu]))) {
+ 		if (cpu_has_vtag_icache)
+ 			flush_icache_all();
+ #ifdef CONFIG_KVM
+@@ -113,7 +108,7 @@ get_new_mmu_context(struct mm_struct *mm, unsigned long cpu)
+ 		local_flush_tlb_all();	/* start new asid cycle */
+ #endif
+ 		if (!asid)		/* fix version if needed */
+-			asid = ASID_FIRST_VERSION;
++			asid = asid_first_version(cpu);
+ 	}
+ 
+ 	cpu_context(cpu, mm) = asid_cache(cpu) = asid;
+@@ -145,7 +140,7 @@ static inline void switch_mm(struct mm_struct *prev, struct mm_struct *next,
+ 
+ 	htw_stop();
+ 	/* Check if our ASID is of an older version and thus invalid */
+-	if ((cpu_context(cpu, next) ^ asid_cache(cpu)) & ASID_VERSION_MASK)
++	if ((cpu_context(cpu, next) ^ asid_cache(cpu)) & asid_version_mask(cpu))
+ 		get_new_mmu_context(next, cpu);
+ 	write_c0_entryhi(cpu_asid(cpu, next));
+ 	TLBMISS_HANDLER_SETUP_PGD(next->pgd);
+
+commit ed4cbc81addbc076b016c5b979fd1a02f0897f0a
+Author: Markos Chandras <markos.chandras@imgtec.com>
+Date:   Mon Jan 26 13:04:33 2015 +0000
+
+    MIPS: HTW: Prevent accidental HTW start due to nested htw_{start, stop}
+    
+    activate_mm() and switch_mm() call get_new_mmu_context() which in turn
+    can enable the HTW before the entryhi is changed with the new ASID.
+    Since the latter will enable the HTW in local_flush_tlb_all(),
+    then there is a small timing window where the HTW is running with the
+    new ASID but with an old pgd since the TLBMISS_HANDLER_SETUP_PGD
+    hasn't assigned a new one yet. In order to prevent that, we introduce a
+    simple htw counter to avoid starting HTW accidentally due to nested
+    htw_{start,stop}() sequences. Moreover, since various IPI calls can
+    enforce TLB flushing operations on a different core, such an operation
+    may interrupt another htw_{stop,start} in progress leading inconsistent
+    updates of the htw_seq variable. In order to avoid that, we disable the
+    interrupts whenever we update that variable.
+    
+    Signed-off-by: Markos Chandras <markos.chandras@imgtec.com>
+    Cc: <stable@vger.kernel.org> # 3.17+
+    Cc: linux-mips@linux-mips.org
+    Patchwork: https://patchwork.linux-mips.org/patch/9118/
+    Signed-off-by: Ralf Baechle <ralf@linux-mips.org>
+
+diff --git a/arch/mips/include/asm/mmu_context.h b/arch/mips/include/asm/mmu_context.h
+index 87f11072f557..45914b59824c 100644
+--- a/arch/mips/include/asm/mmu_context.h
++++ b/arch/mips/include/asm/mmu_context.h
+@@ -25,7 +25,6 @@ do {									\
+ 	if (cpu_has_htw) {						\
+ 		write_c0_pwbase(pgd);					\
+ 		back_to_back_c0_hazard();				\
+-		htw_reset();						\
+ 	}								\
+ } while (0)
+ 
+@@ -144,6 +143,7 @@ static inline void switch_mm(struct mm_struct *prev, struct mm_struct *next,
+ 	unsigned long flags;
+ 	local_irq_save(flags);
+ 
++	htw_stop();
+ 	/* Check if our ASID is of an older version and thus invalid */
+ 	if ((cpu_context(cpu, next) ^ asid_cache(cpu)) & ASID_VERSION_MASK)
+ 		get_new_mmu_context(next, cpu);
+@@ -156,6 +156,7 @@ static inline void switch_mm(struct mm_struct *prev, struct mm_struct *next,
+ 	 */
+ 	cpumask_clear_cpu(cpu, mm_cpumask(prev));
+ 	cpumask_set_cpu(cpu, mm_cpumask(next));
++	htw_start();
+ 
+ 	local_irq_restore(flags);
+ }
+@@ -182,6 +183,7 @@ activate_mm(struct mm_struct *prev, struct mm_struct *next)
+ 
+ 	local_irq_save(flags);
+ 
++	htw_stop();
+ 	/* Unconditionally get a new ASID.  */
+ 	get_new_mmu_context(next, cpu);
+ 
+@@ -191,6 +193,7 @@ activate_mm(struct mm_struct *prev, struct mm_struct *next)
+ 	/* mark mmu ownership change */
+ 	cpumask_clear_cpu(cpu, mm_cpumask(prev));
+ 	cpumask_set_cpu(cpu, mm_cpumask(next));
++	htw_start();
+ 
+ 	local_irq_restore(flags);
+ }
+@@ -205,6 +208,7 @@ drop_mmu_context(struct mm_struct *mm, unsigned cpu)
+ 	unsigned long flags;
+ 
+ 	local_irq_save(flags);
++	htw_stop();
+ 
+ 	if (cpumask_test_cpu(cpu, mm_cpumask(mm)))  {
+ 		get_new_mmu_context(mm, cpu);
+@@ -213,6 +217,7 @@ drop_mmu_context(struct mm_struct *mm, unsigned cpu)
+ 		/* will get a new context next time */
+ 		cpu_context(cpu, mm) = 0;
+ 	}
++	htw_start();
+ 	local_irq_restore(flags);
+ }
+ 
+
+commit 9791554b45a2acc28247f66a5fd5bbc212a6b8c8
+Author: Paul Burton <paul.burton@imgtec.com>
+Date:   Thu Jan 8 12:17:37 2015 +0000
+
+    MIPS,prctl: add PR_[GS]ET_FP_MODE prctl options for MIPS
+    
+    Userland code may be built using an ABI which permits linking to objects
+    that have more restrictive floating point requirements. For example,
+    userland code may be built to target the O32 FPXX ABI. Such code may be
+    linked with other FPXX code, or code built for either one of the more
+    restrictive FP32 or FP64. When linking with more restrictive code, the
+    overall requirement of the process becomes that of the more restrictive
+    code. The kernel has no way to know in advance which mode the process
+    will need to be executed in, and indeed it may need to change during
+    execution. The dynamic loader is the only code which will know the
+    overall required mode, and so it needs to have a means to instruct the
+    kernel to switch the FP mode of the process.
+    
+    This patch introduces 2 new options to the prctl syscall which provide
+    such a capability. The FP mode of the process is represented as a
+    simple bitmask combining a number of mode bits mirroring those present
+    in the hardware. Userland can either retrieve the current FP mode of
+    the process:
+    
+      mode = prctl(PR_GET_FP_MODE);
+    
+    or modify the current FP mode of the process:
+    
+      err = prctl(PR_SET_FP_MODE, new_mode);
+    
+    Signed-off-by: Paul Burton <paul.burton@imgtec.com>
+    Cc: Matthew Fortune <matthew.fortune@imgtec.com>
+    Cc: Markos Chandras <markos.chandras@imgtec.com>
+    Cc: linux-mips@linux-mips.org
+    Patchwork: https://patchwork.linux-mips.org/patch/8899/
+    Signed-off-by: Ralf Baechle <ralf@linux-mips.org>
+
+diff --git a/arch/mips/include/asm/mmu_context.h b/arch/mips/include/asm/mmu_context.h
+index 2f82568a3ee4..87f11072f557 100644
+--- a/arch/mips/include/asm/mmu_context.h
++++ b/arch/mips/include/asm/mmu_context.h
+@@ -132,6 +132,8 @@ init_new_context(struct task_struct *tsk, struct mm_struct *mm)
+ 	for_each_possible_cpu(i)
+ 		cpu_context(i, mm) = 0;
+ 
++	atomic_set(&mm->context.fp_mode_switching, 0);
++
+ 	return 0;
+ }
+ 
+
+commit f1014d1b79d0fde02befadb0ca9e4da08ef8d453
+Author: Markos Chandras <markos.chandras@imgtec.com>
+Date:   Mon Jul 14 12:47:09 2014 +0100
+
+    MIPS: mm: Use the Hardware Page Table Walker if the core supports it
+    
+    The Hardware Page Table Walker aims to speed up TLB refill exceptions
+    by handling them in the hardware level instead of having a software
+    TLB refill handler. However, a TLB refill exception can still be
+    thrown in certain cases such as, synchronus exceptions, or address
+    translation or memory errors during the HTW operation. As a result of
+    which, HTW must not be considered a complete replacement for the TLB
+    refill software handler, but rather a fast-path for it.
+    For HTW to work, the PWBase register must contain the task's page
+    global directory address so the HTW will kick in on TLB refill
+    exceptions.
+    
+    Due to HTW being a separate engine embedded deep in the CPU pipeline,
+    we need to restart the HTW everytime a PTE changes to avoid HTW
+    fetching a old entry from the page tables. It's also necessary to
+    restart the HTW on context switches to prevent it from fetching a
+    page from the previous process. Finally, since HTW is using the
+    entryhi register to write the translations to the TLB, it's necessary
+    to stop the HTW whenever the entryhi changes (eg for tlb probe
+    perations) and enable it back afterwards.
+    
+    == Performance ==
+    
+    The following trivial test was used to measure the performance of the
+    HTW. Using the same root filesystem, the following command was used
+    to measure the number of tlb refill handler executions with and
+    without (using 'nohtw' kernel parameter) HTW support.  The kernel was
+    modified to use a scratch register as a counter for the TLB refill
+    exceptions.
+    
+    find /usr -type f -exec ls -lh {} \;
+    
+    HTW Enabled:
+    TLB refill exceptions: 12306
+    
+    HTW Disabled:
+    TLB refill exceptions: 17805
+    
+    Signed-off-by: Markos Chandras <markos.chandras@imgtec.com>
+    Cc: linux-mips@linux-mips.org
+    Cc: Markos Chandras <markos.chandras@imgtec.com>
+    Patchwork: https://patchwork.linux-mips.org/patch/7336/
+    Signed-off-by: Ralf Baechle <ralf@linux-mips.org>
+
+diff --git a/arch/mips/include/asm/mmu_context.h b/arch/mips/include/asm/mmu_context.h
+index 2e373da5f8e9..2f82568a3ee4 100644
+--- a/arch/mips/include/asm/mmu_context.h
++++ b/arch/mips/include/asm/mmu_context.h
+@@ -20,10 +20,20 @@
+ #include <asm/tlbflush.h>
+ #include <asm-generic/mm_hooks.h>
+ 
++#define htw_set_pwbase(pgd)						\
++do {									\
++	if (cpu_has_htw) {						\
++		write_c0_pwbase(pgd);					\
++		back_to_back_c0_hazard();				\
++		htw_reset();						\
++	}								\
++} while (0)
++
+ #define TLBMISS_HANDLER_SETUP_PGD(pgd)					\
+ do {									\
+ 	extern void tlbmiss_handler_setup_pgd(unsigned long);		\
+ 	tlbmiss_handler_setup_pgd((unsigned long)(pgd));		\
++	htw_set_pwbase((unsigned long)pgd);				\
+ } while (0)
+ 
+ #ifdef CONFIG_MIPS_PGD_C0_CONTEXT
+
+commit 2e2d663d2dd64ffe9855be0b35aa221c9b8139f2
+Merge: 5ec79bf919dd 322014531e1f
+Author: Ralf Baechle <ralf@linux-mips.org>
+Date:   Wed May 28 19:00:14 2014 +0200
+
+    Merge branch 'wip-mips-pm' of https://github.com/paulburton/linux into mips-for-linux-next
+
+commit b633648c5ad3cfbda0b3daea50d2135d44899259
+Author: Ralf Baechle <ralf@linux-mips.org>
+Date:   Fri May 23 16:29:44 2014 +0200
+
+    MIPS: MT: Remove SMTC support
+    
+    Nobody is maintaining SMTC anymore and there also seems to be no userbase.
+    Which is a pity - the SMTC technology primarily developed by Kevin D.
+    Kissell <kevink@paralogos.com> is an ingenious demonstration for the MT
+    ASE's power and elegance.
+    
+    Based on Markos Chandras <Markos.Chandras@imgtec.com> patch
+    https://patchwork.linux-mips.org/patch/6719/ which while very similar did
+    no longer apply cleanly when I tried to merge it plus some additional
+    post-SMTC cleanup - SMTC was a feature as tricky to remove as it was to
+    merge once upon a time.
+    
+    Signed-off-by: Ralf Baechle <ralf@linux-mips.org>
+
+diff --git a/arch/mips/include/asm/mmu_context.h b/arch/mips/include/asm/mmu_context.h
+index e277bbad2871..0f75aaca201b 100644
+--- a/arch/mips/include/asm/mmu_context.h
++++ b/arch/mips/include/asm/mmu_context.h
+@@ -18,10 +18,6 @@
+ #include <asm/cacheflush.h>
+ #include <asm/hazards.h>
+ #include <asm/tlbflush.h>
+-#ifdef CONFIG_MIPS_MT_SMTC
+-#include <asm/mipsmtregs.h>
+-#include <asm/smtc.h>
+-#endif /* SMTC */
+ #include <asm-generic/mm_hooks.h>
+ 
+ #define TLBMISS_HANDLER_SETUP_PGD(pgd)					\
+@@ -63,13 +59,6 @@ extern unsigned long pgd_current[];
+ #define ASID_INC	0x10
+ #define ASID_MASK	0xff0
+ 
+-#elif defined(CONFIG_MIPS_MT_SMTC)
+-
+-#define ASID_INC	0x1
+-extern unsigned long smtc_asid_mask;
+-#define ASID_MASK	(smtc_asid_mask)
+-#define HW_ASID_MASK	0xff
+-/* End SMTC/34K debug hack */
+ #else /* FIXME: not correct for R6000 */
+ 
+ #define ASID_INC	0x1
+@@ -92,7 +81,6 @@ static inline void enter_lazy_tlb(struct mm_struct *mm, struct task_struct *tsk)
+ #define ASID_VERSION_MASK  ((unsigned long)~(ASID_MASK|(ASID_MASK-1)))
+ #define ASID_FIRST_VERSION ((unsigned long)(~ASID_VERSION_MASK) + 1)
+ 
+-#ifndef CONFIG_MIPS_MT_SMTC
+ /* Normal, classic MIPS get_new_mmu_context */
+ static inline void
+ get_new_mmu_context(struct mm_struct *mm, unsigned long cpu)
+@@ -115,12 +103,6 @@ get_new_mmu_context(struct mm_struct *mm, unsigned long cpu)
+ 	cpu_context(cpu, mm) = asid_cache(cpu) = asid;
+ }
+ 
+-#else /* CONFIG_MIPS_MT_SMTC */
+-
+-#define get_new_mmu_context(mm, cpu) smtc_get_new_mmu_context((mm), (cpu))
+-
+-#endif /* CONFIG_MIPS_MT_SMTC */
+-
+ /*
+  * Initialize the context related info for a new mm_struct
+  * instance.
+@@ -141,46 +123,12 @@ static inline void switch_mm(struct mm_struct *prev, struct mm_struct *next,
+ {
+ 	unsigned int cpu = smp_processor_id();
+ 	unsigned long flags;
+-#ifdef CONFIG_MIPS_MT_SMTC
+-	unsigned long oldasid;
+-	unsigned long mtflags;
+-	int mytlb = (smtc_status & SMTC_TLB_SHARED) ? 0 : cpu_data[cpu].vpe_id;
+-	local_irq_save(flags);
+-	mtflags = dvpe();
+-#else /* Not SMTC */
+ 	local_irq_save(flags);
+-#endif /* CONFIG_MIPS_MT_SMTC */
+ 
+ 	/* Check if our ASID is of an older version and thus invalid */
+ 	if ((cpu_context(cpu, next) ^ asid_cache(cpu)) & ASID_VERSION_MASK)
+ 		get_new_mmu_context(next, cpu);
+-#ifdef CONFIG_MIPS_MT_SMTC
+-	/*
+-	 * If the EntryHi ASID being replaced happens to be
+-	 * the value flagged at ASID recycling time as having
+-	 * an extended life, clear the bit showing it being
+-	 * in use by this "CPU", and if that's the last bit,
+-	 * free up the ASID value for use and flush any old
+-	 * instances of it from the TLB.
+-	 */
+-	oldasid = (read_c0_entryhi() & ASID_MASK);
+-	if(smtc_live_asid[mytlb][oldasid]) {
+-		smtc_live_asid[mytlb][oldasid] &= ~(0x1 << cpu);
+-		if(smtc_live_asid[mytlb][oldasid] == 0)
+-			smtc_flush_tlb_asid(oldasid);
+-	}
+-	/*
+-	 * Tread softly on EntryHi, and so long as we support
+-	 * having ASID_MASK smaller than the hardware maximum,
+-	 * make sure no "soft" bits become "hard"...
+-	 */
+-	write_c0_entryhi((read_c0_entryhi() & ~HW_ASID_MASK) |
+-			 cpu_asid(cpu, next));
+-	ehb(); /* Make sure it propagates to TCStatus */
+-	evpe(mtflags);
+-#else
+ 	write_c0_entryhi(cpu_asid(cpu, next));
+-#endif /* CONFIG_MIPS_MT_SMTC */
+ 	TLBMISS_HANDLER_SETUP_PGD(next->pgd);
+ 
+ 	/*
+@@ -213,34 +161,12 @@ activate_mm(struct mm_struct *prev, struct mm_struct *next)
+ 	unsigned long flags;
+ 	unsigned int cpu = smp_processor_id();
+ 
+-#ifdef CONFIG_MIPS_MT_SMTC
+-	unsigned long oldasid;
+-	unsigned long mtflags;
+-	int mytlb = (smtc_status & SMTC_TLB_SHARED) ? 0 : cpu_data[cpu].vpe_id;
+-#endif /* CONFIG_MIPS_MT_SMTC */
+-
+ 	local_irq_save(flags);
+ 
+ 	/* Unconditionally get a new ASID.  */
+ 	get_new_mmu_context(next, cpu);
+ 
+-#ifdef CONFIG_MIPS_MT_SMTC
+-	/* See comments for similar code above */
+-	mtflags = dvpe();
+-	oldasid = read_c0_entryhi() & ASID_MASK;
+-	if(smtc_live_asid[mytlb][oldasid]) {
+-		smtc_live_asid[mytlb][oldasid] &= ~(0x1 << cpu);
+-		if(smtc_live_asid[mytlb][oldasid] == 0)
+-			 smtc_flush_tlb_asid(oldasid);
+-	}
+-	/* See comments for similar code above */
+-	write_c0_entryhi((read_c0_entryhi() & ~HW_ASID_MASK) |
+-			 cpu_asid(cpu, next));
+-	ehb(); /* Make sure it propagates to TCStatus */
+-	evpe(mtflags);
+-#else
+ 	write_c0_entryhi(cpu_asid(cpu, next));
+-#endif /* CONFIG_MIPS_MT_SMTC */
+ 	TLBMISS_HANDLER_SETUP_PGD(next->pgd);
+ 
+ 	/* mark mmu ownership change */
+@@ -258,48 +184,15 @@ static inline void
+ drop_mmu_context(struct mm_struct *mm, unsigned cpu)
+ {
+ 	unsigned long flags;
+-#ifdef CONFIG_MIPS_MT_SMTC
+-	unsigned long oldasid;
+-	/* Can't use spinlock because called from TLB flush within DVPE */
+-	unsigned int prevvpe;
+-	int mytlb = (smtc_status & SMTC_TLB_SHARED) ? 0 : cpu_data[cpu].vpe_id;
+-#endif /* CONFIG_MIPS_MT_SMTC */
+ 
+ 	local_irq_save(flags);
+ 
+ 	if (cpumask_test_cpu(cpu, mm_cpumask(mm)))  {
+ 		get_new_mmu_context(mm, cpu);
+-#ifdef CONFIG_MIPS_MT_SMTC
+-		/* See comments for similar code above */
+-		prevvpe = dvpe();
+-		oldasid = (read_c0_entryhi() & ASID_MASK);
+-		if (smtc_live_asid[mytlb][oldasid]) {
+-			smtc_live_asid[mytlb][oldasid] &= ~(0x1 << cpu);
+-			if(smtc_live_asid[mytlb][oldasid] == 0)
+-				smtc_flush_tlb_asid(oldasid);
+-		}
+-		/* See comments for similar code above */
+-		write_c0_entryhi((read_c0_entryhi() & ~HW_ASID_MASK)
+-				| cpu_asid(cpu, mm));
+-		ehb(); /* Make sure it propagates to TCStatus */
+-		evpe(prevvpe);
+-#else /* not CONFIG_MIPS_MT_SMTC */
+ 		write_c0_entryhi(cpu_asid(cpu, mm));
+-#endif /* CONFIG_MIPS_MT_SMTC */
+ 	} else {
+ 		/* will get a new context next time */
+-#ifndef CONFIG_MIPS_MT_SMTC
+ 		cpu_context(cpu, mm) = 0;
+-#else /* SMTC */
+-		int i;
+-
+-		/* SMTC shares the TLB (and ASIDs) across VPEs */
+-		for_each_online_cpu(i) {
+-		    if((smtc_status & SMTC_TLB_SHARED)
+-		    || (cpu_data[i].vpe_id == cpu_data[cpu].vpe_id))
+-			cpu_context(i, mm) = 0;
+-		}
+-#endif /* CONFIG_MIPS_MT_SMTC */
+ 	}
+ 	local_irq_restore(flags);
+ }
+
+commit ae4ce45419f908cf884d3fdc37f5706972068d34
+Author: James Hogan <james.hogan@imgtec.com>
+Date:   Tue Mar 4 10:20:43 2014 +0000
+
+    MIPS: traps: Add CPU PM callback for trap configuration
+    
+    Implement a CPU power management callback for restoring trap related CPU
+    configuration after CPU power up from a low power state. The following
+    state is restored:
+    
+    - Status register
+    - HWREna register
+    - Exception vector configuration registers
+    - Context/XContext register
+    
+    Signed-off-by: James Hogan <james.hogan@imgtec.com>
+    Signed-off-by: Paul Burton <paul.burton@imgtec.com>
+
+diff --git a/arch/mips/include/asm/mmu_context.h b/arch/mips/include/asm/mmu_context.h
+index e277bbad2871..ecae1dc260fd 100644
+--- a/arch/mips/include/asm/mmu_context.h
++++ b/arch/mips/include/asm/mmu_context.h
+@@ -31,11 +31,15 @@ do {									\
+ } while (0)
+ 
+ #ifdef CONFIG_MIPS_PGD_C0_CONTEXT
++
++#define TLBMISS_HANDLER_RESTORE()					\
++	write_c0_xcontext((unsigned long) smp_processor_id() <<		\
++			  SMP_CPUID_REGSHIFT)
++
+ #define TLBMISS_HANDLER_SETUP()						\
+ 	do {								\
+ 		TLBMISS_HANDLER_SETUP_PGD(swapper_pg_dir);		\
+-		write_c0_xcontext((unsigned long) smp_processor_id() <<	\
+-						SMP_CPUID_REGSHIFT);	\
++		TLBMISS_HANDLER_RESTORE();				\
+ 	} while (0)
+ 
+ #else /* !CONFIG_MIPS_PGD_C0_CONTEXT: using  pgd_current*/
+@@ -47,9 +51,12 @@ do {									\
+  */
+ extern unsigned long pgd_current[];
+ 
+-#define TLBMISS_HANDLER_SETUP()						\
++#define TLBMISS_HANDLER_RESTORE()					\
+ 	write_c0_context((unsigned long) smp_processor_id() <<		\
+-						SMP_CPUID_REGSHIFT);	\
++			 SMP_CPUID_REGSHIFT)
++
++#define TLBMISS_HANDLER_SETUP()						\
++	TLBMISS_HANDLER_RESTORE();					\
+ 	back_to_back_c0_hazard();					\
+ 	TLBMISS_HANDLER_SETUP_PGD(swapper_pg_dir)
+ #endif /* CONFIG_MIPS_PGD_C0_CONTEXT*/
+
+commit f4ae17aa0f2122b52f642985b46210a1f2eceb0a
+Author: Jayachandran C <jchandra@broadcom.com>
+Date:   Wed Sep 25 16:28:04 2013 +0530
+
+    MIPS: mm: Use scratch for PGD when !CONFIG_MIPS_PGD_C0_CONTEXT
+    
+    Allow usage of scratch register for current pgd even when
+    MIPS_PGD_C0_CONTEXT is not configured. MIPS_PGD_C0_CONTEXT is set
+    for 64r2 platforms to indicate availability of Xcontext for saving
+    cpuid, thus freeing Context to be used for saving PGD. This option
+    was also tied to using a scratch register for storing PGD.
+    
+    This commit will allow usage of scratch register to store the current
+    pgd if one can be allocated for the platform, even when
+    MIPS_PGD_C0_CONTEXT is not set. The cpuid will be kept in the CP0
+    Context register in this case.
+    
+    The code to store the current pgd for the TLB miss handler is now
+    generated in all cases. When scratch register is available, the PGD
+    is also stored in the scratch register.
+    
+    Signed-off-by: Jayachandran C <jchandra@broadcom.com>
+    Cc: linux-mips@linux-mips.org
+    Cc: Hauke Mehrtens <hauke@hauke-m.de>
+    Patchwork: https://patchwork.linux-mips.org/patch/5906/
+    Signed-off-by: Ralf Baechle <ralf@linux-mips.org>
+
+diff --git a/arch/mips/include/asm/mmu_context.h b/arch/mips/include/asm/mmu_context.h
+index ab8e26051ed7..e277bbad2871 100644
+--- a/arch/mips/include/asm/mmu_context.h
++++ b/arch/mips/include/asm/mmu_context.h
+@@ -24,14 +24,13 @@
+ #endif /* SMTC */
+ #include <asm-generic/mm_hooks.h>
+ 
+-#ifdef CONFIG_MIPS_PGD_C0_CONTEXT
+-
+ #define TLBMISS_HANDLER_SETUP_PGD(pgd)					\
+ do {									\
+ 	extern void tlbmiss_handler_setup_pgd(unsigned long);		\
+ 	tlbmiss_handler_setup_pgd((unsigned long)(pgd));		\
+ } while (0)
+ 
++#ifdef CONFIG_MIPS_PGD_C0_CONTEXT
+ #define TLBMISS_HANDLER_SETUP()						\
+ 	do {								\
+ 		TLBMISS_HANDLER_SETUP_PGD(swapper_pg_dir);		\
+@@ -48,9 +47,6 @@ do {									\
+  */
+ extern unsigned long pgd_current[];
+ 
+-#define TLBMISS_HANDLER_SETUP_PGD(pgd) \
+-	pgd_current[smp_processor_id()] = (unsigned long)(pgd)
+-
+ #define TLBMISS_HANDLER_SETUP()						\
+ 	write_c0_context((unsigned long) smp_processor_id() <<		\
+ 						SMP_CPUID_REGSHIFT);	\
+
+commit c2377a42cd7696022448bcebaa12b07427dc1038
+Author: Jayachandran C <jchandra@broadcom.com>
+Date:   Sun Aug 11 17:10:16 2013 +0530
+
+    MIPS: Move definition of SMP processor id register to header file
+    
+    The definition of the CP0 register used to save the smp processor
+    id is repicated in many files, move them all to thread_info.h.
+    
+    Signed-off-by: Jayachandran C <jchandra@broadcom.com>
+    Cc: linux-mips@linux-mips.org
+    Patchwork: https://patchwork.linux-mips.org/patch/5708/
+    Signed-off-by: Ralf Baechle <ralf@linux-mips.org>
+
+diff --git a/arch/mips/include/asm/mmu_context.h b/arch/mips/include/asm/mmu_context.h
+index 3b29079b5424..ab8e26051ed7 100644
+--- a/arch/mips/include/asm/mmu_context.h
++++ b/arch/mips/include/asm/mmu_context.h
+@@ -35,10 +35,11 @@ do {									\
+ #define TLBMISS_HANDLER_SETUP()						\
+ 	do {								\
+ 		TLBMISS_HANDLER_SETUP_PGD(swapper_pg_dir);		\
+-		write_c0_xcontext((unsigned long) smp_processor_id() << 51); \
++		write_c0_xcontext((unsigned long) smp_processor_id() <<	\
++						SMP_CPUID_REGSHIFT);	\
+ 	} while (0)
+ 
+-#else /* CONFIG_MIPS_PGD_C0_CONTEXT: using  pgd_current*/
++#else /* !CONFIG_MIPS_PGD_C0_CONTEXT: using  pgd_current*/
+ 
+ /*
+  * For the fast tlb miss handlers, we keep a per cpu array of pointers
+@@ -50,18 +51,11 @@ extern unsigned long pgd_current[];
+ #define TLBMISS_HANDLER_SETUP_PGD(pgd) \
+ 	pgd_current[smp_processor_id()] = (unsigned long)(pgd)
+ 
+-#ifdef CONFIG_32BIT
+ #define TLBMISS_HANDLER_SETUP()						\
+-	write_c0_context((unsigned long) smp_processor_id() << 25);	\
++	write_c0_context((unsigned long) smp_processor_id() <<		\
++						SMP_CPUID_REGSHIFT);	\
+ 	back_to_back_c0_hazard();					\
+ 	TLBMISS_HANDLER_SETUP_PGD(swapper_pg_dir)
+-#endif
+-#ifdef CONFIG_64BIT
+-#define TLBMISS_HANDLER_SETUP()						\
+-	write_c0_context((unsigned long) smp_processor_id() << 26);	\
+-	back_to_back_c0_hazard();					\
+-	TLBMISS_HANDLER_SETUP_PGD(swapper_pg_dir)
+-#endif
+ #endif /* CONFIG_MIPS_PGD_C0_CONTEXT*/
+ #if defined(CONFIG_CPU_R3000) || defined(CONFIG_CPU_TX39XX)
+ 
+
+commit 6ac5310e649df5fcd240d764503bf16a1317ea39
+Merge: 704e6460ab75 3f90b82df110
+Author: Ralf Baechle <ralf@linux-mips.org>
+Date:   Tue Jul 2 17:19:04 2013 +0200
+
+    Merge branch '3.10-fixes' into mips-for-linux-next
+    
+    This that should have been fixed but weren't, way to much, intrusive
+    and late.
+
+commit 6ba045f9fbdafb48da42aa8576ea7a3980443136
+Author: Jayachandran C <jchandra@broadcom.com>
+Date:   Sun Jun 23 17:16:19 2013 +0000
+
+    MIPS: Move generated code to .text for microMIPS
+    
+    Prepare of a next patch which will call tlbmiss_handler_setup_pgd on
+    microMIPS. MicroMIPS complains if the called code s not in the .text
+    section. To fix this we generate code into space reserved in
+    arch/mips/mm/tlb-funcs.S
+    
+    While there, move the rest of the generated functions (handle_tlbl,
+    handle_tlbs, handle_tlbm) to the same file.
+    
+    Signed-off-by: Jayachandran C <jchandra@broadcom.com>
+    Cc: linux-mips@linux-mips.org
+    Patchwork: https://patchwork.linux-mips.org/patch/5542/
+    Signed-off-by: Ralf Baechle <ralf@linux-mips.org>
+
+diff --git a/arch/mips/include/asm/mmu_context.h b/arch/mips/include/asm/mmu_context.h
+index 820116067c10..1fed8bdcf2a0 100644
+--- a/arch/mips/include/asm/mmu_context.h
++++ b/arch/mips/include/asm/mmu_context.h
+@@ -28,11 +28,7 @@
+ 
+ #define TLBMISS_HANDLER_SETUP_PGD(pgd)					\
+ do {									\
+-	void (*tlbmiss_handler_setup_pgd)(unsigned long);		\
+-	extern u32 tlbmiss_handler_setup_pgd_array[16];			\
+-									\
+-	tlbmiss_handler_setup_pgd =					\
+-		(__typeof__(tlbmiss_handler_setup_pgd)) tlbmiss_handler_setup_pgd_array; \
++	extern void tlbmiss_handler_setup_pgd(unsigned long);		\
+ 	tlbmiss_handler_setup_pgd((unsigned long)(pgd));		\
+ } while (0)
+ 
+
+commit d414976d1ca721456f7b7c603a8699d117c2ec07
+Author: Markos Chandras <markos.chandras@imgtec.com>
+Date:   Mon Jun 10 12:16:16 2013 +0000
+
+    MIPS: include: mmu_context.h: Replace VIRTUALIZATION with KVM
+    
+    The kvm_* symbols are only available if KVM is selected.
+    
+    Fixes the following linking problem on a randconfig:
+    
+    arch/mips/built-in.o: In function `local_flush_tlb_mm':
+    (.text+0x18a94): undefined reference to `kvm_local_flush_tlb_all'
+    arch/mips/built-in.o: In function `local_flush_tlb_range':
+    (.text+0x18d0c): undefined reference to `kvm_local_flush_tlb_all'
+    kernel/built-in.o: In function `__schedule':
+    core.c:(.sched.text+0x2a00): undefined reference to `kvm_local_flush_tlb_all'
+    mm/built-in.o: In function `use_mm':
+    (.text+0x30214): undefined reference to `kvm_local_flush_tlb_all'
+    fs/built-in.o: In function `flush_old_exec':
+    (.text+0xf0a0): undefined reference to `kvm_local_flush_tlb_all'
+    make: *** [vmlinux] Error 1
+    
+    Signed-off-by: Markos Chandras <markos.chandras@imgtec.com>
+    Acked-by: Steven J. Hill <Steven.Hill@imgtec.com>
+    Cc: linux-mips@linux-mips.org
+    Patchwork: https://patchwork.linux-mips.org/patch/5437/
+    Signed-off-by: Ralf Baechle <ralf@linux-mips.org>
+
+diff --git a/arch/mips/include/asm/mmu_context.h b/arch/mips/include/asm/mmu_context.h
+index 820116067c10..516e6e9a5594 100644
+--- a/arch/mips/include/asm/mmu_context.h
++++ b/arch/mips/include/asm/mmu_context.h
+@@ -117,7 +117,7 @@ get_new_mmu_context(struct mm_struct *mm, unsigned long cpu)
+ 	if (! ((asid += ASID_INC) & ASID_MASK) ) {
+ 		if (cpu_has_vtag_icache)
+ 			flush_icache_all();
+-#ifdef CONFIG_VIRTUALIZATION
++#ifdef CONFIG_KVM
+ 		kvm_local_flush_tlb_all();      /* start new asid cycle */
+ #else
+ 		local_flush_tlb_all();	/* start new asid cycle */
+
+commit 48c4ac976ae995f263cde8f09578de86bc8e9f1d
+Author: David Daney <david.daney@cavium.com>
+Date:   Mon May 13 13:56:44 2013 -0700
+
+    Revert "MIPS: Allow ASID size to be determined at boot time."
+    
+    This reverts commit d532f3d26716a39dfd4b88d687bd344fbe77e390.
+    
+    The original commit has several problems:
+    
+    1) Doesn't work with 64-bit kernels.
+    
+    2) Calls TLBMISS_HANDLER_SETUP() before the code is generated.
+    
+    3) Calls TLBMISS_HANDLER_SETUP() twice in per_cpu_trap_init() when
+       only one call is needed.
+    
+    [ralf@linux-mips.org: Also revert the bits of the ASID patch which were
+    hidden in the KVM merge.]
+    
+    Signed-off-by: David Daney <david.daney@cavium.com>
+    Cc: linux-mips@linux-mips.org
+    Cc: linux-kernel@vger.kernel.org
+    Cc: "Steven J. Hill" <Steven.Hill@imgtec.com>
+    Cc: David Daney <david.daney@cavium.com>
+    Patchwork: https://patchwork.linux-mips.org/patch/5242/
+    Signed-off-by: Ralf Baechle <ralf@linux-mips.org>
+
+diff --git a/arch/mips/include/asm/mmu_context.h b/arch/mips/include/asm/mmu_context.h
+index 1554721e4808..820116067c10 100644
+--- a/arch/mips/include/asm/mmu_context.h
++++ b/arch/mips/include/asm/mmu_context.h
+@@ -67,68 +67,45 @@ extern unsigned long pgd_current[];
+ 	TLBMISS_HANDLER_SETUP_PGD(swapper_pg_dir)
+ #endif
+ #endif /* CONFIG_MIPS_PGD_C0_CONTEXT*/
++#if defined(CONFIG_CPU_R3000) || defined(CONFIG_CPU_TX39XX)
+ 
+-#define ASID_INC(asid)						\
+-({								\
+-	unsigned long __asid = asid;				\
+-	__asm__("1:\taddiu\t%0,1\t\t\t\t# patched\n\t"		\
+-	".section\t__asid_inc,\"a\"\n\t"			\
+-	".word\t1b\n\t"						\
+-	".previous"						\
+-	:"=r" (__asid)						\
+-	:"0" (__asid));						\
+-	__asid;							\
+-})
+-#define ASID_MASK(asid)						\
+-({								\
+-	unsigned long __asid = asid;				\
+-	__asm__("1:\tandi\t%0,%1,0xfc0\t\t\t# patched\n\t"	\
+-	".section\t__asid_mask,\"a\"\n\t"			\
+-	".word\t1b\n\t"						\
+-	".previous"						\
+-	:"=r" (__asid)						\
+-	:"r" (__asid));						\
+-	__asid;							\
+-})
+-#define ASID_VERSION_MASK					\
+-({								\
+-	unsigned long __asid;					\
+-	__asm__("1:\taddiu\t%0,$0,0xff00\t\t\t\t# patched\n\t"	\
+-	".section\t__asid_version_mask,\"a\"\n\t"		\
+-	".word\t1b\n\t"						\
+-	".previous"						\
+-	:"=r" (__asid));					\
+-	__asid;							\
+-})
+-#define ASID_FIRST_VERSION					\
+-({								\
+-	unsigned long __asid = asid;				\
+-	__asm__("1:\tli\t%0,0x100\t\t\t\t# patched\n\t"		\
+-	".section\t__asid_first_version,\"a\"\n\t"		\
+-	".word\t1b\n\t"						\
+-	".previous"						\
+-	:"=r" (__asid));					\
+-	__asid;							\
+-})
+-
+-#define ASID_FIRST_VERSION_R3000	0x1000
+-#define ASID_FIRST_VERSION_R4000	0x100
+-#define ASID_FIRST_VERSION_R8000	0x1000
+-#define ASID_FIRST_VERSION_RM9000	0x1000
++#define ASID_INC	0x40
++#define ASID_MASK	0xfc0
++
++#elif defined(CONFIG_CPU_R8000)
++
++#define ASID_INC	0x10
++#define ASID_MASK	0xff0
++
++#elif defined(CONFIG_MIPS_MT_SMTC)
++
++#define ASID_INC	0x1
++extern unsigned long smtc_asid_mask;
++#define ASID_MASK	(smtc_asid_mask)
++#define HW_ASID_MASK	0xff
++/* End SMTC/34K debug hack */
++#else /* FIXME: not correct for R6000 */
++
++#define ASID_INC	0x1
++#define ASID_MASK	0xff
+ 
+-#ifdef CONFIG_MIPS_MT_SMTC
+-#define SMTC_HW_ASID_MASK		0xff
+-extern unsigned int smtc_asid_mask;
+ #endif
+ 
+ #define cpu_context(cpu, mm)	((mm)->context.asid[cpu])
+-#define cpu_asid(cpu, mm)	ASID_MASK(cpu_context((cpu), (mm)))
++#define cpu_asid(cpu, mm)	(cpu_context((cpu), (mm)) & ASID_MASK)
+ #define asid_cache(cpu)		(cpu_data[cpu].asid_cache)
+ 
+ static inline void enter_lazy_tlb(struct mm_struct *mm, struct task_struct *tsk)
+ {
+ }
+ 
++/*
++ *  All unused by hardware upper bits will be considered
++ *  as a software asid extension.
++ */
++#define ASID_VERSION_MASK  ((unsigned long)~(ASID_MASK|(ASID_MASK-1)))
++#define ASID_FIRST_VERSION ((unsigned long)(~ASID_VERSION_MASK) + 1)
++
+ #ifndef CONFIG_MIPS_MT_SMTC
+ /* Normal, classic MIPS get_new_mmu_context */
+ static inline void
+@@ -137,7 +114,7 @@ get_new_mmu_context(struct mm_struct *mm, unsigned long cpu)
+ 	extern void kvm_local_flush_tlb_all(void);
+ 	unsigned long asid = asid_cache(cpu);
+ 
+-	if (!ASID_MASK((asid = ASID_INC(asid)))) {
++	if (! ((asid += ASID_INC) & ASID_MASK) ) {
+ 		if (cpu_has_vtag_icache)
+ 			flush_icache_all();
+ #ifdef CONFIG_VIRTUALIZATION
+@@ -200,7 +177,7 @@ static inline void switch_mm(struct mm_struct *prev, struct mm_struct *next,
+ 	 * free up the ASID value for use and flush any old
+ 	 * instances of it from the TLB.
+ 	 */
+-	oldasid = ASID_MASK(read_c0_entryhi());
++	oldasid = (read_c0_entryhi() & ASID_MASK);
+ 	if(smtc_live_asid[mytlb][oldasid]) {
+ 		smtc_live_asid[mytlb][oldasid] &= ~(0x1 << cpu);
+ 		if(smtc_live_asid[mytlb][oldasid] == 0)
+@@ -211,7 +188,7 @@ static inline void switch_mm(struct mm_struct *prev, struct mm_struct *next,
+ 	 * having ASID_MASK smaller than the hardware maximum,
+ 	 * make sure no "soft" bits become "hard"...
+ 	 */
+-	write_c0_entryhi((read_c0_entryhi() & ~SMTC_HW_ASID_MASK) |
++	write_c0_entryhi((read_c0_entryhi() & ~HW_ASID_MASK) |
+ 			 cpu_asid(cpu, next));
+ 	ehb(); /* Make sure it propagates to TCStatus */
+ 	evpe(mtflags);
+@@ -264,15 +241,15 @@ activate_mm(struct mm_struct *prev, struct mm_struct *next)
+ #ifdef CONFIG_MIPS_MT_SMTC
+ 	/* See comments for similar code above */
+ 	mtflags = dvpe();
+-	oldasid = ASID_MASK(read_c0_entryhi());
++	oldasid = read_c0_entryhi() & ASID_MASK;
+ 	if(smtc_live_asid[mytlb][oldasid]) {
+ 		smtc_live_asid[mytlb][oldasid] &= ~(0x1 << cpu);
+ 		if(smtc_live_asid[mytlb][oldasid] == 0)
+ 			 smtc_flush_tlb_asid(oldasid);
+ 	}
+ 	/* See comments for similar code above */
+-	write_c0_entryhi((read_c0_entryhi() & ~SMTC_HW_ASID_MASK) |
+-	                 cpu_asid(cpu, next));
++	write_c0_entryhi((read_c0_entryhi() & ~HW_ASID_MASK) |
++			 cpu_asid(cpu, next));
+ 	ehb(); /* Make sure it propagates to TCStatus */
+ 	evpe(mtflags);
+ #else
+@@ -309,14 +286,14 @@ drop_mmu_context(struct mm_struct *mm, unsigned cpu)
+ #ifdef CONFIG_MIPS_MT_SMTC
+ 		/* See comments for similar code above */
+ 		prevvpe = dvpe();
+-		oldasid = ASID_MASK(read_c0_entryhi());
++		oldasid = (read_c0_entryhi() & ASID_MASK);
+ 		if (smtc_live_asid[mytlb][oldasid]) {
+ 			smtc_live_asid[mytlb][oldasid] &= ~(0x1 << cpu);
+ 			if(smtc_live_asid[mytlb][oldasid] == 0)
+ 				smtc_flush_tlb_asid(oldasid);
+ 		}
+ 		/* See comments for similar code above */
+-		write_c0_entryhi((read_c0_entryhi() & ~SMTC_HW_ASID_MASK)
++		write_c0_entryhi((read_c0_entryhi() & ~HW_ASID_MASK)
+ 				| cpu_asid(cpu, mm));
+ 		ehb(); /* Make sure it propagates to TCStatus */
+ 		evpe(prevvpe);
+
+commit b22d1b6a91ca4260f869e349179ae53f18c664db
+Merge: 5e0e61dd2c89 0ab2b7d08ea7
+Author: Ralf Baechle <ralf@linux-mips.org>
+Date:   Thu May 9 17:57:30 2013 +0200
+
+    Merge branch 'mti-next' of git://git.linux-mips.org/pub/scm/sjhill/linux-sjhill into mips-for-linux-next
+
+commit 5e0e61dd2c89c673f89fb57dcd3cc746dc0c1706
+Merge: 9b3539e0e545 50c8308538dc
+Author: Ralf Baechle <ralf@linux-mips.org>
+Date:   Thu May 9 17:56:40 2013 +0200
+
+    Merge branch 'next/kvm' into mips-for-linux-next
+
+commit d532f3d26716a39dfd4b88d687bd344fbe77e390
+Author: Steven J. Hill <Steven.Hill@imgtec.com>
+Date:   Mon Mar 25 11:58:57 2013 -0500
+
+    MIPS: Allow ASID size to be determined at boot time.
+    
+    Original patch by Ralf Baechle and removed by Harold Koerfgen
+    with commit f67e4ffc79905482c3b9b8c8dd65197bac7eb508. This
+    allows for more generic kernels since the size of the ASID
+    and corresponding masks can be determined at run-time. This
+    patch is also required for the new Aptiv cores and has been
+    tested on Malta and Malta Aptiv platforms.
+    
+    [ralf@linux-mips.org: Added relevant part of fix
+    https://patchwork.linux-mips.org/patch/5213/]
+    
+    Signed-off-by: Steven J. Hill <Steven.Hill@imgtec.com>
+    Signed-off-by: Ralf Baechle <ralf@linux-mips.org>
+
+diff --git a/arch/mips/include/asm/mmu_context.h b/arch/mips/include/asm/mmu_context.h
+index e81d719efcd1..bab1980bbf0d 100644
+--- a/arch/mips/include/asm/mmu_context.h
++++ b/arch/mips/include/asm/mmu_context.h
+@@ -62,45 +62,68 @@ extern unsigned long pgd_current[];
+ 	TLBMISS_HANDLER_SETUP_PGD(swapper_pg_dir)
+ #endif
+ #endif /* CONFIG_MIPS_PGD_C0_CONTEXT*/
+-#if defined(CONFIG_CPU_R3000) || defined(CONFIG_CPU_TX39XX)
+ 
+-#define ASID_INC	0x40
+-#define ASID_MASK	0xfc0
+-
+-#elif defined(CONFIG_CPU_R8000)
+-
+-#define ASID_INC	0x10
+-#define ASID_MASK	0xff0
+-
+-#elif defined(CONFIG_MIPS_MT_SMTC)
+-
+-#define ASID_INC	0x1
+-extern unsigned long smtc_asid_mask;
+-#define ASID_MASK	(smtc_asid_mask)
+-#define HW_ASID_MASK	0xff
+-/* End SMTC/34K debug hack */
+-#else /* FIXME: not correct for R6000 */
+-
+-#define ASID_INC	0x1
+-#define ASID_MASK	0xff
++#define ASID_INC(asid)						\
++({								\
++	unsigned long __asid = asid;				\
++	__asm__("1:\taddiu\t%0,1\t\t\t\t# patched\n\t"		\
++	".section\t__asid_inc,\"a\"\n\t"			\
++	".word\t1b\n\t"						\
++	".previous"						\
++	:"=r" (__asid)						\
++	:"0" (__asid));						\
++	__asid;							\
++})
++#define ASID_MASK(asid)						\
++({								\
++	unsigned long __asid = asid;				\
++	__asm__("1:\tandi\t%0,%1,0xfc0\t\t\t# patched\n\t"	\
++	".section\t__asid_mask,\"a\"\n\t"			\
++	".word\t1b\n\t"						\
++	".previous"						\
++	:"=r" (__asid)						\
++	:"r" (__asid));						\
++	__asid;							\
++})
++#define ASID_VERSION_MASK					\
++({								\
++	unsigned long __asid;					\
++	__asm__("1:\taddiu\t%0,$0,0xff00\t\t\t\t# patched\n\t"	\
++	".section\t__asid_version_mask,\"a\"\n\t"		\
++	".word\t1b\n\t"						\
++	".previous"						\
++	:"=r" (__asid));					\
++	__asid;							\
++})
++#define ASID_FIRST_VERSION					\
++({								\
++	unsigned long __asid = asid;				\
++	__asm__("1:\tli\t%0,0x100\t\t\t\t# patched\n\t"		\
++	".section\t__asid_first_version,\"a\"\n\t"		\
++	".word\t1b\n\t"						\
++	".previous"						\
++	:"=r" (__asid));					\
++	__asid;							\
++})
++
++#define ASID_FIRST_VERSION_R3000	0x1000
++#define ASID_FIRST_VERSION_R4000	0x100
++#define ASID_FIRST_VERSION_R8000	0x1000
++#define ASID_FIRST_VERSION_RM9000	0x1000
+ 
++#ifdef CONFIG_MIPS_MT_SMTC
++#define SMTC_HW_ASID_MASK		0xff
++extern unsigned int smtc_asid_mask;
+ #endif
+ 
+ #define cpu_context(cpu, mm)	((mm)->context.asid[cpu])
+-#define cpu_asid(cpu, mm)	(cpu_context((cpu), (mm)) & ASID_MASK)
++#define cpu_asid(cpu, mm)	ASID_MASK(cpu_context((cpu), (mm)))
+ #define asid_cache(cpu)		(cpu_data[cpu].asid_cache)
+ 
+ static inline void enter_lazy_tlb(struct mm_struct *mm, struct task_struct *tsk)
+ {
+ }
+ 
+-/*
+- *  All unused by hardware upper bits will be considered
+- *  as a software asid extension.
+- */
+-#define ASID_VERSION_MASK  ((unsigned long)~(ASID_MASK|(ASID_MASK-1)))
+-#define ASID_FIRST_VERSION ((unsigned long)(~ASID_VERSION_MASK) + 1)
+-
+ #ifndef CONFIG_MIPS_MT_SMTC
+ /* Normal, classic MIPS get_new_mmu_context */
+ static inline void
+@@ -108,7 +131,7 @@ get_new_mmu_context(struct mm_struct *mm, unsigned long cpu)
+ {
+ 	unsigned long asid = asid_cache(cpu);
+ 
+-	if (! ((asid += ASID_INC) & ASID_MASK) ) {
++	if (!ASID_MASK((asid = ASID_INC(asid)))) {
+ 		if (cpu_has_vtag_icache)
+ 			flush_icache_all();
+ 		local_flush_tlb_all();	/* start new asid cycle */
+@@ -166,7 +189,7 @@ static inline void switch_mm(struct mm_struct *prev, struct mm_struct *next,
+ 	 * free up the ASID value for use and flush any old
+ 	 * instances of it from the TLB.
+ 	 */
+-	oldasid = (read_c0_entryhi() & ASID_MASK);
++	oldasid = ASID_MASK(read_c0_entryhi());
+ 	if(smtc_live_asid[mytlb][oldasid]) {
+ 		smtc_live_asid[mytlb][oldasid] &= ~(0x1 << cpu);
+ 		if(smtc_live_asid[mytlb][oldasid] == 0)
+@@ -177,7 +200,7 @@ static inline void switch_mm(struct mm_struct *prev, struct mm_struct *next,
+ 	 * having ASID_MASK smaller than the hardware maximum,
+ 	 * make sure no "soft" bits become "hard"...
+ 	 */
+-	write_c0_entryhi((read_c0_entryhi() & ~HW_ASID_MASK) |
++	write_c0_entryhi((read_c0_entryhi() & ~SMTC_HW_ASID_MASK) |
+ 			 cpu_asid(cpu, next));
+ 	ehb(); /* Make sure it propagates to TCStatus */
+ 	evpe(mtflags);
+@@ -230,15 +253,15 @@ activate_mm(struct mm_struct *prev, struct mm_struct *next)
+ #ifdef CONFIG_MIPS_MT_SMTC
+ 	/* See comments for similar code above */
+ 	mtflags = dvpe();
+-	oldasid = read_c0_entryhi() & ASID_MASK;
++	oldasid = ASID_MASK(read_c0_entryhi());
+ 	if(smtc_live_asid[mytlb][oldasid]) {
+ 		smtc_live_asid[mytlb][oldasid] &= ~(0x1 << cpu);
+ 		if(smtc_live_asid[mytlb][oldasid] == 0)
+ 			 smtc_flush_tlb_asid(oldasid);
+ 	}
+ 	/* See comments for similar code above */
+-	write_c0_entryhi((read_c0_entryhi() & ~HW_ASID_MASK) |
+-			 cpu_asid(cpu, next));
++	write_c0_entryhi((read_c0_entryhi() & ~SMTC_HW_ASID_MASK) |
++	                 cpu_asid(cpu, next));
+ 	ehb(); /* Make sure it propagates to TCStatus */
+ 	evpe(mtflags);
+ #else
+@@ -275,14 +298,14 @@ drop_mmu_context(struct mm_struct *mm, unsigned cpu)
+ #ifdef CONFIG_MIPS_MT_SMTC
+ 		/* See comments for similar code above */
+ 		prevvpe = dvpe();
+-		oldasid = (read_c0_entryhi() & ASID_MASK);
++		oldasid = ASID_MASK(read_c0_entryhi());
+ 		if (smtc_live_asid[mytlb][oldasid]) {
+ 			smtc_live_asid[mytlb][oldasid] &= ~(0x1 << cpu);
+ 			if(smtc_live_asid[mytlb][oldasid] == 0)
+ 				smtc_flush_tlb_asid(oldasid);
+ 		}
+ 		/* See comments for similar code above */
+-		write_c0_entryhi((read_c0_entryhi() & ~HW_ASID_MASK)
++		write_c0_entryhi((read_c0_entryhi() & ~SMTC_HW_ASID_MASK)
+ 				| cpu_asid(cpu, mm));
+ 		ehb(); /* Make sure it propagates to TCStatus */
+ 		evpe(prevvpe);
+
+commit f9afbd45b0d04e4e1f9bff0b9309f61bfd28491c
+Author: Sanjay Lal <sanjayl@kymasys.com>
+Date:   Wed Nov 21 18:34:11 2012 -0800
+
+    MIPS: If KVM is enabled then use the KVM specific routine to flush the TLBs on a ASID wrap.
+    
+    Signed-off-by: Sanjay Lal <sanjayl@kymasys.com>
+    Cc: kvm@vger.kernel.org
+    Cc: linux-mips@linux-mips.org
+    Signed-off-by: Ralf Baechle <ralf@linux-mips.org>
+
+diff --git a/arch/mips/include/asm/mmu_context.h b/arch/mips/include/asm/mmu_context.h
+index e81d719efcd1..c42562d801c5 100644
+--- a/arch/mips/include/asm/mmu_context.h
++++ b/arch/mips/include/asm/mmu_context.h
+@@ -106,15 +106,21 @@ static inline void enter_lazy_tlb(struct mm_struct *mm, struct task_struct *tsk)
+ static inline void
+ get_new_mmu_context(struct mm_struct *mm, unsigned long cpu)
+ {
++	extern void kvm_local_flush_tlb_all(void);
+ 	unsigned long asid = asid_cache(cpu);
+ 
+ 	if (! ((asid += ASID_INC) & ASID_MASK) ) {
+ 		if (cpu_has_vtag_icache)
+ 			flush_icache_all();
++#ifdef CONFIG_VIRTUALIZATION
++		kvm_local_flush_tlb_all();      /* start new asid cycle */
++#else
+ 		local_flush_tlb_all();	/* start new asid cycle */
++#endif
+ 		if (!asid)		/* fix version if needed */
+ 			asid = ASID_FIRST_VERSION;
+ 	}
++
+ 	cpu_context(cpu, mm) = asid_cache(cpu) = asid;
+ }
+ 
+
+commit 9b3539e0e545e4c2f338acfc1ce52033a6f5e7f7
+Merge: 3d39019a1655 1cd1c0492712
+Author: Ralf Baechle <ralf@linux-mips.org>
+Date:   Wed May 8 01:27:46 2013 +0200
+
+    Merge branch 'mips-next-3.10' of git://git.linux-mips.org/pub/scm/john/linux-john into mips-for-linux-next
+
+commit 224786779d04bbcd5f61eaafc86bf8fee350388a
+Author: Huacai Chen <chenhc@lemote.com>
+Date:   Sun Mar 17 11:50:14 2013 +0000
+
+    MIPS: Init new mmu_context for each possible CPU to avoid memory corruption
+    
+    Currently, init_new_context() only for each online CPU, this may cause
+    memory corruption when CPU hotplug and fork() happens at the same time.
+    To avoid this, we make init_new_context() cover each possible CPU.
+    
+    Scenario:
+    1, CPU#1 is being offline;
+    2, On CPU#0, do_fork() call dup_mm() and copy a mm_struct to the child;
+    3, On CPU#0, dup_mm() call init_new_context(), since CPU#1 is offline
+       and init_new_context() only covers the online CPUs, child has the
+       same asid as its parent on CPU#1 (however, child's asid should be 0);
+    4, CPU#1 is being online;
+    5, Now, if both parent and child run on CPU#1, memory corruption (e.g.
+       segfault, bus error, etc.) will occur.
+    
+    Signed-off-by: Huacai Chen <chenhc@lemote.com>
+    Acked-by: David Daney <david.daney@cavium.com>
+    Patchwork: http://patchwork.linux-mips.org/patch/4995/
+    Acked-by: John Crispin <blogic@openwrt.org>
+
+diff --git a/arch/mips/include/asm/mmu_context.h b/arch/mips/include/asm/mmu_context.h
+index e81d719efcd1..49d220ccc145 100644
+--- a/arch/mips/include/asm/mmu_context.h
++++ b/arch/mips/include/asm/mmu_context.h
+@@ -133,7 +133,7 @@ init_new_context(struct task_struct *tsk, struct mm_struct *mm)
+ {
+ 	int i;
+ 
+-	for_each_online_cpu(i)
++	for_each_possible_cpu(i)
+ 		cpu_context(i, mm) = 0;
+ 
+ 	return 0;
+
+commit 0bfbf6a256348b1543e638c7d7b2f3004b289fdb
+Author: Ralf Baechle <ralf@linux-mips.org>
+Date:   Thu Mar 21 11:28:10 2013 +0100
+
+    MIPS: Make declarations and definitions of tlbmiss_handler_setup_pgd match.
+    
+    tlbmiss_handler_setup_pgd is run-time generated code and it was convenient
+    to pretend the symbol was an array in the generator but a function for
+    the users.  LTO gcc won't tolerate this kind of lie anymore so solve the
+    problem through a cast and function pointer instead.
+    
+    Signed-off-by: Ralf Baechle <ralf@linux-mips.org>
+
+diff --git a/arch/mips/include/asm/mmu_context.h b/arch/mips/include/asm/mmu_context.h
+index e81d719efcd1..13e0fe7fe233 100644
+--- a/arch/mips/include/asm/mmu_context.h
++++ b/arch/mips/include/asm/mmu_context.h
+@@ -26,10 +26,15 @@
+ 
+ #ifdef CONFIG_MIPS_PGD_C0_CONTEXT
+ 
+-#define TLBMISS_HANDLER_SETUP_PGD(pgd)				\
+-	tlbmiss_handler_setup_pgd((unsigned long)(pgd))
+-
+-extern void tlbmiss_handler_setup_pgd(unsigned long pgd);
++#define TLBMISS_HANDLER_SETUP_PGD(pgd)					\
++do {									\
++	void (*tlbmiss_handler_setup_pgd)(unsigned long);		\
++	extern u32 tlbmiss_handler_setup_pgd_array[16];			\
++									\
++	tlbmiss_handler_setup_pgd =					\
++		(__typeof__(tlbmiss_handler_setup_pgd)) tlbmiss_handler_setup_pgd_array; \
++	tlbmiss_handler_setup_pgd((unsigned long)(pgd));		\
++} while (0)
+ 
+ #define TLBMISS_HANDLER_SETUP()						\
+ 	do {								\
+
+commit 7034228792cc561e79ff8600f02884bd4c80e287
+Author: Ralf Baechle <ralf@linux-mips.org>
+Date:   Tue Jan 22 12:59:30 2013 +0100
+
+    MIPS: Whitespace cleanup.
+    
+    Having received another series of whitespace patches I decided to do this
+    once and for all rather than dealing with this kind of patches trickling
+    in forever.
+    
+    Signed-off-by: Ralf Baechle <ralf@linux-mips.org>
+
+diff --git a/arch/mips/include/asm/mmu_context.h b/arch/mips/include/asm/mmu_context.h
+index 45cfa1ad86a6..e81d719efcd1 100644
+--- a/arch/mips/include/asm/mmu_context.h
++++ b/arch/mips/include/asm/mmu_context.h
+@@ -77,7 +77,7 @@ extern unsigned long pgd_current[];
+ #define ASID_INC	0x1
+ extern unsigned long smtc_asid_mask;
+ #define ASID_MASK	(smtc_asid_mask)
+-#define	HW_ASID_MASK	0xff
++#define HW_ASID_MASK	0xff
+ /* End SMTC/34K debug hack */
+ #else /* FIXME: not correct for R6000 */
+ 
+@@ -140,7 +140,7 @@ init_new_context(struct task_struct *tsk, struct mm_struct *mm)
+ }
+ 
+ static inline void switch_mm(struct mm_struct *prev, struct mm_struct *next,
+-                             struct task_struct *tsk)
++			     struct task_struct *tsk)
+ {
+ 	unsigned int cpu = smp_processor_id();
+ 	unsigned long flags;
+@@ -238,7 +238,7 @@ activate_mm(struct mm_struct *prev, struct mm_struct *next)
+ 	}
+ 	/* See comments for similar code above */
+ 	write_c0_entryhi((read_c0_entryhi() & ~HW_ASID_MASK) |
+-	                 cpu_asid(cpu, next));
++			 cpu_asid(cpu, next));
+ 	ehb(); /* Make sure it propagates to TCStatus */
+ 	evpe(mtflags);
+ #else
+
+commit bdf20507da11a9a5b32ef04fa09f352828189aef
+Author: Ralf Baechle <ralf@linux-mips.org>
+Date:   Tue Dec 11 21:02:55 2012 +0100
+
+    MIPS: PMC-Sierra Yosemite: Remove support.
+    
+    Nobody seems to be interested anymore and upstream also never had an
+    ethernet driver.
+    
+    Signed-off-by: Ralf Baechle <ralf@linux-mips.org>
+
+diff --git a/arch/mips/include/asm/mmu_context.h b/arch/mips/include/asm/mmu_context.h
+index 9b02cfba7449..45cfa1ad86a6 100644
+--- a/arch/mips/include/asm/mmu_context.h
++++ b/arch/mips/include/asm/mmu_context.h
+@@ -72,12 +72,6 @@ extern unsigned long pgd_current[];
+ #define ASID_INC	0x10
+ #define ASID_MASK	0xff0
+ 
+-#elif defined(CONFIG_CPU_RM9000)
+-
+-#define ASID_INC	0x1
+-#define ASID_MASK	0xfff
+-
+-/* SMTC/34K debug hack - but maybe we'll keep it */
+ #elif defined(CONFIG_MIPS_MT_SMTC)
+ 
+ #define ASID_INC	0x1
+
+commit dc5efaa049cbb10efaf47fe977d45ea1e38b4465
+Author: David Daney <ddaney@caviumnetworks.com>
+Date:   Wed Mar 28 15:59:58 2012 -0700
+
+    MIPS: Remove get_current_pgd().
+    
+    It is unused in the tree.
+    
+    Signed-off-by: David Daney <ddaney@caviumnetworks.com>
+    Cc: linux-mips@linux-mips.org
+    Patchwork: https://patchwork.linux-mips.org/patch/3557/
+    Signed-off-by: Ralf Baechle <ralf@linux-mips.org>
+
+diff --git a/arch/mips/include/asm/mmu_context.h b/arch/mips/include/asm/mmu_context.h
+index 73c0d45798de..9b02cfba7449 100644
+--- a/arch/mips/include/asm/mmu_context.h
++++ b/arch/mips/include/asm/mmu_context.h
+@@ -37,12 +37,6 @@ extern void tlbmiss_handler_setup_pgd(unsigned long pgd);
+ 		write_c0_xcontext((unsigned long) smp_processor_id() << 51); \
+ 	} while (0)
+ 
+-
+-static inline unsigned long get_current_pgd(void)
+-{
+-	return PHYS_TO_XKSEG_CACHED((read_c0_context() >> 11) & ~0xfffUL);
+-}
+-
+ #else /* CONFIG_MIPS_PGD_C0_CONTEXT: using  pgd_current*/
+ 
+ /*
+
+commit 3d8bfdd0307223de678962f1c1907a7cec549136
+Author: David Daney <ddaney@caviumnetworks.com>
+Date:   Tue Dec 21 14:19:11 2010 -0800
+
+    MIPS: Use C0_KScratch (if present) to hold PGD pointer.
+    
+    Decide at runtime to use either Context or KScratch to hold the PGD
+    pointer.
+    
+    Signed-off-by: David Daney <ddaney@caviumnetworks.com>
+    To: linux-mips@linux-mips.org
+    Patchwork: https://patchwork.linux-mips.org/patch/1876/
+    Signed-off-by: Ralf Baechle <ralf@linux-mips.org>
+
+diff --git a/arch/mips/include/asm/mmu_context.h b/arch/mips/include/asm/mmu_context.h
+index d9592733a7ba..73c0d45798de 100644
+--- a/arch/mips/include/asm/mmu_context.h
++++ b/arch/mips/include/asm/mmu_context.h
+@@ -29,13 +29,7 @@
+ #define TLBMISS_HANDLER_SETUP_PGD(pgd)				\
+ 	tlbmiss_handler_setup_pgd((unsigned long)(pgd))
+ 
+-static inline void tlbmiss_handler_setup_pgd(unsigned long pgd)
+-{
+-	/* Check for swapper_pg_dir and convert to physical address. */
+-	if ((pgd & CKSEG3) == CKSEG0)
+-		pgd = CPHYSADDR(pgd);
+-	write_c0_context(pgd << 11);
+-}
++extern void tlbmiss_handler_setup_pgd(unsigned long pgd);
+ 
+ #define TLBMISS_HANDLER_SETUP()						\
+ 	do {								\
+
+commit c52d0d30aef84aa8893b34e5254716c8ab5c4472
+Author: David Daney <ddaney@caviumnetworks.com>
+Date:   Thu Feb 18 16:13:04 2010 -0800
+
+    MIPS: Preliminary VDSO
+    
+    This is a preliminary patch to add a vdso to all user processes.  Still
+    missing are ELF headers and .eh_frame information.  But it is enough to
+    allow us to move signal trampolines off of the stack.  Note that emulation
+    of branch delay slots in the FPU emulator still requires the stack.
+    
+    We allocate a single page (the vdso) and write all possible signal
+    trampolines into it.  The stack is moved down by one page and the vdso is
+    mapped into this space.
+    
+    Signed-off-by: David Daney <ddaney@caviumnetworks.com>
+    To: linux-mips@linux-mips.org
+    Patchwork: http://patchwork.linux-mips.org/patch/975/
+    Signed-off-by: Ralf Baechle <ralf@linux-mips.org>
+
+diff --git a/arch/mips/include/asm/mmu_context.h b/arch/mips/include/asm/mmu_context.h
+index 145bb81ccaa5..d9592733a7ba 100644
+--- a/arch/mips/include/asm/mmu_context.h
++++ b/arch/mips/include/asm/mmu_context.h
+@@ -104,7 +104,7 @@ extern unsigned long smtc_asid_mask;
+ 
+ #endif
+ 
+-#define cpu_context(cpu, mm)	((mm)->context[cpu])
++#define cpu_context(cpu, mm)	((mm)->context.asid[cpu])
+ #define cpu_asid(cpu, mm)	(cpu_context((cpu), (mm)) & ASID_MASK)
+ #define asid_cache(cpu)		(cpu_data[cpu].asid_cache)
+ 
+
+commit 82622284dd2f8791f9759f3cef601520a8bc63b2
+Author: David Daney <ddaney@caviumnetworks.com>
+Date:   Wed Oct 14 12:16:56 2009 -0700
+
+    MIPS: Put PGD in C0_CONTEXT for 64-bit R2 processors.
+    
+    Processors that support the mips64r2 ISA can in four instructions
+    convert a shifted PGD pointer stored in the upper bits of c0_context
+    into a usable pointer.  By doing this we save a memory load and
+    associated potential cache miss in the TLB exception handlers.
+    
+    Since the upper bits of c0_context were holding the CPU number, we
+    move this to the upper bits of c0_xcontext which doesn't have enough
+    bits to hold the PGD pointer, but has plenty for the CPU number.
+    
+    Signed-off-by: David Daney <ddaney@caviumnetworks.com>
+    Signed-off-by: Ralf Baechle <ralf@linux-mips.org>
+
+diff --git a/arch/mips/include/asm/mmu_context.h b/arch/mips/include/asm/mmu_context.h
+index 6083db586500..145bb81ccaa5 100644
+--- a/arch/mips/include/asm/mmu_context.h
++++ b/arch/mips/include/asm/mmu_context.h
+@@ -24,6 +24,33 @@
+ #endif /* SMTC */
+ #include <asm-generic/mm_hooks.h>
+ 
++#ifdef CONFIG_MIPS_PGD_C0_CONTEXT
++
++#define TLBMISS_HANDLER_SETUP_PGD(pgd)				\
++	tlbmiss_handler_setup_pgd((unsigned long)(pgd))
++
++static inline void tlbmiss_handler_setup_pgd(unsigned long pgd)
++{
++	/* Check for swapper_pg_dir and convert to physical address. */
++	if ((pgd & CKSEG3) == CKSEG0)
++		pgd = CPHYSADDR(pgd);
++	write_c0_context(pgd << 11);
++}
++
++#define TLBMISS_HANDLER_SETUP()						\
++	do {								\
++		TLBMISS_HANDLER_SETUP_PGD(swapper_pg_dir);		\
++		write_c0_xcontext((unsigned long) smp_processor_id() << 51); \
++	} while (0)
++
++
++static inline unsigned long get_current_pgd(void)
++{
++	return PHYS_TO_XKSEG_CACHED((read_c0_context() >> 11) & ~0xfffUL);
++}
++
++#else /* CONFIG_MIPS_PGD_C0_CONTEXT: using  pgd_current*/
++
+ /*
+  * For the fast tlb miss handlers, we keep a per cpu array of pointers
+  * to the current pgd for each processor. Also, the proc. id is stuffed
+@@ -46,7 +73,7 @@ extern unsigned long pgd_current[];
+ 	back_to_back_c0_hazard();					\
+ 	TLBMISS_HANDLER_SETUP_PGD(swapper_pg_dir)
+ #endif
+-
++#endif /* CONFIG_MIPS_PGD_C0_CONTEXT*/
+ #if defined(CONFIG_CPU_R3000) || defined(CONFIG_CPU_TX39XX)
+ 
+ #define ASID_INC	0x40
+
+commit c2ea1d56eaf084c66177eb5658ff4065e79b36ea
+Author: Ralf Baechle <ralf@linux-mips.org>
+Date:   Tue Oct 13 23:23:28 2009 +0200
+
+    MIPS: Avoid potential hazard on Context register
+    
+    set_saved_sp reads Context register. Avoid reading stale value from
+    earlier incomplete write.
+    
+    Issue found and fixed for head.S by Chris Dearman <chris@mips.com>.
+    
+    Signed-off-by: Chris Dearman <chris@mips.com>
+    Signed-off-by: Ralf Baechle <ralf@linux-mips.org>
+
+diff --git a/arch/mips/include/asm/mmu_context.h b/arch/mips/include/asm/mmu_context.h
+index ed331c2e4882..6083db586500 100644
+--- a/arch/mips/include/asm/mmu_context.h
++++ b/arch/mips/include/asm/mmu_context.h
+@@ -16,6 +16,7 @@
+ #include <linux/smp.h>
+ #include <linux/slab.h>
+ #include <asm/cacheflush.h>
++#include <asm/hazards.h>
+ #include <asm/tlbflush.h>
+ #ifdef CONFIG_MIPS_MT_SMTC
+ #include <asm/mipsmtregs.h>
+@@ -36,11 +37,13 @@ extern unsigned long pgd_current[];
+ #ifdef CONFIG_32BIT
+ #define TLBMISS_HANDLER_SETUP()						\
+ 	write_c0_context((unsigned long) smp_processor_id() << 25);	\
++	back_to_back_c0_hazard();					\
+ 	TLBMISS_HANDLER_SETUP_PGD(swapper_pg_dir)
+ #endif
+ #ifdef CONFIG_64BIT
+ #define TLBMISS_HANDLER_SETUP()						\
+ 	write_c0_context((unsigned long) smp_processor_id() << 26);	\
++	back_to_back_c0_hazard();					\
+ 	TLBMISS_HANDLER_SETUP_PGD(swapper_pg_dir)
+ #endif
+ 
+
+commit d30cecbcbe149a36a354757cea835c1bb28689cf
+Author: Ralf Baechle <ralf@linux-mips.org>
+Date:   Wed May 27 17:29:37 2009 +0100
+
+    MIPS: Don't write ones to reserved entryhi bits.
+    
+    We've silently been relying on the hardware chopping off excess, reserved
+    ASID bits for no better reason that it saving an instruction.  Because we
+    already have:
+    
+    #define cpu_asid(cpu, mm)       (cpu_context((cpu), (mm)) & ASID_MASK)
+    
+    in <asm/mmu_context.h>.
+    
+    We can use a cleanup to avoid writing non-zero bits into the reserved
+    entryhi bits.  This avoid triggering some debugging assertion in the
+    Cavium simulator.
+    
+    Signed-off-by: Ralf Baechle <ralf@linux-mips.org>
+
+diff --git a/arch/mips/include/asm/mmu_context.h b/arch/mips/include/asm/mmu_context.h
+index d9743536a621..ed331c2e4882 100644
+--- a/arch/mips/include/asm/mmu_context.h
++++ b/arch/mips/include/asm/mmu_context.h
+@@ -165,12 +165,12 @@ static inline void switch_mm(struct mm_struct *prev, struct mm_struct *next,
+ 	 * having ASID_MASK smaller than the hardware maximum,
+ 	 * make sure no "soft" bits become "hard"...
+ 	 */
+-	write_c0_entryhi((read_c0_entryhi() & ~HW_ASID_MASK)
+-			| (cpu_context(cpu, next) & ASID_MASK));
++	write_c0_entryhi((read_c0_entryhi() & ~HW_ASID_MASK) |
++			 cpu_asid(cpu, next));
+ 	ehb(); /* Make sure it propagates to TCStatus */
+ 	evpe(mtflags);
+ #else
+-	write_c0_entryhi(cpu_context(cpu, next));
++	write_c0_entryhi(cpu_asid(cpu, next));
+ #endif /* CONFIG_MIPS_MT_SMTC */
+ 	TLBMISS_HANDLER_SETUP_PGD(next->pgd);
+ 
+@@ -226,11 +226,11 @@ activate_mm(struct mm_struct *prev, struct mm_struct *next)
+ 	}
+ 	/* See comments for similar code above */
+ 	write_c0_entryhi((read_c0_entryhi() & ~HW_ASID_MASK) |
+-	                 (cpu_context(cpu, next) & ASID_MASK));
++	                 cpu_asid(cpu, next));
+ 	ehb(); /* Make sure it propagates to TCStatus */
+ 	evpe(mtflags);
+ #else
+-	write_c0_entryhi(cpu_context(cpu, next));
++	write_c0_entryhi(cpu_asid(cpu, next));
+ #endif /* CONFIG_MIPS_MT_SMTC */
+ 	TLBMISS_HANDLER_SETUP_PGD(next->pgd);
+ 
+
+commit 55b8cab49dd43d227f0dd49e3524406fdc46d37b
+Author: Rusty Russell <rusty@rustcorp.com.au>
+Date:   Thu Sep 24 09:34:50 2009 -0600
+
+    cpumask: use mm_cpumask() wrapper: mips
+    
+    Makes code futureproof against the impending change to mm->cpu_vm_mask.
+    
+    It's also a chance to use the new cpumask_ ops which take a pointer
+    (the older ones are deprecated, but there's no hurry for arch code).
+    
+    Signed-off-by: Rusty Russell <rusty@rustcorp.com.au>
+
+diff --git a/arch/mips/include/asm/mmu_context.h b/arch/mips/include/asm/mmu_context.h
+index d3bea88d8744..d9743536a621 100644
+--- a/arch/mips/include/asm/mmu_context.h
++++ b/arch/mips/include/asm/mmu_context.h
+@@ -178,8 +178,8 @@ static inline void switch_mm(struct mm_struct *prev, struct mm_struct *next,
+ 	 * Mark current->active_mm as not "active" anymore.
+ 	 * We don't want to mislead possible IPI tlb flush routines.
+ 	 */
+-	cpu_clear(cpu, prev->cpu_vm_mask);
+-	cpu_set(cpu, next->cpu_vm_mask);
++	cpumask_clear_cpu(cpu, mm_cpumask(prev));
++	cpumask_set_cpu(cpu, mm_cpumask(next));
+ 
+ 	local_irq_restore(flags);
+ }
+@@ -235,8 +235,8 @@ activate_mm(struct mm_struct *prev, struct mm_struct *next)
+ 	TLBMISS_HANDLER_SETUP_PGD(next->pgd);
+ 
+ 	/* mark mmu ownership change */
+-	cpu_clear(cpu, prev->cpu_vm_mask);
+-	cpu_set(cpu, next->cpu_vm_mask);
++	cpumask_clear_cpu(cpu, mm_cpumask(prev));
++	cpumask_set_cpu(cpu, mm_cpumask(next));
+ 
+ 	local_irq_restore(flags);
+ }
+@@ -258,7 +258,7 @@ drop_mmu_context(struct mm_struct *mm, unsigned cpu)
+ 
+ 	local_irq_save(flags);
+ 
+-	if (cpu_isset(cpu, mm->cpu_vm_mask))  {
++	if (cpumask_test_cpu(cpu, mm_cpumask(mm)))  {
+ 		get_new_mmu_context(mm, cpu);
+ #ifdef CONFIG_MIPS_MT_SMTC
+ 		/* See comments for similar code above */
+
+commit 631330f5847b3f8a7ea67d689e9f7c56833ccaa6
+Author: Ralf Baechle <ralf@linux-mips.org>
+Date:   Fri Jun 19 14:05:26 2009 +0100
+
+    MIPS: Build fix - include <linux/smp.h> into all smp_processor_id() users.
+    
+    Some of the were relying into smp.h being dragged in by another header
+    which of course is fragile.  <asm/cpu-info.h> uses smp_processor_id()
+    only in macros and including smp.h there leads to an include loop, so
+    don't change cpu-info.h.
+    
+    Signed-off-by: Ralf Baechle <ralf@linux-mips.org>
+
+diff --git a/arch/mips/include/asm/mmu_context.h b/arch/mips/include/asm/mmu_context.h
+index d7f3eb03ad12..d3bea88d8744 100644
+--- a/arch/mips/include/asm/mmu_context.h
++++ b/arch/mips/include/asm/mmu_context.h
+@@ -13,6 +13,7 @@
+ 
+ #include <linux/errno.h>
+ #include <linux/sched.h>
++#include <linux/smp.h>
+ #include <linux/slab.h>
+ #include <asm/cacheflush.h>
+ #include <asm/tlbflush.h>
+
+commit 384740dc49ea651ba350704d13ff6be9976e37fe
+Author: Ralf Baechle <ralf@linux-mips.org>
+Date:   Tue Sep 16 19:48:51 2008 +0200
+
+    MIPS: Move headfiles to new location below arch/mips/include
+    
+    Signed-off-by: Ralf Baechle <ralf@linux-mips.org>
+
+diff --git a/arch/mips/include/asm/mmu_context.h b/arch/mips/include/asm/mmu_context.h
+new file mode 100644
+index 000000000000..d7f3eb03ad12
+--- /dev/null
++++ b/arch/mips/include/asm/mmu_context.h
+@@ -0,0 +1,297 @@
++/*
++ * Switch a MMU context.
++ *
++ * This file is subject to the terms and conditions of the GNU General Public
++ * License.  See the file "COPYING" in the main directory of this archive
++ * for more details.
++ *
++ * Copyright (C) 1996, 1997, 1998, 1999 by Ralf Baechle
++ * Copyright (C) 1999 Silicon Graphics, Inc.
++ */
++#ifndef _ASM_MMU_CONTEXT_H
++#define _ASM_MMU_CONTEXT_H
++
++#include <linux/errno.h>
++#include <linux/sched.h>
++#include <linux/slab.h>
++#include <asm/cacheflush.h>
++#include <asm/tlbflush.h>
++#ifdef CONFIG_MIPS_MT_SMTC
++#include <asm/mipsmtregs.h>
++#include <asm/smtc.h>
++#endif /* SMTC */
++#include <asm-generic/mm_hooks.h>
++
++/*
++ * For the fast tlb miss handlers, we keep a per cpu array of pointers
++ * to the current pgd for each processor. Also, the proc. id is stuffed
++ * into the context register.
++ */
++extern unsigned long pgd_current[];
++
++#define TLBMISS_HANDLER_SETUP_PGD(pgd) \
++	pgd_current[smp_processor_id()] = (unsigned long)(pgd)
++
++#ifdef CONFIG_32BIT
++#define TLBMISS_HANDLER_SETUP()						\
++	write_c0_context((unsigned long) smp_processor_id() << 25);	\
++	TLBMISS_HANDLER_SETUP_PGD(swapper_pg_dir)
++#endif
++#ifdef CONFIG_64BIT
++#define TLBMISS_HANDLER_SETUP()						\
++	write_c0_context((unsigned long) smp_processor_id() << 26);	\
++	TLBMISS_HANDLER_SETUP_PGD(swapper_pg_dir)
++#endif
++
++#if defined(CONFIG_CPU_R3000) || defined(CONFIG_CPU_TX39XX)
++
++#define ASID_INC	0x40
++#define ASID_MASK	0xfc0
++
++#elif defined(CONFIG_CPU_R8000)
++
++#define ASID_INC	0x10
++#define ASID_MASK	0xff0
++
++#elif defined(CONFIG_CPU_RM9000)
++
++#define ASID_INC	0x1
++#define ASID_MASK	0xfff
++
++/* SMTC/34K debug hack - but maybe we'll keep it */
++#elif defined(CONFIG_MIPS_MT_SMTC)
++
++#define ASID_INC	0x1
++extern unsigned long smtc_asid_mask;
++#define ASID_MASK	(smtc_asid_mask)
++#define	HW_ASID_MASK	0xff
++/* End SMTC/34K debug hack */
++#else /* FIXME: not correct for R6000 */
++
++#define ASID_INC	0x1
++#define ASID_MASK	0xff
++
++#endif
++
++#define cpu_context(cpu, mm)	((mm)->context[cpu])
++#define cpu_asid(cpu, mm)	(cpu_context((cpu), (mm)) & ASID_MASK)
++#define asid_cache(cpu)		(cpu_data[cpu].asid_cache)
++
++static inline void enter_lazy_tlb(struct mm_struct *mm, struct task_struct *tsk)
++{
++}
++
++/*
++ *  All unused by hardware upper bits will be considered
++ *  as a software asid extension.
++ */
++#define ASID_VERSION_MASK  ((unsigned long)~(ASID_MASK|(ASID_MASK-1)))
++#define ASID_FIRST_VERSION ((unsigned long)(~ASID_VERSION_MASK) + 1)
++
++#ifndef CONFIG_MIPS_MT_SMTC
++/* Normal, classic MIPS get_new_mmu_context */
++static inline void
++get_new_mmu_context(struct mm_struct *mm, unsigned long cpu)
++{
++	unsigned long asid = asid_cache(cpu);
++
++	if (! ((asid += ASID_INC) & ASID_MASK) ) {
++		if (cpu_has_vtag_icache)
++			flush_icache_all();
++		local_flush_tlb_all();	/* start new asid cycle */
++		if (!asid)		/* fix version if needed */
++			asid = ASID_FIRST_VERSION;
++	}
++	cpu_context(cpu, mm) = asid_cache(cpu) = asid;
++}
++
++#else /* CONFIG_MIPS_MT_SMTC */
++
++#define get_new_mmu_context(mm, cpu) smtc_get_new_mmu_context((mm), (cpu))
++
++#endif /* CONFIG_MIPS_MT_SMTC */
++
++/*
++ * Initialize the context related info for a new mm_struct
++ * instance.
++ */
++static inline int
++init_new_context(struct task_struct *tsk, struct mm_struct *mm)
++{
++	int i;
++
++	for_each_online_cpu(i)
++		cpu_context(i, mm) = 0;
++
++	return 0;
++}
++
++static inline void switch_mm(struct mm_struct *prev, struct mm_struct *next,
++                             struct task_struct *tsk)
++{
++	unsigned int cpu = smp_processor_id();
++	unsigned long flags;
++#ifdef CONFIG_MIPS_MT_SMTC
++	unsigned long oldasid;
++	unsigned long mtflags;
++	int mytlb = (smtc_status & SMTC_TLB_SHARED) ? 0 : cpu_data[cpu].vpe_id;
++	local_irq_save(flags);
++	mtflags = dvpe();
++#else /* Not SMTC */
++	local_irq_save(flags);
++#endif /* CONFIG_MIPS_MT_SMTC */
++
++	/* Check if our ASID is of an older version and thus invalid */
++	if ((cpu_context(cpu, next) ^ asid_cache(cpu)) & ASID_VERSION_MASK)
++		get_new_mmu_context(next, cpu);
++#ifdef CONFIG_MIPS_MT_SMTC
++	/*
++	 * If the EntryHi ASID being replaced happens to be
++	 * the value flagged at ASID recycling time as having
++	 * an extended life, clear the bit showing it being
++	 * in use by this "CPU", and if that's the last bit,
++	 * free up the ASID value for use and flush any old
++	 * instances of it from the TLB.
++	 */
++	oldasid = (read_c0_entryhi() & ASID_MASK);
++	if(smtc_live_asid[mytlb][oldasid]) {
++		smtc_live_asid[mytlb][oldasid] &= ~(0x1 << cpu);
++		if(smtc_live_asid[mytlb][oldasid] == 0)
++			smtc_flush_tlb_asid(oldasid);
++	}
++	/*
++	 * Tread softly on EntryHi, and so long as we support
++	 * having ASID_MASK smaller than the hardware maximum,
++	 * make sure no "soft" bits become "hard"...
++	 */
++	write_c0_entryhi((read_c0_entryhi() & ~HW_ASID_MASK)
++			| (cpu_context(cpu, next) & ASID_MASK));
++	ehb(); /* Make sure it propagates to TCStatus */
++	evpe(mtflags);
++#else
++	write_c0_entryhi(cpu_context(cpu, next));
++#endif /* CONFIG_MIPS_MT_SMTC */
++	TLBMISS_HANDLER_SETUP_PGD(next->pgd);
++
++	/*
++	 * Mark current->active_mm as not "active" anymore.
++	 * We don't want to mislead possible IPI tlb flush routines.
++	 */
++	cpu_clear(cpu, prev->cpu_vm_mask);
++	cpu_set(cpu, next->cpu_vm_mask);
++
++	local_irq_restore(flags);
++}
++
++/*
++ * Destroy context related info for an mm_struct that is about
++ * to be put to rest.
++ */
++static inline void destroy_context(struct mm_struct *mm)
++{
++}
++
++#define deactivate_mm(tsk, mm)	do { } while (0)
++
++/*
++ * After we have set current->mm to a new value, this activates
++ * the context for the new mm so we see the new mappings.
++ */
++static inline void
++activate_mm(struct mm_struct *prev, struct mm_struct *next)
++{
++	unsigned long flags;
++	unsigned int cpu = smp_processor_id();
++
++#ifdef CONFIG_MIPS_MT_SMTC
++	unsigned long oldasid;
++	unsigned long mtflags;
++	int mytlb = (smtc_status & SMTC_TLB_SHARED) ? 0 : cpu_data[cpu].vpe_id;
++#endif /* CONFIG_MIPS_MT_SMTC */
++
++	local_irq_save(flags);
++
++	/* Unconditionally get a new ASID.  */
++	get_new_mmu_context(next, cpu);
++
++#ifdef CONFIG_MIPS_MT_SMTC
++	/* See comments for similar code above */
++	mtflags = dvpe();
++	oldasid = read_c0_entryhi() & ASID_MASK;
++	if(smtc_live_asid[mytlb][oldasid]) {
++		smtc_live_asid[mytlb][oldasid] &= ~(0x1 << cpu);
++		if(smtc_live_asid[mytlb][oldasid] == 0)
++			 smtc_flush_tlb_asid(oldasid);
++	}
++	/* See comments for similar code above */
++	write_c0_entryhi((read_c0_entryhi() & ~HW_ASID_MASK) |
++	                 (cpu_context(cpu, next) & ASID_MASK));
++	ehb(); /* Make sure it propagates to TCStatus */
++	evpe(mtflags);
++#else
++	write_c0_entryhi(cpu_context(cpu, next));
++#endif /* CONFIG_MIPS_MT_SMTC */
++	TLBMISS_HANDLER_SETUP_PGD(next->pgd);
++
++	/* mark mmu ownership change */
++	cpu_clear(cpu, prev->cpu_vm_mask);
++	cpu_set(cpu, next->cpu_vm_mask);
++
++	local_irq_restore(flags);
++}
++
++/*
++ * If mm is currently active_mm, we can't really drop it.  Instead,
++ * we will get a new one for it.
++ */
++static inline void
++drop_mmu_context(struct mm_struct *mm, unsigned cpu)
++{
++	unsigned long flags;
++#ifdef CONFIG_MIPS_MT_SMTC
++	unsigned long oldasid;
++	/* Can't use spinlock because called from TLB flush within DVPE */
++	unsigned int prevvpe;
++	int mytlb = (smtc_status & SMTC_TLB_SHARED) ? 0 : cpu_data[cpu].vpe_id;
++#endif /* CONFIG_MIPS_MT_SMTC */
++
++	local_irq_save(flags);
++
++	if (cpu_isset(cpu, mm->cpu_vm_mask))  {
++		get_new_mmu_context(mm, cpu);
++#ifdef CONFIG_MIPS_MT_SMTC
++		/* See comments for similar code above */
++		prevvpe = dvpe();
++		oldasid = (read_c0_entryhi() & ASID_MASK);
++		if (smtc_live_asid[mytlb][oldasid]) {
++			smtc_live_asid[mytlb][oldasid] &= ~(0x1 << cpu);
++			if(smtc_live_asid[mytlb][oldasid] == 0)
++				smtc_flush_tlb_asid(oldasid);
++		}
++		/* See comments for similar code above */
++		write_c0_entryhi((read_c0_entryhi() & ~HW_ASID_MASK)
++				| cpu_asid(cpu, mm));
++		ehb(); /* Make sure it propagates to TCStatus */
++		evpe(prevvpe);
++#else /* not CONFIG_MIPS_MT_SMTC */
++		write_c0_entryhi(cpu_asid(cpu, mm));
++#endif /* CONFIG_MIPS_MT_SMTC */
++	} else {
++		/* will get a new context next time */
++#ifndef CONFIG_MIPS_MT_SMTC
++		cpu_context(cpu, mm) = 0;
++#else /* SMTC */
++		int i;
++
++		/* SMTC shares the TLB (and ASIDs) across VPEs */
++		for_each_online_cpu(i) {
++		    if((smtc_status & SMTC_TLB_SHARED)
++		    || (cpu_data[i].vpe_id == cpu_data[cpu].vpe_id))
++			cpu_context(i, mm) = 0;
++		}
++#endif /* CONFIG_MIPS_MT_SMTC */
++	}
++	local_irq_restore(flags);
++}
++
++#endif /* _ASM_MMU_CONTEXT_H */

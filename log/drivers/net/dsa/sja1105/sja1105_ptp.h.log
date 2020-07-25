@@ -1,0 +1,1048 @@
+commit 834f8933d5ddd732274cb6050252bd1c7cc7349d
+Author: Vladimir Oltean <vladimir.oltean@nxp.com>
+Date:   Tue May 5 22:20:56 2020 +0300
+
+    net: dsa: sja1105: implement tc-gate using time-triggered virtual links
+    
+    Restrict the TTEthernet hardware support on this switch to operate as
+    closely as possible to IEEE 802.1Qci as possible. This means that it can
+    perform PTP-time-based ingress admission control on streams identified
+    by {DMAC, VID, PCP}, which is useful when trying to ensure the
+    determinism of traffic scheduled via IEEE 802.1Qbv.
+    
+    The oddity comes from the fact that in hardware (and in TTEthernet at
+    large), virtual links always need a full-blown action, including not
+    only the type of policing, but also the list of destination ports. So in
+    practice, a single tc-gate action will result in all packets getting
+    dropped. Additional actions (either "trap" or "redirect") need to be
+    specified in the same filter rule such that the conforming packets are
+    actually forwarded somewhere.
+    
+    Apart from the VL Lookup, Policing and Forwarding tables which need to
+    be programmed for each flow (virtual link), the Schedule engine also
+    needs to be told to open/close the admission gates for each individual
+    virtual link. A fairly accurate (and detailed) description of how that
+    works is already present in sja1105_tas.c, since it is already used to
+    trigger the egress gates for the tc-taprio offload (IEEE 802.1Qbv). Key
+    point here, we remember that the schedule engine supports 8
+    "subschedules" (execution threads that iterate through the global
+    schedule in parallel, and that no 2 hardware threads must execute a
+    schedule entry at the same time). For tc-taprio, each egress port used
+    one of these 8 subschedules, leaving a total of 4 subschedules unused.
+    In principle we could have allocated 1 subschedule for the tc-gate
+    offload of each ingress port, but actually the schedules of all virtual
+    links installed on each ingress port would have needed to be merged
+    together, before they could have been programmed to hardware. So
+    simplify our life and just merge the entire tc-gate configuration, for
+    all virtual links on all ingress ports, into a single subschedule. Be
+    sure to check that against the usual hardware scheduling conflicts, and
+    program it to hardware alongside any tc-taprio subschedule that may be
+    present.
+    
+    The following scenarios were tested:
+    
+    1. Quantitative testing:
+    
+       tc qdisc add dev swp2 clsact
+       tc filter add dev swp2 ingress flower skip_sw \
+               dst_mac 42:be:24:9b:76:20 \
+               action gate index 1 base-time 0 \
+               sched-entry OPEN 1200 -1 -1 \
+               sched-entry CLOSE 1200 -1 -1 \
+               action trap
+    
+       ping 192.168.1.2 -f
+       PING 192.168.1.2 (192.168.1.2) 56(84) bytes of data.
+       .............................
+       --- 192.168.1.2 ping statistics ---
+       948 packets transmitted, 467 received, 50.7384% packet loss, time 9671ms
+    
+    2. Qualitative testing (with a phase-aligned schedule - the clocks are
+       synchronized by ptp4l, not shown here):
+    
+       Receiver (sja1105):
+    
+       tc qdisc add dev swp2 clsact
+       now=$(phc_ctl /dev/ptp1 get | awk '/clock time is/ {print $5}') && \
+               sec=$(echo $now | awk -F. '{print $1}') && \
+               base_time="$(((sec + 2) * 1000000000))" && \
+               echo "base time ${base_time}"
+       tc filter add dev swp2 ingress flower skip_sw \
+               dst_mac 42:be:24:9b:76:20 \
+               action gate base-time ${base_time} \
+               sched-entry OPEN  60000 -1 -1 \
+               sched-entry CLOSE 40000 -1 -1 \
+               action trap
+    
+       Sender (enetc):
+       now=$(phc_ctl /dev/ptp0 get | awk '/clock time is/ {print $5}') && \
+               sec=$(echo $now | awk -F. '{print $1}') && \
+               base_time="$(((sec + 2) * 1000000000))" && \
+               echo "base time ${base_time}"
+       tc qdisc add dev eno0 parent root taprio \
+               num_tc 8 \
+               map 0 1 2 3 4 5 6 7 \
+               queues 1@0 1@1 1@2 1@3 1@4 1@5 1@6 1@7 \
+               base-time ${base_time} \
+               sched-entry S 01  50000 \
+               sched-entry S 00  50000 \
+               flags 2
+    
+       ping -A 192.168.1.1
+       PING 192.168.1.1 (192.168.1.1): 56 data bytes
+       ...
+       ^C
+       --- 192.168.1.1 ping statistics ---
+       1425 packets transmitted, 1424 packets received, 0% packet loss
+       round-trip min/avg/max = 0.322/0.361/0.990 ms
+    
+       And just for comparison, with the tc-taprio schedule deleted:
+    
+       ping -A 192.168.1.1
+       PING 192.168.1.1 (192.168.1.1): 56 data bytes
+       ...
+       ^C
+       --- 192.168.1.1 ping statistics ---
+       33 packets transmitted, 19 packets received, 42% packet loss
+       round-trip min/avg/max = 0.336/0.464/0.597 ms
+    
+    Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/dsa/sja1105/sja1105_ptp.h b/drivers/net/dsa/sja1105/sja1105_ptp.h
+index 43480b24f1f0..6408d1158f2d 100644
+--- a/drivers/net/dsa/sja1105/sja1105_ptp.h
++++ b/drivers/net/dsa/sja1105/sja1105_ptp.h
+@@ -48,6 +48,19 @@ static inline s64 future_base_time(s64 base_time, s64 cycle_time, s64 now)
+ 	return base_time + n * cycle_time;
+ }
+ 
++/* This is not a preprocessor macro because the "ns" argument may or may not be
++ * s64 at caller side. This ensures it is properly type-cast before div_s64.
++ */
++static inline s64 ns_to_sja1105_delta(s64 ns)
++{
++	return div_s64(ns, 200);
++}
++
++static inline s64 sja1105_delta_to_ns(s64 delta)
++{
++	return delta * 200;
++}
++
+ struct sja1105_ptp_cmd {
+ 	u64 startptpcp;		/* start toggling PTP_CLK pin */
+ 	u64 stopptpcp;		/* stop toggling PTP_CLK pin */
+
+commit 747e5eb31d59d047972a0dab03e5430fe4264332
+Author: Vladimir Oltean <vladimir.oltean@nxp.com>
+Date:   Tue Mar 24 00:59:24 2020 +0200
+
+    net: dsa: sja1105: configure the PTP_CLK pin as EXT_TS or PER_OUT
+    
+    The SJA1105 switch family has a PTP_CLK pin which emits a signal with
+    fixed 50% duty cycle, but variable frequency and programmable start time.
+    
+    On the second generation (P/Q/R/S) switches, this pin supports even more
+    functionality. The use case described by the hardware documents talks
+    about synchronization via oneshot pulses: given 2 sja1105 switches,
+    arbitrarily designated as a master and a slave, the master emits a
+    single pulse on PTP_CLK, while the slave is configured to timestamp this
+    pulse received on its PTP_CLK pin (which must obviously be configured as
+    input). The difference between the timestamps then exactly becomes the
+    slave offset to the master.
+    
+    The only trouble with the above is that the hardware is very much tied
+    into this use case only, and not very generic beyond that:
+     - When emitting a oneshot pulse, instead of being told when to emit it,
+       the switch just does it "now" and tells you later what time it was,
+       via the PTPSYNCTS register. [ Incidentally, this is the same register
+       that the slave uses to collect the ext_ts timestamp from, too. ]
+     - On the sync slave, there is no interrupt mechanism on reception of a
+       new extts, and no FIFO to buffer them, because in the foreseen use
+       case, software is in control of both the master and the slave pins,
+       so it "knows" when there's something to collect.
+    
+    These 2 problems mean that:
+     - We don't support (at least yet) the quirky oneshot mode exposed by
+       the hardware, just normal periodic output.
+     - We abuse the hardware a little bit when we expose generic extts.
+       Because there's no interrupt mechanism, we need to poll at double the
+       frequency we expect to receive a pulse. Currently that means a
+       non-configurable "twice a second".
+    
+    Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+    Acked-by: Richard Cochran <richardcochran@gmail.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/dsa/sja1105/sja1105_ptp.h b/drivers/net/dsa/sja1105/sja1105_ptp.h
+index 119e345b40fc..43480b24f1f0 100644
+--- a/drivers/net/dsa/sja1105/sja1105_ptp.h
++++ b/drivers/net/dsa/sja1105/sja1105_ptp.h
+@@ -49,6 +49,8 @@ static inline s64 future_base_time(s64 base_time, s64 cycle_time, s64 now)
+ }
+ 
+ struct sja1105_ptp_cmd {
++	u64 startptpcp;		/* start toggling PTP_CLK pin */
++	u64 stopptpcp;		/* stop toggling PTP_CLK pin */
+ 	u64 ptpstrtsch;		/* start schedule */
+ 	u64 ptpstopsch;		/* stop schedule */
+ 	u64 resptp;		/* reset */
+@@ -57,12 +59,14 @@ struct sja1105_ptp_cmd {
+ };
+ 
+ struct sja1105_ptp_data {
++	struct delayed_work extts_work;
+ 	struct sk_buff_head skb_rxtstamp_queue;
+ 	struct ptp_clock_info caps;
+ 	struct ptp_clock *clock;
+ 	struct sja1105_ptp_cmd cmd;
+ 	/* Serializes all operations on the PTP hardware clock */
+ 	struct mutex lock;
++	u64 ptpsyncts;
+ };
+ 
+ int sja1105_ptp_clock_register(struct dsa_switch *ds);
+
+commit 4bfa1616d95fcb2a4e39c1032c49347770f821e7
+Author: Vladimir Oltean <vladimir.oltean@nxp.com>
+Date:   Tue Mar 24 00:59:22 2020 +0200
+
+    net: dsa: sja1105: make future_base_time a common helper
+    
+    Because the PTP_CLK pin starts toggling only at a time higher than the
+    current PTP clock, this helper from the time-aware shaper code comes in
+    handy here as well. We'll use it to transform generic user input for the
+    perout request into valid input for the sja1105 hardware.
+    
+    Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/dsa/sja1105/sja1105_ptp.h b/drivers/net/dsa/sja1105/sja1105_ptp.h
+index 6f4a19eec709..119e345b40fc 100644
+--- a/drivers/net/dsa/sja1105/sja1105_ptp.h
++++ b/drivers/net/dsa/sja1105/sja1105_ptp.h
+@@ -21,6 +21,33 @@ static inline s64 sja1105_ticks_to_ns(s64 ticks)
+ 	return ticks * SJA1105_TICK_NS;
+ }
+ 
++/* Calculate the first base_time in the future that satisfies this
++ * relationship:
++ *
++ * future_base_time = base_time + N x cycle_time >= now, or
++ *
++ *      now - base_time
++ * N >= ---------------
++ *         cycle_time
++ *
++ * Because N is an integer, the ceiling value of the above "a / b" ratio
++ * is in fact precisely the floor value of "(a + b - 1) / b", which is
++ * easier to calculate only having integer division tools.
++ */
++static inline s64 future_base_time(s64 base_time, s64 cycle_time, s64 now)
++{
++	s64 a, b, n;
++
++	if (base_time >= now)
++		return base_time;
++
++	a = now - base_time;
++	b = cycle_time;
++	n = div_s64(a + b - 1, b);
++
++	return base_time + n * cycle_time;
++}
++
+ struct sja1105_ptp_cmd {
+ 	u64 ptpstrtsch;		/* start schedule */
+ 	u64 ptpstopsch;		/* stop schedule */
+
+commit 1e762bd278d2a70bc74b9cbee7f1e93bd4704fe2
+Author: Vladimir Oltean <olteanv@gmail.com>
+Date:   Fri Dec 27 15:02:29 2019 +0200
+
+    net: dsa: sja1105: Use PTP core's dedicated kernel thread for RX timestamping
+    
+    And move the queue of skb's waiting for RX timestamps into the ptp_data
+    structure, since it isn't needed if PTP is not compiled.
+    
+    Signed-off-by: Vladimir Oltean <olteanv@gmail.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/dsa/sja1105/sja1105_ptp.h b/drivers/net/dsa/sja1105/sja1105_ptp.h
+index 470f44b76318..6f4a19eec709 100644
+--- a/drivers/net/dsa/sja1105/sja1105_ptp.h
++++ b/drivers/net/dsa/sja1105/sja1105_ptp.h
+@@ -30,6 +30,7 @@ struct sja1105_ptp_cmd {
+ };
+ 
+ struct sja1105_ptp_data {
++	struct sk_buff_head skb_rxtstamp_queue;
+ 	struct ptp_clock_info caps;
+ 	struct ptp_clock *clock;
+ 	struct sja1105_ptp_cmd cmd;
+
+commit 86db36a347b4ea030ee3e6c73ce04e35e4732999
+Author: Vladimir Oltean <olteanv@gmail.com>
+Date:   Tue Nov 12 02:11:54 2019 +0200
+
+    net: dsa: sja1105: Implement state machine for TAS with PTP clock source
+    
+    Tested using the following bash script and the tc from iproute2-next:
+    
+            #!/bin/bash
+    
+            set -e -u -o pipefail
+    
+            NSEC_PER_SEC="1000000000"
+    
+            gatemask() {
+                    local tc_list="$1"
+                    local mask=0
+    
+                    for tc in ${tc_list}; do
+                            mask=$((${mask} | (1 << ${tc})))
+                    done
+    
+                    printf "%02x" ${mask}
+            }
+    
+            if ! systemctl is-active --quiet ptp4l; then
+                    echo "Please start the ptp4l service"
+                    exit
+            fi
+    
+            now=$(phc_ctl /dev/ptp1 get | gawk '/clock time is/ { print $5; }')
+            # Phase-align the base time to the start of the next second.
+            sec=$(echo "${now}" | gawk -F. '{ print $1; }')
+            base_time="$(((${sec} + 1) * ${NSEC_PER_SEC}))"
+    
+            tc qdisc add dev swp5 parent root handle 100 taprio \
+                    num_tc 8 \
+                    map 0 1 2 3 5 6 7 \
+                    queues 1@0 1@1 1@2 1@3 1@4 1@5 1@6 1@7 \
+                    base-time ${base_time} \
+                    sched-entry S $(gatemask 7) 100000 \
+                    sched-entry S $(gatemask "0 1 2 3 4 5 6") 400000 \
+                    clockid CLOCK_TAI flags 2
+    
+    The "state machine" is a workqueue invoked after each manipulation
+    command on the PTP clock (reset, adjust time, set time, adjust
+    frequency) which checks over the state of the time-aware scheduler.
+    So it is not monitored periodically, only in reaction to a PTP command
+    typically triggered from a userspace daemon (linuxptp). Otherwise there
+    is no reason for things to go wrong.
+    
+    Now that the timecounter/cyclecounter has been replaced with hardware
+    operations on the PTP clock, the TAS Kconfig now depends upon PTP and
+    the standalone clocksource operating mode has been removed.
+    
+    Signed-off-by: Vladimir Oltean <olteanv@gmail.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/dsa/sja1105/sja1105_ptp.h b/drivers/net/dsa/sja1105/sja1105_ptp.h
+index 83d9d4ae6d3a..470f44b76318 100644
+--- a/drivers/net/dsa/sja1105/sja1105_ptp.h
++++ b/drivers/net/dsa/sja1105/sja1105_ptp.h
+@@ -22,6 +22,8 @@ static inline s64 sja1105_ticks_to_ns(s64 ticks)
+ }
+ 
+ struct sja1105_ptp_cmd {
++	u64 ptpstrtsch;		/* start schedule */
++	u64 ptpstopsch;		/* stop schedule */
+ 	u64 resptp;		/* reset */
+ 	u64 corrclk4ts;		/* use the corrected clock for timestamps */
+ 	u64 ptpclkadd;		/* enum sja1105_ptp_clk_mode */
+@@ -69,6 +71,9 @@ int __sja1105_ptp_settime(struct dsa_switch *ds, u64 ns,
+ 
+ int __sja1105_ptp_adjtime(struct dsa_switch *ds, s64 delta);
+ 
++int sja1105_ptp_commit(struct dsa_switch *ds, struct sja1105_ptp_cmd *cmd,
++		       sja1105_spi_rw_mode_t rw);
++
+ #else
+ 
+ struct sja1105_ptp_cmd;
+@@ -110,6 +115,13 @@ static inline int __sja1105_ptp_adjtime(struct dsa_switch *ds, s64 delta)
+ 	return 0;
+ }
+ 
++static inline int sja1105_ptp_commit(struct dsa_switch *ds,
++				     struct sja1105_ptp_cmd *cmd,
++				     sja1105_spi_rw_mode_t rw)
++{
++	return 0;
++}
++
+ #define sja1105et_ptp_cmd_packing NULL
+ 
+ #define sja1105pqrs_ptp_cmd_packing NULL
+
+commit 41603d78b3626cf0da8aa562ecc2a276033db76c
+Author: Vladimir Oltean <olteanv@gmail.com>
+Date:   Tue Nov 12 02:11:53 2019 +0200
+
+    net: dsa: sja1105: Make the PTP command read-write
+    
+    The PTPSTRTSCH and PTPSTOPSCH bits are actually readable and indicate
+    whether the time-aware scheduler is running or not. We will be using
+    that for monitoring the scheduler in the next patch, so refactor the PTP
+    command API in order to allow that.
+    
+    Signed-off-by: Vladimir Oltean <olteanv@gmail.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/dsa/sja1105/sja1105_ptp.h b/drivers/net/dsa/sja1105/sja1105_ptp.h
+index 19e707db7e8c..83d9d4ae6d3a 100644
+--- a/drivers/net/dsa/sja1105/sja1105_ptp.h
++++ b/drivers/net/dsa/sja1105/sja1105_ptp.h
+@@ -39,11 +39,11 @@ int sja1105_ptp_clock_register(struct dsa_switch *ds);
+ 
+ void sja1105_ptp_clock_unregister(struct dsa_switch *ds);
+ 
+-int sja1105et_ptp_cmd(const struct dsa_switch *ds,
+-		      const struct sja1105_ptp_cmd *cmd);
++void sja1105et_ptp_cmd_packing(u8 *buf, struct sja1105_ptp_cmd *cmd,
++			       enum packing_op op);
+ 
+-int sja1105pqrs_ptp_cmd(const struct dsa_switch *ds,
+-			const struct sja1105_ptp_cmd *cmd);
++void sja1105pqrs_ptp_cmd_packing(u8 *buf, struct sja1105_ptp_cmd *cmd,
++				 enum packing_op op);
+ 
+ int sja1105_get_ts_info(struct dsa_switch *ds, int port,
+ 			struct ethtool_ts_info *ts);
+@@ -110,9 +110,9 @@ static inline int __sja1105_ptp_adjtime(struct dsa_switch *ds, s64 delta)
+ 	return 0;
+ }
+ 
+-#define sja1105et_ptp_cmd NULL
++#define sja1105et_ptp_cmd_packing NULL
+ 
+-#define sja1105pqrs_ptp_cmd NULL
++#define sja1105pqrs_ptp_cmd_packing NULL
+ 
+ #define sja1105_get_ts_info NULL
+ 
+
+commit 6cf99c13ea07b5cb345d83598adea60823cea576
+Author: Vladimir Oltean <olteanv@gmail.com>
+Date:   Sat Nov 9 13:32:23 2019 +0200
+
+    net: dsa: sja1105: Restore PTP time after switch reset
+    
+    The PTP time of the switch is not preserved when uploading a new static
+    configuration. Work around this hardware oddity by reading its PTP time
+    before a static config upload, and restoring it afterwards.
+    
+    Static config changes are expected to occur at runtime even in scenarios
+    directly related to PTP, i.e. the Time-Aware Scheduler of the switch is
+    programmed in this way.
+    
+    Perhaps the larger implication of this patch is that the PTP .gettimex64
+    and .settime functions need to be exposed to sja1105_main.c, where the
+    PTP lock needs to be held during this entire process. So their core
+    implementation needs to move to some common functions which get exposed
+    in sja1105_ptp.h.
+    
+    Signed-off-by: Vladimir Oltean <olteanv@gmail.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/dsa/sja1105/sja1105_ptp.h b/drivers/net/dsa/sja1105/sja1105_ptp.h
+index 243f130374d2..19e707db7e8c 100644
+--- a/drivers/net/dsa/sja1105/sja1105_ptp.h
++++ b/drivers/net/dsa/sja1105/sja1105_ptp.h
+@@ -51,8 +51,6 @@ int sja1105_get_ts_info(struct dsa_switch *ds, int port,
+ void sja1105_ptp_txtstamp_skb(struct dsa_switch *ds, int slot,
+ 			      struct sk_buff *clone);
+ 
+-int sja1105_ptp_reset(struct dsa_switch *ds);
+-
+ bool sja1105_port_rxtstamp(struct dsa_switch *ds, int port,
+ 			   struct sk_buff *skb, unsigned int type);
+ 
+@@ -63,6 +61,14 @@ int sja1105_hwtstamp_get(struct dsa_switch *ds, int port, struct ifreq *ifr);
+ 
+ int sja1105_hwtstamp_set(struct dsa_switch *ds, int port, struct ifreq *ifr);
+ 
++int __sja1105_ptp_gettimex(struct dsa_switch *ds, u64 *ns,
++			   struct ptp_system_timestamp *sts);
++
++int __sja1105_ptp_settime(struct dsa_switch *ds, u64 ns,
++			  struct ptp_system_timestamp *ptp_sts);
++
++int __sja1105_ptp_adjtime(struct dsa_switch *ds, s64 delta);
++
+ #else
+ 
+ struct sja1105_ptp_cmd;
+@@ -87,7 +93,19 @@ static inline void sja1105_ptp_txtstamp_skb(struct dsa_switch *ds, int slot,
+ {
+ }
+ 
+-static inline int sja1105_ptp_reset(struct dsa_switch *ds)
++static inline int __sja1105_ptp_gettimex(struct dsa_switch *ds, u64 *ns,
++					 struct ptp_system_timestamp *sts)
++{
++	return 0;
++}
++
++static inline int __sja1105_ptp_settime(struct dsa_switch *ds, u64 ns,
++					struct ptp_system_timestamp *ptp_sts)
++{
++	return 0;
++}
++
++static inline int __sja1105_ptp_adjtime(struct dsa_switch *ds, s64 delta)
+ {
+ 	return 0;
+ }
+
+commit 2f184393e0c2d409c62262f57f2a57efdf9370b8
+Merge: ebcd670d05d5 531e93d11470
+Author: David S. Miller <davem@davemloft.net>
+Date:   Sat Oct 19 22:51:25 2019 -0700
+
+    Merge git://git.kernel.org/pub/scm/linux/kernel/git/netdev/net
+    
+    Several cases of overlapping changes which were for the most
+    part trivially resolvable.
+    
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+commit 2fb079a28ae856145e8977d08b77403a3a5d6a70
+Author: Vladimir Oltean <olteanv@gmail.com>
+Date:   Wed Oct 16 21:41:02 2019 +0300
+
+    net: dsa: sja1105: Switch to hardware operations for PTP
+    
+    Adjusting the hardware clock (PTPCLKVAL, PTPCLKADD, PTPCLKRATE) is a
+    requirement for the auxiliary PTP functionality of the switch
+    (TTEthernet, PPS input, PPS output).
+    
+    Therefore we need to switch to using these registers to keep a
+    synchronized time in hardware, instead of the timecounter/cyclecounter
+    implementation, which is reliant on the free-running PTPTSCLK.
+    
+    Signed-off-by: Vladimir Oltean <olteanv@gmail.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/dsa/sja1105/sja1105_ptp.h b/drivers/net/dsa/sja1105/sja1105_ptp.h
+index 507107ffd6a3..ea80e479dc1c 100644
+--- a/drivers/net/dsa/sja1105/sja1105_ptp.h
++++ b/drivers/net/dsa/sja1105/sja1105_ptp.h
+@@ -6,21 +6,32 @@
+ 
+ #if IS_ENABLED(CONFIG_NET_DSA_SJA1105_PTP)
+ 
++/* Timestamps are in units of 8 ns clock ticks (equivalent to
++ * a fixed 125 MHz clock).
++ */
++#define SJA1105_TICK_NS			8
++
++static inline s64 ns_to_sja1105_ticks(s64 ns)
++{
++	return ns / SJA1105_TICK_NS;
++}
++
++static inline s64 sja1105_ticks_to_ns(s64 ticks)
++{
++	return ticks * SJA1105_TICK_NS;
++}
++
+ struct sja1105_ptp_cmd {
+ 	u64 resptp;		/* reset */
++	u64 corrclk4ts;		/* use the corrected clock for timestamps */
++	u64 ptpclkadd;		/* enum sja1105_ptp_clk_mode */
+ };
+ 
+ struct sja1105_ptp_data {
+ 	struct ptp_clock_info caps;
+ 	struct ptp_clock *clock;
+ 	struct sja1105_ptp_cmd cmd;
+-	/* The cycle counter translates the PTP timestamps (based on
+-	 * a free-running counter) into a software time domain.
+-	 */
+-	struct cyclecounter tstamp_cc;
+-	struct timecounter tstamp_tc;
+-	struct delayed_work refresh_work;
+-	/* Serializes all operations on the cycle counter */
++	/* Serializes all operations on the PTP hardware clock */
+ 	struct mutex lock;
+ };
+ 
+
+commit b790b5549bdf498ab0ecc5632610a9149532fa38
+Author: Nishad Kamdar <nishadkamdar@gmail.com>
+Date:   Mon Oct 14 21:51:20 2019 +0530
+
+    net: dsa: sja1105: Use the correct style for SPDX License Identifier
+    
+    This patch corrects the SPDX License Identifier style
+    in header files related to Distributed Switch Architecture
+    drivers for NXP SJA1105 series Ethernet switch support.
+    It uses an expilict block comment for the SPDX License
+    Identifier.
+    
+    Changes made by using a script provided by Joe Perches here:
+    https://lkml.org/lkml/2019/2/7/46.
+    
+    Suggested-by: Joe Perches <joe@perches.com>
+    Signed-off-by: Nishad Kamdar <nishadkamdar@gmail.com>
+    Reviewed-by: Andrew Lunn <andrew@lunn.ch>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/dsa/sja1105/sja1105_ptp.h b/drivers/net/dsa/sja1105/sja1105_ptp.h
+index af456b0a4d27..394e12a6ad59 100644
+--- a/drivers/net/dsa/sja1105/sja1105_ptp.h
++++ b/drivers/net/dsa/sja1105/sja1105_ptp.h
+@@ -1,5 +1,5 @@
+-/* SPDX-License-Identifier: GPL-2.0
+- * Copyright (c) 2019, Vladimir Oltean <olteanv@gmail.com>
++/* SPDX-License-Identifier: GPL-2.0 */
++/* Copyright (c) 2019, Vladimir Oltean <olteanv@gmail.com>
+  */
+ #ifndef _SJA1105_PTP_H
+ #define _SJA1105_PTP_H
+
+commit 664277781c4cb312971c5a2e2df3290bd990ac14
+Author: Vladimir Oltean <olteanv@gmail.com>
+Date:   Sat Oct 12 02:18:16 2019 +0300
+
+    net: dsa: sja1105: Change the PTP command access pattern
+    
+    The PTP command register contains enable bits for:
+    - Putting the 64-bit PTPCLKVAL register in add/subtract or write mode
+    - Taking timestamps off of the corrected vs free-running clock
+    - Starting/stopping the TTEthernet scheduling
+    - Starting/stopping PPS output
+    - Resetting the switch
+    
+    When a command needs to be issued (e.g. "change the PTPCLKVAL from write
+    mode to add/subtract mode"), one cannot simply write to the command
+    register setting the PTPCLKADD bit to 1, because that would zeroize the
+    other settings. One also cannot do a read-modify-write (that would be
+    too easy for this hardware) because not all bits of the command register
+    are readable over SPI.
+    
+    So this leaves us with the only option of keeping the value of the PTP
+    command register in the driver, and operating on that.
+    
+    Actually there are 2 types of PTP operations now:
+    - Operations that modify the cached PTP command. These operate on
+      ptp_data->cmd as a pointer.
+    - Operations that apply all previously cached PTP settings, but don't
+      otherwise cache what they did themselves. The sja1105_ptp_reset
+      function is such an example. It copies the ptp_data->cmd on stack
+      before modifying and writing it to SPI.
+    
+    This practically means that struct sja1105_ptp_cmd is no longer an
+    implementation detail, since it needs to be stored in full into struct
+    sja1105_ptp_data, and hence in struct sja1105_private. So the (*ptp_cmd)
+    function prototype can change and take struct sja1105_ptp_cmd as second
+    argument now.
+    
+    Signed-off-by: Vladimir Oltean <olteanv@gmail.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/dsa/sja1105/sja1105_ptp.h b/drivers/net/dsa/sja1105/sja1105_ptp.h
+index 0b6b0e262a02..507107ffd6a3 100644
+--- a/drivers/net/dsa/sja1105/sja1105_ptp.h
++++ b/drivers/net/dsa/sja1105/sja1105_ptp.h
+@@ -6,9 +6,14 @@
+ 
+ #if IS_ENABLED(CONFIG_NET_DSA_SJA1105_PTP)
+ 
++struct sja1105_ptp_cmd {
++	u64 resptp;		/* reset */
++};
++
+ struct sja1105_ptp_data {
+ 	struct ptp_clock_info caps;
+ 	struct ptp_clock *clock;
++	struct sja1105_ptp_cmd cmd;
+ 	/* The cycle counter translates the PTP timestamps (based on
+ 	 * a free-running counter) into a software time domain.
+ 	 */
+@@ -23,9 +28,11 @@ int sja1105_ptp_clock_register(struct dsa_switch *ds);
+ 
+ void sja1105_ptp_clock_unregister(struct dsa_switch *ds);
+ 
+-int sja1105et_ptp_cmd(const struct dsa_switch *ds, const void *data);
++int sja1105et_ptp_cmd(const struct dsa_switch *ds,
++		      const struct sja1105_ptp_cmd *cmd);
+ 
+-int sja1105pqrs_ptp_cmd(const struct dsa_switch *ds, const void *data);
++int sja1105pqrs_ptp_cmd(const struct dsa_switch *ds,
++			const struct sja1105_ptp_cmd *cmd);
+ 
+ int sja1105_get_ts_info(struct dsa_switch *ds, int port,
+ 			struct ethtool_ts_info *ts);
+@@ -47,6 +54,8 @@ int sja1105_hwtstamp_set(struct dsa_switch *ds, int port, struct ifreq *ifr);
+ 
+ #else
+ 
++struct sja1105_ptp_cmd;
++
+ /* Structures cannot be empty in C. Bah!
+  * Keep the mutex as the only element, which is a bit more difficult to
+  * refactor out of sja1105_main.c anyway.
+
+commit a9d6ed7a8bd0f3091b9fe6d0b9facc9392c1ec21
+Author: Vladimir Oltean <olteanv@gmail.com>
+Date:   Sat Oct 12 02:18:15 2019 +0300
+
+    net: dsa: sja1105: Move PTP data to its own private structure
+    
+    This is a non-functional change with 2 goals (both for the case when
+    CONFIG_NET_DSA_SJA1105_PTP is not enabled):
+    
+    - Reduce the size of the sja1105_private structure.
+    - Make the PTP code more self-contained.
+    
+    Leaving priv->ptp_data.lock to be initialized in sja1105_main.c is not a
+    leftover: it will be used in a future patch "net: dsa: sja1105: Restore
+    PTP time after switch reset".
+    
+    Signed-off-by: Vladimir Oltean <olteanv@gmail.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/dsa/sja1105/sja1105_ptp.h b/drivers/net/dsa/sja1105/sja1105_ptp.h
+index 65d3d51da9ad..0b6b0e262a02 100644
+--- a/drivers/net/dsa/sja1105/sja1105_ptp.h
++++ b/drivers/net/dsa/sja1105/sja1105_ptp.h
+@@ -6,12 +6,23 @@
+ 
+ #if IS_ENABLED(CONFIG_NET_DSA_SJA1105_PTP)
+ 
++struct sja1105_ptp_data {
++	struct ptp_clock_info caps;
++	struct ptp_clock *clock;
++	/* The cycle counter translates the PTP timestamps (based on
++	 * a free-running counter) into a software time domain.
++	 */
++	struct cyclecounter tstamp_cc;
++	struct timecounter tstamp_tc;
++	struct delayed_work refresh_work;
++	/* Serializes all operations on the cycle counter */
++	struct mutex lock;
++};
++
+ int sja1105_ptp_clock_register(struct dsa_switch *ds);
+ 
+ void sja1105_ptp_clock_unregister(struct dsa_switch *ds);
+ 
+-int sja1105_ptpegr_ts_poll(struct dsa_switch *ds, int port, u64 *ts);
+-
+ int sja1105et_ptp_cmd(const struct dsa_switch *ds, const void *data);
+ 
+ int sja1105pqrs_ptp_cmd(const struct dsa_switch *ds, const void *data);
+@@ -19,12 +30,31 @@ int sja1105pqrs_ptp_cmd(const struct dsa_switch *ds, const void *data);
+ int sja1105_get_ts_info(struct dsa_switch *ds, int port,
+ 			struct ethtool_ts_info *ts);
+ 
+-u64 sja1105_tstamp_reconstruct(struct dsa_switch *ds, u64 now, u64 ts_partial);
++void sja1105_ptp_txtstamp_skb(struct dsa_switch *ds, int slot,
++			      struct sk_buff *clone);
+ 
+ int sja1105_ptp_reset(struct dsa_switch *ds);
+ 
++bool sja1105_port_rxtstamp(struct dsa_switch *ds, int port,
++			   struct sk_buff *skb, unsigned int type);
++
++bool sja1105_port_txtstamp(struct dsa_switch *ds, int port,
++			   struct sk_buff *skb, unsigned int type);
++
++int sja1105_hwtstamp_get(struct dsa_switch *ds, int port, struct ifreq *ifr);
++
++int sja1105_hwtstamp_set(struct dsa_switch *ds, int port, struct ifreq *ifr);
++
+ #else
+ 
++/* Structures cannot be empty in C. Bah!
++ * Keep the mutex as the only element, which is a bit more difficult to
++ * refactor out of sja1105_main.c anyway.
++ */
++struct sja1105_ptp_data {
++	struct mutex lock;
++};
++
+ static inline int sja1105_ptp_clock_register(struct dsa_switch *ds)
+ {
+ 	return 0;
+@@ -32,16 +62,9 @@ static inline int sja1105_ptp_clock_register(struct dsa_switch *ds)
+ 
+ static inline void sja1105_ptp_clock_unregister(struct dsa_switch *ds) { }
+ 
+-static inline int
+-sja1105_ptpegr_ts_poll(struct dsa_switch *ds, int port, u64 *ts)
++static inline void sja1105_ptp_txtstamp_skb(struct dsa_switch *ds, int slot,
++					    struct sk_buff *clone)
+ {
+-	return 0;
+-}
+-
+-static inline u64 sja1105_tstamp_reconstruct(struct dsa_switch *ds,
+-					     u64 now, u64 ts_partial)
+-{
+-	return 0;
+ }
+ 
+ static inline int sja1105_ptp_reset(struct dsa_switch *ds)
+@@ -55,6 +78,14 @@ static inline int sja1105_ptp_reset(struct dsa_switch *ds)
+ 
+ #define sja1105_get_ts_info NULL
+ 
++#define sja1105_port_rxtstamp NULL
++
++#define sja1105_port_txtstamp NULL
++
++#define sja1105_hwtstamp_get NULL
++
++#define sja1105_hwtstamp_set NULL
++
+ #endif /* IS_ENABLED(CONFIG_NET_DSA_SJA1105_PTP) */
+ 
+ #endif /* _SJA1105_PTP_H */
+
+commit 61c77126278eb950010d2ed944c3bc09d10e0eb4
+Author: Vladimir Oltean <olteanv@gmail.com>
+Date:   Sat Oct 12 02:18:14 2019 +0300
+
+    net: dsa: sja1105: Make all public PTP functions take dsa_switch as argument
+    
+    The new rule (as already started for sja1105_tas.h) is for functions of
+    optional driver components (ones which may be disabled via Kconfig - PTP
+    and TAS) to take struct dsa_switch *ds instead of struct sja1105_private
+    *priv as first argument.
+    
+    This is so that forward-declarations of struct sja1105_private can be
+    avoided.
+    
+    So make sja1105_ptp.h the second user of this rule.
+    
+    Signed-off-by: Vladimir Oltean <olteanv@gmail.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/dsa/sja1105/sja1105_ptp.h b/drivers/net/dsa/sja1105/sja1105_ptp.h
+index af456b0a4d27..65d3d51da9ad 100644
+--- a/drivers/net/dsa/sja1105/sja1105_ptp.h
++++ b/drivers/net/dsa/sja1105/sja1105_ptp.h
+@@ -6,49 +6,45 @@
+ 
+ #if IS_ENABLED(CONFIG_NET_DSA_SJA1105_PTP)
+ 
+-int sja1105_ptp_clock_register(struct sja1105_private *priv);
++int sja1105_ptp_clock_register(struct dsa_switch *ds);
+ 
+-void sja1105_ptp_clock_unregister(struct sja1105_private *priv);
++void sja1105_ptp_clock_unregister(struct dsa_switch *ds);
+ 
+-int sja1105_ptpegr_ts_poll(struct sja1105_private *priv, int port, u64 *ts);
++int sja1105_ptpegr_ts_poll(struct dsa_switch *ds, int port, u64 *ts);
+ 
+-int sja1105et_ptp_cmd(const void *ctx, const void *data);
++int sja1105et_ptp_cmd(const struct dsa_switch *ds, const void *data);
+ 
+-int sja1105pqrs_ptp_cmd(const void *ctx, const void *data);
++int sja1105pqrs_ptp_cmd(const struct dsa_switch *ds, const void *data);
+ 
+ int sja1105_get_ts_info(struct dsa_switch *ds, int port,
+ 			struct ethtool_ts_info *ts);
+ 
+-u64 sja1105_tstamp_reconstruct(struct sja1105_private *priv, u64 now,
+-			       u64 ts_partial);
++u64 sja1105_tstamp_reconstruct(struct dsa_switch *ds, u64 now, u64 ts_partial);
+ 
+-int sja1105_ptp_reset(struct sja1105_private *priv);
++int sja1105_ptp_reset(struct dsa_switch *ds);
+ 
+ #else
+ 
+-static inline int sja1105_ptp_clock_register(struct sja1105_private *priv)
++static inline int sja1105_ptp_clock_register(struct dsa_switch *ds)
+ {
+ 	return 0;
+ }
+ 
+-static inline void sja1105_ptp_clock_unregister(struct sja1105_private *priv)
+-{
+-	return;
+-}
++static inline void sja1105_ptp_clock_unregister(struct dsa_switch *ds) { }
+ 
+ static inline int
+-sja1105_ptpegr_ts_poll(struct sja1105_private *priv, int port, u64 *ts)
++sja1105_ptpegr_ts_poll(struct dsa_switch *ds, int port, u64 *ts)
+ {
+ 	return 0;
+ }
+ 
+-static inline u64 sja1105_tstamp_reconstruct(struct sja1105_private *priv,
++static inline u64 sja1105_tstamp_reconstruct(struct dsa_switch *ds,
+ 					     u64 now, u64 ts_partial)
+ {
+ 	return 0;
+ }
+ 
+-static inline int sja1105_ptp_reset(struct sja1105_private *priv)
++static inline int sja1105_ptp_reset(struct dsa_switch *ds)
+ {
+ 	return 0;
+ }
+
+commit 47ed985e97f513b7746270e8c5d1f3a3f959b2da
+Author: Vladimir Oltean <olteanv@gmail.com>
+Date:   Sat Jun 8 15:04:35 2019 +0300
+
+    net: dsa: sja1105: Add logic for TX timestamping
+    
+    On TX, timestamping is performed synchronously from the
+    port_deferred_xmit worker thread.
+    In management routes, the switch is requested to take egress timestamps
+    (again partial), which are reconstructed and appended to a clone of the
+    skb that was just sent.  The cloning is done by DSA and we retrieve the
+    pointer from the structure that DSA keeps in skb->cb.
+    Then these clones are enqueued to the socket's error queue for
+    application-level processing.
+    
+    Signed-off-by: Vladimir Oltean <olteanv@gmail.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/dsa/sja1105/sja1105_ptp.h b/drivers/net/dsa/sja1105/sja1105_ptp.h
+index 137ffbb0a233..af456b0a4d27 100644
+--- a/drivers/net/dsa/sja1105/sja1105_ptp.h
++++ b/drivers/net/dsa/sja1105/sja1105_ptp.h
+@@ -10,6 +10,8 @@ int sja1105_ptp_clock_register(struct sja1105_private *priv);
+ 
+ void sja1105_ptp_clock_unregister(struct sja1105_private *priv);
+ 
++int sja1105_ptpegr_ts_poll(struct sja1105_private *priv, int port, u64 *ts);
++
+ int sja1105et_ptp_cmd(const void *ctx, const void *data);
+ 
+ int sja1105pqrs_ptp_cmd(const void *ctx, const void *data);
+@@ -17,6 +19,9 @@ int sja1105pqrs_ptp_cmd(const void *ctx, const void *data);
+ int sja1105_get_ts_info(struct dsa_switch *ds, int port,
+ 			struct ethtool_ts_info *ts);
+ 
++u64 sja1105_tstamp_reconstruct(struct sja1105_private *priv, u64 now,
++			       u64 ts_partial);
++
+ int sja1105_ptp_reset(struct sja1105_private *priv);
+ 
+ #else
+@@ -31,6 +36,18 @@ static inline void sja1105_ptp_clock_unregister(struct sja1105_private *priv)
+ 	return;
+ }
+ 
++static inline int
++sja1105_ptpegr_ts_poll(struct sja1105_private *priv, int port, u64 *ts)
++{
++	return 0;
++}
++
++static inline u64 sja1105_tstamp_reconstruct(struct sja1105_private *priv,
++					     u64 now, u64 ts_partial)
++{
++	return 0;
++}
++
+ static inline int sja1105_ptp_reset(struct sja1105_private *priv)
+ {
+ 	return 0;
+
+commit bb77f36ac21d226b8ae4311daceb983be764f746
+Author: Vladimir Oltean <olteanv@gmail.com>
+Date:   Sat Jun 8 15:04:34 2019 +0300
+
+    net: dsa: sja1105: Add support for the PTP clock
+    
+    The design of this PHC driver is influenced by the switch's behavior
+    w.r.t. timestamping.  It exposes two PTP counters, one free-running
+    (PTPTSCLK) and the other offset- and frequency-corrected in hardware
+    through PTPCLKVAL, PTPCLKADD and PTPCLKRATE.  The MACs can sample either
+    of these for frame timestamps.
+    
+    However, the user manual warns that taking timestamps based on the
+    corrected clock is less than useful, as the switch can deliver corrupted
+    timestamps in a variety of circumstances.
+    
+    Therefore, this PHC uses the free-running PTPTSCLK together with a
+    timecounter/cyclecounter structure that translates it into a software
+    time domain.  Thus, the settime/adjtime and adjfine callbacks are
+    hardware no-ops.
+    
+    The timestamps (introduced in a further patch) will also be translated
+    to the correct time domain before being handed over to the userspace PTP
+    stack.
+    
+    The introduction of a second set of PHC operations that operate on the
+    hardware PTPCLKVAL/PTPCLKADD/PTPCLKRATE in the future is somewhat
+    unavoidable, as the TTEthernet core uses the corrected PTP time domain.
+    However, the free-running counter + timecounter structure combination
+    will suffice for now, as the resulting timestamps yield a sub-50 ns
+    synchronization offset in steady state using linuxptp.
+    
+    For this patch, in absence of frame timestamping, the operations of the
+    switch PHC were tested by syncing it to the system time as a local slave
+    clock with:
+    
+    phc2sys -s CLOCK_REALTIME -c swp2 -O 0 -m -S 0.01
+    
+    Signed-off-by: Vladimir Oltean <olteanv@gmail.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/dsa/sja1105/sja1105_ptp.h b/drivers/net/dsa/sja1105/sja1105_ptp.h
+new file mode 100644
+index 000000000000..137ffbb0a233
+--- /dev/null
++++ b/drivers/net/dsa/sja1105/sja1105_ptp.h
+@@ -0,0 +1,47 @@
++/* SPDX-License-Identifier: GPL-2.0
++ * Copyright (c) 2019, Vladimir Oltean <olteanv@gmail.com>
++ */
++#ifndef _SJA1105_PTP_H
++#define _SJA1105_PTP_H
++
++#if IS_ENABLED(CONFIG_NET_DSA_SJA1105_PTP)
++
++int sja1105_ptp_clock_register(struct sja1105_private *priv);
++
++void sja1105_ptp_clock_unregister(struct sja1105_private *priv);
++
++int sja1105et_ptp_cmd(const void *ctx, const void *data);
++
++int sja1105pqrs_ptp_cmd(const void *ctx, const void *data);
++
++int sja1105_get_ts_info(struct dsa_switch *ds, int port,
++			struct ethtool_ts_info *ts);
++
++int sja1105_ptp_reset(struct sja1105_private *priv);
++
++#else
++
++static inline int sja1105_ptp_clock_register(struct sja1105_private *priv)
++{
++	return 0;
++}
++
++static inline void sja1105_ptp_clock_unregister(struct sja1105_private *priv)
++{
++	return;
++}
++
++static inline int sja1105_ptp_reset(struct sja1105_private *priv)
++{
++	return 0;
++}
++
++#define sja1105et_ptp_cmd NULL
++
++#define sja1105pqrs_ptp_cmd NULL
++
++#define sja1105_get_ts_info NULL
++
++#endif /* IS_ENABLED(CONFIG_NET_DSA_SJA1105_PTP) */
++
++#endif /* _SJA1105_PTP_H */

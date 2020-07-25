@@ -1,0 +1,2412 @@
+commit 9f6c61f96f2d97cbb5f7fa85607bc398f843ff0f
+Author: Miklos Szeredi <mszeredi@redhat.com>
+Date:   Thu May 14 16:44:24 2020 +0200
+
+    proc/mounts: add cursor
+    
+    If mounts are deleted after a read(2) call on /proc/self/mounts (or its
+    kin), the subsequent read(2) could miss a mount that comes after the
+    deleted one in the list.  This is because the file position is interpreted
+    as the number mount entries from the start of the list.
+    
+    E.g. first read gets entries #0 to #9; the seq file index will be 10.  Then
+    entry #5 is deleted, resulting in #10 becoming #9 and #11 becoming #10,
+    etc...  The next read will continue from entry #10, and #9 is missed.
+    
+    Solve this by adding a cursor entry for each open instance.  Taking the
+    global namespace_sem for write seems excessive, since we are only dealing
+    with a per-namespace list.  Instead add a per-namespace spinlock and use
+    that together with namespace_sem taken for read to protect against
+    concurrent modification of the mount list.  This may reduce parallelism of
+    is_local_mountpoint(), but it's hardly a big contention point.  We could
+    also use RCU freeing of cursors to make traversal not need additional
+    locks, if that turns out to be neceesary.
+    
+    Only move the cursor once for each read (cursor is not added on open) to
+    minimize cacheline invalidation.  When EOF is reached, the cursor is taken
+    off the list, in order to prevent an excessive number of cursors due to
+    inactive open file descriptors.
+    
+    Reported-by: Karel Zak <kzak@redhat.com>
+    Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index 711a4093e475..c7abb7b394d8 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -9,7 +9,13 @@ struct mnt_namespace {
+ 	atomic_t		count;
+ 	struct ns_common	ns;
+ 	struct mount *	root;
++	/*
++	 * Traversal and modification of .list is protected by either
++	 * - taking namespace_sem for write, OR
++	 * - taking namespace_sem for read AND taking .ns_lock.
++	 */
+ 	struct list_head	list;
++	spinlock_t		ns_lock;
+ 	struct user_namespace	*user_ns;
+ 	struct ucounts		*ucounts;
+ 	u64			seq;	/* Sequence number to prevent loops */
+@@ -133,9 +139,7 @@ struct proc_mounts {
+ 	struct mnt_namespace *ns;
+ 	struct path root;
+ 	int (*show)(struct seq_file *, struct vfsmount *);
+-	void *cached_mount;
+-	u64 cached_event;
+-	loff_t cached_index;
++	struct mount cursor;
+ };
+ 
+ extern const struct seq_operations mounts_op;
+@@ -153,3 +157,5 @@ static inline bool is_anon_ns(struct mnt_namespace *ns)
+ {
+ 	return ns->seq == 0;
+ }
++
++extern void mnt_cursor_del(struct mnt_namespace *ns, struct mount *cursor);
+
+commit 56cbb429d911991170fe867b4bba14f0efed5829
+Author: Al Viro <viro@zeniv.linux.org.uk>
+Date:   Thu Jul 4 16:57:51 2019 -0400
+
+    switch the remnants of releasing the mountpoint away from fs_pin
+    
+    We used to need rather convoluted ordering trickery to guarantee
+    that dput() of ex-mountpoints happens before the final mntput()
+    of the same.  Since we don't need that anymore, there's no point
+    playing with fs_pin for that.
+    
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index 84aa8cdf4971..711a4093e475 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -58,7 +58,10 @@ struct mount {
+ 	struct mount *mnt_master;	/* slave is on master->mnt_slave_list */
+ 	struct mnt_namespace *mnt_ns;	/* containing namespace */
+ 	struct mountpoint *mnt_mp;	/* where is it mounted */
+-	struct hlist_node mnt_mp_list;	/* list mounts with the same mountpoint */
++	union {
++		struct hlist_node mnt_mp_list;	/* list mounts with the same mountpoint */
++		struct hlist_node mnt_umount;
++	};
+ 	struct list_head mnt_umounting; /* list entry for umount propagation */
+ #ifdef CONFIG_FSNOTIFY
+ 	struct fsnotify_mark_connector __rcu *mnt_fsnotify_marks;
+@@ -68,7 +71,7 @@ struct mount {
+ 	int mnt_group_id;		/* peer group identifier */
+ 	int mnt_expiry_mark;		/* true if marked for expiry */
+ 	struct hlist_head mnt_pins;
+-	struct fs_pin mnt_umount;
++	struct hlist_head mnt_stuck_children;
+ } __randomize_layout;
+ 
+ #define MNT_NS_INTERNAL ERR_PTR(-EINVAL) /* distinct from any mnt_namespace */
+
+commit 4edbe133f851c9e3a2f2a1db367e826b01e72594
+Author: Al Viro <viro@zeniv.linux.org.uk>
+Date:   Sun Jun 30 10:39:08 2019 -0400
+
+    make struct mountpoint bear the dentry reference to mountpoint, not struct mount
+    
+    Using dput_to_list() to shift the contributing reference from ->mnt_mountpoint
+    to ->mnt_mp->m_dentry.  Dentries are dropped (with dput_to_list()) as soon
+    as struct mountpoint is destroyed; in cases where we are under namespace_sem
+    we use the global list, shrinking it in namespace_unlock().  In case of
+    detaching stuck MNT_LOCKed children at final mntput_no_expire() we use a local
+    list and shrink it ourselves.  ->mnt_ex_mountpoint crap is gone.
+    
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index 6250de544760..84aa8cdf4971 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -69,7 +69,6 @@ struct mount {
+ 	int mnt_expiry_mark;		/* true if marked for expiry */
+ 	struct hlist_head mnt_pins;
+ 	struct fs_pin mnt_umount;
+-	struct dentry *mnt_ex_mountpoint;
+ } __randomize_layout;
+ 
+ #define MNT_NS_INTERNAL ERR_PTR(-EINVAL) /* distinct from any mnt_namespace */
+
+commit 74e831221cfd79460ec11c1b641093863f0ef3ce
+Author: Al Viro <viro@zeniv.linux.org.uk>
+Date:   Wed Jan 30 13:30:21 2019 -0500
+
+    saner handling of temporary namespaces
+    
+    mount_subtree() creates (and soon destroys) a temporary namespace,
+    so that automounts could function normally.  These beasts should
+    never become anyone's current namespaces; they don't, but it would
+    be better to make prevention of that more straightforward.  And
+    since they don't become anyone's current namespace, we don't need
+    to bother with reserving procfs inums for those.
+    
+    Teach alloc_mnt_ns() to skip inum allocation if told so, adjust
+    put_mnt_ns() accordingly, make mount_subtree() use temporary
+    (anon) namespace.  is_anon_ns() checks if a namespace is such.
+    
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index f39bc9da4d73..6250de544760 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -146,3 +146,8 @@ static inline bool is_local_mountpoint(struct dentry *dentry)
+ 
+ 	return __is_local_mountpoint(dentry);
+ }
++
++static inline bool is_anon_ns(struct mnt_namespace *ns)
++{
++	return ns->seq == 0;
++}
+
+commit b24413180f5600bcb3bb70fbed5cf186b60864bd
+Author: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Date:   Wed Nov 1 15:07:57 2017 +0100
+
+    License cleanup: add SPDX GPL-2.0 license identifier to files with no license
+    
+    Many source files in the tree are missing licensing information, which
+    makes it harder for compliance tools to determine the correct license.
+    
+    By default all files without license information are under the default
+    license of the kernel, which is GPL version 2.
+    
+    Update the files which contain no license information with the 'GPL-2.0'
+    SPDX license identifier.  The SPDX identifier is a legally binding
+    shorthand, which can be used instead of the full boiler plate text.
+    
+    This patch is based on work done by Thomas Gleixner and Kate Stewart and
+    Philippe Ombredanne.
+    
+    How this work was done:
+    
+    Patches were generated and checked against linux-4.14-rc6 for a subset of
+    the use cases:
+     - file had no licensing information it it.
+     - file was a */uapi/* one with no licensing information in it,
+     - file was a */uapi/* one with existing licensing information,
+    
+    Further patches will be generated in subsequent months to fix up cases
+    where non-standard license headers were used, and references to license
+    had to be inferred by heuristics based on keywords.
+    
+    The analysis to determine which SPDX License Identifier to be applied to
+    a file was done in a spreadsheet of side by side results from of the
+    output of two independent scanners (ScanCode & Windriver) producing SPDX
+    tag:value files created by Philippe Ombredanne.  Philippe prepared the
+    base worksheet, and did an initial spot review of a few 1000 files.
+    
+    The 4.13 kernel was the starting point of the analysis with 60,537 files
+    assessed.  Kate Stewart did a file by file comparison of the scanner
+    results in the spreadsheet to determine which SPDX license identifier(s)
+    to be applied to the file. She confirmed any determination that was not
+    immediately clear with lawyers working with the Linux Foundation.
+    
+    Criteria used to select files for SPDX license identifier tagging was:
+     - Files considered eligible had to be source code files.
+     - Make and config files were included as candidates if they contained >5
+       lines of source
+     - File already had some variant of a license header in it (even if <5
+       lines).
+    
+    All documentation files were explicitly excluded.
+    
+    The following heuristics were used to determine which SPDX license
+    identifiers to apply.
+    
+     - when both scanners couldn't find any license traces, file was
+       considered to have no license information in it, and the top level
+       COPYING file license applied.
+    
+       For non */uapi/* files that summary was:
+    
+       SPDX license identifier                            # files
+       ---------------------------------------------------|-------
+       GPL-2.0                                              11139
+    
+       and resulted in the first patch in this series.
+    
+       If that file was a */uapi/* path one, it was "GPL-2.0 WITH
+       Linux-syscall-note" otherwise it was "GPL-2.0".  Results of that was:
+    
+       SPDX license identifier                            # files
+       ---------------------------------------------------|-------
+       GPL-2.0 WITH Linux-syscall-note                        930
+    
+       and resulted in the second patch in this series.
+    
+     - if a file had some form of licensing information in it, and was one
+       of the */uapi/* ones, it was denoted with the Linux-syscall-note if
+       any GPL family license was found in the file or had no licensing in
+       it (per prior point).  Results summary:
+    
+       SPDX license identifier                            # files
+       ---------------------------------------------------|------
+       GPL-2.0 WITH Linux-syscall-note                       270
+       GPL-2.0+ WITH Linux-syscall-note                      169
+       ((GPL-2.0 WITH Linux-syscall-note) OR BSD-2-Clause)    21
+       ((GPL-2.0 WITH Linux-syscall-note) OR BSD-3-Clause)    17
+       LGPL-2.1+ WITH Linux-syscall-note                      15
+       GPL-1.0+ WITH Linux-syscall-note                       14
+       ((GPL-2.0+ WITH Linux-syscall-note) OR BSD-3-Clause)    5
+       LGPL-2.0+ WITH Linux-syscall-note                       4
+       LGPL-2.1 WITH Linux-syscall-note                        3
+       ((GPL-2.0 WITH Linux-syscall-note) OR MIT)              3
+       ((GPL-2.0 WITH Linux-syscall-note) AND MIT)             1
+    
+       and that resulted in the third patch in this series.
+    
+     - when the two scanners agreed on the detected license(s), that became
+       the concluded license(s).
+    
+     - when there was disagreement between the two scanners (one detected a
+       license but the other didn't, or they both detected different
+       licenses) a manual inspection of the file occurred.
+    
+     - In most cases a manual inspection of the information in the file
+       resulted in a clear resolution of the license that should apply (and
+       which scanner probably needed to revisit its heuristics).
+    
+     - When it was not immediately clear, the license identifier was
+       confirmed with lawyers working with the Linux Foundation.
+    
+     - If there was any question as to the appropriate license identifier,
+       the file was flagged for further research and to be revisited later
+       in time.
+    
+    In total, over 70 hours of logged manual review was done on the
+    spreadsheet to determine the SPDX license identifiers to apply to the
+    source files by Kate, Philippe, Thomas and, in some cases, confirmation
+    by lawyers working with the Linux Foundation.
+    
+    Kate also obtained a third independent scan of the 4.13 code base from
+    FOSSology, and compared selected files where the other two scanners
+    disagreed against that SPDX file, to see if there was new insights.  The
+    Windriver scanner is based on an older version of FOSSology in part, so
+    they are related.
+    
+    Thomas did random spot checks in about 500 files from the spreadsheets
+    for the uapi headers and agreed with SPDX license identifier in the
+    files he inspected. For the non-uapi files Thomas did random spot checks
+    in about 15000 files.
+    
+    In initial set of patches against 4.14-rc6, 3 files were found to have
+    copy/paste license identifier errors, and have been fixed to reflect the
+    correct identifier.
+    
+    Additionally Philippe spent 10 hours this week doing a detailed manual
+    inspection and review of the 12,461 patched files from the initial patch
+    version early this week with:
+     - a full scancode scan run, collecting the matched texts, detected
+       license ids and scores
+     - reviewing anything where there was a license detected (about 500+
+       files) to ensure that the applied SPDX license was correct
+     - reviewing anything where there was no detection but the patch license
+       was not GPL-2.0 WITH Linux-syscall-note to ensure that the applied
+       SPDX license was correct
+    
+    This produced a worksheet with 20 files needing minor correction.  This
+    worksheet was then exported into 3 different .csv files for the
+    different types of files to be modified.
+    
+    These .csv files were then reviewed by Greg.  Thomas wrote a script to
+    parse the csv files and add the proper SPDX tag to the file, in the
+    format that the file expected.  This script was further refined by Greg
+    based on the output to detect more types of files automatically and to
+    distinguish between header and source .c files (which need different
+    comment types.)  Finally Greg ran the script using the .csv files to
+    generate the patches.
+    
+    Reviewed-by: Kate Stewart <kstewart@linuxfoundation.org>
+    Reviewed-by: Philippe Ombredanne <pombredanne@nexb.com>
+    Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index 6790767d1883..f39bc9da4d73 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -1,3 +1,4 @@
++/* SPDX-License-Identifier: GPL-2.0 */
+ #include <linux/mount.h>
+ #include <linux/seq_file.h>
+ #include <linux/poll.h>
+
+commit e06fdaf40a5c021dd4a2ec797e8b724f07360070
+Merge: a90c6ac2b565 8acdf5055974
+Author: Linus Torvalds <torvalds@linux-foundation.org>
+Date:   Wed Jul 19 08:55:18 2017 -0700
+
+    Merge tag 'gcc-plugins-v4.13-rc2' of git://git.kernel.org/pub/scm/linux/kernel/git/kees/linux
+    
+    Pull structure randomization updates from Kees Cook:
+     "Now that IPC and other changes have landed, enable manual markings for
+      randstruct plugin, including the task_struct.
+    
+      This is the rest of what was staged in -next for the gcc-plugins, and
+      comes in three patches, largest first:
+    
+       - mark "easy" structs with __randomize_layout
+    
+       - mark task_struct with an optional anonymous struct to isolate the
+         __randomize_layout section
+    
+       - mark structs to opt _out_ of automated marking (which will come
+         later)
+    
+      And, FWIW, this continues to pass allmodconfig (normal and patched to
+      enable gcc-plugins) builds of x86_64, i386, arm64, arm, powerpc, and
+      s390 for me"
+    
+    * tag 'gcc-plugins-v4.13-rc2' of git://git.kernel.org/pub/scm/linux/kernel/git/kees/linux:
+      randstruct: opt-out externally exposed function pointer structs
+      task_struct: Allow randomized layout
+      randstruct: Mark various structs for randomization
+
+commit 3859a271a003aba01e45b85c9d8b355eb7bf25f9
+Author: Kees Cook <keescook@chromium.org>
+Date:   Fri Oct 28 01:22:25 2016 -0700
+
+    randstruct: Mark various structs for randomization
+    
+    This marks many critical kernel structures for randomization. These are
+    structures that have been targeted in the past in security exploits, or
+    contain functions pointers, pointers to function pointer tables, lists,
+    workqueues, ref-counters, credentials, permissions, or are otherwise
+    sensitive. This initial list was extracted from Brad Spengler/PaX Team's
+    code in the last public patch of grsecurity/PaX based on my understanding
+    of the code. Changes or omissions from the original code are mine and
+    don't reflect the original grsecurity/PaX code.
+    
+    Left out of this list is task_struct, which requires special handling
+    and will be covered in a subsequent patch.
+    
+    Signed-off-by: Kees Cook <keescook@chromium.org>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index bf1fda6eed8f..e406b286fba1 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -16,7 +16,7 @@ struct mnt_namespace {
+ 	u64 event;
+ 	unsigned int		mounts; /* # of mounts in the namespace */
+ 	unsigned int		pending_mounts;
+-};
++} __randomize_layout;
+ 
+ struct mnt_pcp {
+ 	int mnt_count;
+@@ -68,7 +68,7 @@ struct mount {
+ 	struct hlist_head mnt_pins;
+ 	struct fs_pin mnt_umount;
+ 	struct dentry *mnt_ex_mountpoint;
+-};
++} __randomize_layout;
+ 
+ #define MNT_NS_INTERNAL ERR_PTR(-EINVAL) /* distinct from any mnt_namespace */
+ 
+
+commit 99b19d16471e9c3faa85cad38abc9cbbe04c6d55
+Author: Eric W. Biederman <ebiederm@xmission.com>
+Date:   Mon Oct 24 16:16:13 2016 -0500
+
+    mnt: In propgate_umount handle visiting mounts in any order
+    
+    While investigating some poor umount performance I realized that in
+    the case of overlapping mount trees where some of the mounts are locked
+    the code has been failing to unmount all of the mounts it should
+    have been unmounting.
+    
+    This failure to unmount all of the necessary
+    mounts can be reproduced with:
+    
+    $ cat locked_mounts_test.sh
+    
+    mount -t tmpfs test-base /mnt
+    mount --make-shared /mnt
+    mkdir -p /mnt/b
+    
+    mount -t tmpfs test1 /mnt/b
+    mount --make-shared /mnt/b
+    mkdir -p /mnt/b/10
+    
+    mount -t tmpfs test2 /mnt/b/10
+    mount --make-shared /mnt/b/10
+    mkdir -p /mnt/b/10/20
+    
+    mount --rbind /mnt/b /mnt/b/10/20
+    
+    unshare -Urm --propagation unchaged /bin/sh -c 'sleep 5; if [ $(grep test /proc/self/mountinfo | wc -l) -eq 1 ] ; then echo SUCCESS ; else echo FAILURE ; fi'
+    sleep 1
+    umount -l /mnt/b
+    wait %%
+    
+    $ unshare -Urm ./locked_mounts_test.sh
+    
+    This failure is corrected by removing the prepass that marks mounts
+    that may be umounted.
+    
+    A first pass is added that umounts mounts if possible and if not sets
+    mount mark if they could be unmounted if they weren't locked and adds
+    them to a list to umount possibilities.  This first pass reconsiders
+    the mounts parent if it is on the list of umount possibilities, ensuring
+    that information of umoutability will pass from child to mount parent.
+    
+    A second pass then walks through all mounts that are umounted and processes
+    their children unmounting them or marking them for reparenting.
+    
+    A last pass cleans up the state on the mounts that could not be umounted
+    and if applicable reparents them to their first parent that remained
+    mounted.
+    
+    While a bit longer than the old code this code is much more robust
+    as it allows information to flow up from the leaves and down
+    from the trunk making the order in which mounts are encountered
+    in the umount propgation tree irrelevant.
+    
+    Cc: stable@vger.kernel.org
+    Fixes: 0c56fe31420c ("mnt: Don't propagate unmounts to locked mounts")
+    Reviewed-by: Andrei Vagin <avagin@virtuozzo.com>
+    Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index ede5a1d5cf99..de45d9e76748 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -58,7 +58,7 @@ struct mount {
+ 	struct mnt_namespace *mnt_ns;	/* containing namespace */
+ 	struct mountpoint *mnt_mp;	/* where is it mounted */
+ 	struct hlist_node mnt_mp_list;	/* list mounts with the same mountpoint */
+-	struct list_head mnt_reparent;	/* reparent list entry */
++	struct list_head mnt_umounting; /* list entry for umount propagation */
+ #ifdef CONFIG_FSNOTIFY
+ 	struct fsnotify_mark_connector __rcu *mnt_fsnotify_marks;
+ 	__u32 mnt_fsnotify_mask;
+
+commit 570487d3faf2a1d8a220e6ee10f472163123d7da
+Author: Eric W. Biederman <ebiederm@xmission.com>
+Date:   Mon May 15 14:42:07 2017 -0500
+
+    mnt: In umount propagation reparent in a separate pass
+    
+    It was observed that in some pathlogical cases that the current code
+    does not unmount everything it should.  After investigation it
+    was determined that the issue is that mnt_change_mntpoint can
+    can change which mounts are available to be unmounted during mount
+    propagation which is wrong.
+    
+    The trivial reproducer is:
+    $ cat ./pathological.sh
+    
+    mount -t tmpfs test-base /mnt
+    cd /mnt
+    mkdir 1 2 1/1
+    mount --bind 1 1
+    mount --make-shared 1
+    mount --bind 1 2
+    mount --bind 1/1 1/1
+    mount --bind 1/1 1/1
+    echo
+    grep test-base /proc/self/mountinfo
+    umount 1/1
+    echo
+    grep test-base /proc/self/mountinfo
+    
+    $ unshare -Urm ./pathological.sh
+    
+    The expected output looks like:
+    46 31 0:25 / /mnt rw,relatime - tmpfs test-base rw,uid=1000,gid=1000
+    47 46 0:25 /1 /mnt/1 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+    48 46 0:25 /1 /mnt/2 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+    49 54 0:25 /1/1 /mnt/1/1 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+    50 53 0:25 /1/1 /mnt/2/1 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+    51 49 0:25 /1/1 /mnt/1/1 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+    54 47 0:25 /1/1 /mnt/1/1 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+    53 48 0:25 /1/1 /mnt/2/1 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+    52 50 0:25 /1/1 /mnt/2/1 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+    
+    46 31 0:25 / /mnt rw,relatime - tmpfs test-base rw,uid=1000,gid=1000
+    47 46 0:25 /1 /mnt/1 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+    48 46 0:25 /1 /mnt/2 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+    
+    The output without the fix looks like:
+    46 31 0:25 / /mnt rw,relatime - tmpfs test-base rw,uid=1000,gid=1000
+    47 46 0:25 /1 /mnt/1 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+    48 46 0:25 /1 /mnt/2 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+    49 54 0:25 /1/1 /mnt/1/1 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+    50 53 0:25 /1/1 /mnt/2/1 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+    51 49 0:25 /1/1 /mnt/1/1 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+    54 47 0:25 /1/1 /mnt/1/1 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+    53 48 0:25 /1/1 /mnt/2/1 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+    52 50 0:25 /1/1 /mnt/2/1 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+    
+    46 31 0:25 / /mnt rw,relatime - tmpfs test-base rw,uid=1000,gid=1000
+    47 46 0:25 /1 /mnt/1 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+    48 46 0:25 /1 /mnt/2 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+    52 48 0:25 /1/1 /mnt/2/1 rw,relatime shared:1 - tmpfs test-base rw,uid=1000,gid=1000
+    
+    That last mount in the output was in the propgation tree to be unmounted but
+    was missed because the mnt_change_mountpoint changed it's parent before the walk
+    through the mount propagation tree observed it.
+    
+    Cc: stable@vger.kernel.org
+    Fixes: 1064f874abc0 ("mnt: Tuck mounts under others instead of creating shadow/side mounts.")
+    Acked-by: Andrei Vagin <avagin@virtuozzo.com>
+    Reviewed-by: Ram Pai <linuxram@us.ibm.com>
+    Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index bf1fda6eed8f..ede5a1d5cf99 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -58,6 +58,7 @@ struct mount {
+ 	struct mnt_namespace *mnt_ns;	/* containing namespace */
+ 	struct mountpoint *mnt_mp;	/* where is it mounted */
+ 	struct hlist_node mnt_mp_list;	/* list mounts with the same mountpoint */
++	struct list_head mnt_reparent;	/* reparent list entry */
+ #ifdef CONFIG_FSNOTIFY
+ 	struct fsnotify_mark_connector __rcu *mnt_fsnotify_marks;
+ 	__u32 mnt_fsnotify_mask;
+
+commit 08991e83b7286635167bab40927665a90fb00d81
+Author: Jan Kara <jack@suse.cz>
+Date:   Wed Feb 1 09:21:58 2017 +0100
+
+    fsnotify: Free fsnotify_mark_connector when there is no mark attached
+    
+    Currently we free fsnotify_mark_connector structure only when inode /
+    vfsmount is getting freed. This can however impose noticeable memory
+    overhead when marks get attached to inodes only temporarily. So free the
+    connector structure once the last mark is detached from the object.
+    Since notification infrastructure can be working with the connector
+    under the protection of fsnotify_mark_srcu, we have to be careful and
+    free the fsnotify_mark_connector only after SRCU period passes.
+    
+    Reviewed-by: Miklos Szeredi <mszeredi@redhat.com>
+    Reviewed-by: Amir Goldstein <amir73il@gmail.com>
+    Signed-off-by: Jan Kara <jack@suse.cz>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index bc409360a03b..bf1fda6eed8f 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -59,7 +59,7 @@ struct mount {
+ 	struct mountpoint *mnt_mp;	/* where is it mounted */
+ 	struct hlist_node mnt_mp_list;	/* list mounts with the same mountpoint */
+ #ifdef CONFIG_FSNOTIFY
+-	struct fsnotify_mark_connector *mnt_fsnotify_marks;
++	struct fsnotify_mark_connector __rcu *mnt_fsnotify_marks;
+ 	__u32 mnt_fsnotify_mask;
+ #endif
+ 	int mnt_id;			/* mount identifier */
+
+commit 9dd813c15b2c101168808d4f5941a29985758973
+Author: Jan Kara <jack@suse.cz>
+Date:   Tue Mar 14 12:31:02 2017 +0100
+
+    fsnotify: Move mark list head from object into dedicated structure
+    
+    Currently notification marks are attached to object (inode or vfsmnt) by
+    a hlist_head in the object. The list is also protected by a spinlock in
+    the object. So while there is any mark attached to the list of marks,
+    the object must be pinned in memory (and thus e.g. last iput() deleting
+    inode cannot happen). Also for list iteration in fsnotify() to work, we
+    must hold fsnotify_mark_srcu lock so that mark itself and
+    mark->obj_list.next cannot get freed. Thus we are required to wait for
+    response to fanotify events from userspace process with
+    fsnotify_mark_srcu lock held. That causes issues when userspace process
+    is buggy and does not reply to some event - basically the whole
+    notification subsystem gets eventually stuck.
+    
+    So to be able to drop fsnotify_mark_srcu lock while waiting for
+    response, we have to pin the mark in memory and make sure it stays in
+    the object list (as removing the mark waiting for response could lead to
+    lost notification events for groups later in the list). However we don't
+    want inode reclaim to block on such mark as that would lead to system
+    just locking up elsewhere.
+    
+    This commit is the first in the series that paves way towards solving
+    these conflicting lifetime needs. Instead of anchoring the list of marks
+    directly in the object, we anchor it in a dedicated structure
+    (fsnotify_mark_connector) and just point to that structure from the
+    object. The following commits will also add spinlock protecting the list
+    and object pointer to the structure.
+    
+    Reviewed-by: Miklos Szeredi <mszeredi@redhat.com>
+    Reviewed-by: Amir Goldstein <amir73il@gmail.com>
+    Signed-off-by: Jan Kara <jack@suse.cz>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index 2826543a131d..bc409360a03b 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -59,7 +59,7 @@ struct mount {
+ 	struct mountpoint *mnt_mp;	/* where is it mounted */
+ 	struct hlist_node mnt_mp_list;	/* list mounts with the same mountpoint */
+ #ifdef CONFIG_FSNOTIFY
+-	struct hlist_head mnt_fsnotify_marks;
++	struct fsnotify_mark_connector *mnt_fsnotify_marks;
+ 	__u32 mnt_fsnotify_mask;
+ #endif
+ 	int mnt_id;			/* mount identifier */
+
+commit 1064f874abc0d05eeed8993815f584d847b72486
+Author: Eric W. Biederman <ebiederm@xmission.com>
+Date:   Fri Jan 20 18:28:35 2017 +1300
+
+    mnt: Tuck mounts under others instead of creating shadow/side mounts.
+    
+    Ever since mount propagation was introduced in cases where a mount in
+    propagated to parent mount mountpoint pair that is already in use the
+    code has placed the new mount behind the old mount in the mount hash
+    table.
+    
+    This implementation detail is problematic as it allows creating
+    arbitrary length mount hash chains.
+    
+    Furthermore it invalidates the constraint maintained elsewhere in the
+    mount code that a parent mount and a mountpoint pair will have exactly
+    one mount upon them.  Making it hard to deal with and to talk about
+    this special case in the mount code.
+    
+    Modify mount propagation to notice when there is already a mount at
+    the parent mount and mountpoint where a new mount is propagating to
+    and place that preexisting mount on top of the new mount.
+    
+    Modify unmount propagation to notice when a mount that is being
+    unmounted has another mount on top of it (and no other children), and
+    to replace the unmounted mount with the mount on top of it.
+    
+    Move the MNT_UMUONT test from __lookup_mnt_last into
+    __propagate_umount as that is the only call of __lookup_mnt_last where
+    MNT_UMOUNT may be set on any mount visible in the mount hash table.
+    
+    These modifications allow:
+     - __lookup_mnt_last to be removed.
+     - attach_shadows to be renamed __attach_mnt and its shadow
+       handling to be removed.
+     - commit_tree to be simplified
+     - copy_tree to be simplified
+    
+    The result is an easier to understand tree of mounts that does not
+    allow creation of arbitrary length hash chains in the mount hash table.
+    
+    The result is also a very slight userspace visible difference in semantics.
+    The following two cases now behave identically, where before order
+    mattered:
+    
+    case 1: (explicit user action)
+            B is a slave of A
+            mount something on A/a , it will propagate to B/a
+            and than mount something on B/a
+    
+    case 2: (tucked mount)
+            B is a slave of A
+            mount something on B/a
+            and than mount something on A/a
+    
+    Histroically umount A/a would fail in case 1 and succeed in case 2.
+    Now umount A/a succeeds in both configurations.
+    
+    This very small change in semantics appears if anything to be a bug
+    fix to me and my survey of userspace leads me to believe that no programs
+    will notice or care of this subtle semantic change.
+    
+    v2: Updated to mnt_change_mountpoint to not call dput or mntput
+    and instead to decrement the counts directly.  It is guaranteed
+    that there will be other references when mnt_change_mountpoint is
+    called so this is safe.
+    
+    v3: Moved put_mountpoint under mount_lock in attach_recursive_mnt
+        As the locking in fs/namespace.c changed between v2 and v3.
+    
+    v4: Reworked the logic in propagate_mount_busy and __propagate_umount
+        that detects when a mount completely covers another mount.
+    
+    v5: Removed unnecessary tests whose result is alwasy true in
+        find_topper and attach_recursive_mnt.
+    
+    v6: Document the user space visible semantic difference.
+    
+    Cc: stable@vger.kernel.org
+    Fixes: b90fa9ae8f51 ("[PATCH] shared mount handling: bind and rbind")
+    Tested-by: Andrei Vagin <avagin@virtuozzo.com>
+    Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index 2c856fc47ae3..2826543a131d 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -89,7 +89,6 @@ static inline int is_mounted(struct vfsmount *mnt)
+ }
+ 
+ extern struct mount *__lookup_mnt(struct vfsmount *, struct dentry *);
+-extern struct mount *__lookup_mnt_last(struct vfsmount *, struct dentry *);
+ 
+ extern int __legitimize_mnt(struct vfsmount *, unsigned);
+ extern bool legitimize_mnt(struct vfsmount *, unsigned);
+
+commit c6609c0a1c34fc097152b28b496236625673924f
+Author: Ian Kent <ikent@redhat.com>
+Date:   Thu Nov 24 08:03:41 2016 +1100
+
+    vfs: add path_is_mountpoint() helper
+    
+    d_mountpoint() can only be used reliably to establish if a dentry is
+    not mounted in any namespace. It isn't aware of the possibility there
+    may be multiple mounts using a given dentry that may be in a different
+    namespace.
+    
+    Add helper functions, path_is_mountpoint(), that checks if a struct path
+    is a mountpoint for this case.
+    
+    Link: http://lkml.kernel.org/r/20161011053358.27645.9729.stgit@pluto.themaw.net
+    Signed-off-by: Ian Kent <raven@themaw.net>
+    Cc: Al Viro <viro@ZenIV.linux.org.uk>
+    Cc: Eric W. Biederman <ebiederm@xmission.com>
+    Cc: Omar Sandoval <osandov@osandov.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index d2e25d7b64b3..2c856fc47ae3 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -94,6 +94,12 @@ extern struct mount *__lookup_mnt_last(struct vfsmount *, struct dentry *);
+ extern int __legitimize_mnt(struct vfsmount *, unsigned);
+ extern bool legitimize_mnt(struct vfsmount *, unsigned);
+ 
++static inline bool __path_is_mountpoint(const struct path *path)
++{
++	struct mount *m = __lookup_mnt(path->mnt, path->dentry);
++	return m && likely(!(m->mnt.mnt_flags & MNT_SYNC_UMOUNT));
++}
++
+ extern void __detach_mounts(struct dentry *dentry);
+ 
+ static inline void detach_mounts(struct dentry *dentry)
+
+commit d29216842a85c7970c536108e093963f02714498
+Author: Eric W. Biederman <ebiederm@xmission.com>
+Date:   Wed Sep 28 00:27:17 2016 -0500
+
+    mnt: Add a per mount namespace limit on the number of mounts
+    
+    CAI Qian <caiqian@redhat.com> pointed out that the semantics
+    of shared subtrees make it possible to create an exponentially
+    increasing number of mounts in a mount namespace.
+    
+        mkdir /tmp/1 /tmp/2
+        mount --make-rshared /
+        for i in $(seq 1 20) ; do mount --bind /tmp/1 /tmp/2 ; done
+    
+    Will create create 2^20 or 1048576 mounts, which is a practical problem
+    as some people have managed to hit this by accident.
+    
+    As such CVE-2016-6213 was assigned.
+    
+    Ian Kent <raven@themaw.net> described the situation for autofs users
+    as follows:
+    
+    > The number of mounts for direct mount maps is usually not very large because of
+    > the way they are implemented, large direct mount maps can have performance
+    > problems. There can be anywhere from a few (likely case a few hundred) to less
+    > than 10000, plus mounts that have been triggered and not yet expired.
+    >
+    > Indirect mounts have one autofs mount at the root plus the number of mounts that
+    > have been triggered and not yet expired.
+    >
+    > The number of autofs indirect map entries can range from a few to the common
+    > case of several thousand and in rare cases up to between 30000 and 50000. I've
+    > not heard of people with maps larger than 50000 entries.
+    >
+    > The larger the number of map entries the greater the possibility for a large
+    > number of active mounts so it's not hard to expect cases of a 1000 or somewhat
+    > more active mounts.
+    
+    So I am setting the default number of mounts allowed per mount
+    namespace at 100,000.  This is more than enough for any use case I
+    know of, but small enough to quickly stop an exponential increase
+    in mounts.  Which should be perfect to catch misconfigurations and
+    malfunctioning programs.
+    
+    For anyone who needs a higher limit this can be changed by writing
+    to the new /proc/sys/fs/mount-max sysctl.
+    
+    Tested-by: CAI Qian <caiqian@redhat.com>
+    Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index e037981d8351..d2e25d7b64b3 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -14,6 +14,8 @@ struct mnt_namespace {
+ 	u64			seq;	/* Sequence number to prevent loops */
+ 	wait_queue_head_t poll;
+ 	u64 event;
++	unsigned int		mounts; /* # of mounts in the namespace */
++	unsigned int		pending_mounts;
+ };
+ 
+ struct mnt_pcp {
+
+commit 537f7ccb396804c6d0057b93ba8eb104ba44f851
+Author: Eric W. Biederman <ebiederm@xmission.com>
+Date:   Mon Aug 8 14:37:37 2016 -0500
+
+    mntns: Add a limit on the number of mount namespaces.
+    
+    v2: Fixed the very obvious lack of setting ucounts
+        on struct mnt_ns reported by Andrei Vagin, and the kbuild
+        test report.
+    
+    Reported-by: Andrei Vagin <avagin@openvz.org>
+    Acked-by: Kees Cook <keescook@chromium.org>
+    Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index 14db05d424f7..e037981d8351 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -10,6 +10,7 @@ struct mnt_namespace {
+ 	struct mount *	root;
+ 	struct list_head	list;
+ 	struct user_namespace	*user_ns;
++	struct ucounts		*ucounts;
+ 	u64			seq;	/* Sequence number to prevent loops */
+ 	wait_queue_head_t poll;
+ 	u64 event;
+
+commit ede1bf0dcff2b07001c760992b1ca18fd0f419bc
+Author: Yann Droneaud <ydroneaud@opteya.com>
+Date:   Tue Jun 30 14:57:30 2015 -0700
+
+    fs: use seq_open_private() for proc_mounts
+    
+    A patchset to remove support for passing pre-allocated struct seq_file to
+    seq_open().  Such feature is undocumented and prone to error.
+    
+    In particular, if seq_release() is used in release handler, it will
+    kfree() a pointer which was not allocated by seq_open().
+    
+    So this patchset drops support for pre-allocated struct seq_file: it's
+    only of use in proc_namespace.c and can be easily replaced by using
+    seq_open_private()/seq_release_private().
+    
+    Additionally, it documents the use of file->private_data to hold pointer
+    to struct seq_file by seq_open().
+    
+    This patch (of 3):
+    
+    Since patch described below, from v2.6.15-rc1, seq_open() could use a
+    struct seq_file already allocated by the caller if the pointer to the
+    structure is stored in file->private_data before calling the function.
+    
+        Commit 1abe77b0fc4b485927f1f798ae81a752677e1d05
+        Author: Al Viro <viro@zeniv.linux.org.uk>
+        Date:   Mon Nov 7 17:15:34 2005 -0500
+    
+            [PATCH] allow callers of seq_open do allocation themselves
+    
+            Allow caller of seq_open() to kmalloc() seq_file + whatever else they
+            want and set ->private_data to it.  seq_open() will then abstain from
+            doing allocation itself.
+    
+    Such behavior is only used by mounts_open_common().
+    
+    In order to drop support for such uncommon feature, proc_mounts is
+    converted to use seq_open_private(), which take care of allocating the
+    proc_mounts structure, making it available through ->private in struct
+    seq_file.
+    
+    Conversely, proc_mounts is converted to use seq_release_private(), in
+    order to release the private structure allocated by seq_open_private().
+    
+    Then, ->private is used directly instead of proc_mounts() macro to access
+    to the proc_mounts structure.
+    
+    Link: http://lkml.kernel.org/r/cover.1433193673.git.ydroneaud@opteya.com
+    Signed-off-by: Yann Droneaud <ydroneaud@opteya.com>
+    Cc: Al Viro <viro@zeniv.linux.org.uk>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index b5b8082bfa42..14db05d424f7 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -118,7 +118,6 @@ static inline void unlock_mount_hash(void)
+ }
+ 
+ struct proc_mounts {
+-	struct seq_file m;
+ 	struct mnt_namespace *ns;
+ 	struct path root;
+ 	int (*show)(struct seq_file *, struct vfsmount *);
+@@ -127,8 +126,6 @@ struct proc_mounts {
+ 	loff_t cached_index;
+ };
+ 
+-#define proc_mounts(p) (container_of((p), struct proc_mounts, m))
+-
+ extern const struct seq_operations mounts_op;
+ 
+ extern bool __is_local_mountpoint(struct dentry *dentry);
+
+commit 294d71ff2f020aa2ef7057a7bd10cf2ec71b5ee3
+Author: Al Viro <viro@zeniv.linux.org.uk>
+Date:   Fri May 8 11:43:53 2015 -0400
+
+    new helper: __legitimize_mnt()
+    
+    same as legitimize_mnt(), except that it does *not* drop and regain
+    rcu_read_lock; return values are
+    0  =>  grabbed a reference, we are fine
+    1  =>  failed, just go away
+    -1 =>  failed, go away and mntput(bastard) when outside of rcu_read_lock
+    
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index 6a61c2b3e385..b5b8082bfa42 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -88,6 +88,7 @@ static inline int is_mounted(struct vfsmount *mnt)
+ extern struct mount *__lookup_mnt(struct vfsmount *, struct dentry *);
+ extern struct mount *__lookup_mnt_last(struct vfsmount *, struct dentry *);
+ 
++extern int __legitimize_mnt(struct vfsmount *, unsigned);
+ extern bool legitimize_mnt(struct vfsmount *, unsigned);
+ 
+ extern void __detach_mounts(struct dentry *dentry);
+
+commit 87b95ce0964c016ede92763be9c164e49f1019e9
+Author: Al Viro <viro@zeniv.linux.org.uk>
+Date:   Sat Jan 10 19:01:08 2015 -0500
+
+    switch the IO-triggering parts of umount to fs_pin
+    
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index 0ad6f760ce52..6a61c2b3e385 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -2,6 +2,7 @@
+ #include <linux/seq_file.h>
+ #include <linux/poll.h>
+ #include <linux/ns_common.h>
++#include <linux/fs_pin.h>
+ 
+ struct mnt_namespace {
+ 	atomic_t		count;
+@@ -62,7 +63,8 @@ struct mount {
+ 	int mnt_group_id;		/* peer group identifier */
+ 	int mnt_expiry_mark;		/* true if marked for expiry */
+ 	struct hlist_head mnt_pins;
+-	struct path mnt_ex_mountpoint;
++	struct fs_pin mnt_umount;
++	struct dentry *mnt_ex_mountpoint;
+ };
+ 
+ #define MNT_NS_INTERNAL ERR_PTR(-EINVAL) /* distinct from any mnt_namespace */
+
+commit 435d5f4bb2ccba3b791d9ef61d2590e30b8e806e
+Author: Al Viro <viro@zeniv.linux.org.uk>
+Date:   Fri Oct 31 22:56:04 2014 -0400
+
+    common object embedded into various struct ....ns
+    
+    for now - just move corresponding ->proc_inum instances over there
+    
+    Acked-by: "Eric W. Biederman" <ebiederm@xmission.com>
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index f82c62840905..0ad6f760ce52 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -1,10 +1,11 @@
+ #include <linux/mount.h>
+ #include <linux/seq_file.h>
+ #include <linux/poll.h>
++#include <linux/ns_common.h>
+ 
+ struct mnt_namespace {
+ 	atomic_t		count;
+-	unsigned int		proc_inum;
++	struct ns_common	ns;
+ 	struct mount *	root;
+ 	struct list_head	list;
+ 	struct user_namespace	*user_ns;
+
+commit 80b5dce8c59b0de1ed6e403b8298e02dcb4db64b
+Author: Eric W. Biederman <ebiederman@twitter.com>
+Date:   Thu Oct 3 01:31:18 2013 -0700
+
+    vfs: Add a function to lazily unmount all mounts from any dentry.
+    
+    The new function detach_mounts comes in two pieces.  The first piece
+    is a static inline test of d_mounpoint that returns immediately
+    without taking any locks if d_mounpoint is not set.  In the common
+    case when mountpoints are absent this allows the vfs to continue
+    running with it's same cacheline foot print.
+    
+    The second piece of detach_mounts __detach_mounts actually does the
+    work and it assumes that a mountpoint is present so it is slow and
+    takes namespace_sem for write, and then locks the mount hash (aka
+    mount_lock) after a struct mountpoint has been found.
+    
+    With those two locks held each entry on the list of mounts on a
+    mountpoint is selected and lazily unmounted until all of the mount
+    have been lazily unmounted.
+    
+    v7: Wrote a proper change description and removed the changelog
+        documenting deleted wrong turns.
+    
+    Signed-off-by: Eric W. Biederman <ebiederman@twitter.com>
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index 68bb03ed7f19..f82c62840905 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -87,6 +87,15 @@ extern struct mount *__lookup_mnt_last(struct vfsmount *, struct dentry *);
+ 
+ extern bool legitimize_mnt(struct vfsmount *, unsigned);
+ 
++extern void __detach_mounts(struct dentry *dentry);
++
++static inline void detach_mounts(struct dentry *dentry)
++{
++	if (!d_mountpoint(dentry))
++		return;
++	__detach_mounts(dentry);
++}
++
+ static inline void get_mnt_ns(struct mnt_namespace *ns)
+ {
+ 	atomic_inc(&ns->count);
+
+commit 0a5eb7c8189922e86a840972cd0b57e41de6f031
+Author: Eric W. Biederman <ebiederman@twitter.com>
+Date:   Sun Sep 22 19:37:01 2013 -0700
+
+    vfs: Keep a list of mounts on a mount point
+    
+    To spot any possible problems call BUG if a mountpoint
+    is put when it's list of mounts is not empty.
+    
+    AV: use hlist instead of list_head
+    
+    Reviewed-by: Miklos Szeredi <miklos@szeredi.hu>
+    Signed-off-by: Eric W. Biederman <ebiederman@twitter.com>
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index 8c6a2a651254..68bb03ed7f19 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -21,6 +21,7 @@ struct mnt_pcp {
+ struct mountpoint {
+ 	struct hlist_node m_hash;
+ 	struct dentry *m_dentry;
++	struct hlist_head m_list;
+ 	int m_count;
+ };
+ 
+@@ -51,6 +52,7 @@ struct mount {
+ 	struct mount *mnt_master;	/* slave is on master->mnt_slave_list */
+ 	struct mnt_namespace *mnt_ns;	/* containing namespace */
+ 	struct mountpoint *mnt_mp;	/* where is it mounted */
++	struct hlist_node mnt_mp_list;	/* list mounts with the same mountpoint */
+ #ifdef CONFIG_FSNOTIFY
+ 	struct hlist_head mnt_fsnotify_marks;
+ 	__u32 mnt_fsnotify_mask;
+
+commit 7af1364ffa64db61e386628594836e13d2ef04b5
+Author: Eric W. Biederman <ebiederm@xmission.com>
+Date:   Fri Oct 4 19:15:13 2013 -0700
+
+    vfs: Don't allow overwriting mounts in the current mount namespace
+    
+    In preparation for allowing mountpoints to be renamed and unlinked
+    in remote filesystems and in other mount namespaces test if on a dentry
+    there is a mount in the local mount namespace before allowing it to
+    be renamed or unlinked.
+    
+    The primary motivation here are old versions of fusermount unmount
+    which is not safe if the a path can be renamed or unlinked while it is
+    verifying the mount is safe to unmount.  More recent versions are simpler
+    and safer by simply using UMOUNT_NOFOLLOW when unmounting a mount
+    in a directory owned by an arbitrary user.
+    
+    Miklos Szeredi <miklos@szeredi.hu> reports this is approach is good
+    enough to remove concerns about new kernels mixed with old versions
+    of fusermount.
+    
+    A secondary motivation for restrictions here is that it removing empty
+    directories that have non-empty mount points on them appears to
+    violate the rule that rmdir can not remove empty directories.  As
+    Linus Torvalds pointed out this is useful for programs (like git) that
+    test if a directory is empty with rmdir.
+    
+    Therefore this patch arranges to enforce the existing mount point
+    semantics for local mount namespace.
+    
+    v2: Rewrote the test to be a drop in replacement for d_mountpoint
+    v3: Use bool instead of int as the return type of is_local_mountpoint
+    
+    Reviewed-by: Miklos Szeredi <miklos@szeredi.hu>
+    Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index 8f2a14ae38a2..8c6a2a651254 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -115,3 +115,12 @@ struct proc_mounts {
+ #define proc_mounts(p) (container_of((p), struct proc_mounts, m))
+ 
+ extern const struct seq_operations mounts_op;
++
++extern bool __is_local_mountpoint(struct dentry *dentry);
++static inline bool is_local_mountpoint(struct dentry *dentry)
++{
++	if (!d_mountpoint(dentry))
++		return false;
++
++	return __is_local_mountpoint(dentry);
++}
+
+commit 9ea459e110df32e60a762f311f7939eaa879601d
+Author: Al Viro <viro@zeniv.linux.org.uk>
+Date:   Fri Aug 8 13:08:20 2014 -0400
+
+    delayed mntput
+    
+    On final mntput() we want fs shutdown to happen before return to
+    userland; however, the only case where we want it happen right
+    there (i.e. where task_work_add won't do) is MNT_INTERNAL victim.
+    Those have to be fully synchronous - failure halfway through module
+    init might count on having vfsmount killed right there.  Fortunately,
+    final mntput on MNT_INTERNAL vfsmounts happens on shallow stack.
+    So we handle those synchronously and do an analog of delayed fput
+    logics for everything else.
+    
+    As the result, we are guaranteed that fs shutdown will always happen
+    on shallow stack.
+    
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index 6740a6215529..8f2a14ae38a2 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -29,7 +29,10 @@ struct mount {
+ 	struct mount *mnt_parent;
+ 	struct dentry *mnt_mountpoint;
+ 	struct vfsmount mnt;
+-	struct rcu_head mnt_rcu;
++	union {
++		struct rcu_head mnt_rcu;
++		struct llist_node mnt_llist;
++	};
+ #ifdef CONFIG_SMP
+ 	struct mnt_pcp __percpu *mnt_pcp;
+ #else
+
+commit 3064c3563ba4c23e2c7a47254ec056ed9ba0098a
+Author: Al Viro <viro@zeniv.linux.org.uk>
+Date:   Thu Aug 7 09:12:31 2014 -0400
+
+    death to mnt_pinned
+    
+    Rather than playing silly buggers with vfsmount refcounts, just have
+    acct_on() ask fs/namespace.c for internal clone of file->f_path.mnt
+    and replace it with said clone.  Then attach the pin to original
+    vfsmount.  Voila - the clone will be alive until the file gets closed,
+    making sure that underlying superblock remains active, etc., and
+    we can drop the original vfsmount, so that it's not kept busy.
+    If the file lives until the final mntput of the original vfsmount,
+    we'll notice that there's an fs_pin (one in bsd_acct_struct that
+    holds that file) and mnt_pin_kill() will take it out.  Since
+    ->kill() is synchronous, we won't proceed past that point until
+    these files are closed (and private clones of our vfsmount are
+    gone), so we get the same ordering warranties we used to get.
+    
+    mnt_pin()/mnt_unpin()/->mnt_pinned is gone now, and good riddance -
+    it never became usable outside of kernel/acct.c (and racy wrt
+    umount even there).
+    
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index 0a2d1458681f..6740a6215529 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -55,7 +55,6 @@ struct mount {
+ 	int mnt_id;			/* mount identifier */
+ 	int mnt_group_id;		/* peer group identifier */
+ 	int mnt_expiry_mark;		/* true if marked for expiry */
+-	int mnt_pinned;
+ 	struct hlist_head mnt_pins;
+ 	struct path mnt_ex_mountpoint;
+ };
+
+commit 215752fce31c80f3b3a1530bc7cddb3ba6a69b3a
+Author: Al Viro <viro@zeniv.linux.org.uk>
+Date:   Thu Aug 7 06:23:41 2014 -0400
+
+    acct: get rid of acct_list
+    
+    Put these suckers on per-vfsmount and per-superblock lists instead.
+    Note: right now it's still acct_lock for everything, but that's
+    going to change.
+    
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index d55297f2fa05..0a2d1458681f 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -56,6 +56,7 @@ struct mount {
+ 	int mnt_group_id;		/* peer group identifier */
+ 	int mnt_expiry_mark;		/* true if marked for expiry */
+ 	int mnt_pinned;
++	struct hlist_head mnt_pins;
+ 	struct path mnt_ex_mountpoint;
+ };
+ 
+
+commit c7999c3627bc6d49aa6fb9451063938cfd2c2082
+Author: Al Viro <viro@zeniv.linux.org.uk>
+Date:   Thu Feb 27 14:40:10 2014 -0500
+
+    reduce m_start() cost...
+    
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index b29e42f05f34..d55297f2fa05 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -10,7 +10,7 @@ struct mnt_namespace {
+ 	struct user_namespace	*user_ns;
+ 	u64			seq;	/* Sequence number to prevent loops */
+ 	wait_queue_head_t poll;
+-	int event;
++	u64 event;
+ };
+ 
+ struct mnt_pcp {
+@@ -104,6 +104,9 @@ struct proc_mounts {
+ 	struct mnt_namespace *ns;
+ 	struct path root;
+ 	int (*show)(struct seq_file *, struct vfsmount *);
++	void *cached_mount;
++	u64 cached_event;
++	loff_t cached_index;
+ };
+ 
+ #define proc_mounts(p) (container_of((p), struct proc_mounts, m))
+
+commit 38129a13e6e71f666e0468e99fdd932a687b4d7e
+Author: Al Viro <viro@zeniv.linux.org.uk>
+Date:   Thu Mar 20 21:10:51 2014 -0400
+
+    switch mnt_hash to hlist
+    
+    fixes RCU bug - walking through hlist is safe in face of element moves,
+    since it's self-terminating.  Cyclic lists are not - if we end up jumping
+    to another hash chain, we'll loop infinitely without ever hitting the
+    original list head.
+    
+    [fix for dumb braino folded]
+    
+    Spotted by: Max Kellermann <mk@cm4all.com>
+    Cc: stable@vger.kernel.org
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index acdb428de393..b29e42f05f34 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -25,7 +25,7 @@ struct mountpoint {
+ };
+ 
+ struct mount {
+-	struct list_head mnt_hash;
++	struct hlist_node mnt_hash;
+ 	struct mount *mnt_parent;
+ 	struct dentry *mnt_mountpoint;
+ 	struct vfsmount mnt;
+
+commit 0818bf27c05b2de56c5b2bd08cfae2a939bd5f52
+Author: Al Viro <viro@zeniv.linux.org.uk>
+Date:   Fri Feb 28 13:46:44 2014 -0500
+
+    resizable namespace.c hashes
+    
+    * switch allocation to alloc_large_system_hash()
+    * make sizes overridable by boot parameters (mhash_entries=, mphash_entries=)
+    * switch mountpoint_hashtable from list_head to hlist_head
+    
+    Cc: stable@vger.kernel.org
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index a17458ca6f29..acdb428de393 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -19,7 +19,7 @@ struct mnt_pcp {
+ };
+ 
+ struct mountpoint {
+-	struct list_head m_hash;
++	struct hlist_node m_hash;
+ 	struct dentry *m_dentry;
+ 	int m_count;
+ };
+
+commit 260a459d2e39761fbd39803497205ce1690bc7b1
+Author: Eric W. Biederman <ebiederm@xmission.com>
+Date:   Mon Jan 20 15:26:15 2014 -0800
+
+    vfs: Is mounted should be testing mnt_ns for NULL or error.
+    
+    A bug was introduced with the is_mounted helper function in
+    commit f7a99c5b7c8bd3d3f533c8b38274e33f3da9096e
+    Author: Al Viro <viro@zeniv.linux.org.uk>
+    Date:   Sat Jun 9 00:59:08 2012 -0400
+    
+        get rid of ->mnt_longterm
+    
+        it's enough to set ->mnt_ns of internal vfsmounts to something
+        distinct from all struct mnt_namespace out there; then we can
+        just use the check for ->mnt_ns != NULL in the fast path of
+        mntput_no_expire()
+    
+        Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+    
+    The intent was to test if the real_mount(vfsmount)->mnt_ns was
+    NULL_OR_ERR but the code is actually testing real_mount(vfsmount)
+    and always returning true.
+    
+    The result is d_absolute_path returning paths it should be hiding.
+    
+    Cc: stable@vger.kernel.org
+    Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index d64c594be6c4..a17458ca6f29 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -74,7 +74,7 @@ static inline int mnt_has_parent(struct mount *mnt)
+ static inline int is_mounted(struct vfsmount *mnt)
+ {
+ 	/* neither detached nor internal? */
+-	return !IS_ERR_OR_NULL(real_mount(mnt));
++	return !IS_ERR_OR_NULL(real_mount(mnt)->mnt_ns);
+ }
+ 
+ extern struct mount *__lookup_mnt(struct vfsmount *, struct dentry *);
+
+commit 48a066e72d970a3e225a9c18690d570c736fc455
+Author: Al Viro <viro@zeniv.linux.org.uk>
+Date:   Sun Sep 29 22:06:07 2013 -0400
+
+    RCU'd vfsmounts
+    
+    * RCU-delayed freeing of vfsmounts
+    * vfsmount_lock replaced with a seqlock (mount_lock)
+    * sequence number from mount_lock is stored in nameidata->m_seq and
+    used when we exit RCU mode
+    * new vfsmount flag - MNT_SYNC_UMOUNT.  Set by umount_tree() when its
+    caller knows that vfsmount will have no surviving references.
+    * synchronize_rcu() done between unlocking namespace_sem in namespace_unlock()
+    and doing pending mntput().
+    * new helper: legitimize_mnt(mnt, seq).  Checks the mount_lock sequence
+    number against seq, then grabs reference to mnt.  Then it rechecks mount_lock
+    again to close the race and either returns success or drops the reference it
+    has acquired.  The subtle point is that in case of MNT_SYNC_UMOUNT we can
+    simply decrement the refcount and sod off - aforementioned synchronize_rcu()
+    makes sure that final mntput() won't come until we leave RCU mode.  We need
+    that, since we don't want to end up with some lazy pathwalk racing with
+    umount() and stealing the final mntput() from it - caller of umount() may
+    expect it to return only once the fs is shut down and we don't want to break
+    that.  In other cases (i.e. with MNT_SYNC_UMOUNT absent) we have to do
+    full-blown mntput() in case of mount_lock sequence number mismatch happening
+    just as we'd grabbed the reference, but in those cases we won't be stealing
+    the final mntput() from anything that would care.
+    * mntput_no_expire() doesn't lock anything on the fast path now.  Incidentally,
+    SMP and UP cases are handled the same way - no ifdefs there.
+    * normal pathname resolution does *not* do any writes to mount_lock.  It does,
+    of course, bump the refcounts of vfsmount and dentry in the very end, but that's
+    it.
+    
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index f0866076de6e..d64c594be6c4 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -1,7 +1,6 @@
+ #include <linux/mount.h>
+ #include <linux/seq_file.h>
+ #include <linux/poll.h>
+-#include <linux/lglock.h>
+ 
+ struct mnt_namespace {
+ 	atomic_t		count;
+@@ -30,6 +29,7 @@ struct mount {
+ 	struct mount *mnt_parent;
+ 	struct dentry *mnt_mountpoint;
+ 	struct vfsmount mnt;
++	struct rcu_head mnt_rcu;
+ #ifdef CONFIG_SMP
+ 	struct mnt_pcp __percpu *mnt_pcp;
+ #else
+@@ -80,21 +80,23 @@ static inline int is_mounted(struct vfsmount *mnt)
+ extern struct mount *__lookup_mnt(struct vfsmount *, struct dentry *);
+ extern struct mount *__lookup_mnt_last(struct vfsmount *, struct dentry *);
+ 
++extern bool legitimize_mnt(struct vfsmount *, unsigned);
++
+ static inline void get_mnt_ns(struct mnt_namespace *ns)
+ {
+ 	atomic_inc(&ns->count);
+ }
+ 
+-extern struct lglock vfsmount_lock;
++extern seqlock_t mount_lock;
+ 
+ static inline void lock_mount_hash(void)
+ {
+-	br_write_lock(&vfsmount_lock);
++	write_seqlock(&mount_lock);
+ }
+ 
+ static inline void unlock_mount_hash(void)
+ {
+-	br_write_unlock(&vfsmount_lock);
++	write_sequnlock(&mount_lock);
+ }
+ 
+ struct proc_mounts {
+
+commit 474279dc0f7745124fc76b474c8dc1294f8e87ce
+Author: Al Viro <viro@zeniv.linux.org.uk>
+Date:   Tue Oct 1 16:11:26 2013 -0400
+
+    split __lookup_mnt() in two functions
+    
+    Instead of passing the direction as argument (and checking it on every
+    step through the hash chain), just have separate __lookup_mnt() and
+    __lookup_mnt_last().  And use the standard iterators...
+    
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index 7076f25af35d..f0866076de6e 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -77,7 +77,8 @@ static inline int is_mounted(struct vfsmount *mnt)
+ 	return !IS_ERR_OR_NULL(real_mount(mnt));
+ }
+ 
+-extern struct mount *__lookup_mnt(struct vfsmount *, struct dentry *, int);
++extern struct mount *__lookup_mnt(struct vfsmount *, struct dentry *);
++extern struct mount *__lookup_mnt_last(struct vfsmount *, struct dentry *);
+ 
+ static inline void get_mnt_ns(struct mnt_namespace *ns)
+ {
+
+commit 719ea2fbb553ab3f61a174a4b5861289dcc46cb1
+Author: Al Viro <viro@zeniv.linux.org.uk>
+Date:   Sun Sep 29 11:24:49 2013 -0400
+
+    new helpers: lock_mount_hash/unlock_mount_hash
+    
+    aka br_write_{lock,unlock} of vfsmount_lock.  Inlines in fs/mount.h,
+    vfsmount_lock extern moved over there as well.
+    
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index 3168dc41bad5..7076f25af35d 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -1,6 +1,7 @@
+ #include <linux/mount.h>
+ #include <linux/seq_file.h>
+ #include <linux/poll.h>
++#include <linux/lglock.h>
+ 
+ struct mnt_namespace {
+ 	atomic_t		count;
+@@ -83,6 +84,18 @@ static inline void get_mnt_ns(struct mnt_namespace *ns)
+ 	atomic_inc(&ns->count);
+ }
+ 
++extern struct lglock vfsmount_lock;
++
++static inline void lock_mount_hash(void)
++{
++	br_write_lock(&vfsmount_lock);
++}
++
++static inline void unlock_mount_hash(void)
++{
++	br_write_unlock(&vfsmount_lock);
++}
++
+ struct proc_mounts {
+ 	struct seq_file m;
+ 	struct mnt_namespace *ns;
+
+commit aba809cf0944fdc5a83ef8b5864cdce2a99b2513
+Author: Al Viro <viro@zeniv.linux.org.uk>
+Date:   Sat Sep 28 23:10:55 2013 -0400
+
+    namespace.c: get rid of mnt_ghosts
+    
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index 64a858143ff9..3168dc41bad5 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -55,7 +55,7 @@ struct mount {
+ 	int mnt_group_id;		/* peer group identifier */
+ 	int mnt_expiry_mark;		/* true if marked for expiry */
+ 	int mnt_pinned;
+-	int mnt_ghosts;
++	struct path mnt_ex_mountpoint;
+ };
+ 
+ #define MNT_NS_INTERNAL ERR_PTR(-EINVAL) /* distinct from any mnt_namespace */
+
+commit 84d17192d2afd52aeba88c71ae4959a015f56a38
+Author: Al Viro <viro@zeniv.linux.org.uk>
+Date:   Fri Mar 15 10:53:28 2013 -0400
+
+    get rid of full-hash scan on detaching vfsmounts
+    
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index cd5007980400..64a858143ff9 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -18,6 +18,12 @@ struct mnt_pcp {
+ 	int mnt_writers;
+ };
+ 
++struct mountpoint {
++	struct list_head m_hash;
++	struct dentry *m_dentry;
++	int m_count;
++};
++
+ struct mount {
+ 	struct list_head mnt_hash;
+ 	struct mount *mnt_parent;
+@@ -40,6 +46,7 @@ struct mount {
+ 	struct list_head mnt_slave;	/* slave list entry */
+ 	struct mount *mnt_master;	/* slave is on master->mnt_slave_list */
+ 	struct mnt_namespace *mnt_ns;	/* containing namespace */
++	struct mountpoint *mnt_mp;	/* where is it mounted */
+ #ifdef CONFIG_FSNOTIFY
+ 	struct hlist_head mnt_fsnotify_marks;
+ 	__u32 mnt_fsnotify_mask;
+
+commit 98f842e675f96ffac96e6c50315790912b2812be
+Author: Eric W. Biederman <ebiederm@xmission.com>
+Date:   Wed Jun 15 10:21:48 2011 -0700
+
+    proc: Usable inode numbers for the namespace file descriptors.
+    
+    Assign a unique proc inode to each namespace, and use that
+    inode number to ensure we only allocate at most one proc
+    inode for every namespace in proc.
+    
+    A single proc inode per namespace allows userspace to test
+    to see if two processes are in the same namespace.
+    
+    This has been a long requested feature and only blocked because
+    a naive implementation would put the id in a global space and
+    would ultimately require having a namespace for the names of
+    namespaces, making migration and certain virtualization tricks
+    impossible.
+    
+    We still don't have per superblock inode numbers for proc, which
+    appears necessary for application unaware checkpoint/restart and
+    migrations (if the application is using namespace file descriptors)
+    but that is now allowd by the design if it becomes important.
+    
+    I have preallocated the ipc and uts initial proc inode numbers so
+    their structures can be statically initialized.
+    
+    Signed-off-by: Eric W. Biederman <ebiederm@xmission.com>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index 630fafc616bb..cd5007980400 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -4,6 +4,7 @@
+ 
+ struct mnt_namespace {
+ 	atomic_t		count;
++	unsigned int		proc_inum;
+ 	struct mount *	root;
+ 	struct list_head	list;
+ 	struct user_namespace	*user_ns;
+
+commit 771b1371686e0a63e938ada28de020b9a0040f55
+Author: Eric W. Biederman <ebiederm@xmission.com>
+Date:   Thu Jul 26 21:08:32 2012 -0700
+
+    vfs: Add a user namespace reference from struct mnt_namespace
+    
+    This will allow for support for unprivileged mounts in a new user namespace.
+    
+    Acked-by: "Serge E. Hallyn" <serge@hallyn.com>
+    Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index e9c37dd3d00d..630fafc616bb 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -6,6 +6,7 @@ struct mnt_namespace {
+ 	atomic_t		count;
+ 	struct mount *	root;
+ 	struct list_head	list;
++	struct user_namespace	*user_ns;
+ 	u64			seq;	/* Sequence number to prevent loops */
+ 	wait_queue_head_t poll;
+ 	int event;
+
+commit 8823c079ba7136dc1948d6f6dcb5f8022bde438e
+Author: Eric W. Biederman <ebiederm@xmission.com>
+Date:   Sun Mar 7 18:49:36 2010 -0800
+
+    vfs: Add setns support for the mount namespace
+    
+    setns support for the mount namespace is a little tricky as an
+    arbitrary decision must be made about what to set fs->root and
+    fs->pwd to, as there is no expectation of a relationship between
+    the two mount namespaces.  Therefore I arbitrarily find the root
+    mount point, and follow every mount on top of it to find the top
+    of the mount stack.  Then I set fs->root and fs->pwd to that
+    location.  The topmost root of the mount stack seems like a
+    reasonable place to be.
+    
+    Bind mount support for the mount namespace inodes has the
+    possibility of creating circular dependencies between mount
+    namespaces.  Circular dependencies can result in loops that
+    prevent mount namespaces from every being freed.  I avoid
+    creating those circular dependencies by adding a sequence number
+    to the mount namespace and require all bind mounts be of a
+    younger mount namespace into an older mount namespace.
+    
+    Add a helper function proc_ns_inode so it is possible to
+    detect when we are attempting to bind mound a namespace inode.
+    
+    Acked-by: Serge Hallyn <serge.hallyn@canonical.com>
+    Signed-off-by: Eric W. Biederman <ebiederm@xmission.com>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index 4f291f9de641..e9c37dd3d00d 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -6,6 +6,7 @@ struct mnt_namespace {
+ 	atomic_t		count;
+ 	struct mount *	root;
+ 	struct list_head	list;
++	u64			seq;	/* Sequence number to prevent loops */
+ 	wait_queue_head_t poll;
+ 	int event;
+ };
+
+commit 6ce6e24e72233073c8ead9419fc5040d44803dae
+Author: Al Viro <viro@zeniv.linux.org.uk>
+Date:   Sat Jun 9 01:16:59 2012 -0400
+
+    get rid of magic in proc_namespace.c
+    
+    don't rely on proc_mounts->m being the first field; container_of()
+    is there for purpose.  No need to bother with ->private, while
+    we are at it - the same container_of will do nicely.
+    
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index 05a2a1185efc..4f291f9de641 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -74,10 +74,12 @@ static inline void get_mnt_ns(struct mnt_namespace *ns)
+ }
+ 
+ struct proc_mounts {
+-	struct seq_file m; /* must be the first element */
++	struct seq_file m;
+ 	struct mnt_namespace *ns;
+ 	struct path root;
+ 	int (*show)(struct seq_file *, struct vfsmount *);
+ };
+ 
++#define proc_mounts(p) (container_of((p), struct proc_mounts, m))
++
+ extern const struct seq_operations mounts_op;
+
+commit f7a99c5b7c8bd3d3f533c8b38274e33f3da9096e
+Author: Al Viro <viro@zeniv.linux.org.uk>
+Date:   Sat Jun 9 00:59:08 2012 -0400
+
+    get rid of ->mnt_longterm
+    
+    it's enough to set ->mnt_ns of internal vfsmounts to something
+    distinct from all struct mnt_namespace out there; then we can
+    just use the check for ->mnt_ns != NULL in the fast path of
+    mntput_no_expire()
+    
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index 4ef36d93e5a2..05a2a1185efc 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -22,7 +22,6 @@ struct mount {
+ 	struct vfsmount mnt;
+ #ifdef CONFIG_SMP
+ 	struct mnt_pcp __percpu *mnt_pcp;
+-	atomic_t mnt_longterm;		/* how many of the refs are longterm */
+ #else
+ 	int mnt_count;
+ 	int mnt_writers;
+@@ -49,6 +48,8 @@ struct mount {
+ 	int mnt_ghosts;
+ };
+ 
++#define MNT_NS_INTERNAL ERR_PTR(-EINVAL) /* distinct from any mnt_namespace */
++
+ static inline struct mount *real_mount(struct vfsmount *mnt)
+ {
+ 	return container_of(mnt, struct mount, mnt);
+@@ -59,6 +60,12 @@ static inline int mnt_has_parent(struct mount *mnt)
+ 	return mnt != mnt->mnt_parent;
+ }
+ 
++static inline int is_mounted(struct vfsmount *mnt)
++{
++	/* neither detached nor internal? */
++	return !IS_ERR_OR_NULL(real_mount(mnt));
++}
++
+ extern struct mount *__lookup_mnt(struct vfsmount *, struct dentry *, int);
+ 
+ static inline void get_mnt_ns(struct mnt_namespace *ns)
+
+commit 39f7c4db1d2d9e2e2a90abdf34811783089d217d
+Author: Miklos Szeredi <mszeredi@suse.cz>
+Date:   Mon Nov 21 12:11:30 2011 +0100
+
+    vfs: keep list of mounts for each superblock
+    
+    Keep track of vfsmounts belonging to a superblock.  List is protected
+    by vfsmount_lock.
+    
+    Signed-off-by: Miklos Szeredi <mszeredi@suse.cz>
+    Tested-by: Toshiyuki Okajima <toshi.okajima@jp.fujitsu.com>
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index 0921b51e27e2..4ef36d93e5a2 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -29,6 +29,7 @@ struct mount {
+ #endif
+ 	struct list_head mnt_mounts;	/* list of children, anchored here */
+ 	struct list_head mnt_child;	/* and going through their mnt_child */
++	struct list_head mnt_instance;	/* mount instance on sb->s_mounts */
+ 	const char *mnt_devname;	/* Name of device e.g. /dev/dsk/hda1 */
+ 	struct list_head mnt_list;
+ 	struct list_head mnt_expire;	/* link in fs-specific expiry list */
+
+commit be08d6d260b6e7eb346162a1081cdf5f94fda569
+Author: Al Viro <viro@zeniv.linux.org.uk>
+Date:   Tue Dec 6 13:32:36 2011 -0500
+
+    switch mnt_namespace ->root to struct mount
+    
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index c6e99e03350a..0921b51e27e2 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -4,7 +4,7 @@
+ 
+ struct mnt_namespace {
+ 	atomic_t		count;
+-	struct vfsmount *	root;
++	struct mount *	root;
+ 	struct list_head	list;
+ 	wait_queue_head_t poll;
+ 	int event;
+
+commit 0226f4923f6c9b40cfa1c1c1b19a6ac6b3924ead
+Author: Al Viro <viro@zeniv.linux.org.uk>
+Date:   Tue Dec 6 12:21:54 2011 -0500
+
+    vfs: take /proc/*/mounts and friends to fs/proc_namespace.c
+    
+    rationale: that stuff is far tighter bound to fs/namespace.c than to
+    the guts of procfs proper.
+    
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index e094c863c8af..c6e99e03350a 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -1,4 +1,14 @@
+ #include <linux/mount.h>
++#include <linux/seq_file.h>
++#include <linux/poll.h>
++
++struct mnt_namespace {
++	atomic_t		count;
++	struct vfsmount *	root;
++	struct list_head	list;
++	wait_queue_head_t poll;
++	int event;
++};
+ 
+ struct mnt_pcp {
+ 	int mnt_count;
+@@ -49,3 +59,17 @@ static inline int mnt_has_parent(struct mount *mnt)
+ }
+ 
+ extern struct mount *__lookup_mnt(struct vfsmount *, struct dentry *, int);
++
++static inline void get_mnt_ns(struct mnt_namespace *ns)
++{
++	atomic_inc(&ns->count);
++}
++
++struct proc_mounts {
++	struct seq_file m; /* must be the first element */
++	struct mnt_namespace *ns;
++	struct path root;
++	int (*show)(struct seq_file *, struct vfsmount *);
++};
++
++extern const struct seq_operations mounts_op;
+
+commit c63181e6b6df89176b3984c6977bb5ec03d0df23
+Author: Al Viro <viro@zeniv.linux.org.uk>
+Date:   Fri Nov 25 02:35:16 2011 -0500
+
+    vfs: move fsnotify junk to struct mount
+    
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index c5fc3f7a9580..e094c863c8af 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -19,7 +19,6 @@ struct mount {
+ #endif
+ 	struct list_head mnt_mounts;	/* list of children, anchored here */
+ 	struct list_head mnt_child;	/* and going through their mnt_child */
+-	/* yet to be moved - fsnotify ones go here */
+ 	const char *mnt_devname;	/* Name of device e.g. /dev/dsk/hda1 */
+ 	struct list_head mnt_list;
+ 	struct list_head mnt_expire;	/* link in fs-specific expiry list */
+@@ -28,6 +27,10 @@ struct mount {
+ 	struct list_head mnt_slave;	/* slave list entry */
+ 	struct mount *mnt_master;	/* slave is on master->mnt_slave_list */
+ 	struct mnt_namespace *mnt_ns;	/* containing namespace */
++#ifdef CONFIG_FSNOTIFY
++	struct hlist_head mnt_fsnotify_marks;
++	__u32 mnt_fsnotify_mask;
++#endif
+ 	int mnt_id;			/* mount identifier */
+ 	int mnt_group_id;		/* peer group identifier */
+ 	int mnt_expiry_mark;		/* true if marked for expiry */
+
+commit 52ba1621de1479ce7e52b6d167860462e483313c
+Author: Al Viro <viro@zeniv.linux.org.uk>
+Date:   Fri Nov 25 02:25:17 2011 -0500
+
+    vfs: move mnt_devname
+    
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index 7060d2a6f802..c5fc3f7a9580 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -19,7 +19,8 @@ struct mount {
+ #endif
+ 	struct list_head mnt_mounts;	/* list of children, anchored here */
+ 	struct list_head mnt_child;	/* and going through their mnt_child */
+-	/* yet to be moved - up to mnt_devname */
++	/* yet to be moved - fsnotify ones go here */
++	const char *mnt_devname;	/* Name of device e.g. /dev/dsk/hda1 */
+ 	struct list_head mnt_list;
+ 	struct list_head mnt_expire;	/* link in fs-specific expiry list */
+ 	struct list_head mnt_share;	/* circular list of shared mounts */
+
+commit 1a4eeaf2a8c07404e2d1c3ff99b393fd4c207170
+Author: Al Viro <viro@zeniv.linux.org.uk>
+Date:   Fri Nov 25 02:19:55 2011 -0500
+
+    vfs: move mnt_list to struct mount
+    
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index 9217e03ba5e7..7060d2a6f802 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -19,7 +19,8 @@ struct mount {
+ #endif
+ 	struct list_head mnt_mounts;	/* list of children, anchored here */
+ 	struct list_head mnt_child;	/* and going through their mnt_child */
+-	/* yet to be moved - up to mnt_list */
++	/* yet to be moved - up to mnt_devname */
++	struct list_head mnt_list;
+ 	struct list_head mnt_expire;	/* link in fs-specific expiry list */
+ 	struct list_head mnt_share;	/* circular list of shared mounts */
+ 	struct list_head mnt_slave_list;/* list of slave mounts */
+
+commit 863d684f946eb240c7dd57d265d88315950ca5cc
+Author: Al Viro <viro@zeniv.linux.org.uk>
+Date:   Fri Nov 25 00:57:42 2011 -0500
+
+    vfs: move the rest of int fields to struct mount
+    
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index c7bd401960ea..9217e03ba5e7 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -28,6 +28,9 @@ struct mount {
+ 	struct mnt_namespace *mnt_ns;	/* containing namespace */
+ 	int mnt_id;			/* mount identifier */
+ 	int mnt_group_id;		/* peer group identifier */
++	int mnt_expiry_mark;		/* true if marked for expiry */
++	int mnt_pinned;
++	int mnt_ghosts;
+ };
+ 
+ static inline struct mount *real_mount(struct vfsmount *mnt)
+
+commit 15169fe784a9846b24cdb0840329d41aebc23249
+Author: Al Viro <viro@zeniv.linux.org.uk>
+Date:   Fri Nov 25 00:50:41 2011 -0500
+
+    vfs: mnt_id/mnt_group_id moved
+    
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index 4a5f1dca0c2e..c7bd401960ea 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -26,6 +26,8 @@ struct mount {
+ 	struct list_head mnt_slave;	/* slave list entry */
+ 	struct mount *mnt_master;	/* slave is on master->mnt_slave_list */
+ 	struct mnt_namespace *mnt_ns;	/* containing namespace */
++	int mnt_id;			/* mount identifier */
++	int mnt_group_id;		/* peer group identifier */
+ };
+ 
+ static inline struct mount *real_mount(struct vfsmount *mnt)
+
+commit 143c8c91cee7efdd732ec5f61b3471fc46192f20
+Author: Al Viro <viro@zeniv.linux.org.uk>
+Date:   Fri Nov 25 00:46:35 2011 -0500
+
+    vfs: mnt_ns moved to struct mount
+    
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index eb62ad232e4d..4a5f1dca0c2e 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -25,6 +25,7 @@ struct mount {
+ 	struct list_head mnt_slave_list;/* list of slave mounts */
+ 	struct list_head mnt_slave;	/* slave list entry */
+ 	struct mount *mnt_master;	/* slave is on master->mnt_slave_list */
++	struct mnt_namespace *mnt_ns;	/* containing namespace */
+ };
+ 
+ static inline struct mount *real_mount(struct vfsmount *mnt)
+
+commit 6776db3d32b2a59198ec7ac6d32be0b9fdbd8a68
+Author: Al Viro <viro@zeniv.linux.org.uk>
+Date:   Fri Nov 25 00:22:05 2011 -0500
+
+    vfs: take mnt_share/mnt_slave/mnt_slave_list and mnt_expire to struct mount
+    
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index d4db4c7e1815..eb62ad232e4d 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -19,7 +19,11 @@ struct mount {
+ #endif
+ 	struct list_head mnt_mounts;	/* list of children, anchored here */
+ 	struct list_head mnt_child;	/* and going through their mnt_child */
+-	/* yet to be moved - up to mnt_slave */
++	/* yet to be moved - up to mnt_list */
++	struct list_head mnt_expire;	/* link in fs-specific expiry list */
++	struct list_head mnt_share;	/* circular list of shared mounts */
++	struct list_head mnt_slave_list;/* list of slave mounts */
++	struct list_head mnt_slave;	/* slave list entry */
+ 	struct mount *mnt_master;	/* slave is on master->mnt_slave_list */
+ };
+ 
+
+commit 32301920f44a9334f57dd94bebfc6e593b99ad47
+Author: Al Viro <viro@zeniv.linux.org.uk>
+Date:   Fri Nov 25 00:10:28 2011 -0500
+
+    vfs: and now we can make ->mnt_master point to struct mount
+    
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index 7071d8fa9307..d4db4c7e1815 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -20,7 +20,7 @@ struct mount {
+ 	struct list_head mnt_mounts;	/* list of children, anchored here */
+ 	struct list_head mnt_child;	/* and going through their mnt_child */
+ 	/* yet to be moved - up to mnt_slave */
+-	struct vfsmount *mnt_master;	/* slave is on master->mnt_slave_list */
++	struct mount *mnt_master;	/* slave is on master->mnt_slave_list */
+ };
+ 
+ static inline struct mount *real_mount(struct vfsmount *mnt)
+
+commit d10e8def07fc87488c396d2eff2c26c43bb541dd
+Author: Al Viro <viro@zeniv.linux.org.uk>
+Date:   Fri Nov 25 00:07:16 2011 -0500
+
+    vfs: take mnt_master to struct mount
+    
+    make IS_MNT_SLAVE take struct mount * at the same time
+    
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index e4ecf59c9353..7071d8fa9307 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -19,6 +19,8 @@ struct mount {
+ #endif
+ 	struct list_head mnt_mounts;	/* list of children, anchored here */
+ 	struct list_head mnt_child;	/* and going through their mnt_child */
++	/* yet to be moved - up to mnt_slave */
++	struct vfsmount *mnt_master;	/* slave is on master->mnt_slave_list */
+ };
+ 
+ static inline struct mount *real_mount(struct vfsmount *mnt)
+
+commit 6b41d536f7c84e7cb1c1462073150277e46f6ea8
+Author: Al Viro <viro@zeniv.linux.org.uk>
+Date:   Thu Nov 24 23:24:33 2011 -0500
+
+    vfs: take mnt_child/mnt_mounts to struct mount
+    
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index 452ae41e0131..e4ecf59c9353 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -17,6 +17,8 @@ struct mount {
+ 	int mnt_count;
+ 	int mnt_writers;
+ #endif
++	struct list_head mnt_mounts;	/* list of children, anchored here */
++	struct list_head mnt_child;	/* and going through their mnt_child */
+ };
+ 
+ static inline struct mount *real_mount(struct vfsmount *mnt)
+
+commit 68e8a9feab251f9d3c8fd9e9893c97843bcd4bd0
+Author: Al Viro <viro@zeniv.linux.org.uk>
+Date:   Thu Nov 24 22:53:09 2011 -0500
+
+    vfs: all counters taken to struct mount
+    
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index 853738f5897f..452ae41e0131 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -1,10 +1,22 @@
+ #include <linux/mount.h>
+ 
++struct mnt_pcp {
++	int mnt_count;
++	int mnt_writers;
++};
++
+ struct mount {
+ 	struct list_head mnt_hash;
+ 	struct mount *mnt_parent;
+ 	struct dentry *mnt_mountpoint;
+ 	struct vfsmount mnt;
++#ifdef CONFIG_SMP
++	struct mnt_pcp __percpu *mnt_pcp;
++	atomic_t mnt_longterm;		/* how many of the refs are longterm */
++#else
++	int mnt_count;
++	int mnt_writers;
++#endif
+ };
+ 
+ static inline struct mount *real_mount(struct vfsmount *mnt)
+
+commit a73324da7af4052e1d1ddec6a5980f552420e58b
+Author: Al Viro <viro@zeniv.linux.org.uk>
+Date:   Thu Nov 24 22:25:07 2011 -0500
+
+    vfs: move mnt_mountpoint to struct mount
+    
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index 201dd616e6c4..853738f5897f 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -3,6 +3,7 @@
+ struct mount {
+ 	struct list_head mnt_hash;
+ 	struct mount *mnt_parent;
++	struct dentry *mnt_mountpoint;
+ 	struct vfsmount mnt;
+ };
+ 
+
+commit 0714a533805a0f8ebfc6fdb6bda9f129b8c7c6d7
+Author: Al Viro <viro@zeniv.linux.org.uk>
+Date:   Thu Nov 24 22:19:58 2011 -0500
+
+    vfs: now it can be done - make mnt_parent point to struct mount
+    
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index 5126c0861102..201dd616e6c4 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -2,7 +2,7 @@
+ 
+ struct mount {
+ 	struct list_head mnt_hash;
+-	struct vfsmount *mnt_parent;
++	struct mount *mnt_parent;
+ 	struct vfsmount mnt;
+ };
+ 
+@@ -13,7 +13,7 @@ static inline struct mount *real_mount(struct vfsmount *mnt)
+ 
+ static inline int mnt_has_parent(struct mount *mnt)
+ {
+-	return &mnt->mnt != mnt->mnt_parent;
++	return mnt != mnt->mnt_parent;
+ }
+ 
+ extern struct mount *__lookup_mnt(struct vfsmount *, struct dentry *, int);
+
+commit 3376f34fff5be9954fd9a9c4fd68f4a0a36d480e
+Author: Al Viro <viro@zeniv.linux.org.uk>
+Date:   Thu Nov 24 22:05:19 2011 -0500
+
+    vfs: mnt_parent moved to struct mount
+    
+    the second victim...
+    
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index 541daf568f63..5126c0861102 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -2,6 +2,7 @@
+ 
+ struct mount {
+ 	struct list_head mnt_hash;
++	struct vfsmount *mnt_parent;
+ 	struct vfsmount mnt;
+ };
+ 
+@@ -12,7 +13,7 @@ static inline struct mount *real_mount(struct vfsmount *mnt)
+ 
+ static inline int mnt_has_parent(struct mount *mnt)
+ {
+-	return &mnt->mnt != mnt->mnt.mnt_parent;
++	return &mnt->mnt != mnt->mnt_parent;
+ }
+ 
+ extern struct mount *__lookup_mnt(struct vfsmount *, struct dentry *, int);
+
+commit 676da58df740f325034b8641311413c2393588e1
+Author: Al Viro <viro@zeniv.linux.org.uk>
+Date:   Thu Nov 24 21:47:05 2011 -0500
+
+    vfs: spread struct mount - mnt_has_parent
+    
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index 831e7c86835b..541daf568f63 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -10,9 +10,9 @@ static inline struct mount *real_mount(struct vfsmount *mnt)
+ 	return container_of(mnt, struct mount, mnt);
+ }
+ 
+-static inline int mnt_has_parent(struct vfsmount *mnt)
++static inline int mnt_has_parent(struct mount *mnt)
+ {
+-	return mnt != mnt->mnt_parent;
++	return &mnt->mnt != mnt->mnt.mnt_parent;
+ }
+ 
+ extern struct mount *__lookup_mnt(struct vfsmount *, struct dentry *, int);
+
+commit 1b8e5564b9d34cbeb3047dd2be8ec9cd5e2785e2
+Author: Al Viro <viro@zeniv.linux.org.uk>
+Date:   Thu Nov 24 21:01:32 2011 -0500
+
+    vfs: the first spoils - mnt_hash moved
+    
+    taken out of struct vfsmount into struct mount
+    
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index 44e5b6f54b7e..831e7c86835b 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -1,6 +1,7 @@
+ #include <linux/mount.h>
+ 
+ struct mount {
++	struct list_head mnt_hash;
+ 	struct vfsmount mnt;
+ };
+ 
+
+commit c71053659e3bb27d44b79da0bb4abf5838c2060a
+Author: Al Viro <viro@zeniv.linux.org.uk>
+Date:   Thu Nov 24 18:22:03 2011 -0500
+
+    vfs: spread struct mount - __lookup_mnt() result
+    
+    switch __lookup_mnt() to returning struct mount *; callers adjusted.
+    
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index 47da8163e1f4..44e5b6f54b7e 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -13,3 +13,5 @@ static inline int mnt_has_parent(struct vfsmount *mnt)
+ {
+ 	return mnt != mnt->mnt_parent;
+ }
++
++extern struct mount *__lookup_mnt(struct vfsmount *, struct dentry *, int);
+
+commit 7d6fec45a5131918b51dcd76da52f2ec86a85be6
+Author: Al Viro <viro@zeniv.linux.org.uk>
+Date:   Wed Nov 23 12:14:10 2011 -0500
+
+    vfs: start hiding vfsmount guts series
+    
+    Almost all fields of struct vfsmount are used only by core VFS (and
+    a fairly small part of it, at that).  The plan: embed struct vfsmount
+    into struct mount, making the latter visible only to core parts of VFS.
+    Then move fields from vfsmount to mount, eventually leaving only
+    mnt_root/mnt_sb/mnt_flags in struct vfsmount.  Filesystem code still
+    gets pointers to struct vfsmount and remains unchanged; all such
+    pointers go to struct vfsmount embedded into the instances of struct
+    mount allocated by fs/namespace.c.  When fs/namespace.c et.al. get
+    a pointer to vfsmount, they turn it into pointer to mount (using
+    container_of) and work with that.
+    
+    This is the first part of series; struct mount is introduced,
+    allocation switched to using it.
+    
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/fs/mount.h b/fs/mount.h
+index 7890e49f74ef..47da8163e1f4 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -1,5 +1,14 @@
+ #include <linux/mount.h>
+ 
++struct mount {
++	struct vfsmount mnt;
++};
++
++static inline struct mount *real_mount(struct vfsmount *mnt)
++{
++	return container_of(mnt, struct mount, mnt);
++}
++
+ static inline int mnt_has_parent(struct vfsmount *mnt)
+ {
+ 	return mnt != mnt->mnt_parent;
+
+commit b2dba1af3c4157040303a76d25216b1713d333d0
+Author: Al Viro <viro@zeniv.linux.org.uk>
+Date:   Wed Nov 23 19:26:23 2011 -0500
+
+    vfs: new internal helper: mnt_has_parent(mnt)
+    
+    vfsmounts have ->mnt_parent pointing either to a different vfsmount
+    or to itself; it's never NULL and termination condition in loops
+    traversing the tree towards root is mnt == mnt->mnt_parent.  At least
+    one place (see the next patch) is confused about what's going on;
+    let's add an explicit helper checking it right way and use it in
+    all places where we need it.  Not that there had been too many,
+    but...
+    
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/fs/mount.h b/fs/mount.h
+new file mode 100644
+index 000000000000..7890e49f74ef
+--- /dev/null
++++ b/fs/mount.h
+@@ -0,0 +1,6 @@
++#include <linux/mount.h>
++
++static inline int mnt_has_parent(struct vfsmount *mnt)
++{
++	return mnt != mnt->mnt_parent;
++}

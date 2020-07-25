@@ -1,0 +1,957 @@
+commit 834f8933d5ddd732274cb6050252bd1c7cc7349d
+Author: Vladimir Oltean <vladimir.oltean@nxp.com>
+Date:   Tue May 5 22:20:56 2020 +0300
+
+    net: dsa: sja1105: implement tc-gate using time-triggered virtual links
+    
+    Restrict the TTEthernet hardware support on this switch to operate as
+    closely as possible to IEEE 802.1Qci as possible. This means that it can
+    perform PTP-time-based ingress admission control on streams identified
+    by {DMAC, VID, PCP}, which is useful when trying to ensure the
+    determinism of traffic scheduled via IEEE 802.1Qbv.
+    
+    The oddity comes from the fact that in hardware (and in TTEthernet at
+    large), virtual links always need a full-blown action, including not
+    only the type of policing, but also the list of destination ports. So in
+    practice, a single tc-gate action will result in all packets getting
+    dropped. Additional actions (either "trap" or "redirect") need to be
+    specified in the same filter rule such that the conforming packets are
+    actually forwarded somewhere.
+    
+    Apart from the VL Lookup, Policing and Forwarding tables which need to
+    be programmed for each flow (virtual link), the Schedule engine also
+    needs to be told to open/close the admission gates for each individual
+    virtual link. A fairly accurate (and detailed) description of how that
+    works is already present in sja1105_tas.c, since it is already used to
+    trigger the egress gates for the tc-taprio offload (IEEE 802.1Qbv). Key
+    point here, we remember that the schedule engine supports 8
+    "subschedules" (execution threads that iterate through the global
+    schedule in parallel, and that no 2 hardware threads must execute a
+    schedule entry at the same time). For tc-taprio, each egress port used
+    one of these 8 subschedules, leaving a total of 4 subschedules unused.
+    In principle we could have allocated 1 subschedule for the tc-gate
+    offload of each ingress port, but actually the schedules of all virtual
+    links installed on each ingress port would have needed to be merged
+    together, before they could have been programmed to hardware. So
+    simplify our life and just merge the entire tc-gate configuration, for
+    all virtual links on all ingress ports, into a single subschedule. Be
+    sure to check that against the usual hardware scheduling conflicts, and
+    program it to hardware alongside any tc-taprio subschedule that may be
+    present.
+    
+    The following scenarios were tested:
+    
+    1. Quantitative testing:
+    
+       tc qdisc add dev swp2 clsact
+       tc filter add dev swp2 ingress flower skip_sw \
+               dst_mac 42:be:24:9b:76:20 \
+               action gate index 1 base-time 0 \
+               sched-entry OPEN 1200 -1 -1 \
+               sched-entry CLOSE 1200 -1 -1 \
+               action trap
+    
+       ping 192.168.1.2 -f
+       PING 192.168.1.2 (192.168.1.2) 56(84) bytes of data.
+       .............................
+       --- 192.168.1.2 ping statistics ---
+       948 packets transmitted, 467 received, 50.7384% packet loss, time 9671ms
+    
+    2. Qualitative testing (with a phase-aligned schedule - the clocks are
+       synchronized by ptp4l, not shown here):
+    
+       Receiver (sja1105):
+    
+       tc qdisc add dev swp2 clsact
+       now=$(phc_ctl /dev/ptp1 get | awk '/clock time is/ {print $5}') && \
+               sec=$(echo $now | awk -F. '{print $1}') && \
+               base_time="$(((sec + 2) * 1000000000))" && \
+               echo "base time ${base_time}"
+       tc filter add dev swp2 ingress flower skip_sw \
+               dst_mac 42:be:24:9b:76:20 \
+               action gate base-time ${base_time} \
+               sched-entry OPEN  60000 -1 -1 \
+               sched-entry CLOSE 40000 -1 -1 \
+               action trap
+    
+       Sender (enetc):
+       now=$(phc_ctl /dev/ptp0 get | awk '/clock time is/ {print $5}') && \
+               sec=$(echo $now | awk -F. '{print $1}') && \
+               base_time="$(((sec + 2) * 1000000000))" && \
+               echo "base time ${base_time}"
+       tc qdisc add dev eno0 parent root taprio \
+               num_tc 8 \
+               map 0 1 2 3 4 5 6 7 \
+               queues 1@0 1@1 1@2 1@3 1@4 1@5 1@6 1@7 \
+               base-time ${base_time} \
+               sched-entry S 01  50000 \
+               sched-entry S 00  50000 \
+               flags 2
+    
+       ping -A 192.168.1.1
+       PING 192.168.1.1 (192.168.1.1): 56 data bytes
+       ...
+       ^C
+       --- 192.168.1.1 ping statistics ---
+       1425 packets transmitted, 1424 packets received, 0% packet loss
+       round-trip min/avg/max = 0.322/0.361/0.990 ms
+    
+       And just for comparison, with the tc-taprio schedule deleted:
+    
+       ping -A 192.168.1.1
+       PING 192.168.1.1 (192.168.1.1): 56 data bytes
+       ...
+       ^C
+       --- 192.168.1.1 ping statistics ---
+       33 packets transmitted, 19 packets received, 42% packet loss
+       round-trip min/avg/max = 0.336/0.464/0.597 ms
+    
+    Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/dsa/sja1105/sja1105_flower.c b/drivers/net/dsa/sja1105/sja1105_flower.c
+index 5f08eed0b1fc..9ee8968610cd 100644
+--- a/drivers/net/dsa/sja1105/sja1105_flower.c
++++ b/drivers/net/dsa/sja1105/sja1105_flower.c
+@@ -309,7 +309,9 @@ int sja1105_cls_flower_add(struct dsa_switch *ds, int port,
+ 	struct sja1105_private *priv = ds->priv;
+ 	const struct flow_action_entry *act;
+ 	unsigned long cookie = cls->cookie;
++	bool routing_rule = false;
+ 	struct sja1105_key key;
++	bool gate_rule = false;
+ 	bool vl_rule = false;
+ 	int rc, i;
+ 
+@@ -332,6 +334,7 @@ int sja1105_cls_flower_add(struct dsa_switch *ds, int port,
+ 		case FLOW_ACTION_TRAP: {
+ 			int cpu = dsa_upstream_port(ds, port);
+ 
++			routing_rule = true;
+ 			vl_rule = true;
+ 
+ 			rc = sja1105_vl_redirect(priv, port, extack, cookie,
+@@ -350,6 +353,7 @@ int sja1105_cls_flower_add(struct dsa_switch *ds, int port,
+ 				return -EOPNOTSUPP;
+ 			}
+ 
++			routing_rule = true;
+ 			vl_rule = true;
+ 
+ 			rc = sja1105_vl_redirect(priv, port, extack, cookie,
+@@ -366,6 +370,21 @@ int sja1105_cls_flower_add(struct dsa_switch *ds, int port,
+ 			if (rc)
+ 				goto out;
+ 			break;
++		case FLOW_ACTION_GATE:
++			gate_rule = true;
++			vl_rule = true;
++
++			rc = sja1105_vl_gate(priv, port, extack, cookie,
++					     &key, act->gate.index,
++					     act->gate.prio,
++					     act->gate.basetime,
++					     act->gate.cycletime,
++					     act->gate.cycletimeext,
++					     act->gate.num_entries,
++					     act->gate.entries);
++			if (rc)
++				goto out;
++			break;
+ 		default:
+ 			NL_SET_ERR_MSG_MOD(extack,
+ 					   "Action not supported");
+@@ -374,8 +393,23 @@ int sja1105_cls_flower_add(struct dsa_switch *ds, int port,
+ 		}
+ 	}
+ 
+-	if (vl_rule && !rc)
++	if (vl_rule && !rc) {
++		/* Delay scheduling configuration until DESTPORTS has been
++		 * populated by all other actions.
++		 */
++		if (gate_rule) {
++			if (!routing_rule) {
++				NL_SET_ERR_MSG_MOD(extack,
++						   "Can only offload gate action together with redirect or trap");
++				return -EOPNOTSUPP;
++			}
++			rc = sja1105_init_scheduling(priv);
++			if (rc)
++				goto out;
++		}
++
+ 		rc = sja1105_static_config_reload(priv, SJA1105_VIRTUAL_LINKS);
++	}
+ 
+ out:
+ 	return rc;
+@@ -421,6 +455,27 @@ int sja1105_cls_flower_del(struct dsa_switch *ds, int port,
+ 	return sja1105_static_config_reload(priv, SJA1105_BEST_EFFORT_POLICING);
+ }
+ 
++int sja1105_cls_flower_stats(struct dsa_switch *ds, int port,
++			     struct flow_cls_offload *cls, bool ingress)
++{
++	struct sja1105_private *priv = ds->priv;
++	struct sja1105_rule *rule = sja1105_rule_find(priv, cls->cookie);
++	int rc;
++
++	if (!rule)
++		return 0;
++
++	if (rule->type != SJA1105_RULE_VL)
++		return 0;
++
++	rc = sja1105_vl_stats(priv, port, rule, &cls->stats,
++			      cls->common.extack);
++	if (rc)
++		return rc;
++
++	return 0;
++}
++
+ void sja1105_flower_setup(struct dsa_switch *ds)
+ {
+ 	struct sja1105_private *priv = ds->priv;
+
+commit dfacc5a23e227cabdff41b6202f510398e90d36b
+Author: Vladimir Oltean <vladimir.oltean@nxp.com>
+Date:   Tue May 5 22:20:55 2020 +0300
+
+    net: dsa: sja1105: support flow-based redirection via virtual links
+    
+    Implement tc-flower offloads for redirect, trap and drop using
+    non-critical virtual links.
+    
+    Commands which were tested to work are:
+    
+      # Send frames received on swp2 with a DA of 42:be:24:9b:76:20 to the
+      # CPU and to swp3. This type of key (DA only) when the port's VLAN
+      # awareness state is off.
+      tc qdisc add dev swp2 clsact
+      tc filter add dev swp2 ingress flower skip_sw dst_mac 42:be:24:9b:76:20 \
+              action mirred egress redirect dev swp3 \
+              action trap
+    
+      # Drop frames received on swp2 with a DA of 42:be:24:9b:76:20, a VID
+      # of 100 and a PCP of 0.
+      tc filter add dev swp2 ingress protocol 802.1Q flower skip_sw \
+              dst_mac 42:be:24:9b:76:20 vlan_id 100 vlan_prio 0 action drop
+    
+    Under the hood, all rules match on DMAC, VID and PCP, but when VLAN
+    filtering is disabled, those are set internally by the driver to the
+    port-based defaults. Because we would be put in an awkward situation if
+    the user were to change the VLAN filtering state while there are active
+    rules (packets would no longer match on the specified keys), we simply
+    deny changing vlan_filtering unless the list of flows offloaded via
+    virtual links is empty. Then the user can re-add new rules.
+    
+    Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/dsa/sja1105/sja1105_flower.c b/drivers/net/dsa/sja1105/sja1105_flower.c
+index 3246d5a49436..5f08eed0b1fc 100644
+--- a/drivers/net/dsa/sja1105/sja1105_flower.c
++++ b/drivers/net/dsa/sja1105/sja1105_flower.c
+@@ -2,9 +2,10 @@
+ /* Copyright 2020, NXP Semiconductors
+  */
+ #include "sja1105.h"
++#include "sja1105_vl.h"
+ 
+-static struct sja1105_rule *sja1105_rule_find(struct sja1105_private *priv,
+-					      unsigned long cookie)
++struct sja1105_rule *sja1105_rule_find(struct sja1105_private *priv,
++				       unsigned long cookie)
+ {
+ 	struct sja1105_rule *rule;
+ 
+@@ -173,7 +174,8 @@ static int sja1105_setup_tc_policer(struct sja1105_private *priv,
+ 
+ static int sja1105_flower_policer(struct sja1105_private *priv, int port,
+ 				  struct netlink_ext_ack *extack,
+-				  unsigned long cookie, struct sja1105_key *key,
++				  unsigned long cookie,
++				  struct sja1105_key *key,
+ 				  u64 rate_bytes_per_sec,
+ 				  s64 burst)
+ {
+@@ -308,6 +310,7 @@ int sja1105_cls_flower_add(struct dsa_switch *ds, int port,
+ 	const struct flow_action_entry *act;
+ 	unsigned long cookie = cls->cookie;
+ 	struct sja1105_key key;
++	bool vl_rule = false;
+ 	int rc, i;
+ 
+ 	rc = sja1105_flower_parse_key(priv, extack, cls, &key);
+@@ -319,13 +322,50 @@ int sja1105_cls_flower_add(struct dsa_switch *ds, int port,
+ 	flow_action_for_each(i, act, &rule->action) {
+ 		switch (act->id) {
+ 		case FLOW_ACTION_POLICE:
+-			rc = sja1105_flower_policer(priv, port,
+-						    extack, cookie, &key,
++			rc = sja1105_flower_policer(priv, port, extack, cookie,
++						    &key,
+ 						    act->police.rate_bytes_ps,
+ 						    act->police.burst);
+ 			if (rc)
+ 				goto out;
+ 			break;
++		case FLOW_ACTION_TRAP: {
++			int cpu = dsa_upstream_port(ds, port);
++
++			vl_rule = true;
++
++			rc = sja1105_vl_redirect(priv, port, extack, cookie,
++						 &key, BIT(cpu), true);
++			if (rc)
++				goto out;
++			break;
++		}
++		case FLOW_ACTION_REDIRECT: {
++			struct dsa_port *to_dp;
++
++			to_dp = dsa_port_from_netdev(act->dev);
++			if (IS_ERR(to_dp)) {
++				NL_SET_ERR_MSG_MOD(extack,
++						   "Destination not a switch port");
++				return -EOPNOTSUPP;
++			}
++
++			vl_rule = true;
++
++			rc = sja1105_vl_redirect(priv, port, extack, cookie,
++						 &key, BIT(to_dp->index), true);
++			if (rc)
++				goto out;
++			break;
++		}
++		case FLOW_ACTION_DROP:
++			vl_rule = true;
++
++			rc = sja1105_vl_redirect(priv, port, extack, cookie,
++						 &key, 0, false);
++			if (rc)
++				goto out;
++			break;
+ 		default:
+ 			NL_SET_ERR_MSG_MOD(extack,
+ 					   "Action not supported");
+@@ -333,6 +373,10 @@ int sja1105_cls_flower_add(struct dsa_switch *ds, int port,
+ 			goto out;
+ 		}
+ 	}
++
++	if (vl_rule && !rc)
++		rc = sja1105_static_config_reload(priv, SJA1105_VIRTUAL_LINKS);
++
+ out:
+ 	return rc;
+ }
+@@ -348,6 +392,9 @@ int sja1105_cls_flower_del(struct dsa_switch *ds, int port,
+ 	if (!rule)
+ 		return 0;
+ 
++	if (rule->type == SJA1105_RULE_VL)
++		return sja1105_vl_delete(priv, port, rule, cls->common.extack);
++
+ 	policing = priv->static_config.tables[BLK_IDX_L2_POLICING].entries;
+ 
+ 	if (rule->type == SJA1105_RULE_BCAST_POLICER) {
+
+commit b70bb8d4ab2c0a4992e4692f07e9b91056b30c88
+Author: Vladimir Oltean <vladimir.oltean@nxp.com>
+Date:   Tue May 5 22:20:54 2020 +0300
+
+    net: dsa: sja1105: make room for virtual link parsing in flower offload
+    
+    Virtual links are a sja1105 hardware concept of executing various flow
+    actions based on a key extracted from the frame's DMAC, VID and PCP.
+    
+    Currently the tc-flower offload code supports only parsing the DMAC if
+    that is the broadcast MAC address, and the VLAN PCP. Extract the key
+    parsing logic from the L2 policers functionality and move it into its
+    own function, after adding extra logic for matching on any DMAC and VID.
+    
+    Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/dsa/sja1105/sja1105_flower.c b/drivers/net/dsa/sja1105/sja1105_flower.c
+index 5288a722e625..3246d5a49436 100644
+--- a/drivers/net/dsa/sja1105/sja1105_flower.c
++++ b/drivers/net/dsa/sja1105/sja1105_flower.c
+@@ -46,6 +46,7 @@ static int sja1105_setup_bcast_policer(struct sja1105_private *priv,
+ 		rule->cookie = cookie;
+ 		rule->type = SJA1105_RULE_BCAST_POLICER;
+ 		rule->bcast_pol.sharindx = sja1105_find_free_l2_policer(priv);
++		rule->key.type = SJA1105_KEY_BCAST;
+ 		new_rule = true;
+ 	}
+ 
+@@ -117,7 +118,8 @@ static int sja1105_setup_tc_policer(struct sja1105_private *priv,
+ 		rule->cookie = cookie;
+ 		rule->type = SJA1105_RULE_TC_POLICER;
+ 		rule->tc_pol.sharindx = sja1105_find_free_l2_policer(priv);
+-		rule->tc_pol.tc = tc;
++		rule->key.type = SJA1105_KEY_TC;
++		rule->key.tc.pcp = tc;
+ 		new_rule = true;
+ 	}
+ 
+@@ -169,14 +171,37 @@ static int sja1105_setup_tc_policer(struct sja1105_private *priv,
+ 	return rc;
+ }
+ 
+-static int sja1105_flower_parse_policer(struct sja1105_private *priv, int port,
+-					struct netlink_ext_ack *extack,
+-					struct flow_cls_offload *cls,
+-					u64 rate_bytes_per_sec,
+-					s64 burst)
++static int sja1105_flower_policer(struct sja1105_private *priv, int port,
++				  struct netlink_ext_ack *extack,
++				  unsigned long cookie, struct sja1105_key *key,
++				  u64 rate_bytes_per_sec,
++				  s64 burst)
++{
++	switch (key->type) {
++	case SJA1105_KEY_BCAST:
++		return sja1105_setup_bcast_policer(priv, extack, cookie, port,
++						   rate_bytes_per_sec, burst);
++	case SJA1105_KEY_TC:
++		return sja1105_setup_tc_policer(priv, extack, cookie, port,
++						key->tc.pcp, rate_bytes_per_sec,
++						burst);
++	default:
++		NL_SET_ERR_MSG_MOD(extack, "Unknown keys for policing");
++		return -EOPNOTSUPP;
++	}
++}
++
++static int sja1105_flower_parse_key(struct sja1105_private *priv,
++				    struct netlink_ext_ack *extack,
++				    struct flow_cls_offload *cls,
++				    struct sja1105_key *key)
+ {
+ 	struct flow_rule *rule = flow_cls_offload_flow_rule(cls);
+ 	struct flow_dissector *dissector = rule->match.dissector;
++	bool is_bcast_dmac = false;
++	u64 dmac = U64_MAX;
++	u16 vid = U16_MAX;
++	u16 pcp = U16_MAX;
+ 
+ 	if (dissector->used_keys &
+ 	    ~(BIT(FLOW_DISSECTOR_KEY_BASIC) |
+@@ -213,16 +238,14 @@ static int sja1105_flower_parse_policer(struct sja1105_private *priv, int port,
+ 			return -EOPNOTSUPP;
+ 		}
+ 
+-		if (!ether_addr_equal_masked(match.key->dst, bcast,
+-					     match.mask->dst)) {
++		if (!ether_addr_equal(match.mask->dst, bcast)) {
+ 			NL_SET_ERR_MSG_MOD(extack,
+-					   "Only matching on broadcast DMAC is supported");
++					   "Masked matching on MAC not supported");
+ 			return -EOPNOTSUPP;
+ 		}
+ 
+-		return sja1105_setup_bcast_policer(priv, extack, cls->cookie,
+-						   port, rate_bytes_per_sec,
+-						   burst);
++		dmac = ether_addr_to_u64(match.key->dst);
++		is_bcast_dmac = ether_addr_equal(match.key->dst, bcast);
+ 	}
+ 
+ 	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_VLAN)) {
+@@ -230,22 +253,46 @@ static int sja1105_flower_parse_policer(struct sja1105_private *priv, int port,
+ 
+ 		flow_rule_match_vlan(rule, &match);
+ 
+-		if (match.key->vlan_id & match.mask->vlan_id) {
++		if (match.mask->vlan_id &&
++		    match.mask->vlan_id != VLAN_VID_MASK) {
+ 			NL_SET_ERR_MSG_MOD(extack,
+-					   "Matching on VID is not supported");
++					   "Masked matching on VID is not supported");
+ 			return -EOPNOTSUPP;
+ 		}
+ 
+-		if (match.mask->vlan_priority != 0x7) {
++		if (match.mask->vlan_priority &&
++		    match.mask->vlan_priority != 0x7) {
+ 			NL_SET_ERR_MSG_MOD(extack,
+ 					   "Masked matching on PCP is not supported");
+ 			return -EOPNOTSUPP;
+ 		}
+ 
+-		return sja1105_setup_tc_policer(priv, extack, cls->cookie, port,
+-						match.key->vlan_priority,
+-						rate_bytes_per_sec,
+-						burst);
++		if (match.mask->vlan_id)
++			vid = match.key->vlan_id;
++		if (match.mask->vlan_priority)
++			pcp = match.key->vlan_priority;
++	}
++
++	if (is_bcast_dmac && vid == U16_MAX && pcp == U16_MAX) {
++		key->type = SJA1105_KEY_BCAST;
++		return 0;
++	}
++	if (dmac == U64_MAX && vid == U16_MAX && pcp != U16_MAX) {
++		key->type = SJA1105_KEY_TC;
++		key->tc.pcp = pcp;
++		return 0;
++	}
++	if (dmac != U64_MAX && vid != U16_MAX && pcp != U16_MAX) {
++		key->type = SJA1105_KEY_VLAN_AWARE_VL;
++		key->vl.dmac = dmac;
++		key->vl.vid = vid;
++		key->vl.pcp = pcp;
++		return 0;
++	}
++	if (dmac != U64_MAX) {
++		key->type = SJA1105_KEY_VLAN_UNAWARE_VL;
++		key->vl.dmac = dmac;
++		return 0;
+ 	}
+ 
+ 	NL_SET_ERR_MSG_MOD(extack, "Not matching on any known key");
+@@ -259,22 +306,34 @@ int sja1105_cls_flower_add(struct dsa_switch *ds, int port,
+ 	struct netlink_ext_ack *extack = cls->common.extack;
+ 	struct sja1105_private *priv = ds->priv;
+ 	const struct flow_action_entry *act;
+-	int rc = -EOPNOTSUPP, i;
++	unsigned long cookie = cls->cookie;
++	struct sja1105_key key;
++	int rc, i;
++
++	rc = sja1105_flower_parse_key(priv, extack, cls, &key);
++	if (rc)
++		return rc;
++
++	rc = -EOPNOTSUPP;
+ 
+ 	flow_action_for_each(i, act, &rule->action) {
+ 		switch (act->id) {
+ 		case FLOW_ACTION_POLICE:
+-			rc = sja1105_flower_parse_policer(priv, port, extack, cls,
+-							  act->police.rate_bytes_ps,
+-							  act->police.burst);
++			rc = sja1105_flower_policer(priv, port,
++						    extack, cookie, &key,
++						    act->police.rate_bytes_ps,
++						    act->police.burst);
++			if (rc)
++				goto out;
+ 			break;
+ 		default:
+ 			NL_SET_ERR_MSG_MOD(extack,
+ 					   "Action not supported");
+-			break;
++			rc = -EOPNOTSUPP;
++			goto out;
+ 		}
+ 	}
+-
++out:
+ 	return rc;
+ }
+ 
+@@ -297,7 +356,7 @@ int sja1105_cls_flower_del(struct dsa_switch *ds, int port,
+ 		old_sharindx = policing[bcast].sharindx;
+ 		policing[bcast].sharindx = port;
+ 	} else if (rule->type == SJA1105_RULE_TC_POLICER) {
+-		int index = (port * SJA1105_NUM_TC) + rule->tc_pol.tc;
++		int index = (port * SJA1105_NUM_TC) + rule->key.tc.pcp;
+ 
+ 		old_sharindx = policing[index].sharindx;
+ 		policing[index].sharindx = port;
+
+commit a6af77637adc92aa0725ac14f71ad915c6000609
+Author: Vladimir Oltean <vladimir.oltean@nxp.com>
+Date:   Sun Mar 29 14:52:02 2020 +0300
+
+    net: dsa: sja1105: add broadcast and per-traffic class policers
+    
+    This patch adds complete support for manipulating the L2 Policing Tables
+    from this switch. There are 45 table entries, one entry per each port
+    and traffic class, and one dedicated entry for broadcast traffic for
+    each ingress port.
+    
+    Policing entries are shareable, and we use this functionality to support
+    shared block filters.
+    
+    We are modeling broadcast policers as simple tc-flower matches on
+    dst_mac. As for the traffic class policers, the switch only deduces the
+    traffic class from the VLAN PCP field, so it makes sense to model this
+    as a tc-flower match on vlan_prio.
+    
+    How to limit broadcast traffic coming from all front-panel ports to a
+    cumulated total of 10 Mbit/s:
+    
+    tc qdisc add dev sw0p0 ingress_block 1 clsact
+    tc qdisc add dev sw0p1 ingress_block 1 clsact
+    tc qdisc add dev sw0p2 ingress_block 1 clsact
+    tc qdisc add dev sw0p3 ingress_block 1 clsact
+    tc filter add block 1 flower skip_sw dst_mac ff:ff:ff:ff:ff:ff \
+            action police rate 10mbit burst 64k
+    
+    How to limit traffic with VLAN PCP 0 (also includes untagged traffic) to
+    100 Mbit/s on port 0 only:
+    
+    tc filter add dev sw0p0 ingress protocol 802.1Q flower skip_sw \
+            vlan_prio 0 action police rate 100mbit burst 64k
+    
+    The broadcast, VLAN PCP and port policers are compatible with one
+    another (can be installed at the same time on a port).
+    
+    Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/net/dsa/sja1105/sja1105_flower.c b/drivers/net/dsa/sja1105/sja1105_flower.c
+new file mode 100644
+index 000000000000..5288a722e625
+--- /dev/null
++++ b/drivers/net/dsa/sja1105/sja1105_flower.c
+@@ -0,0 +1,340 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright 2020, NXP Semiconductors
++ */
++#include "sja1105.h"
++
++static struct sja1105_rule *sja1105_rule_find(struct sja1105_private *priv,
++					      unsigned long cookie)
++{
++	struct sja1105_rule *rule;
++
++	list_for_each_entry(rule, &priv->flow_block.rules, list)
++		if (rule->cookie == cookie)
++			return rule;
++
++	return NULL;
++}
++
++static int sja1105_find_free_l2_policer(struct sja1105_private *priv)
++{
++	int i;
++
++	for (i = 0; i < SJA1105_NUM_L2_POLICERS; i++)
++		if (!priv->flow_block.l2_policer_used[i])
++			return i;
++
++	return -1;
++}
++
++static int sja1105_setup_bcast_policer(struct sja1105_private *priv,
++				       struct netlink_ext_ack *extack,
++				       unsigned long cookie, int port,
++				       u64 rate_bytes_per_sec,
++				       s64 burst)
++{
++	struct sja1105_rule *rule = sja1105_rule_find(priv, cookie);
++	struct sja1105_l2_policing_entry *policing;
++	bool new_rule = false;
++	unsigned long p;
++	int rc;
++
++	if (!rule) {
++		rule = kzalloc(sizeof(*rule), GFP_KERNEL);
++		if (!rule)
++			return -ENOMEM;
++
++		rule->cookie = cookie;
++		rule->type = SJA1105_RULE_BCAST_POLICER;
++		rule->bcast_pol.sharindx = sja1105_find_free_l2_policer(priv);
++		new_rule = true;
++	}
++
++	if (rule->bcast_pol.sharindx == -1) {
++		NL_SET_ERR_MSG_MOD(extack, "No more L2 policers free");
++		rc = -ENOSPC;
++		goto out;
++	}
++
++	policing = priv->static_config.tables[BLK_IDX_L2_POLICING].entries;
++
++	if (policing[(SJA1105_NUM_PORTS * SJA1105_NUM_TC) + port].sharindx != port) {
++		NL_SET_ERR_MSG_MOD(extack,
++				   "Port already has a broadcast policer");
++		rc = -EEXIST;
++		goto out;
++	}
++
++	rule->port_mask |= BIT(port);
++
++	/* Make the broadcast policers of all ports attached to this block
++	 * point to the newly allocated policer
++	 */
++	for_each_set_bit(p, &rule->port_mask, SJA1105_NUM_PORTS) {
++		int bcast = (SJA1105_NUM_PORTS * SJA1105_NUM_TC) + p;
++
++		policing[bcast].sharindx = rule->bcast_pol.sharindx;
++	}
++
++	policing[rule->bcast_pol.sharindx].rate = div_u64(rate_bytes_per_sec *
++							  512, 1000000);
++	policing[rule->bcast_pol.sharindx].smax = div_u64(rate_bytes_per_sec *
++							  PSCHED_NS2TICKS(burst),
++							  PSCHED_TICKS_PER_SEC);
++	/* TODO: support per-flow MTU */
++	policing[rule->bcast_pol.sharindx].maxlen = VLAN_ETH_FRAME_LEN +
++						    ETH_FCS_LEN;
++
++	rc = sja1105_static_config_reload(priv, SJA1105_BEST_EFFORT_POLICING);
++
++out:
++	if (rc == 0 && new_rule) {
++		priv->flow_block.l2_policer_used[rule->bcast_pol.sharindx] = true;
++		list_add(&rule->list, &priv->flow_block.rules);
++	} else if (new_rule) {
++		kfree(rule);
++	}
++
++	return rc;
++}
++
++static int sja1105_setup_tc_policer(struct sja1105_private *priv,
++				    struct netlink_ext_ack *extack,
++				    unsigned long cookie, int port, int tc,
++				    u64 rate_bytes_per_sec,
++				    s64 burst)
++{
++	struct sja1105_rule *rule = sja1105_rule_find(priv, cookie);
++	struct sja1105_l2_policing_entry *policing;
++	bool new_rule = false;
++	unsigned long p;
++	int rc;
++
++	if (!rule) {
++		rule = kzalloc(sizeof(*rule), GFP_KERNEL);
++		if (!rule)
++			return -ENOMEM;
++
++		rule->cookie = cookie;
++		rule->type = SJA1105_RULE_TC_POLICER;
++		rule->tc_pol.sharindx = sja1105_find_free_l2_policer(priv);
++		rule->tc_pol.tc = tc;
++		new_rule = true;
++	}
++
++	if (rule->tc_pol.sharindx == -1) {
++		NL_SET_ERR_MSG_MOD(extack, "No more L2 policers free");
++		rc = -ENOSPC;
++		goto out;
++	}
++
++	policing = priv->static_config.tables[BLK_IDX_L2_POLICING].entries;
++
++	if (policing[(port * SJA1105_NUM_TC) + tc].sharindx != port) {
++		NL_SET_ERR_MSG_MOD(extack,
++				   "Port-TC pair already has an L2 policer");
++		rc = -EEXIST;
++		goto out;
++	}
++
++	rule->port_mask |= BIT(port);
++
++	/* Make the policers for traffic class @tc of all ports attached to
++	 * this block point to the newly allocated policer
++	 */
++	for_each_set_bit(p, &rule->port_mask, SJA1105_NUM_PORTS) {
++		int index = (p * SJA1105_NUM_TC) + tc;
++
++		policing[index].sharindx = rule->tc_pol.sharindx;
++	}
++
++	policing[rule->tc_pol.sharindx].rate = div_u64(rate_bytes_per_sec *
++						       512, 1000000);
++	policing[rule->tc_pol.sharindx].smax = div_u64(rate_bytes_per_sec *
++						       PSCHED_NS2TICKS(burst),
++						       PSCHED_TICKS_PER_SEC);
++	/* TODO: support per-flow MTU */
++	policing[rule->tc_pol.sharindx].maxlen = VLAN_ETH_FRAME_LEN +
++						 ETH_FCS_LEN;
++
++	rc = sja1105_static_config_reload(priv, SJA1105_BEST_EFFORT_POLICING);
++
++out:
++	if (rc == 0 && new_rule) {
++		priv->flow_block.l2_policer_used[rule->tc_pol.sharindx] = true;
++		list_add(&rule->list, &priv->flow_block.rules);
++	} else if (new_rule) {
++		kfree(rule);
++	}
++
++	return rc;
++}
++
++static int sja1105_flower_parse_policer(struct sja1105_private *priv, int port,
++					struct netlink_ext_ack *extack,
++					struct flow_cls_offload *cls,
++					u64 rate_bytes_per_sec,
++					s64 burst)
++{
++	struct flow_rule *rule = flow_cls_offload_flow_rule(cls);
++	struct flow_dissector *dissector = rule->match.dissector;
++
++	if (dissector->used_keys &
++	    ~(BIT(FLOW_DISSECTOR_KEY_BASIC) |
++	      BIT(FLOW_DISSECTOR_KEY_CONTROL) |
++	      BIT(FLOW_DISSECTOR_KEY_VLAN) |
++	      BIT(FLOW_DISSECTOR_KEY_ETH_ADDRS))) {
++		NL_SET_ERR_MSG_MOD(extack,
++				   "Unsupported keys used");
++		return -EOPNOTSUPP;
++	}
++
++	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_BASIC)) {
++		struct flow_match_basic match;
++
++		flow_rule_match_basic(rule, &match);
++		if (match.key->n_proto) {
++			NL_SET_ERR_MSG_MOD(extack,
++					   "Matching on protocol not supported");
++			return -EOPNOTSUPP;
++		}
++	}
++
++	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_ETH_ADDRS)) {
++		u8 bcast[] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
++		u8 null[] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
++		struct flow_match_eth_addrs match;
++
++		flow_rule_match_eth_addrs(rule, &match);
++
++		if (!ether_addr_equal_masked(match.key->src, null,
++					     match.mask->src)) {
++			NL_SET_ERR_MSG_MOD(extack,
++					   "Matching on source MAC not supported");
++			return -EOPNOTSUPP;
++		}
++
++		if (!ether_addr_equal_masked(match.key->dst, bcast,
++					     match.mask->dst)) {
++			NL_SET_ERR_MSG_MOD(extack,
++					   "Only matching on broadcast DMAC is supported");
++			return -EOPNOTSUPP;
++		}
++
++		return sja1105_setup_bcast_policer(priv, extack, cls->cookie,
++						   port, rate_bytes_per_sec,
++						   burst);
++	}
++
++	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_VLAN)) {
++		struct flow_match_vlan match;
++
++		flow_rule_match_vlan(rule, &match);
++
++		if (match.key->vlan_id & match.mask->vlan_id) {
++			NL_SET_ERR_MSG_MOD(extack,
++					   "Matching on VID is not supported");
++			return -EOPNOTSUPP;
++		}
++
++		if (match.mask->vlan_priority != 0x7) {
++			NL_SET_ERR_MSG_MOD(extack,
++					   "Masked matching on PCP is not supported");
++			return -EOPNOTSUPP;
++		}
++
++		return sja1105_setup_tc_policer(priv, extack, cls->cookie, port,
++						match.key->vlan_priority,
++						rate_bytes_per_sec,
++						burst);
++	}
++
++	NL_SET_ERR_MSG_MOD(extack, "Not matching on any known key");
++	return -EOPNOTSUPP;
++}
++
++int sja1105_cls_flower_add(struct dsa_switch *ds, int port,
++			   struct flow_cls_offload *cls, bool ingress)
++{
++	struct flow_rule *rule = flow_cls_offload_flow_rule(cls);
++	struct netlink_ext_ack *extack = cls->common.extack;
++	struct sja1105_private *priv = ds->priv;
++	const struct flow_action_entry *act;
++	int rc = -EOPNOTSUPP, i;
++
++	flow_action_for_each(i, act, &rule->action) {
++		switch (act->id) {
++		case FLOW_ACTION_POLICE:
++			rc = sja1105_flower_parse_policer(priv, port, extack, cls,
++							  act->police.rate_bytes_ps,
++							  act->police.burst);
++			break;
++		default:
++			NL_SET_ERR_MSG_MOD(extack,
++					   "Action not supported");
++			break;
++		}
++	}
++
++	return rc;
++}
++
++int sja1105_cls_flower_del(struct dsa_switch *ds, int port,
++			   struct flow_cls_offload *cls, bool ingress)
++{
++	struct sja1105_private *priv = ds->priv;
++	struct sja1105_rule *rule = sja1105_rule_find(priv, cls->cookie);
++	struct sja1105_l2_policing_entry *policing;
++	int old_sharindx;
++
++	if (!rule)
++		return 0;
++
++	policing = priv->static_config.tables[BLK_IDX_L2_POLICING].entries;
++
++	if (rule->type == SJA1105_RULE_BCAST_POLICER) {
++		int bcast = (SJA1105_NUM_PORTS * SJA1105_NUM_TC) + port;
++
++		old_sharindx = policing[bcast].sharindx;
++		policing[bcast].sharindx = port;
++	} else if (rule->type == SJA1105_RULE_TC_POLICER) {
++		int index = (port * SJA1105_NUM_TC) + rule->tc_pol.tc;
++
++		old_sharindx = policing[index].sharindx;
++		policing[index].sharindx = port;
++	} else {
++		return -EINVAL;
++	}
++
++	rule->port_mask &= ~BIT(port);
++	if (!rule->port_mask) {
++		priv->flow_block.l2_policer_used[old_sharindx] = false;
++		list_del(&rule->list);
++		kfree(rule);
++	}
++
++	return sja1105_static_config_reload(priv, SJA1105_BEST_EFFORT_POLICING);
++}
++
++void sja1105_flower_setup(struct dsa_switch *ds)
++{
++	struct sja1105_private *priv = ds->priv;
++	int port;
++
++	INIT_LIST_HEAD(&priv->flow_block.rules);
++
++	for (port = 0; port < SJA1105_NUM_PORTS; port++)
++		priv->flow_block.l2_policer_used[port] = true;
++}
++
++void sja1105_flower_teardown(struct dsa_switch *ds)
++{
++	struct sja1105_private *priv = ds->priv;
++	struct sja1105_rule *rule;
++	struct list_head *pos, *n;
++
++	list_for_each_safe(pos, n, &priv->flow_block.rules) {
++		rule = list_entry(pos, struct sja1105_rule, list);
++		list_del(&rule->list);
++		kfree(rule);
++	}
++}

@@ -1,0 +1,1287 @@
+commit 6a757c07e51f80ac34325fcd558490d2d1439e1b
+Author: Florian Westphal <fw@strlen.de>
+Date:   Mon Feb 3 17:37:07 2020 +0100
+
+    netfilter: conntrack: allow insertion of clashing entries
+    
+    This patch further relaxes the need to drop an skb due to a clash with
+    an existing conntrack entry.
+    
+    Current clash resolution handles the case where the clash occurs between
+    two identical entries (distinct nf_conn objects with same tuples), i.e.:
+    
+                        Original                        Reply
+    existing: 10.2.3.4:42 -> 10.8.8.8:53      10.2.3.4:42 <- 10.0.0.6:5353
+    clashing: 10.2.3.4:42 -> 10.8.8.8:53      10.2.3.4:42 <- 10.0.0.6:5353
+    
+    ... existing handling will discard the unconfirmed clashing entry and
+    makes skb->_nfct point to the existing one.  The skb can then be
+    processed normally just as if the clash would not have existed in the
+    first place.
+    
+    For other clashes, the skb needs to be dropped.
+    This frequently happens with DNS resolvers that send A and AAAA queries
+    back-to-back when NAT rules are present that cause packets to get
+    different DNAT transformations applied, for example:
+    
+    -m statistics --mode random ... -j DNAT --dnat-to 10.0.0.6:5353
+    -m statistics --mode random ... -j DNAT --dnat-to 10.0.0.7:5353
+    
+    In this case the A or AAAA query is dropped which incurs a costly
+    delay during name resolution.
+    
+    This patch also allows this collision type:
+                           Original                   Reply
+    existing: 10.2.3.4:42 -> 10.8.8.8:53      10.2.3.4:42 <- 10.0.0.6:5353
+    clashing: 10.2.3.4:42 -> 10.8.8.8:53      10.2.3.4:42 <- 10.0.0.7:5353
+    
+    In this case, clash is in original direction -- the reply direction
+    is still unique.
+    
+    The change makes it so that when the 2nd colliding packet is received,
+    the clashing conntrack is tagged with new IPS_NAT_CLASH_BIT, gets a fixed
+    1 second timeout and is inserted in the reply direction only.
+    
+    The entry is hidden from 'conntrack -L', it will time out quickly
+    and it can be early dropped because it will never progress to the
+    ASSURED state.
+    
+    To avoid special-casing the delete code path to special case
+    the ORIGINAL hlist_nulls node, a new helper, "hlist_nulls_add_fake", is
+    added so hlist_nulls_del() will work.
+    
+    Example:
+    
+          CPU A:                               CPU B:
+    1.  10.2.3.4:42 -> 10.8.8.8:53 (A)
+    2.                                         10.2.3.4:42 -> 10.8.8.8:53 (AAAA)
+    3.  Apply DNAT, reply changed to 10.0.0.6
+    4.                                         10.2.3.4:42 -> 10.8.8.8:53 (AAAA)
+    5.                                         Apply DNAT, reply changed to 10.0.0.7
+    6. confirm/commit to conntrack table, no collisions
+    7.                                         commit clashing entry
+    
+    Reply comes in:
+    
+    10.2.3.4:42 <- 10.0.0.6:5353 (A)
+     -> Finds a conntrack, DNAT is reversed & packet forwarded to 10.2.3.4:42
+    10.2.3.4:42 <- 10.0.0.7:5353 (AAAA)
+     -> Finds a conntrack, DNAT is reversed & packet forwarded to 10.2.3.4:42
+        The conntrack entry is deleted from table, as it has the NAT_CLASH
+        bit set.
+    
+    In case of a retransmit from ORIGINAL dir, all further packets will get
+    the DNAT transformation to 10.0.0.6.
+    
+    I tried to come up with other solutions but they all have worse
+    problems.
+    
+    Alternatives considered were:
+    1.  Confirm ct entries at allocation time, not in postrouting.
+     a. will cause uneccesarry work when the skb that creates the
+        conntrack is dropped by ruleset.
+     b. in case nat is applied, ct entry would need to be moved in
+        the table, which requires another spinlock pair to be taken.
+     c. breaks the 'unconfirmed entry is private to cpu' assumption:
+        we would need to guard all nfct->ext allocation requests with
+        ct->lock spinlock.
+    
+    2. Make the unconfirmed list a hash table instead of a pcpu list.
+       Shares drawback c) of the first alternative.
+    
+    3. Document this is expected and force users to rearrange their
+       ruleset (e.g. by using "-m cluster" instead of "-m statistics").
+       nft has the 'jhash' expression which can be used instead of 'numgen'.
+    
+       Major drawback: doesn't fix what I consider a bug, not very realistic
+       and I believe its reasonable to have the existing rulesets to 'just
+       work'.
+    
+    4. Document this is expected and force users to steer problematic
+       packets to the same CPU -- this would serialize the "allocate new
+       conntrack entry/nat table evaluation/perform nat/confirm entry", so
+       no race can occur.  Similar drawback to 3.
+    
+    Another advantage of this patch compared to 1) and 2) is that there are
+    no changes to the hot path; things are handled in the udp tracker and
+    the clash resolution path.
+    
+    Cc: rcu@vger.kernel.org
+    Cc: "Paul E. McKenney" <paulmck@kernel.org>
+    Cc: Josh Triplett <josh@joshtriplett.org>
+    Cc: Jozsef Kadlecsik <kadlec@netfilter.org>
+    Signed-off-by: Florian Westphal <fw@strlen.de>
+    Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+
+diff --git a/include/linux/rculist_nulls.h b/include/linux/rculist_nulls.h
+index e5b752027a03..9670b54b484a 100644
+--- a/include/linux/rculist_nulls.h
++++ b/include/linux/rculist_nulls.h
+@@ -145,6 +145,13 @@ static inline void hlist_nulls_add_tail_rcu(struct hlist_nulls_node *n,
+ 	}
+ }
+ 
++/* after that hlist_nulls_del will work */
++static inline void hlist_nulls_add_fake(struct hlist_nulls_node *n)
++{
++	n->pprev = &n->next;
++	n->next = (struct hlist_nulls_node *)NULLS_MARKER(NULL);
++}
++
+ /**
+  * hlist_nulls_for_each_entry_rcu - iterate over rcu list of given type
+  * @tpos:	the type * to use as a loop cursor.
+
+commit f8a4bb6bfa639fbdd07aede615be6dffe86a9713
+Merge: 4703d9119972 0e247386d9ed
+Author: Ingo Molnar <mingo@kernel.org>
+Date:   Sat Jan 25 10:05:23 2020 +0100
+
+    Merge branch 'for-mingo' of git://git.kernel.org/pub/scm/linux/kernel/git/paulmck/linux-rcu into core/rcu
+    
+    Pull RCU updates from Paul E. McKenney:
+    
+     - Expedited grace-period updates
+     - kfree_rcu() updates
+     - RCU list updates
+     - Preemptible RCU updates
+     - Torture-test updates
+     - Miscellaneous fixes
+     - Documentation updates
+    
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+commit 459b5287066f53c4b91569c070780a540de90b85
+Author: Madhuparna Bhowmik <madhuparnabhowmik04@gmail.com>
+Date:   Fri Dec 6 00:23:52 2019 +0530
+
+    rculist_nulls: Change docbook comment headers
+    
+    This patch changes the docbook comment "head for your list"
+    to "head of the list".
+    
+    Signed-off-by: Madhuparna Bhowmik <madhuparnabhowmik04@gmail.com>
+    Signed-off-by: Paul E. McKenney <paulmck@kernel.org>
+
+diff --git a/include/linux/rculist_nulls.h b/include/linux/rculist_nulls.h
+index 25952c4f83b0..409a86bb5f25 100644
+--- a/include/linux/rculist_nulls.h
++++ b/include/linux/rculist_nulls.h
+@@ -112,7 +112,7 @@ static inline void hlist_nulls_add_head_rcu(struct hlist_nulls_node *n,
+  * hlist_nulls_for_each_entry_rcu - iterate over rcu list of given type
+  * @tpos:	the type * to use as a loop cursor.
+  * @pos:	the &struct hlist_nulls_node to use as a loop cursor.
+- * @head:	the head for your list.
++ * @head:	the head of the list.
+  * @member:	the name of the hlist_nulls_node within the struct.
+  *
+  * The barrier() is needed to make sure compiler doesn't cache first element [1],
+@@ -132,7 +132,7 @@ static inline void hlist_nulls_add_head_rcu(struct hlist_nulls_node *n,
+  *   iterate over list of given type safe against removal of list entry
+  * @tpos:	the type * to use as a loop cursor.
+  * @pos:	the &struct hlist_nulls_node to use as a loop cursor.
+- * @head:	the head for your list.
++ * @head:	the head of the list.
+  * @member:	the name of the hlist_nulls_node within the struct.
+  */
+ #define hlist_nulls_for_each_entry_safe(tpos, pos, head, member)		\
+
+commit 7f5d51e26a471f771b8dae1b9ef417f5fd5e9c85
+Author: Madhuparna Bhowmik <madhuparnabhowmik04@gmail.com>
+Date:   Thu Dec 5 11:46:49 2019 +0530
+
+    rculist_nulls: Add docbook comments
+    
+    This patch adds docbook comment headers for hlist_nulls_first_rcu()
+    and hlist_nulls_next_rcu() in rculist_nulls.h.
+    
+    Signed-off-by: Madhuparna Bhowmik <madhuparnabhowmik04@gmail.com>
+    Signed-off-by: Paul E. McKenney <paulmck@kernel.org>
+
+diff --git a/include/linux/rculist_nulls.h b/include/linux/rculist_nulls.h
+index 517a06f36c7a..25952c4f83b0 100644
+--- a/include/linux/rculist_nulls.h
++++ b/include/linux/rculist_nulls.h
+@@ -38,9 +38,17 @@ static inline void hlist_nulls_del_init_rcu(struct hlist_nulls_node *n)
+ 	}
+ }
+ 
++/**
++ * hlist_nulls_first_rcu - returns the first element of the hash list.
++ * @head: the head of the list.
++ */
+ #define hlist_nulls_first_rcu(head) \
+ 	(*((struct hlist_nulls_node __rcu __force **)&(head)->first))
+ 
++/**
++ * hlist_nulls_next_rcu - returns the element of the list after @node.
++ * @node: element of the list.
++ */
+ #define hlist_nulls_next_rcu(node) \
+ 	(*((struct hlist_nulls_node __rcu __force **)&(node)->next))
+ 
+
+commit 860c8802ace14c646864795e057349c9fb2d60ad
+Author: Paul E. McKenney <paulmck@kernel.org>
+Date:   Sat Nov 9 09:42:13 2019 -0800
+
+    rcu: Use WRITE_ONCE() for assignments to ->pprev for hlist_nulls
+    
+    Eric Dumazet supplied a KCSAN report of a bug that forces use
+    of hlist_unhashed_lockless() from sk_unhashed():
+    
+    ------------------------------------------------------------------------
+    
+    BUG: KCSAN: data-race in inet_unhash / inet_unhash
+    
+    write to 0xffff8880a69a0170 of 8 bytes by interrupt on cpu 1:
+     __hlist_nulls_del include/linux/list_nulls.h:88 [inline]
+     hlist_nulls_del_init_rcu include/linux/rculist_nulls.h:36 [inline]
+     __sk_nulls_del_node_init_rcu include/net/sock.h:676 [inline]
+     inet_unhash+0x38f/0x4a0 net/ipv4/inet_hashtables.c:612
+     tcp_set_state+0xfa/0x3e0 net/ipv4/tcp.c:2249
+     tcp_done+0x93/0x1e0 net/ipv4/tcp.c:3854
+     tcp_write_err+0x7e/0xc0 net/ipv4/tcp_timer.c:56
+     tcp_retransmit_timer+0x9b8/0x16d0 net/ipv4/tcp_timer.c:479
+     tcp_write_timer_handler+0x42d/0x510 net/ipv4/tcp_timer.c:599
+     tcp_write_timer+0xd1/0xf0 net/ipv4/tcp_timer.c:619
+     call_timer_fn+0x5f/0x2f0 kernel/time/timer.c:1404
+     expire_timers kernel/time/timer.c:1449 [inline]
+     __run_timers kernel/time/timer.c:1773 [inline]
+     __run_timers kernel/time/timer.c:1740 [inline]
+     run_timer_softirq+0xc0c/0xcd0 kernel/time/timer.c:1786
+     __do_softirq+0x115/0x33f kernel/softirq.c:292
+     invoke_softirq kernel/softirq.c:373 [inline]
+     irq_exit+0xbb/0xe0 kernel/softirq.c:413
+     exiting_irq arch/x86/include/asm/apic.h:536 [inline]
+     smp_apic_timer_interrupt+0xe6/0x280 arch/x86/kernel/apic/apic.c:1137
+     apic_timer_interrupt+0xf/0x20 arch/x86/entry/entry_64.S:830
+     native_safe_halt+0xe/0x10 arch/x86/kernel/paravirt.c:71
+     arch_cpu_idle+0x1f/0x30 arch/x86/kernel/process.c:571
+     default_idle_call+0x1e/0x40 kernel/sched/idle.c:94
+     cpuidle_idle_call kernel/sched/idle.c:154 [inline]
+     do_idle+0x1af/0x280 kernel/sched/idle.c:263
+     cpu_startup_entry+0x1b/0x20 kernel/sched/idle.c:355
+     start_secondary+0x208/0x260 arch/x86/kernel/smpboot.c:264
+     secondary_startup_64+0xa4/0xb0 arch/x86/kernel/head_64.S:241
+    
+    read to 0xffff8880a69a0170 of 8 bytes by interrupt on cpu 0:
+     sk_unhashed include/net/sock.h:607 [inline]
+     inet_unhash+0x3d/0x4a0 net/ipv4/inet_hashtables.c:592
+     tcp_set_state+0xfa/0x3e0 net/ipv4/tcp.c:2249
+     tcp_done+0x93/0x1e0 net/ipv4/tcp.c:3854
+     tcp_write_err+0x7e/0xc0 net/ipv4/tcp_timer.c:56
+     tcp_retransmit_timer+0x9b8/0x16d0 net/ipv4/tcp_timer.c:479
+     tcp_write_timer_handler+0x42d/0x510 net/ipv4/tcp_timer.c:599
+     tcp_write_timer+0xd1/0xf0 net/ipv4/tcp_timer.c:619
+     call_timer_fn+0x5f/0x2f0 kernel/time/timer.c:1404
+     expire_timers kernel/time/timer.c:1449 [inline]
+     __run_timers kernel/time/timer.c:1773 [inline]
+     __run_timers kernel/time/timer.c:1740 [inline]
+     run_timer_softirq+0xc0c/0xcd0 kernel/time/timer.c:1786
+     __do_softirq+0x115/0x33f kernel/softirq.c:292
+     invoke_softirq kernel/softirq.c:373 [inline]
+     irq_exit+0xbb/0xe0 kernel/softirq.c:413
+     exiting_irq arch/x86/include/asm/apic.h:536 [inline]
+     smp_apic_timer_interrupt+0xe6/0x280 arch/x86/kernel/apic/apic.c:1137
+     apic_timer_interrupt+0xf/0x20 arch/x86/entry/entry_64.S:830
+     native_safe_halt+0xe/0x10 arch/x86/kernel/paravirt.c:71
+     arch_cpu_idle+0x1f/0x30 arch/x86/kernel/process.c:571
+     default_idle_call+0x1e/0x40 kernel/sched/idle.c:94
+     cpuidle_idle_call kernel/sched/idle.c:154 [inline]
+     do_idle+0x1af/0x280 kernel/sched/idle.c:263
+     cpu_startup_entry+0x1b/0x20 kernel/sched/idle.c:355
+     rest_init+0xec/0xf6 init/main.c:452
+     arch_call_rest_init+0x17/0x37
+     start_kernel+0x838/0x85e init/main.c:786
+     x86_64_start_reservations+0x29/0x2b arch/x86/kernel/head64.c:490
+     x86_64_start_kernel+0x72/0x76 arch/x86/kernel/head64.c:471
+     secondary_startup_64+0xa4/0xb0 arch/x86/kernel/head_64.S:241
+    
+    Reported by Kernel Concurrency Sanitizer on:
+    CPU: 0 PID: 0 Comm: swapper/0 Not tainted 5.4.0-rc6+ #0
+    Hardware name: Google Google Compute Engine/Google Compute Engine,
+    BIOS Google 01/01/2011
+    
+    ------------------------------------------------------------------------
+    
+    This commit therefore replaces C-language assignments with WRITE_ONCE()
+    in include/linux/list_nulls.h and include/linux/rculist_nulls.h.
+    
+    Reported-by: Eric Dumazet <edumazet@google.com> # For KCSAN
+    Signed-off-by: Paul E. McKenney <paulmck@kernel.org>
+
+diff --git a/include/linux/rculist_nulls.h b/include/linux/rculist_nulls.h
+index bc8206a8f30e..517a06f36c7a 100644
+--- a/include/linux/rculist_nulls.h
++++ b/include/linux/rculist_nulls.h
+@@ -34,7 +34,7 @@ static inline void hlist_nulls_del_init_rcu(struct hlist_nulls_node *n)
+ {
+ 	if (!hlist_nulls_unhashed(n)) {
+ 		__hlist_nulls_del(n);
+-		n->pprev = NULL;
++		WRITE_ONCE(n->pprev, NULL);
+ 	}
+ }
+ 
+@@ -66,7 +66,7 @@ static inline void hlist_nulls_del_init_rcu(struct hlist_nulls_node *n)
+ static inline void hlist_nulls_del_rcu(struct hlist_nulls_node *n)
+ {
+ 	__hlist_nulls_del(n);
+-	n->pprev = LIST_POISON2;
++	WRITE_ONCE(n->pprev, LIST_POISON2);
+ }
+ 
+ /**
+@@ -94,10 +94,10 @@ static inline void hlist_nulls_add_head_rcu(struct hlist_nulls_node *n,
+ 	struct hlist_nulls_node *first = h->first;
+ 
+ 	n->next = first;
+-	n->pprev = &h->first;
++	WRITE_ONCE(n->pprev, &h->first);
+ 	rcu_assign_pointer(hlist_nulls_first_rcu(h), n);
+ 	if (!is_a_nulls(first))
+-		first->pprev = &n->next;
++		WRITE_ONCE(first->pprev, &n->next);
+ }
+ 
+ /**
+
+commit 8dbd76e79a16b45b2ccb01d2f2e08dbf64e71e40
+Author: Eric Dumazet <edumazet@google.com>
+Date:   Fri Dec 13 18:20:41 2019 -0800
+
+    tcp/dccp: fix possible race __inet_lookup_established()
+    
+    Michal Kubecek and Firo Yang did a very nice analysis of crashes
+    happening in __inet_lookup_established().
+    
+    Since a TCP socket can go from TCP_ESTABLISH to TCP_LISTEN
+    (via a close()/socket()/listen() cycle) without a RCU grace period,
+    I should not have changed listeners linkage in their hash table.
+    
+    They must use the nulls protocol (Documentation/RCU/rculist_nulls.txt),
+    so that a lookup can detect a socket in a hash list was moved in
+    another one.
+    
+    Since we added code in commit d296ba60d8e2 ("soreuseport: Resolve
+    merge conflict for v4/v6 ordering fix"), we have to add
+    hlist_nulls_add_tail_rcu() helper.
+    
+    Fixes: 3b24d854cb35 ("tcp/dccp: do not touch listener sk_refcnt under synflood")
+    Signed-off-by: Eric Dumazet <edumazet@google.com>
+    Reported-by: Michal Kubecek <mkubecek@suse.cz>
+    Reported-by: Firo Yang <firo.yang@suse.com>
+    Reviewed-by: Michal Kubecek <mkubecek@suse.cz>
+    Link: https://lore.kernel.org/netdev/20191120083919.GH27852@unicorn.suse.cz/
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+
+diff --git a/include/linux/rculist_nulls.h b/include/linux/rculist_nulls.h
+index bc8206a8f30e..61974c4c566b 100644
+--- a/include/linux/rculist_nulls.h
++++ b/include/linux/rculist_nulls.h
+@@ -100,6 +100,43 @@ static inline void hlist_nulls_add_head_rcu(struct hlist_nulls_node *n,
+ 		first->pprev = &n->next;
+ }
+ 
++/**
++ * hlist_nulls_add_tail_rcu
++ * @n: the element to add to the hash list.
++ * @h: the list to add to.
++ *
++ * Description:
++ * Adds the specified element to the specified hlist_nulls,
++ * while permitting racing traversals.
++ *
++ * The caller must take whatever precautions are necessary
++ * (such as holding appropriate locks) to avoid racing
++ * with another list-mutation primitive, such as hlist_nulls_add_head_rcu()
++ * or hlist_nulls_del_rcu(), running on this same list.
++ * However, it is perfectly legal to run concurrently with
++ * the _rcu list-traversal primitives, such as
++ * hlist_nulls_for_each_entry_rcu(), used to prevent memory-consistency
++ * problems on Alpha CPUs.  Regardless of the type of CPU, the
++ * list-traversal primitive must be guarded by rcu_read_lock().
++ */
++static inline void hlist_nulls_add_tail_rcu(struct hlist_nulls_node *n,
++					    struct hlist_nulls_head *h)
++{
++	struct hlist_nulls_node *i, *last = NULL;
++
++	/* Note: write side code, so rcu accessors are not needed. */
++	for (i = h->first; !is_a_nulls(i); i = i->next)
++		last = i;
++
++	if (last) {
++		n->next = last->next;
++		n->pprev = &last->next;
++		rcu_assign_pointer(hlist_next_rcu(last), n);
++	} else {
++		hlist_nulls_add_head_rcu(n, h);
++	}
++}
++
+ /**
+  * hlist_nulls_for_each_entry_rcu - iterate over rcu list of given type
+  * @tpos:	the type * to use as a loop cursor.
+
+commit 5fb94e9ca333f0fe1d96de06704a79942b3832c3
+Author: Mauro Carvalho Chehab <mchehab+samsung@kernel.org>
+Date:   Tue May 8 15:14:57 2018 -0300
+
+    docs: Fix some broken references
+    
+    As we move stuff around, some doc references are broken. Fix some of
+    them via this script:
+            ./scripts/documentation-file-ref-check --fix
+    
+    Manually checked if the produced result is valid, removing a few
+    false-positives.
+    
+    Acked-by: Takashi Iwai <tiwai@suse.de>
+    Acked-by: Masami Hiramatsu <mhiramat@kernel.org>
+    Acked-by: Stephen Boyd <sboyd@kernel.org>
+    Acked-by: Charles Keepax <ckeepax@opensource.wolfsonmicro.com>
+    Acked-by: Mathieu Poirier <mathieu.poirier@linaro.org>
+    Reviewed-by: Coly Li <colyli@suse.de>
+    Signed-off-by: Mauro Carvalho Chehab <mchehab+samsung@kernel.org>
+    Acked-by: Jonathan Corbet <corbet@lwn.net>
+
+diff --git a/include/linux/rculist_nulls.h b/include/linux/rculist_nulls.h
+index e4b257ff881b..bc8206a8f30e 100644
+--- a/include/linux/rculist_nulls.h
++++ b/include/linux/rculist_nulls.h
+@@ -109,7 +109,7 @@ static inline void hlist_nulls_add_head_rcu(struct hlist_nulls_node *n,
+  *
+  * The barrier() is needed to make sure compiler doesn't cache first element [1],
+  * as this loop can be restarted [2]
+- * [1] Documentation/atomic_ops.txt around line 114
++ * [1] Documentation/core-api/atomic_ops.rst around line 114
+  * [2] Documentation/RCU/rculist_nulls.txt around line 146
+  */
+ #define hlist_nulls_for_each_entry_rcu(tpos, pos, head, member)			\
+
+commit d7efc6c11b277d9d80b99b1334a78bfe7d7edf10
+Author: Eric Dumazet <edumazet@google.com>
+Date:   Tue Dec 5 12:45:56 2017 -0800
+
+    net: remove hlist_nulls_add_tail_rcu()
+    
+    Alexander Potapenko reported use of uninitialized memory [1]
+    
+    This happens when inserting a request socket into TCP ehash,
+    in __sk_nulls_add_node_rcu(), since sk_reuseport is not initialized.
+    
+    Bug was added by commit d894ba18d4e4 ("soreuseport: fix ordering for
+    mixed v4/v6 sockets")
+    
+    Note that d296ba60d8e2 ("soreuseport: Resolve merge conflict for v4/v6
+    ordering fix") missed the opportunity to get rid of
+    hlist_nulls_add_tail_rcu() :
+    
+    Both UDP sockets and TCP/DCCP listeners no longer use
+    __sk_nulls_add_node_rcu() for their hash insertion.
+    
+    Since all other sockets have unique 4-tuple, the reuseport status
+    has no special meaning, so we can always use hlist_nulls_add_head_rcu()
+    for them and save few cycles/instructions.
+    
+    [1]
+    
+    ==================================================================
+    BUG: KMSAN: use of uninitialized memory in inet_ehash_insert+0xd40/0x1050
+    CPU: 0 PID: 0 Comm: swapper/0 Not tainted 4.13.0+ #3288
+    Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS Bochs 01/01/2011
+    Call Trace:
+     <IRQ>
+     __dump_stack lib/dump_stack.c:16
+     dump_stack+0x185/0x1d0 lib/dump_stack.c:52
+     kmsan_report+0x13f/0x1c0 mm/kmsan/kmsan.c:1016
+     __msan_warning_32+0x69/0xb0 mm/kmsan/kmsan_instr.c:766
+     __sk_nulls_add_node_rcu ./include/net/sock.h:684
+     inet_ehash_insert+0xd40/0x1050 net/ipv4/inet_hashtables.c:413
+     reqsk_queue_hash_req net/ipv4/inet_connection_sock.c:754
+     inet_csk_reqsk_queue_hash_add+0x1cc/0x300 net/ipv4/inet_connection_sock.c:765
+     tcp_conn_request+0x31e7/0x36f0 net/ipv4/tcp_input.c:6414
+     tcp_v4_conn_request+0x16d/0x220 net/ipv4/tcp_ipv4.c:1314
+     tcp_rcv_state_process+0x42a/0x7210 net/ipv4/tcp_input.c:5917
+     tcp_v4_do_rcv+0xa6a/0xcd0 net/ipv4/tcp_ipv4.c:1483
+     tcp_v4_rcv+0x3de0/0x4ab0 net/ipv4/tcp_ipv4.c:1763
+     ip_local_deliver_finish+0x6bb/0xcb0 net/ipv4/ip_input.c:216
+     NF_HOOK ./include/linux/netfilter.h:248
+     ip_local_deliver+0x3fa/0x480 net/ipv4/ip_input.c:257
+     dst_input ./include/net/dst.h:477
+     ip_rcv_finish+0x6fb/0x1540 net/ipv4/ip_input.c:397
+     NF_HOOK ./include/linux/netfilter.h:248
+     ip_rcv+0x10f6/0x15c0 net/ipv4/ip_input.c:488
+     __netif_receive_skb_core+0x36f6/0x3f60 net/core/dev.c:4298
+     __netif_receive_skb net/core/dev.c:4336
+     netif_receive_skb_internal+0x63c/0x19c0 net/core/dev.c:4497
+     napi_skb_finish net/core/dev.c:4858
+     napi_gro_receive+0x629/0xa50 net/core/dev.c:4889
+     e1000_receive_skb drivers/net/ethernet/intel/e1000/e1000_main.c:4018
+     e1000_clean_rx_irq+0x1492/0x1d30
+    drivers/net/ethernet/intel/e1000/e1000_main.c:4474
+     e1000_clean+0x43aa/0x5970 drivers/net/ethernet/intel/e1000/e1000_main.c:3819
+     napi_poll net/core/dev.c:5500
+     net_rx_action+0x73c/0x1820 net/core/dev.c:5566
+     __do_softirq+0x4b4/0x8dd kernel/softirq.c:284
+     invoke_softirq kernel/softirq.c:364
+     irq_exit+0x203/0x240 kernel/softirq.c:405
+     exiting_irq+0xe/0x10 ./arch/x86/include/asm/apic.h:638
+     do_IRQ+0x15e/0x1a0 arch/x86/kernel/irq.c:263
+     common_interrupt+0x86/0x86
+    
+    Fixes: d894ba18d4e4 ("soreuseport: fix ordering for mixed v4/v6 sockets")
+    Fixes: d296ba60d8e2 ("soreuseport: Resolve merge conflict for v4/v6 ordering fix")
+    Signed-off-by: Eric Dumazet <edumazet@google.com>
+    Reported-by: Alexander Potapenko <glider@google.com>
+    Acked-by: Craig Gallek <kraig@google.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/include/linux/rculist_nulls.h b/include/linux/rculist_nulls.h
+index a328e8181e49..e4b257ff881b 100644
+--- a/include/linux/rculist_nulls.h
++++ b/include/linux/rculist_nulls.h
+@@ -100,44 +100,6 @@ static inline void hlist_nulls_add_head_rcu(struct hlist_nulls_node *n,
+ 		first->pprev = &n->next;
+ }
+ 
+-/**
+- * hlist_nulls_add_tail_rcu
+- * @n: the element to add to the hash list.
+- * @h: the list to add to.
+- *
+- * Description:
+- * Adds the specified element to the end of the specified hlist_nulls,
+- * while permitting racing traversals.  NOTE: tail insertion requires
+- * list traversal.
+- *
+- * The caller must take whatever precautions are necessary
+- * (such as holding appropriate locks) to avoid racing
+- * with another list-mutation primitive, such as hlist_nulls_add_head_rcu()
+- * or hlist_nulls_del_rcu(), running on this same list.
+- * However, it is perfectly legal to run concurrently with
+- * the _rcu list-traversal primitives, such as
+- * hlist_nulls_for_each_entry_rcu(), used to prevent memory-consistency
+- * problems on Alpha CPUs.  Regardless of the type of CPU, the
+- * list-traversal primitive must be guarded by rcu_read_lock().
+- */
+-static inline void hlist_nulls_add_tail_rcu(struct hlist_nulls_node *n,
+-					struct hlist_nulls_head *h)
+-{
+-	struct hlist_nulls_node *i, *last = NULL;
+-
+-	for (i = hlist_nulls_first_rcu(h); !is_a_nulls(i);
+-	     i = hlist_nulls_next_rcu(i))
+-		last = i;
+-
+-	if (last) {
+-		n->next = last->next;
+-		n->pprev = &last->next;
+-		rcu_assign_pointer(hlist_nulls_next_rcu(last), n);
+-	} else {
+-		hlist_nulls_add_head_rcu(n, h);
+-	}
+-}
+-
+ /**
+  * hlist_nulls_for_each_entry_rcu - iterate over rcu list of given type
+  * @tpos:	the type * to use as a loop cursor.
+
+commit b24413180f5600bcb3bb70fbed5cf186b60864bd
+Author: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Date:   Wed Nov 1 15:07:57 2017 +0100
+
+    License cleanup: add SPDX GPL-2.0 license identifier to files with no license
+    
+    Many source files in the tree are missing licensing information, which
+    makes it harder for compliance tools to determine the correct license.
+    
+    By default all files without license information are under the default
+    license of the kernel, which is GPL version 2.
+    
+    Update the files which contain no license information with the 'GPL-2.0'
+    SPDX license identifier.  The SPDX identifier is a legally binding
+    shorthand, which can be used instead of the full boiler plate text.
+    
+    This patch is based on work done by Thomas Gleixner and Kate Stewart and
+    Philippe Ombredanne.
+    
+    How this work was done:
+    
+    Patches were generated and checked against linux-4.14-rc6 for a subset of
+    the use cases:
+     - file had no licensing information it it.
+     - file was a */uapi/* one with no licensing information in it,
+     - file was a */uapi/* one with existing licensing information,
+    
+    Further patches will be generated in subsequent months to fix up cases
+    where non-standard license headers were used, and references to license
+    had to be inferred by heuristics based on keywords.
+    
+    The analysis to determine which SPDX License Identifier to be applied to
+    a file was done in a spreadsheet of side by side results from of the
+    output of two independent scanners (ScanCode & Windriver) producing SPDX
+    tag:value files created by Philippe Ombredanne.  Philippe prepared the
+    base worksheet, and did an initial spot review of a few 1000 files.
+    
+    The 4.13 kernel was the starting point of the analysis with 60,537 files
+    assessed.  Kate Stewart did a file by file comparison of the scanner
+    results in the spreadsheet to determine which SPDX license identifier(s)
+    to be applied to the file. She confirmed any determination that was not
+    immediately clear with lawyers working with the Linux Foundation.
+    
+    Criteria used to select files for SPDX license identifier tagging was:
+     - Files considered eligible had to be source code files.
+     - Make and config files were included as candidates if they contained >5
+       lines of source
+     - File already had some variant of a license header in it (even if <5
+       lines).
+    
+    All documentation files were explicitly excluded.
+    
+    The following heuristics were used to determine which SPDX license
+    identifiers to apply.
+    
+     - when both scanners couldn't find any license traces, file was
+       considered to have no license information in it, and the top level
+       COPYING file license applied.
+    
+       For non */uapi/* files that summary was:
+    
+       SPDX license identifier                            # files
+       ---------------------------------------------------|-------
+       GPL-2.0                                              11139
+    
+       and resulted in the first patch in this series.
+    
+       If that file was a */uapi/* path one, it was "GPL-2.0 WITH
+       Linux-syscall-note" otherwise it was "GPL-2.0".  Results of that was:
+    
+       SPDX license identifier                            # files
+       ---------------------------------------------------|-------
+       GPL-2.0 WITH Linux-syscall-note                        930
+    
+       and resulted in the second patch in this series.
+    
+     - if a file had some form of licensing information in it, and was one
+       of the */uapi/* ones, it was denoted with the Linux-syscall-note if
+       any GPL family license was found in the file or had no licensing in
+       it (per prior point).  Results summary:
+    
+       SPDX license identifier                            # files
+       ---------------------------------------------------|------
+       GPL-2.0 WITH Linux-syscall-note                       270
+       GPL-2.0+ WITH Linux-syscall-note                      169
+       ((GPL-2.0 WITH Linux-syscall-note) OR BSD-2-Clause)    21
+       ((GPL-2.0 WITH Linux-syscall-note) OR BSD-3-Clause)    17
+       LGPL-2.1+ WITH Linux-syscall-note                      15
+       GPL-1.0+ WITH Linux-syscall-note                       14
+       ((GPL-2.0+ WITH Linux-syscall-note) OR BSD-3-Clause)    5
+       LGPL-2.0+ WITH Linux-syscall-note                       4
+       LGPL-2.1 WITH Linux-syscall-note                        3
+       ((GPL-2.0 WITH Linux-syscall-note) OR MIT)              3
+       ((GPL-2.0 WITH Linux-syscall-note) AND MIT)             1
+    
+       and that resulted in the third patch in this series.
+    
+     - when the two scanners agreed on the detected license(s), that became
+       the concluded license(s).
+    
+     - when there was disagreement between the two scanners (one detected a
+       license but the other didn't, or they both detected different
+       licenses) a manual inspection of the file occurred.
+    
+     - In most cases a manual inspection of the information in the file
+       resulted in a clear resolution of the license that should apply (and
+       which scanner probably needed to revisit its heuristics).
+    
+     - When it was not immediately clear, the license identifier was
+       confirmed with lawyers working with the Linux Foundation.
+    
+     - If there was any question as to the appropriate license identifier,
+       the file was flagged for further research and to be revisited later
+       in time.
+    
+    In total, over 70 hours of logged manual review was done on the
+    spreadsheet to determine the SPDX license identifiers to apply to the
+    source files by Kate, Philippe, Thomas and, in some cases, confirmation
+    by lawyers working with the Linux Foundation.
+    
+    Kate also obtained a third independent scan of the 4.13 code base from
+    FOSSology, and compared selected files where the other two scanners
+    disagreed against that SPDX file, to see if there was new insights.  The
+    Windriver scanner is based on an older version of FOSSology in part, so
+    they are related.
+    
+    Thomas did random spot checks in about 500 files from the spreadsheets
+    for the uapi headers and agreed with SPDX license identifier in the
+    files he inspected. For the non-uapi files Thomas did random spot checks
+    in about 15000 files.
+    
+    In initial set of patches against 4.14-rc6, 3 files were found to have
+    copy/paste license identifier errors, and have been fixed to reflect the
+    correct identifier.
+    
+    Additionally Philippe spent 10 hours this week doing a detailed manual
+    inspection and review of the 12,461 patched files from the initial patch
+    version early this week with:
+     - a full scancode scan run, collecting the matched texts, detected
+       license ids and scores
+     - reviewing anything where there was a license detected (about 500+
+       files) to ensure that the applied SPDX license was correct
+     - reviewing anything where there was no detection but the patch license
+       was not GPL-2.0 WITH Linux-syscall-note to ensure that the applied
+       SPDX license was correct
+    
+    This produced a worksheet with 20 files needing minor correction.  This
+    worksheet was then exported into 3 different .csv files for the
+    different types of files to be modified.
+    
+    These .csv files were then reviewed by Greg.  Thomas wrote a script to
+    parse the csv files and add the proper SPDX tag to the file, in the
+    format that the file expected.  This script was further refined by Greg
+    based on the output to detect more types of files automatically and to
+    distinguish between header and source .c files (which need different
+    comment types.)  Finally Greg ran the script using the .csv files to
+    generate the patches.
+    
+    Reviewed-by: Kate Stewart <kstewart@linuxfoundation.org>
+    Reviewed-by: Philippe Ombredanne <pombredanne@nexb.com>
+    Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/include/linux/rculist_nulls.h b/include/linux/rculist_nulls.h
+index a23a33153180..a328e8181e49 100644
+--- a/include/linux/rculist_nulls.h
++++ b/include/linux/rculist_nulls.h
+@@ -1,3 +1,4 @@
++/* SPDX-License-Identifier: GPL-2.0 */
+ #ifndef _LINUX_RCULIST_NULLS_H
+ #define _LINUX_RCULIST_NULLS_H
+ 
+
+commit 4fe8435909fddc97b81472026aa954e06dd192a5
+Author: Alexei Starovoitov <ast@fb.com>
+Date:   Tue Mar 7 20:00:13 2017 -0800
+
+    bpf: convert htab map to hlist_nulls
+    
+    when all map elements are pre-allocated one cpu can delete and reuse htab_elem
+    while another cpu is still walking the hlist. In such case the lookup may
+    miss the element. Convert hlist to hlist_nulls to avoid such scenario.
+    When bucket lock is taken there is no need to take such precautions,
+    so only convert map_lookup and map_get_next to nulls.
+    The race window is extremely small and only reproducible with explicit
+    udelay() inside lookup_nulls_elem_raw()
+    
+    Similar to hlist add hlist_nulls_for_each_entry_safe() and
+    hlist_nulls_entry_safe() helpers.
+    
+    Fixes: 6c9059817432 ("bpf: pre-allocate hash map elements")
+    Reported-by: Jonathan Perry <jonperry@fb.com>
+    Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+    Acked-by: Daniel Borkmann <daniel@iogearbox.net>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/include/linux/rculist_nulls.h b/include/linux/rculist_nulls.h
+index 4ae95f7e8597..a23a33153180 100644
+--- a/include/linux/rculist_nulls.h
++++ b/include/linux/rculist_nulls.h
+@@ -156,5 +156,19 @@ static inline void hlist_nulls_add_tail_rcu(struct hlist_nulls_node *n,
+ 		({ tpos = hlist_nulls_entry(pos, typeof(*tpos), member); 1; }); \
+ 		pos = rcu_dereference_raw(hlist_nulls_next_rcu(pos)))
+ 
++/**
++ * hlist_nulls_for_each_entry_safe -
++ *   iterate over list of given type safe against removal of list entry
++ * @tpos:	the type * to use as a loop cursor.
++ * @pos:	the &struct hlist_nulls_node to use as a loop cursor.
++ * @head:	the head for your list.
++ * @member:	the name of the hlist_nulls_node within the struct.
++ */
++#define hlist_nulls_for_each_entry_safe(tpos, pos, head, member)		\
++	for (({barrier();}),							\
++	     pos = rcu_dereference_raw(hlist_nulls_first_rcu(head));		\
++		(!is_a_nulls(pos)) &&						\
++		({ tpos = hlist_nulls_entry(pos, typeof(*tpos), member);	\
++		   pos = rcu_dereference_raw(hlist_nulls_next_rcu(pos)); 1; });)
+ #endif
+ #endif
+
+commit d894ba18d4e449b3a7f6eb491f16c9e02933736e
+Author: Craig Gallek <kraig@google.com>
+Date:   Tue Apr 12 13:11:25 2016 -0400
+
+    soreuseport: fix ordering for mixed v4/v6 sockets
+    
+    With the SO_REUSEPORT socket option, it is possible to create sockets
+    in the AF_INET and AF_INET6 domains which are bound to the same IPv4 address.
+    This is only possible with SO_REUSEPORT and when not using IPV6_V6ONLY on
+    the AF_INET6 sockets.
+    
+    Prior to the commits referenced below, an incoming IPv4 packet would
+    always be routed to a socket of type AF_INET when this mixed-mode was used.
+    After those changes, the same packet would be routed to the most recently
+    bound socket (if this happened to be an AF_INET6 socket, it would
+    have an IPv4 mapped IPv6 address).
+    
+    The change in behavior occurred because the recent SO_REUSEPORT optimizations
+    short-circuit the socket scoring logic as soon as they find a match.  They
+    did not take into account the scoring logic that favors AF_INET sockets
+    over AF_INET6 sockets in the event of a tie.
+    
+    To fix this problem, this patch changes the insertion order of AF_INET
+    and AF_INET6 addresses in the TCP and UDP socket lists when the sockets
+    have SO_REUSEPORT set.  AF_INET sockets will be inserted at the head of the
+    list and AF_INET6 sockets with SO_REUSEPORT set will always be inserted at
+    the tail of the list.  This will force AF_INET sockets to always be
+    considered first.
+    
+    Fixes: e32ea7e74727 ("soreuseport: fast reuseport UDP socket selection")
+    Fixes: 125e80b88687 ("soreuseport: fast reuseport TCP socket selection")
+    
+    Reported-by: Maciej Żenczykowski <maze@google.com>
+    Signed-off-by: Craig Gallek <kraig@google.com>
+    Signed-off-by: Eric Dumazet <edumazet@google.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/include/linux/rculist_nulls.h b/include/linux/rculist_nulls.h
+index 1c33dd7da4a7..4ae95f7e8597 100644
+--- a/include/linux/rculist_nulls.h
++++ b/include/linux/rculist_nulls.h
+@@ -98,6 +98,45 @@ static inline void hlist_nulls_add_head_rcu(struct hlist_nulls_node *n,
+ 	if (!is_a_nulls(first))
+ 		first->pprev = &n->next;
+ }
++
++/**
++ * hlist_nulls_add_tail_rcu
++ * @n: the element to add to the hash list.
++ * @h: the list to add to.
++ *
++ * Description:
++ * Adds the specified element to the end of the specified hlist_nulls,
++ * while permitting racing traversals.  NOTE: tail insertion requires
++ * list traversal.
++ *
++ * The caller must take whatever precautions are necessary
++ * (such as holding appropriate locks) to avoid racing
++ * with another list-mutation primitive, such as hlist_nulls_add_head_rcu()
++ * or hlist_nulls_del_rcu(), running on this same list.
++ * However, it is perfectly legal to run concurrently with
++ * the _rcu list-traversal primitives, such as
++ * hlist_nulls_for_each_entry_rcu(), used to prevent memory-consistency
++ * problems on Alpha CPUs.  Regardless of the type of CPU, the
++ * list-traversal primitive must be guarded by rcu_read_lock().
++ */
++static inline void hlist_nulls_add_tail_rcu(struct hlist_nulls_node *n,
++					struct hlist_nulls_head *h)
++{
++	struct hlist_nulls_node *i, *last = NULL;
++
++	for (i = hlist_nulls_first_rcu(h); !is_a_nulls(i);
++	     i = hlist_nulls_next_rcu(i))
++		last = i;
++
++	if (last) {
++		n->next = last->next;
++		n->pprev = &last->next;
++		rcu_assign_pointer(hlist_nulls_next_rcu(last), n);
++	} else {
++		hlist_nulls_add_head_rcu(n, h);
++	}
++}
++
+ /**
+  * hlist_nulls_for_each_entry_rcu - iterate over rcu list of given type
+  * @tpos:	the type * to use as a loop cursor.
+
+commit c87a124a5d5e8cf8e21c4363c3372bcaf53ea190
+Author: Eric Dumazet <eric.dumazet@gmail.com>
+Date:   Wed May 29 09:06:27 2013 +0000
+
+    net: force a reload of first item in hlist_nulls_for_each_entry_rcu
+    
+    Roman Gushchin discovered that udp4_lib_lookup2() was not reloading
+    first item in the rcu protected list, in case the loop was restarted.
+    
+    This produced soft lockups as in https://lkml.org/lkml/2013/4/16/37
+    
+    rcu_dereference(X)/ACCESS_ONCE(X) seem to not work as intended if X is
+    ptr->field :
+    
+    In some cases, gcc caches the value or ptr->field in a register.
+    
+    Use a barrier() to disallow such caching, as documented in
+    Documentation/atomic_ops.txt line 114
+    
+    Thanks a lot to Roman for providing analysis and numerous patches.
+    
+    Diagnosed-by: Roman Gushchin <klamm@yandex-team.ru>
+    Signed-off-by: Eric Dumazet <edumazet@google.com>
+    Reported-by: Boris Zhmurov <zhmurov@yandex-team.ru>
+    Signed-off-by: Roman Gushchin <klamm@yandex-team.ru>
+    Acked-by: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/include/linux/rculist_nulls.h b/include/linux/rculist_nulls.h
+index 2ae13714828b..1c33dd7da4a7 100644
+--- a/include/linux/rculist_nulls.h
++++ b/include/linux/rculist_nulls.h
+@@ -105,9 +105,14 @@ static inline void hlist_nulls_add_head_rcu(struct hlist_nulls_node *n,
+  * @head:	the head for your list.
+  * @member:	the name of the hlist_nulls_node within the struct.
+  *
++ * The barrier() is needed to make sure compiler doesn't cache first element [1],
++ * as this loop can be restarted [2]
++ * [1] Documentation/atomic_ops.txt around line 114
++ * [2] Documentation/RCU/rculist_nulls.txt around line 146
+  */
+ #define hlist_nulls_for_each_entry_rcu(tpos, pos, head, member)			\
+-	for (pos = rcu_dereference_raw(hlist_nulls_first_rcu(head));		\
++	for (({barrier();}),							\
++	     pos = rcu_dereference_raw(hlist_nulls_first_rcu(head));		\
+ 		(!is_a_nulls(pos)) &&						\
+ 		({ tpos = hlist_nulls_entry(pos, typeof(*tpos), member); 1; }); \
+ 		pos = rcu_dereference_raw(hlist_nulls_next_rcu(pos)))
+
+commit 67bdbffd696f29a0b68aa8daa285783a06651583
+Author: Arnd Bergmann <arnd@arndb.de>
+Date:   Thu Feb 25 16:55:13 2010 +0100
+
+    rculist: avoid __rcu annotations
+    
+    This avoids warnings from missing __rcu annotations
+    in the rculist implementation, making it possible to
+    use the same lists in both RCU and non-RCU cases.
+    
+    We can add rculist annotations later, together with
+    lockdep support for rculist, which is missing as well,
+    but that may involve changing all the users.
+    
+    Signed-off-by: Arnd Bergmann <arnd@arndb.de>
+    Signed-off-by: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+    Cc: Pavel Emelyanov <xemul@openvz.org>
+    Cc: Sukadev Bhattiprolu <sukadev@us.ibm.com>
+    Reviewed-by: Josh Triplett <josh@joshtriplett.org>
+
+diff --git a/include/linux/rculist_nulls.h b/include/linux/rculist_nulls.h
+index b70ffe53cb9f..2ae13714828b 100644
+--- a/include/linux/rculist_nulls.h
++++ b/include/linux/rculist_nulls.h
+@@ -37,6 +37,12 @@ static inline void hlist_nulls_del_init_rcu(struct hlist_nulls_node *n)
+ 	}
+ }
+ 
++#define hlist_nulls_first_rcu(head) \
++	(*((struct hlist_nulls_node __rcu __force **)&(head)->first))
++
++#define hlist_nulls_next_rcu(node) \
++	(*((struct hlist_nulls_node __rcu __force **)&(node)->next))
++
+ /**
+  * hlist_nulls_del_rcu - deletes entry from hash list without re-initialization
+  * @n: the element to delete from the hash list.
+@@ -88,7 +94,7 @@ static inline void hlist_nulls_add_head_rcu(struct hlist_nulls_node *n,
+ 
+ 	n->next = first;
+ 	n->pprev = &h->first;
+-	rcu_assign_pointer(h->first, n);
++	rcu_assign_pointer(hlist_nulls_first_rcu(h), n);
+ 	if (!is_a_nulls(first))
+ 		first->pprev = &n->next;
+ }
+@@ -100,11 +106,11 @@ static inline void hlist_nulls_add_head_rcu(struct hlist_nulls_node *n,
+  * @member:	the name of the hlist_nulls_node within the struct.
+  *
+  */
+-#define hlist_nulls_for_each_entry_rcu(tpos, pos, head, member) \
+-	for (pos = rcu_dereference_raw((head)->first);			 \
+-		(!is_a_nulls(pos)) &&			\
++#define hlist_nulls_for_each_entry_rcu(tpos, pos, head, member)			\
++	for (pos = rcu_dereference_raw(hlist_nulls_first_rcu(head));		\
++		(!is_a_nulls(pos)) &&						\
+ 		({ tpos = hlist_nulls_entry(pos, typeof(*tpos), member); 1; }); \
+-		pos = rcu_dereference_raw(pos->next))
++		pos = rcu_dereference_raw(hlist_nulls_next_rcu(pos)))
+ 
+ #endif
+ #endif
+
+commit 3120438ad68601f341e61e7cb1323b0e1a6ca367
+Author: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+Date:   Mon Feb 22 17:04:48 2010 -0800
+
+    rcu: Disable lockdep checking in RCU list-traversal primitives
+    
+    The theory is that use of bare rcu_dereference() is more prone
+    to error than use of the RCU list-traversal primitives.
+    Therefore, disable lockdep RCU read-side critical-section
+    checking in these primitives for the time being.  Once all of
+    the rcu_dereference() uses have been dealt with, it may be time
+    to re-enable lockdep checking for the RCU list-traversal
+    primitives.
+    
+    Signed-off-by: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+    Cc: laijs@cn.fujitsu.com
+    Cc: dipankar@in.ibm.com
+    Cc: mathieu.desnoyers@polymtl.ca
+    Cc: josh@joshtriplett.org
+    Cc: dvhltc@us.ibm.com
+    Cc: niv@us.ibm.com
+    Cc: peterz@infradead.org
+    Cc: rostedt@goodmis.org
+    Cc: Valdis.Kletnieks@vt.edu
+    Cc: dhowells@redhat.com
+    LKML-Reference: <1266887105-1528-4-git-send-email-paulmck@linux.vnet.ibm.com>
+    Signed-off-by: Ingo Molnar <mingo@elte.hu>
+
+diff --git a/include/linux/rculist_nulls.h b/include/linux/rculist_nulls.h
+index 589a40919f01..b70ffe53cb9f 100644
+--- a/include/linux/rculist_nulls.h
++++ b/include/linux/rculist_nulls.h
+@@ -101,10 +101,10 @@ static inline void hlist_nulls_add_head_rcu(struct hlist_nulls_node *n,
+  *
+  */
+ #define hlist_nulls_for_each_entry_rcu(tpos, pos, head, member) \
+-	for (pos = rcu_dereference((head)->first);			 \
++	for (pos = rcu_dereference_raw((head)->first);			 \
+ 		(!is_a_nulls(pos)) &&			\
+ 		({ tpos = hlist_nulls_entry(pos, typeof(*tpos), member); 1; }); \
+-		pos = rcu_dereference(pos->next))
++		pos = rcu_dereference_raw(pos->next))
+ 
+ #endif
+ #endif
+
+commit a71fca58b7f4abca551ae2256ac08dd9123a03f9
+Author: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+Date:   Fri Sep 18 10:28:19 2009 -0700
+
+    rcu: Fix whitespace inconsistencies
+    
+    Fix a number of whitespace ^Ierrors in the include/linux/rcu*
+    and the kernel/rcu* files.
+    
+    Signed-off-by: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+    Cc: laijs@cn.fujitsu.com
+    Cc: dipankar@in.ibm.com
+    Cc: akpm@linux-foundation.org
+    Cc: mathieu.desnoyers@polymtl.ca
+    Cc: josh@joshtriplett.org
+    Cc: dvhltc@us.ibm.com
+    Cc: niv@us.ibm.com
+    Cc: peterz@infradead.org
+    Cc: rostedt@goodmis.org
+    Cc: Valdis.Kletnieks@vt.edu
+    LKML-Reference: <20090918172819.GA24405@linux.vnet.ibm.com>
+    [ did more checkpatch fixlets ]
+    Signed-off-by: Ingo Molnar <mingo@elte.hu>
+
+diff --git a/include/linux/rculist_nulls.h b/include/linux/rculist_nulls.h
+index f9ddd03961a8..589a40919f01 100644
+--- a/include/linux/rculist_nulls.h
++++ b/include/linux/rculist_nulls.h
+@@ -102,7 +102,7 @@ static inline void hlist_nulls_add_head_rcu(struct hlist_nulls_node *n,
+  */
+ #define hlist_nulls_for_each_entry_rcu(tpos, pos, head, member) \
+ 	for (pos = rcu_dereference((head)->first);			 \
+-		(!is_a_nulls(pos)) && 			\
++		(!is_a_nulls(pos)) &&			\
+ 		({ tpos = hlist_nulls_entry(pos, typeof(*tpos), member); 1; }); \
+ 		pos = rcu_dereference(pos->next))
+ 
+
+commit bbaffaca4810de1a25e32ecaf836eeaacc7a3d11
+Author: Eric Dumazet <dada1@cosmosbay.com>
+Date:   Sun Nov 16 19:37:55 2008 -0800
+
+    rcu: Introduce hlist_nulls variant of hlist
+    
+    hlist uses NULL value to finish a chain.
+    
+    hlist_nulls variant use the low order bit set to 1 to signal an end-of-list marker.
+    
+    This allows to store many different end markers, so that some RCU lockless
+    algos (used in TCP/UDP stack for example) can save some memory barriers in
+    fast paths.
+    
+    Two new files are added :
+    
+    include/linux/list_nulls.h
+      - mimics hlist part of include/linux/list.h, derived to hlist_nulls variant
+    
+    include/linux/rculist_nulls.h
+      - mimics hlist part of include/linux/rculist.h, derived to hlist_nulls variant
+    
+       Only four helpers are declared for the moment :
+    
+         hlist_nulls_del_init_rcu(), hlist_nulls_del_rcu(),
+         hlist_nulls_add_head_rcu() and hlist_nulls_for_each_entry_rcu()
+    
+    prefetches() were removed, since an end of list is not anymore NULL value.
+    prefetches() could trigger useless (and possibly dangerous) memory transactions.
+    
+    Example of use (extracted from __udp4_lib_lookup())
+    
+            struct sock *sk, *result;
+            struct hlist_nulls_node *node;
+            unsigned short hnum = ntohs(dport);
+            unsigned int hash = udp_hashfn(net, hnum);
+            struct udp_hslot *hslot = &udptable->hash[hash];
+            int score, badness;
+    
+            rcu_read_lock();
+    begin:
+            result = NULL;
+            badness = -1;
+            sk_nulls_for_each_rcu(sk, node, &hslot->head) {
+                    score = compute_score(sk, net, saddr, hnum, sport,
+                                          daddr, dport, dif);
+                    if (score > badness) {
+                            result = sk;
+                            badness = score;
+                    }
+            }
+            /*
+             * if the nulls value we got at the end of this lookup is
+             * not the expected one, we must restart lookup.
+             * We probably met an item that was moved to another chain.
+             */
+            if (get_nulls_value(node) != hash)
+                    goto begin;
+    
+            if (result) {
+                    if (unlikely(!atomic_inc_not_zero(&result->sk_refcnt)))
+                            result = NULL;
+                    else if (unlikely(compute_score(result, net, saddr, hnum, sport,
+                                      daddr, dport, dif) < badness)) {
+                            sock_put(result);
+                            goto begin;
+                    }
+            }
+            rcu_read_unlock();
+            return result;
+    
+    Signed-off-by: Eric Dumazet <dada1@cosmosbay.com>
+    Acked-by: Peter Zijlstra <a.p.zijlstra@chello.nl>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/include/linux/rculist_nulls.h b/include/linux/rculist_nulls.h
+new file mode 100644
+index 000000000000..f9ddd03961a8
+--- /dev/null
++++ b/include/linux/rculist_nulls.h
+@@ -0,0 +1,110 @@
++#ifndef _LINUX_RCULIST_NULLS_H
++#define _LINUX_RCULIST_NULLS_H
++
++#ifdef __KERNEL__
++
++/*
++ * RCU-protected list version
++ */
++#include <linux/list_nulls.h>
++#include <linux/rcupdate.h>
++
++/**
++ * hlist_nulls_del_init_rcu - deletes entry from hash list with re-initialization
++ * @n: the element to delete from the hash list.
++ *
++ * Note: hlist_nulls_unhashed() on the node return true after this. It is
++ * useful for RCU based read lockfree traversal if the writer side
++ * must know if the list entry is still hashed or already unhashed.
++ *
++ * In particular, it means that we can not poison the forward pointers
++ * that may still be used for walking the hash list and we can only
++ * zero the pprev pointer so list_unhashed() will return true after
++ * this.
++ *
++ * The caller must take whatever precautions are necessary (such as
++ * holding appropriate locks) to avoid racing with another
++ * list-mutation primitive, such as hlist_nulls_add_head_rcu() or
++ * hlist_nulls_del_rcu(), running on this same list.  However, it is
++ * perfectly legal to run concurrently with the _rcu list-traversal
++ * primitives, such as hlist_nulls_for_each_entry_rcu().
++ */
++static inline void hlist_nulls_del_init_rcu(struct hlist_nulls_node *n)
++{
++	if (!hlist_nulls_unhashed(n)) {
++		__hlist_nulls_del(n);
++		n->pprev = NULL;
++	}
++}
++
++/**
++ * hlist_nulls_del_rcu - deletes entry from hash list without re-initialization
++ * @n: the element to delete from the hash list.
++ *
++ * Note: hlist_nulls_unhashed() on entry does not return true after this,
++ * the entry is in an undefined state. It is useful for RCU based
++ * lockfree traversal.
++ *
++ * In particular, it means that we can not poison the forward
++ * pointers that may still be used for walking the hash list.
++ *
++ * The caller must take whatever precautions are necessary
++ * (such as holding appropriate locks) to avoid racing
++ * with another list-mutation primitive, such as hlist_nulls_add_head_rcu()
++ * or hlist_nulls_del_rcu(), running on this same list.
++ * However, it is perfectly legal to run concurrently with
++ * the _rcu list-traversal primitives, such as
++ * hlist_nulls_for_each_entry().
++ */
++static inline void hlist_nulls_del_rcu(struct hlist_nulls_node *n)
++{
++	__hlist_nulls_del(n);
++	n->pprev = LIST_POISON2;
++}
++
++/**
++ * hlist_nulls_add_head_rcu
++ * @n: the element to add to the hash list.
++ * @h: the list to add to.
++ *
++ * Description:
++ * Adds the specified element to the specified hlist_nulls,
++ * while permitting racing traversals.
++ *
++ * The caller must take whatever precautions are necessary
++ * (such as holding appropriate locks) to avoid racing
++ * with another list-mutation primitive, such as hlist_nulls_add_head_rcu()
++ * or hlist_nulls_del_rcu(), running on this same list.
++ * However, it is perfectly legal to run concurrently with
++ * the _rcu list-traversal primitives, such as
++ * hlist_nulls_for_each_entry_rcu(), used to prevent memory-consistency
++ * problems on Alpha CPUs.  Regardless of the type of CPU, the
++ * list-traversal primitive must be guarded by rcu_read_lock().
++ */
++static inline void hlist_nulls_add_head_rcu(struct hlist_nulls_node *n,
++					struct hlist_nulls_head *h)
++{
++	struct hlist_nulls_node *first = h->first;
++
++	n->next = first;
++	n->pprev = &h->first;
++	rcu_assign_pointer(h->first, n);
++	if (!is_a_nulls(first))
++		first->pprev = &n->next;
++}
++/**
++ * hlist_nulls_for_each_entry_rcu - iterate over rcu list of given type
++ * @tpos:	the type * to use as a loop cursor.
++ * @pos:	the &struct hlist_nulls_node to use as a loop cursor.
++ * @head:	the head for your list.
++ * @member:	the name of the hlist_nulls_node within the struct.
++ *
++ */
++#define hlist_nulls_for_each_entry_rcu(tpos, pos, head, member) \
++	for (pos = rcu_dereference((head)->first);			 \
++		(!is_a_nulls(pos)) && 			\
++		({ tpos = hlist_nulls_entry(pos, typeof(*tpos), member); 1; }); \
++		pos = rcu_dereference(pos->next))
++
++#endif
++#endif

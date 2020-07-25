@@ -1,0 +1,4214 @@
+commit 0bc8fb4dda2b461491ec567b2333d13897780d8c
+Author: Johannes Berg <johannes.berg@intel.com>
+Date:   Thu Feb 13 14:26:48 2020 +0100
+
+    um: Implement ndelay/udelay in time-travel mode
+    
+    In external or inf-cpu time-travel mode, ndelay/udelay currently
+    just waste CPU time since the simulation time doesn't advance.
+    Implement them properly in this case.
+    
+    Note that the "if (time_travel_mode == ...)" parts compile out
+    if CONFIG_UML_TIME_TRAVEL_SUPPORT isn't set, time_travel_mode is
+    defined to TT_MODE_OFF in that case.
+    
+    Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+    Signed-off-by: Richard Weinberger <richard@nod.at>
+
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+index 15c4825b857e..25eaa6a0c658 100644
+--- a/arch/um/kernel/time.c
++++ b/arch/um/kernel/time.c
+@@ -374,6 +374,12 @@ static void time_travel_update_time(unsigned long long next, bool idle)
+ 	time_travel_del_event(&ne);
+ }
+ 
++void time_travel_ndelay(unsigned long nsec)
++{
++	time_travel_update_time(time_travel_time + nsec, false);
++}
++EXPORT_SYMBOL(time_travel_ndelay);
++
+ void time_travel_add_irq_event(struct time_travel_event *e)
+ {
+ 	BUG_ON(time_travel_mode != TT_MODE_EXTERNAL);
+
+commit 88ce642492339f49a0b391af40e5798c08948e49
+Author: Johannes Berg <johannes.berg@intel.com>
+Date:   Thu Feb 13 14:26:47 2020 +0100
+
+    um: Implement time-travel=ext
+    
+    This implements synchronized time-travel mode which - using a special
+    application on a unix socket - lets multiple machines take part in a
+    time-travelling simulation together.
+    
+    The protocol for the unix domain socket is defined in the new file
+    include/uapi/linux/um_timetravel.h.
+    
+    Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+    Signed-off-by: Richard Weinberger <richard@nod.at>
+
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+index cdebe96308d7..15c4825b857e 100644
+--- a/arch/um/kernel/time.c
++++ b/arch/um/kernel/time.c
+@@ -20,10 +20,12 @@
+ #include <kern_util.h>
+ #include <os.h>
+ #include <linux/time-internal.h>
++#include <linux/um_timetravel.h>
+ #include <shared/init.h>
+ 
+ #ifdef CONFIG_UML_TIME_TRAVEL_SUPPORT
+ enum time_travel_mode time_travel_mode;
++EXPORT_SYMBOL_GPL(time_travel_mode);
+ 
+ static bool time_travel_start_set;
+ static unsigned long long time_travel_start;
+@@ -32,6 +34,12 @@ static LIST_HEAD(time_travel_events);
+ static unsigned long long time_travel_timer_interval;
+ static unsigned long long time_travel_next_event;
+ static struct time_travel_event time_travel_timer_event;
++static int time_travel_ext_fd = -1;
++static unsigned int time_travel_ext_waiting;
++static bool time_travel_ext_prev_request_valid;
++static unsigned long long time_travel_ext_prev_request;
++static bool time_travel_ext_free_until_valid;
++static unsigned long long time_travel_ext_free_until;
+ 
+ static void time_travel_set_time(unsigned long long ns)
+ {
+@@ -41,6 +49,199 @@ static void time_travel_set_time(unsigned long long ns)
+ 	time_travel_time = ns;
+ }
+ 
++enum time_travel_message_handling {
++	TTMH_IDLE,
++	TTMH_POLL,
++	TTMH_READ,
++};
++
++static void time_travel_handle_message(struct um_timetravel_msg *msg,
++				       enum time_travel_message_handling mode)
++{
++	struct um_timetravel_msg resp = {
++		.op = UM_TIMETRAVEL_ACK,
++	};
++	int ret;
++
++	/*
++	 * Poll outside the locked section (if we're not called to only read
++	 * the response) so we can get interrupts for e.g. virtio while we're
++	 * here, but then we need to lock to not get interrupted between the
++	 * read of the message and write of the ACK.
++	 */
++	if (mode != TTMH_READ) {
++		while (os_poll(1, &time_travel_ext_fd) != 0) {
++			if (mode == TTMH_IDLE) {
++				BUG_ON(!irqs_disabled());
++				local_irq_enable();
++				local_irq_disable();
++			}
++		}
++	}
++
++	ret = os_read_file(time_travel_ext_fd, msg, sizeof(*msg));
++
++	if (ret == 0)
++		panic("time-travel external link is broken\n");
++	if (ret != sizeof(*msg))
++		panic("invalid time-travel message - %d bytes\n", ret);
++
++	switch (msg->op) {
++	default:
++		WARN_ONCE(1, "time-travel: unexpected message %lld\n",
++			  (unsigned long long)msg->op);
++		break;
++	case UM_TIMETRAVEL_ACK:
++		return;
++	case UM_TIMETRAVEL_RUN:
++		time_travel_set_time(msg->time);
++		break;
++	case UM_TIMETRAVEL_FREE_UNTIL:
++		time_travel_ext_free_until_valid = true;
++		time_travel_ext_free_until = msg->time;
++		break;
++	}
++
++	os_write_file(time_travel_ext_fd, &resp, sizeof(resp));
++}
++
++static u64 time_travel_ext_req(u32 op, u64 time)
++{
++	static int seq;
++	int mseq = ++seq;
++	struct um_timetravel_msg msg = {
++		.op = op,
++		.time = time,
++		.seq = mseq,
++	};
++	unsigned long flags;
++
++	/*
++	 * We need to save interrupts here and only restore when we
++	 * got the ACK - otherwise we can get interrupted and send
++	 * another request while we're still waiting for an ACK, but
++	 * the peer doesn't know we got interrupted and will send
++	 * the ACKs in the same order as the message, but we'd need
++	 * to see them in the opposite order ...
++	 *
++	 * This wouldn't matter *too* much, but some ACKs carry the
++	 * current time (for UM_TIMETRAVEL_GET) and getting another
++	 * ACK without a time would confuse us a lot!
++	 *
++	 * The sequence number assignment that happens here lets us
++	 * debug such message handling issues more easily.
++	 */
++	local_irq_save(flags);
++	os_write_file(time_travel_ext_fd, &msg, sizeof(msg));
++
++	while (msg.op != UM_TIMETRAVEL_ACK)
++		time_travel_handle_message(&msg, TTMH_READ);
++
++	if (msg.seq != mseq)
++		panic("time-travel: ACK message has different seqno! op=%d, seq=%d != %d time=%lld\n",
++		      msg.op, msg.seq, mseq, msg.time);
++
++	if (op == UM_TIMETRAVEL_GET)
++		time_travel_set_time(msg.time);
++	local_irq_restore(flags);
++
++	return msg.time;
++}
++
++void __time_travel_wait_readable(int fd)
++{
++	int fds[2] = { fd, time_travel_ext_fd };
++	int ret;
++
++	if (time_travel_mode != TT_MODE_EXTERNAL)
++		return;
++
++	while ((ret = os_poll(2, fds))) {
++		struct um_timetravel_msg msg;
++
++		if (ret == 1)
++			time_travel_handle_message(&msg, TTMH_READ);
++	}
++}
++EXPORT_SYMBOL_GPL(__time_travel_wait_readable);
++
++static void time_travel_ext_update_request(unsigned long long time)
++{
++	if (time_travel_mode != TT_MODE_EXTERNAL)
++		return;
++
++	/* asked for exactly this time previously */
++	if (time_travel_ext_prev_request_valid &&
++	    time == time_travel_ext_prev_request)
++		return;
++
++	time_travel_ext_prev_request = time;
++	time_travel_ext_prev_request_valid = true;
++	time_travel_ext_req(UM_TIMETRAVEL_REQUEST, time);
++}
++
++void __time_travel_propagate_time(void)
++{
++	time_travel_ext_req(UM_TIMETRAVEL_UPDATE, time_travel_time);
++}
++EXPORT_SYMBOL_GPL(__time_travel_propagate_time);
++
++/* returns true if we must do a wait to the simtime device */
++static bool time_travel_ext_request(unsigned long long time)
++{
++	/*
++	 * If we received an external sync point ("free until") then we
++	 * don't have to request/wait for anything until then, unless
++	 * we're already waiting.
++	 */
++	if (!time_travel_ext_waiting && time_travel_ext_free_until_valid &&
++	    time < time_travel_ext_free_until)
++		return false;
++
++	time_travel_ext_update_request(time);
++	return true;
++}
++
++static void time_travel_ext_wait(bool idle)
++{
++	struct um_timetravel_msg msg = {
++		.op = UM_TIMETRAVEL_ACK,
++	};
++
++	time_travel_ext_prev_request_valid = false;
++	time_travel_ext_waiting++;
++
++	time_travel_ext_req(UM_TIMETRAVEL_WAIT, -1);
++
++	/*
++	 * Here we are deep in the idle loop, so we have to break out of the
++	 * kernel abstraction in a sense and implement this in terms of the
++	 * UML system waiting on the VQ interrupt while sleeping, when we get
++	 * the signal it'll call time_travel_ext_vq_notify_done() completing the
++	 * call.
++	 */
++	while (msg.op != UM_TIMETRAVEL_RUN)
++		time_travel_handle_message(&msg, idle ? TTMH_IDLE : TTMH_POLL);
++
++	time_travel_ext_waiting--;
++
++	/* we might request more stuff while polling - reset when we run */
++	time_travel_ext_prev_request_valid = false;
++}
++
++static void time_travel_ext_get_time(void)
++{
++	time_travel_ext_req(UM_TIMETRAVEL_GET, -1);
++}
++
++static void __time_travel_update_time(unsigned long long ns, bool idle)
++{
++	if (time_travel_mode == TT_MODE_EXTERNAL && time_travel_ext_request(ns))
++		time_travel_ext_wait(idle);
++	else
++		time_travel_set_time(ns);
++}
++
+ static struct time_travel_event *time_travel_first_event(void)
+ {
+ 	return list_first_entry_or_null(&time_travel_events,
+@@ -85,6 +286,7 @@ static void __time_travel_add_event(struct time_travel_event *e,
+ 		list_add_tail(&e->list, &time_travel_events);
+ 
+ 	tmp = time_travel_first_event();
++	time_travel_ext_update_request(tmp->time);
+ 	time_travel_next_event = tmp->time;
+ }
+ 
+@@ -106,8 +308,21 @@ void time_travel_periodic_timer(struct time_travel_event *e)
+ 
+ static void time_travel_deliver_event(struct time_travel_event *e)
+ {
+-	/* this is basically just deliver_alarm(), handles IRQs itself */
+-	e->fn(e);
++	if (e == &time_travel_timer_event) {
++		/*
++		 * deliver_alarm() does the irq_enter/irq_exit
++		 * by itself, so must handle it specially here
++		 */
++		e->fn(e);
++	} else {
++		unsigned long flags;
++
++		local_irq_save(flags);
++		irq_enter();
++		e->fn(e);
++		irq_exit();
++		local_irq_restore(flags);
++	}
+ }
+ 
+ static bool time_travel_del_event(struct time_travel_event *e)
+@@ -119,13 +334,13 @@ static bool time_travel_del_event(struct time_travel_event *e)
+ 	return true;
+ }
+ 
+-static void time_travel_update_time(unsigned long long next, bool retearly)
++static void time_travel_update_time(unsigned long long next, bool idle)
+ {
+ 	struct time_travel_event ne = {
+ 		.onstack = true,
+ 	};
+ 	struct time_travel_event *e;
+-	bool finished = retearly;
++	bool finished = idle;
+ 
+ 	/* add it without a handler - we deal with that specifically below */
+ 	__time_travel_add_event(&ne, next);
+@@ -134,7 +349,7 @@ static void time_travel_update_time(unsigned long long next, bool retearly)
+ 		e = time_travel_first_event();
+ 
+ 		BUG_ON(!e);
+-		time_travel_set_time(e->time);
++		__time_travel_update_time(e->time, idle);
+ 
+ 		/* new events may have been inserted while we were waiting */
+ 		if (e == time_travel_first_event()) {
+@@ -150,11 +365,29 @@ static void time_travel_update_time(unsigned long long next, bool retearly)
+ 				time_travel_deliver_event(e);
+ 			}
+ 		}
+-	} while (!finished);
++
++		e = time_travel_first_event();
++		if (e)
++			time_travel_ext_update_request(e->time);
++	} while (ne.pending && !finished);
+ 
+ 	time_travel_del_event(&ne);
+ }
+ 
++void time_travel_add_irq_event(struct time_travel_event *e)
++{
++	BUG_ON(time_travel_mode != TT_MODE_EXTERNAL);
++
++	time_travel_ext_get_time();
++	/*
++	 * We could model interrupt latency here, for now just
++	 * don't have any latency at all and request the exact
++	 * same time (again) to run the interrupt...
++	 */
++	time_travel_add_event(e, time_travel_time);
++}
++EXPORT_SYMBOL_GPL(time_travel_add_irq_event);
++
+ static void time_travel_oneshot_timer(struct time_travel_event *e)
+ {
+ 	deliver_alarm();
+@@ -199,6 +432,42 @@ static void time_travel_set_interval(unsigned long long interval)
+ {
+ 	time_travel_timer_interval = interval;
+ }
++
++static int time_travel_connect_external(const char *socket)
++{
++	const char *sep;
++	unsigned long long id = (unsigned long long)-1;
++	int rc;
++
++	if ((sep = strchr(socket, ':'))) {
++		char buf[25] = {};
++		if (sep - socket > sizeof(buf) - 1)
++			goto invalid_number;
++
++		memcpy(buf, socket, sep - socket);
++		if (kstrtoull(buf, 0, &id)) {
++invalid_number:
++			panic("time-travel: invalid external ID in string '%s'\n",
++			      socket);
++			return -EINVAL;
++		}
++
++		socket = sep + 1;
++	}
++
++	rc = os_connect_socket(socket);
++	if (rc < 0) {
++		panic("time-travel: failed to connect to external socket %s\n",
++		      socket);
++		return rc;
++	}
++
++	time_travel_ext_fd = rc;
++
++	time_travel_ext_req(UM_TIMETRAVEL_START, id);
++
++	return 1;
++}
+ #else /* CONFIG_UML_TIME_TRAVEL_SUPPORT */
+ #define time_travel_start_set 0
+ #define time_travel_start 0
+@@ -216,6 +485,9 @@ static void time_travel_set_interval(unsigned long long interval)
+ {
+ }
+ 
++/* fail link if this actually gets used */
++extern u64 time_travel_ext_req(u32 op, u64 time);
++
+ /* these are empty macros so the struct/fn need not exist */
+ #define time_travel_add_event(e, time) do { } while (0)
+ #define time_travel_del_event(e) do { } while (0)
+@@ -246,7 +518,8 @@ static int itimer_shutdown(struct clock_event_device *evt)
+ 	if (time_travel_mode != TT_MODE_OFF)
+ 		time_travel_del_event(&time_travel_timer_event);
+ 
+-	if (time_travel_mode != TT_MODE_INFCPU)
++	if (time_travel_mode != TT_MODE_INFCPU &&
++	    time_travel_mode != TT_MODE_EXTERNAL)
+ 		os_timer_disable();
+ 
+ 	return 0;
+@@ -265,7 +538,8 @@ static int itimer_set_periodic(struct clock_event_device *evt)
+ 				      time_travel_time + interval);
+ 	}
+ 
+-	if (time_travel_mode != TT_MODE_INFCPU)
++	if (time_travel_mode != TT_MODE_INFCPU &&
++	    time_travel_mode != TT_MODE_EXTERNAL)
+ 		os_timer_set_interval(interval);
+ 
+ 	return 0;
+@@ -284,7 +558,8 @@ static int itimer_next_event(unsigned long delta,
+ 				      time_travel_time + delta);
+ 	}
+ 
+-	if (time_travel_mode != TT_MODE_INFCPU)
++	if (time_travel_mode != TT_MODE_INFCPU &&
++	    time_travel_mode != TT_MODE_EXTERNAL)
+ 		return os_timer_one_shot(delta);
+ 
+ 	return 0;
+@@ -335,8 +610,14 @@ static u64 timer_read(struct clocksource *cs)
+ 		 * stuck in loops that expect time to move more than the
+ 		 * exact requested sleep amount, e.g. python's socket server,
+ 		 * see https://bugs.python.org/issue37026.
++		 *
++		 * However, don't do that when we're in interrupt or such as
++		 * then we might recurse into our own processing, and get to
++		 * even more waiting, and that's not good - it messes up the
++		 * "what do I do next" and onstack event we use to know when
++		 * to return from time_travel_update_time().
+ 		 */
+-		if (!irqs_disabled())
++		if (!irqs_disabled() && !in_interrupt() && !in_softirq())
+ 			time_travel_update_time(time_travel_time +
+ 						TIMER_MULTIPLIER,
+ 						false);
+@@ -383,6 +664,8 @@ void read_persistent_clock64(struct timespec64 *ts)
+ 
+ 	if (time_travel_start_set)
+ 		nsecs = time_travel_start + time_travel_time;
++	else if (time_travel_mode == TT_MODE_EXTERNAL)
++		nsecs = time_travel_ext_req(UM_TIMETRAVEL_GET_TOD, -1);
+ 	else
+ 		nsecs = os_persistent_clock_emulation();
+ 
+@@ -399,7 +682,8 @@ void __init time_init(void)
+ #ifdef CONFIG_UML_TIME_TRAVEL_SUPPORT
+ unsigned long calibrate_delay_is_known(void)
+ {
+-	if (time_travel_mode == TT_MODE_INFCPU)
++	if (time_travel_mode == TT_MODE_INFCPU ||
++	    time_travel_mode == TT_MODE_EXTERNAL)
+ 		return 1;
+ 	return 0;
+ }
+@@ -413,6 +697,13 @@ int setup_time_travel(char *str)
+ 		return 1;
+ 	}
+ 
++	if (strncmp(str, "=ext:", 5) == 0) {
++		time_travel_mode = TT_MODE_EXTERNAL;
++		timer_clockevent.name = "time-travel-timer-external";
++		timer_clocksource.name = "time-travel-clock-external";
++		return time_travel_connect_external(str + 5);
++	}
++
+ 	if (!*str) {
+ 		time_travel_mode = TT_MODE_BASIC;
+ 		timer_clockevent.name = "time-travel-timer";
+@@ -437,7 +728,15 @@ __uml_help(setup_time_travel,
+ "are no wall clock timers, and any CPU processing happens - as seen from the\n"
+ "guest - instantly. This can be useful for accurate simulation regardless of\n"
+ "debug overhead, physical CPU speed, etc. but is somewhat dangerous as it can\n"
+-"easily lead to getting stuck (e.g. if anything in the system busy loops).\n");
++"easily lead to getting stuck (e.g. if anything in the system busy loops).\n"
++"\n"
++"time-travel=ext:[ID:]/path/to/socket\n"
++"This enables time travel mode similar to =inf-cpu, except the system will\n"
++"use the given socket to coordinate with a central scheduler, in order to\n"
++"have more than one system simultaneously be on simulated time. The virtio\n"
++"driver code in UML knows about this so you can also simulate networks and\n"
++"devices using it, assuming the device has the right capabilities.\n"
++"The optional ID is a 64-bit integer that's sent to the central scheduler.\n");
+ 
+ int setup_time_travel_start(char *str)
+ {
+
+commit 4b786e24ca80a492736b359b3d1a8d07612a78e5
+Author: Johannes Berg <johannes.berg@intel.com>
+Date:   Thu Feb 13 14:26:45 2020 +0100
+
+    um: time-travel: Rewrite as an event scheduler
+    
+    Instead of tracking all the various timer configurations,
+    modify the time-travel mode to have an event scheduler and
+    use a timer event on the scheduler to handle the different
+    timer configurations.
+    
+    This doesn't change the function right now, but it prepares
+    the code for having different kinds of events in the future
+    (i.e. interrupts coming from other devices that are part of
+    co-simulation.)
+    
+    While at it, also move time_travel_sleep() to time.c to
+    reduce the externally visible API surface.
+    
+    Also, we really should mark time-travel as incompatible with
+    SMP, even if UML doesn't support SMP yet.
+    
+    Finally, I noticed a bug while developing this - if we move
+    time forward due to consuming time while reading the clock,
+    we might move across the next event and that would cause us
+    to go backward in time when we then handle that event. Fix
+    that by invoking the whole event machine in this case, but
+    in order to simplify this, make reading the clock only cost
+    something when interrupts are not disabled. Otherwise, we'd
+    have to hook into the interrupt delivery machinery etc. and
+    that's somewhat intrusive.
+    
+    Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+    Signed-off-by: Richard Weinberger <richard@nod.at>
+
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+index a849d391e909..cdebe96308d7 100644
+--- a/arch/um/kernel/time.c
++++ b/arch/um/kernel/time.c
+@@ -4,6 +4,7 @@
+  * Copyright (C) 2015 Thomas Meyer (thomas@m3y3r.de)
+  * Copyright (C) 2012-2014 Cisco Systems
+  * Copyright (C) 2000 - 2007 Jeff Dike (jdike@{addtoit,linux.intel}.com)
++ * Copyright (C) 2019 Intel Corporation
+  */
+ 
+ #include <linux/clockchips.h>
+@@ -23,16 +24,201 @@
+ 
+ #ifdef CONFIG_UML_TIME_TRAVEL_SUPPORT
+ enum time_travel_mode time_travel_mode;
+-unsigned long long time_travel_time;
+-enum time_travel_timer_mode time_travel_timer_mode;
+-unsigned long long time_travel_timer_expiry;
+-unsigned long long time_travel_timer_interval;
+ 
+ static bool time_travel_start_set;
+ static unsigned long long time_travel_start;
+-#else
++static unsigned long long time_travel_time;
++static LIST_HEAD(time_travel_events);
++static unsigned long long time_travel_timer_interval;
++static unsigned long long time_travel_next_event;
++static struct time_travel_event time_travel_timer_event;
++
++static void time_travel_set_time(unsigned long long ns)
++{
++	if (unlikely(ns < time_travel_time))
++		panic("time-travel: time goes backwards %lld -> %lld\n",
++		      time_travel_time, ns);
++	time_travel_time = ns;
++}
++
++static struct time_travel_event *time_travel_first_event(void)
++{
++	return list_first_entry_or_null(&time_travel_events,
++					struct time_travel_event,
++					list);
++}
++
++static void __time_travel_add_event(struct time_travel_event *e,
++				    unsigned long long time)
++{
++	struct time_travel_event *tmp;
++	bool inserted = false;
++
++	if (WARN(time_travel_mode == TT_MODE_BASIC &&
++		 e != &time_travel_timer_event,
++		 "only timer events can be handled in basic mode"))
++		return;
++
++	if (e->pending)
++		return;
++
++	e->pending = true;
++	e->time = time;
++
++	list_for_each_entry(tmp, &time_travel_events, list) {
++		/*
++		 * Add the new entry before one with higher time,
++		 * or if they're equal and both on stack, because
++		 * in that case we need to unwind the stack in the
++		 * right order, and the later event (timer sleep
++		 * or such) must be dequeued first.
++		 */
++		if ((tmp->time > e->time) ||
++		    (tmp->time == e->time && tmp->onstack && e->onstack)) {
++			list_add_tail(&e->list, &tmp->list);
++			inserted = true;
++			break;
++		}
++	}
++
++	if (!inserted)
++		list_add_tail(&e->list, &time_travel_events);
++
++	tmp = time_travel_first_event();
++	time_travel_next_event = tmp->time;
++}
++
++static void time_travel_add_event(struct time_travel_event *e,
++				  unsigned long long time)
++{
++	if (WARN_ON(!e->fn))
++		return;
++
++	__time_travel_add_event(e, time);
++}
++
++void time_travel_periodic_timer(struct time_travel_event *e)
++{
++	time_travel_add_event(&time_travel_timer_event,
++			      time_travel_time + time_travel_timer_interval);
++	deliver_alarm();
++}
++
++static void time_travel_deliver_event(struct time_travel_event *e)
++{
++	/* this is basically just deliver_alarm(), handles IRQs itself */
++	e->fn(e);
++}
++
++static bool time_travel_del_event(struct time_travel_event *e)
++{
++	if (!e->pending)
++		return false;
++	list_del(&e->list);
++	e->pending = false;
++	return true;
++}
++
++static void time_travel_update_time(unsigned long long next, bool retearly)
++{
++	struct time_travel_event ne = {
++		.onstack = true,
++	};
++	struct time_travel_event *e;
++	bool finished = retearly;
++
++	/* add it without a handler - we deal with that specifically below */
++	__time_travel_add_event(&ne, next);
++
++	do {
++		e = time_travel_first_event();
++
++		BUG_ON(!e);
++		time_travel_set_time(e->time);
++
++		/* new events may have been inserted while we were waiting */
++		if (e == time_travel_first_event()) {
++			BUG_ON(!time_travel_del_event(e));
++			BUG_ON(time_travel_time != e->time);
++
++			if (e == &ne) {
++				finished = true;
++			} else {
++				if (e->onstack)
++					panic("On-stack event dequeued outside of the stack! time=%lld, event time=%lld, event=%pS\n",
++					      time_travel_time, e->time, e);
++				time_travel_deliver_event(e);
++			}
++		}
++	} while (!finished);
++
++	time_travel_del_event(&ne);
++}
++
++static void time_travel_oneshot_timer(struct time_travel_event *e)
++{
++	deliver_alarm();
++}
++
++void time_travel_sleep(unsigned long long duration)
++{
++	unsigned long long next = time_travel_time + duration;
++
++	if (time_travel_mode == TT_MODE_BASIC)
++		os_timer_disable();
++
++	time_travel_update_time(next, true);
++
++	if (time_travel_mode == TT_MODE_BASIC &&
++	    time_travel_timer_event.pending) {
++		if (time_travel_timer_event.fn == time_travel_periodic_timer) {
++			/*
++			 * This is somewhat wrong - we should get the first
++			 * one sooner like the os_timer_one_shot() below...
++			 */
++			os_timer_set_interval(time_travel_timer_interval);
++		} else {
++			os_timer_one_shot(time_travel_timer_event.time - next);
++		}
++	}
++}
++
++static void time_travel_handle_real_alarm(void)
++{
++	time_travel_set_time(time_travel_next_event);
++
++	time_travel_del_event(&time_travel_timer_event);
++
++	if (time_travel_timer_event.fn == time_travel_periodic_timer)
++		time_travel_add_event(&time_travel_timer_event,
++				      time_travel_time +
++				      time_travel_timer_interval);
++}
++
++static void time_travel_set_interval(unsigned long long interval)
++{
++	time_travel_timer_interval = interval;
++}
++#else /* CONFIG_UML_TIME_TRAVEL_SUPPORT */
+ #define time_travel_start_set 0
+ #define time_travel_start 0
++#define time_travel_time 0
++
++static inline void time_travel_update_time(unsigned long long ns, bool retearly)
++{
++}
++
++static inline void time_travel_handle_real_alarm(void)
++{
++}
++
++static void time_travel_set_interval(unsigned long long interval)
++{
++}
++
++/* these are empty macros so the struct/fn need not exist */
++#define time_travel_add_event(e, time) do { } while (0)
++#define time_travel_del_event(e) do { } while (0)
+ #endif
+ 
+ void timer_handler(int sig, struct siginfo *unused_si, struct uml_pt_regs *regs)
+@@ -48,7 +234,7 @@ void timer_handler(int sig, struct siginfo *unused_si, struct uml_pt_regs *regs)
+ 	 * never get any real signals from the OS.
+ 	 */
+ 	if (time_travel_mode == TT_MODE_BASIC)
+-		time_travel_set_time(time_travel_timer_expiry);
++		time_travel_handle_real_alarm();
+ 
+ 	local_irq_save(flags);
+ 	do_IRQ(TIMER_IRQ, regs);
+@@ -58,7 +244,7 @@ void timer_handler(int sig, struct siginfo *unused_si, struct uml_pt_regs *regs)
+ static int itimer_shutdown(struct clock_event_device *evt)
+ {
+ 	if (time_travel_mode != TT_MODE_OFF)
+-		time_travel_set_timer_mode(TT_TMR_DISABLED);
++		time_travel_del_event(&time_travel_timer_event);
+ 
+ 	if (time_travel_mode != TT_MODE_INFCPU)
+ 		os_timer_disable();
+@@ -71,9 +257,12 @@ static int itimer_set_periodic(struct clock_event_device *evt)
+ 	unsigned long long interval = NSEC_PER_SEC / HZ;
+ 
+ 	if (time_travel_mode != TT_MODE_OFF) {
+-		time_travel_set_timer_mode(TT_TMR_PERIODIC);
+-		time_travel_set_timer_expiry(time_travel_time + interval);
+-		time_travel_set_timer_interval(interval);
++		time_travel_del_event(&time_travel_timer_event);
++		time_travel_set_event_fn(&time_travel_timer_event,
++					 time_travel_periodic_timer);
++		time_travel_set_interval(interval);
++		time_travel_add_event(&time_travel_timer_event,
++				      time_travel_time + interval);
+ 	}
+ 
+ 	if (time_travel_mode != TT_MODE_INFCPU)
+@@ -88,8 +277,11 @@ static int itimer_next_event(unsigned long delta,
+ 	delta += 1;
+ 
+ 	if (time_travel_mode != TT_MODE_OFF) {
+-		time_travel_set_timer_mode(TT_TMR_ONESHOT);
+-		time_travel_set_timer_expiry(time_travel_time + delta);
++		time_travel_del_event(&time_travel_timer_event);
++		time_travel_set_event_fn(&time_travel_timer_event,
++					 time_travel_oneshot_timer);
++		time_travel_add_event(&time_travel_timer_event,
++				      time_travel_time + delta);
+ 	}
+ 
+ 	if (time_travel_mode != TT_MODE_INFCPU)
+@@ -144,7 +336,10 @@ static u64 timer_read(struct clocksource *cs)
+ 		 * exact requested sleep amount, e.g. python's socket server,
+ 		 * see https://bugs.python.org/issue37026.
+ 		 */
+-		time_travel_set_time(time_travel_time + TIMER_MULTIPLIER);
++		if (!irqs_disabled())
++			time_travel_update_time(time_travel_time +
++						TIMER_MULTIPLIER,
++						false);
+ 		return time_travel_time / TIMER_MULTIPLIER;
+ 	}
+ 
+
+commit f185063bff914e589b50f1b711fc42218c4790c6
+Author: Johannes Berg <johannes.berg@intel.com>
+Date:   Thu Feb 13 14:26:44 2020 +0100
+
+    um: Move timer-internal.h to non-shared
+    
+    This file isn't really shared, it's only used on the kernel side,
+    not on the user side. Remove the include from the user-side and
+    move the file to a better place.
+    
+    While at it, rename it to time-internal.h, it's not really just
+    timers but all kinds of things related to timekeeping.
+    
+    Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+    Signed-off-by: Richard Weinberger <richard@nod.at>
+
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+index 94ea87bd231c..a849d391e909 100644
+--- a/arch/um/kernel/time.c
++++ b/arch/um/kernel/time.c
+@@ -18,7 +18,7 @@
+ #include <asm/param.h>
+ #include <kern_util.h>
+ #include <os.h>
+-#include <timer-internal.h>
++#include <linux/time-internal.h>
+ #include <shared/init.h>
+ 
+ #ifdef CONFIG_UML_TIME_TRAVEL_SUPPORT
+
+commit 0d1fb0a47c09b21d82c680476da26035f402660a
+Author: Alex Dewar <alex.dewar@gmx.co.uk>
+Date:   Sun Aug 25 10:49:17 2019 +0100
+
+    um: Add SPDX headers to files in arch/um/kernel/
+    
+    Convert files to use SPDX header. All files are licensed under the
+    GPLv2.
+    
+    Signed-off-by: Alex Dewar <alex.dewar@gmx.co.uk>
+    Signed-off-by: Richard Weinberger <richard@nod.at>
+
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+index 15f2e88ba927..94ea87bd231c 100644
+--- a/arch/um/kernel/time.c
++++ b/arch/um/kernel/time.c
+@@ -1,9 +1,9 @@
++// SPDX-License-Identifier: GPL-2.0
+ /*
+  * Copyright (C) 2015 Anton Ivanov (aivanov@{brocade.com,kot-begemot.co.uk})
+  * Copyright (C) 2015 Thomas Meyer (thomas@m3y3r.de)
+  * Copyright (C) 2012-2014 Cisco Systems
+  * Copyright (C) 2000 - 2007 Jeff Dike (jdike@{addtoit,linux.intel}.com)
+- * Licensed under the GPL
+  */
+ 
+ #include <linux/clockchips.h>
+
+commit 278911ee89fa0f35127c0194010ffe2c17c2e3af
+Author: Johannes Berg <johannes.berg@intel.com>
+Date:   Tue Sep 10 17:03:53 2019 +0200
+
+    um: time-travel: Restrict time update in IRQ handler
+    
+    We currently do the time updates in the timer handler, even if
+    we just call the timer handler ourselves. In basic mode we must
+    in fact do it there since otherwise the OS timer signal won't
+    move time forward, but in inf-cpu mode we don't need to, and
+    it's harder to understand.
+    
+    Restrict the update there to basic mode, adding a comment, and
+    do it before calling the timer_handler() in inf-cpu mode.
+    
+    Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+    Signed-off-by: Richard Weinberger <richard@nod.at>
+
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+index 4ecabf7e54c9..15f2e88ba927 100644
+--- a/arch/um/kernel/time.c
++++ b/arch/um/kernel/time.c
+@@ -39,7 +39,15 @@ void timer_handler(int sig, struct siginfo *unused_si, struct uml_pt_regs *regs)
+ {
+ 	unsigned long flags;
+ 
+-	if (time_travel_mode != TT_MODE_OFF)
++	/*
++	 * In basic time-travel mode we still get real interrupts
++	 * (signals) but since we don't read time from the OS, we
++	 * must update the simulated time here to the expiry when
++	 * we get a signal.
++	 * This is not the case in inf-cpu mode, since there we
++	 * never get any real signals from the OS.
++	 */
++	if (time_travel_mode == TT_MODE_BASIC)
+ 		time_travel_set_time(time_travel_timer_expiry);
+ 
+ 	local_irq_save(flags);
+
+commit eec94b8acb03aaaa6fb050883624381f5c07a3f0
+Author: Johannes Berg <johannes.berg@intel.com>
+Date:   Tue Sep 10 17:03:52 2019 +0200
+
+    um: time-travel: Fix periodic timers
+    
+    Periodic timers are broken, because the also only fire once.
+    As it happens, Linux doesn't care because it only sets the
+    timer to periodic very briefly during boot, and then switches
+    it only between one-shot and off later.
+    
+    Nevertheless, fix the logic (we shouldn't even be looking at
+    time_travel_timer_expiry unless the timer is enabled) and
+    change the code to fire the timer periodically in periodic
+    mode, in case it ever gets used in the future.
+    
+    Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+    Signed-off-by: Richard Weinberger <richard@nod.at>
+
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+index 234757233355..4ecabf7e54c9 100644
+--- a/arch/um/kernel/time.c
++++ b/arch/um/kernel/time.c
+@@ -65,6 +65,7 @@ static int itimer_set_periodic(struct clock_event_device *evt)
+ 	if (time_travel_mode != TT_MODE_OFF) {
+ 		time_travel_set_timer_mode(TT_TMR_PERIODIC);
+ 		time_travel_set_timer_expiry(time_travel_time + interval);
++		time_travel_set_timer_interval(interval);
+ 	}
+ 
+ 	if (time_travel_mode != TT_MODE_INFCPU)
+
+commit e0917f879536cbf57367429d084775d8224c986c
+Author: Johannes Berg <johannes.berg@intel.com>
+Date:   Mon Jul 22 09:12:56 2019 +0200
+
+    um: fix time travel mode
+    
+    Unfortunately, my build fix for when time travel mode isn't
+    enabled broke time travel mode, because I forgot that we need
+    to use the timer time after the timer has been marked disabled,
+    and thus need to leave the time stored instead of zeroing it.
+    
+    Fix that by splitting the inline into two, so we can call only
+    the _mode() one in the relevant code path.
+    
+    Fixes: b482e48d29f1 ("um: fix build without CONFIG_UML_TIME_TRAVEL_SUPPORT")
+    Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+    Signed-off-by: Richard Weinberger <richard@nod.at>
+
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+index 6a051b078359..234757233355 100644
+--- a/arch/um/kernel/time.c
++++ b/arch/um/kernel/time.c
+@@ -50,7 +50,7 @@ void timer_handler(int sig, struct siginfo *unused_si, struct uml_pt_regs *regs)
+ static int itimer_shutdown(struct clock_event_device *evt)
+ {
+ 	if (time_travel_mode != TT_MODE_OFF)
+-		time_travel_set_timer(TT_TMR_DISABLED, 0);
++		time_travel_set_timer_mode(TT_TMR_DISABLED);
+ 
+ 	if (time_travel_mode != TT_MODE_INFCPU)
+ 		os_timer_disable();
+@@ -62,9 +62,10 @@ static int itimer_set_periodic(struct clock_event_device *evt)
+ {
+ 	unsigned long long interval = NSEC_PER_SEC / HZ;
+ 
+-	if (time_travel_mode != TT_MODE_OFF)
+-		time_travel_set_timer(TT_TMR_PERIODIC,
+-				      time_travel_time + interval);
++	if (time_travel_mode != TT_MODE_OFF) {
++		time_travel_set_timer_mode(TT_TMR_PERIODIC);
++		time_travel_set_timer_expiry(time_travel_time + interval);
++	}
+ 
+ 	if (time_travel_mode != TT_MODE_INFCPU)
+ 		os_timer_set_interval(interval);
+@@ -77,9 +78,10 @@ static int itimer_next_event(unsigned long delta,
+ {
+ 	delta += 1;
+ 
+-	if (time_travel_mode != TT_MODE_OFF)
+-		time_travel_set_timer(TT_TMR_ONESHOT,
+-				      time_travel_time + delta);
++	if (time_travel_mode != TT_MODE_OFF) {
++		time_travel_set_timer_mode(TT_TMR_ONESHOT);
++		time_travel_set_timer_expiry(time_travel_time + delta);
++	}
+ 
+ 	if (time_travel_mode != TT_MODE_INFCPU)
+ 		return os_timer_one_shot(delta);
+
+commit 065038706f77a56754e8f0c2556dab7e22dfe577
+Author: Johannes Berg <johannes.berg@intel.com>
+Date:   Mon May 27 10:34:27 2019 +0200
+
+    um: Support time travel mode
+    
+    Sometimes it can be useful to run with "time travel" inside the
+    UML instance, for example for testing. For example, some tests
+    for the wireless subsystem and userspace are based on hwsim, a
+    virtual wireless adapter. Some tests can take a long time to
+    run because they e.g. wait for 120 seconds to elapse for some
+    regulatory checks. This obviously goes faster if it need not
+    actually wait that long, but time inside the test environment
+    just "bumps up" when there's nothing to do.
+    
+    Add CONFIG_UML_TIME_TRAVEL_SUPPORT to enable code to support
+    such modes at runtime, selected on the command line:
+     * just "time-travel", in which time inside the UML instance
+       can move faster than real time, if there's nothing to do
+     * "time-travel=inf-cpu" in which time also moves slower and
+       any CPU processing takes no time at all, which allows to
+       implement consistent behaviour regardless of host CPU load
+       (or speed) or debug overhead.
+    
+    An additional "time-travel-start=<seconds>" parameter is also
+    supported in this case to start the wall clock at this time
+    (in unix epoch).
+    
+    With this enabled, the test mentioned above goes from a runtime
+    of about 140 seconds (with startup overhead and all) to being
+    CPU bound and finishing in 15 seconds (on my slow laptop).
+    
+    Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+    Signed-off-by: Richard Weinberger <richard@nod.at>
+
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+index 3a2fe54bef65..6a051b078359 100644
+--- a/arch/um/kernel/time.c
++++ b/arch/um/kernel/time.c
+@@ -19,11 +19,29 @@
+ #include <kern_util.h>
+ #include <os.h>
+ #include <timer-internal.h>
++#include <shared/init.h>
++
++#ifdef CONFIG_UML_TIME_TRAVEL_SUPPORT
++enum time_travel_mode time_travel_mode;
++unsigned long long time_travel_time;
++enum time_travel_timer_mode time_travel_timer_mode;
++unsigned long long time_travel_timer_expiry;
++unsigned long long time_travel_timer_interval;
++
++static bool time_travel_start_set;
++static unsigned long long time_travel_start;
++#else
++#define time_travel_start_set 0
++#define time_travel_start 0
++#endif
+ 
+ void timer_handler(int sig, struct siginfo *unused_si, struct uml_pt_regs *regs)
+ {
+ 	unsigned long flags;
+ 
++	if (time_travel_mode != TT_MODE_OFF)
++		time_travel_set_time(time_travel_timer_expiry);
++
+ 	local_irq_save(flags);
+ 	do_IRQ(TIMER_IRQ, regs);
+ 	local_irq_restore(flags);
+@@ -31,26 +49,47 @@ void timer_handler(int sig, struct siginfo *unused_si, struct uml_pt_regs *regs)
+ 
+ static int itimer_shutdown(struct clock_event_device *evt)
+ {
+-	os_timer_disable();
++	if (time_travel_mode != TT_MODE_OFF)
++		time_travel_set_timer(TT_TMR_DISABLED, 0);
++
++	if (time_travel_mode != TT_MODE_INFCPU)
++		os_timer_disable();
++
+ 	return 0;
+ }
+ 
+ static int itimer_set_periodic(struct clock_event_device *evt)
+ {
+-	os_timer_set_interval(NSEC_PER_SEC / HZ);
++	unsigned long long interval = NSEC_PER_SEC / HZ;
++
++	if (time_travel_mode != TT_MODE_OFF)
++		time_travel_set_timer(TT_TMR_PERIODIC,
++				      time_travel_time + interval);
++
++	if (time_travel_mode != TT_MODE_INFCPU)
++		os_timer_set_interval(interval);
++
+ 	return 0;
+ }
+ 
+ static int itimer_next_event(unsigned long delta,
+ 			     struct clock_event_device *evt)
+ {
+-	return os_timer_one_shot(delta + 1);
++	delta += 1;
++
++	if (time_travel_mode != TT_MODE_OFF)
++		time_travel_set_timer(TT_TMR_ONESHOT,
++				      time_travel_time + delta);
++
++	if (time_travel_mode != TT_MODE_INFCPU)
++		return os_timer_one_shot(delta);
++
++	return 0;
+ }
+ 
+ static int itimer_one_shot(struct clock_event_device *evt)
+ {
+-	os_timer_one_shot(1);
+-	return 0;
++	return itimer_next_event(0, evt);
+ }
+ 
+ static struct clock_event_device timer_clockevent = {
+@@ -87,6 +126,17 @@ static irqreturn_t um_timer(int irq, void *dev)
+ 
+ static u64 timer_read(struct clocksource *cs)
+ {
++	if (time_travel_mode != TT_MODE_OFF) {
++		/*
++		 * We make reading the timer cost a bit so that we don't get
++		 * stuck in loops that expect time to move more than the
++		 * exact requested sleep amount, e.g. python's socket server,
++		 * see https://bugs.python.org/issue37026.
++		 */
++		time_travel_set_time(time_travel_time + TIMER_MULTIPLIER);
++		return time_travel_time / TIMER_MULTIPLIER;
++	}
++
+ 	return os_nsecs() / TIMER_MULTIPLIER;
+ }
+ 
+@@ -123,7 +173,12 @@ static void __init um_timer_setup(void)
+ 
+ void read_persistent_clock64(struct timespec64 *ts)
+ {
+-	long long nsecs = os_persistent_clock_emulation();
++	long long nsecs;
++
++	if (time_travel_start_set)
++		nsecs = time_travel_start + time_travel_time;
++	else
++		nsecs = os_persistent_clock_emulation();
+ 
+ 	set_normalized_timespec64(ts, nsecs / NSEC_PER_SEC,
+ 				  nsecs % NSEC_PER_SEC);
+@@ -134,3 +189,65 @@ void __init time_init(void)
+ 	timer_set_signal_handler();
+ 	late_time_init = um_timer_setup;
+ }
++
++#ifdef CONFIG_UML_TIME_TRAVEL_SUPPORT
++unsigned long calibrate_delay_is_known(void)
++{
++	if (time_travel_mode == TT_MODE_INFCPU)
++		return 1;
++	return 0;
++}
++
++int setup_time_travel(char *str)
++{
++	if (strcmp(str, "=inf-cpu") == 0) {
++		time_travel_mode = TT_MODE_INFCPU;
++		timer_clockevent.name = "time-travel-timer-infcpu";
++		timer_clocksource.name = "time-travel-clock";
++		return 1;
++	}
++
++	if (!*str) {
++		time_travel_mode = TT_MODE_BASIC;
++		timer_clockevent.name = "time-travel-timer";
++		timer_clocksource.name = "time-travel-clock";
++		return 1;
++	}
++
++	return -EINVAL;
++}
++
++__setup("time-travel", setup_time_travel);
++__uml_help(setup_time_travel,
++"time-travel\n"
++"This option just enables basic time travel mode, in which the clock/timers\n"
++"inside the UML instance skip forward when there's nothing to do, rather than\n"
++"waiting for real time to elapse. However, instance CPU speed is limited by\n"
++"the real CPU speed, so e.g. a 10ms timer will always fire after ~10ms wall\n"
++"clock (but quicker when there's nothing to do).\n"
++"\n"
++"time-travel=inf-cpu\n"
++"This enables time travel mode with infinite processing power, in which there\n"
++"are no wall clock timers, and any CPU processing happens - as seen from the\n"
++"guest - instantly. This can be useful for accurate simulation regardless of\n"
++"debug overhead, physical CPU speed, etc. but is somewhat dangerous as it can\n"
++"easily lead to getting stuck (e.g. if anything in the system busy loops).\n");
++
++int setup_time_travel_start(char *str)
++{
++	int err;
++
++	err = kstrtoull(str, 0, &time_travel_start);
++	if (err)
++		return err;
++
++	time_travel_start_set = 1;
++	return 1;
++}
++
++__setup("time-travel-start", setup_time_travel_start);
++__uml_help(setup_time_travel_start,
++"time-travel-start=<seconds>\n"
++"Configure the UML instance's wall clock to start at this value rather than\n"
++"the host's wall clock at the time of UML boot.\n");
++#endif
+
+commit c7c6f3b95303c7de5d52af56c902fcb5abe827df
+Author: Johannes Berg <johannes.berg@intel.com>
+Date:   Mon May 27 10:34:26 2019 +0200
+
+    um: Pass nsecs to os timer functions
+    
+    This makes the code clearer and lets the time travel patch have
+    the actual time used for these functions in just one place.
+    
+    Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+    Signed-off-by: Richard Weinberger <richard@nod.at>
+
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+index 3898119f773e..3a2fe54bef65 100644
+--- a/arch/um/kernel/time.c
++++ b/arch/um/kernel/time.c
+@@ -37,14 +37,14 @@ static int itimer_shutdown(struct clock_event_device *evt)
+ 
+ static int itimer_set_periodic(struct clock_event_device *evt)
+ {
+-	os_timer_set_interval();
++	os_timer_set_interval(NSEC_PER_SEC / HZ);
+ 	return 0;
+ }
+ 
+ static int itimer_next_event(unsigned long delta,
+ 			     struct clock_event_device *evt)
+ {
+-	return os_timer_one_shot(delta);
++	return os_timer_one_shot(delta + 1);
+ }
+ 
+ static int itimer_one_shot(struct clock_event_device *evt)
+
+commit 56fc187065451ebca74edb30d50de5f10a88339b
+Author: Johannes Berg <johannes.berg@intel.com>
+Date:   Mon May 6 14:39:38 2019 +0200
+
+    um: Timer code cleanup
+    
+    There are some unused functions, and some others that have
+    unused arguments; clean up the timer code a bit.
+    
+    Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+    Signed-off-by: Richard Weinberger <richard@nod.at>
+
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+index 0c572a48158e..3898119f773e 100644
+--- a/arch/um/kernel/time.c
++++ b/arch/um/kernel/time.c
+@@ -37,7 +37,7 @@ static int itimer_shutdown(struct clock_event_device *evt)
+ 
+ static int itimer_set_periodic(struct clock_event_device *evt)
+ {
+-	os_timer_set_interval(NULL, NULL);
++	os_timer_set_interval();
+ 	return 0;
+ }
+ 
+@@ -107,7 +107,7 @@ static void __init um_timer_setup(void)
+ 		printk(KERN_ERR "register_timer : request_irq failed - "
+ 		       "errno = %d\n", -err);
+ 
+-	err = os_timer_create(NULL);
++	err = os_timer_create();
+ 	if (err != 0) {
+ 		printk(KERN_ERR "creation of timer failed - errno = %d\n", -err);
+ 		return;
+
+commit 689a58605b63173acb0a8cf954af6a8f60440c93
+Author: Maciej Żenczykowski <maze@google.com>
+Date:   Wed Apr 10 11:11:23 2019 -0700
+
+    uml: fix a boot splat wrt use of cpu_all_mask
+    
+    Memory: 509108K/542612K available (3835K kernel code, 919K rwdata, 1028K rodata, 129K init, 211K bss, 33504K reserved, 0K cma-reserved)
+    NR_IRQS: 15
+    clocksource: timer: mask: 0xffffffffffffffff max_cycles: 0x1cd42e205, max_idle_ns: 881590404426 ns
+    ------------[ cut here ]------------
+    WARNING: CPU: 0 PID: 0 at kernel/time/clockevents.c:458 clockevents_register_device+0x72/0x140
+    posix-timer cpumask == cpu_all_mask, using cpu_possible_mask instead
+    Modules linked in:
+    CPU: 0 PID: 0 Comm: swapper Not tainted 5.1.0-rc4-00048-ged79cc87302b #4
+    Stack:
+     604ebda0 603c5370 604ebe20 6046fd17
+     00000000 6006fcbb 604ebdb0 603c53b5
+     604ebe10 6003bfc4 604ebdd0 9000001ca
+    Call Trace:
+     [<6006fcbb>] ? printk+0x0/0x94
+     [<60083160>] ? clockevents_register_device+0x72/0x140
+     [<6001f16e>] show_stack+0x13b/0x155
+     [<603c5370>] ? dump_stack_print_info+0xe2/0xeb
+     [<6006fcbb>] ? printk+0x0/0x94
+     [<603c53b5>] dump_stack+0x2a/0x2c
+     [<6003bfc4>] __warn+0x10e/0x13e
+     [<60070320>] ? vprintk_func+0xc8/0xcf
+     [<60030fd6>] ? block_signals+0x0/0x16
+     [<6006fcbb>] ? printk+0x0/0x94
+     [<6003c08b>] warn_slowpath_fmt+0x97/0x99
+     [<600311a1>] ? set_signals+0x0/0x3f
+     [<6003bff4>] ? warn_slowpath_fmt+0x0/0x99
+     [<600842cb>] ? tick_oneshot_mode_active+0x44/0x4f
+     [<60030fd6>] ? block_signals+0x0/0x16
+     [<6006fcbb>] ? printk+0x0/0x94
+     [<6007d2d5>] ? __clocksource_select+0x20/0x1b1
+     [<60030fd6>] ? block_signals+0x0/0x16
+     [<6006fcbb>] ? printk+0x0/0x94
+     [<60083160>] clockevents_register_device+0x72/0x140
+     [<60031192>] ? get_signals+0x0/0xf
+     [<60030fd6>] ? block_signals+0x0/0x16
+     [<6006fcbb>] ? printk+0x0/0x94
+     [<60002eec>] um_timer_setup+0xc8/0xca
+     [<60001b59>] start_kernel+0x47f/0x57e
+     [<600035bc>] start_kernel_proc+0x49/0x4d
+     [<6006c483>] ? kmsg_dump_register+0x82/0x8a
+     [<6001de62>] new_thread_handler+0x81/0xb2
+     [<60003571>] ? kmsg_dumper_stdout_init+0x1a/0x1c
+     [<60020c75>] uml_finishsetup+0x54/0x59
+    
+    random: get_random_bytes called from init_oops_id+0x27/0x34 with crng_init=0
+    ---[ end trace 00173d0117a88acb ]---
+    Calibrating delay loop... 6941.90 BogoMIPS (lpj=34709504)
+    
+    Signed-off-by: Maciej Żenczykowski <maze@google.com>
+    Cc: Jeff Dike <jdike@addtoit.com>
+    Cc: Richard Weinberger <richard@nod.at>
+    Cc: Anton Ivanov <anton.ivanov@cambridgegreys.com>
+    Cc: linux-um@lists.infradead.org
+    Cc: linux-kernel@vger.kernel.org
+    
+    Signed-off-by: Richard Weinberger <richard@nod.at>
+
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+index 052de4c8acb2..0c572a48158e 100644
+--- a/arch/um/kernel/time.c
++++ b/arch/um/kernel/time.c
+@@ -56,7 +56,7 @@ static int itimer_one_shot(struct clock_event_device *evt)
+ static struct clock_event_device timer_clockevent = {
+ 	.name			= "posix-timer",
+ 	.rating			= 250,
+-	.cpumask		= cpu_all_mask,
++	.cpumask		= cpu_possible_mask,
+ 	.features		= CLOCK_EVT_FEAT_PERIODIC |
+ 				  CLOCK_EVT_FEAT_ONESHOT,
+ 	.set_state_shutdown	= itimer_shutdown,
+
+commit 288fb3d5683f5089fa1ba9258e4351170c1f0401
+Author: Arnd Bergmann <arnd@arndb.de>
+Date:   Thu Nov 2 13:07:02 2017 +0100
+
+    um: time: Use timespec64 for persistent clock
+    
+    This read_persistent_clock() implementation is the only remaining
+    caller of set_normalized_timespec(). Using read_persistent_clock64()
+    and set_normalized_timespec64() instead lets us remove the deprecated
+    interface in the future and helps make 32-bit arch/um get closer to
+    working beyond 2038.
+    
+    Signed-off-by: Arnd Bergmann <arnd@arndb.de>
+    Signed-off-by: Richard Weinberger <richard@nod.at>
+
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+index 7f69d17de354..052de4c8acb2 100644
+--- a/arch/um/kernel/time.c
++++ b/arch/um/kernel/time.c
+@@ -121,12 +121,12 @@ static void __init um_timer_setup(void)
+ 	clockevents_register_device(&timer_clockevent);
+ }
+ 
+-void read_persistent_clock(struct timespec *ts)
++void read_persistent_clock64(struct timespec64 *ts)
+ {
+ 	long long nsecs = os_persistent_clock_emulation();
+ 
+-	set_normalized_timespec(ts, nsecs / NSEC_PER_SEC,
+-				nsecs % NSEC_PER_SEC);
++	set_normalized_timespec64(ts, nsecs / NSEC_PER_SEC,
++				  nsecs % NSEC_PER_SEC);
+ }
+ 
+ void __init time_init(void)
+
+commit 69b73e95982649a1f2dc63b8f08f2113d28f7fed
+Author: Thomas Gleixner <tglx@linutronix.de>
+Date:   Fri Sep 29 10:07:44 2017 +0200
+
+    um/time: Fixup namespace collision
+    
+    The new timer_setup() function for struct timer_list collides with a
+    private um function. Rename it.
+    
+    Fixes: 686fef928bba ("timer: Prepare to change timer callback argument type")
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Richard Weinberger <richard@nod.at>
+    Cc: Jeff Dike <jdike@addtoit.com>
+    Cc: user-mode-linux-devel@lists.sourceforge.net
+    Cc: Kees Cook  <keescook@chromium.org>
+
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+index 0b034ebbda2a..7f69d17de354 100644
+--- a/arch/um/kernel/time.c
++++ b/arch/um/kernel/time.c
+@@ -98,7 +98,7 @@ static struct clocksource timer_clocksource = {
+ 	.flags		= CLOCK_SOURCE_IS_CONTINUOUS,
+ };
+ 
+-static void __init timer_setup(void)
++static void __init um_timer_setup(void)
+ {
+ 	int err;
+ 
+@@ -132,5 +132,5 @@ void read_persistent_clock(struct timespec *ts)
+ void __init time_init(void)
+ {
+ 	timer_set_signal_handler();
+-	late_time_init = timer_setup;
++	late_time_init = um_timer_setup;
+ }
+
+commit 8ab3a284a6348f4160a93051d1ed69692589a5c8
+Author: Nicolai Stange <nicstange@gmail.com>
+Date:   Thu Mar 30 21:59:42 2017 +0200
+
+    um/time: Set ->min_delta_ticks and ->max_delta_ticks
+    
+    In preparation for making the clockevents core NTP correction aware,
+    all clockevent device drivers must set ->min_delta_ticks and
+    ->max_delta_ticks rather than ->min_delta_ns and ->max_delta_ns: a
+    clockevent device's rate is going to change dynamically and thus, the
+    ratio of ns to ticks ceases to stay invariant.
+    
+    Make the uml arch's clockevent driver initialize these fields properly.
+    
+    This patch alone doesn't introduce any change in functionality as the
+    clockevents core still looks exclusively at the (untouched) ->min_delta_ns
+    and ->max_delta_ns. As soon as this has changed, a followup patch will
+    purge the initialization of ->min_delta_ns and ->max_delta_ns from this
+    driver.
+    
+    Cc: Ingo Molnar <mingo@redhat.com>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Daniel Lezcano <daniel.lezcano@linaro.org>
+    Cc: Richard Cochran <richardcochran@gmail.com>
+    Cc: Prarit Bhargava <prarit@redhat.com>
+    Cc: Stephen Boyd <sboyd@codeaurora.org>
+    Cc: Richard Weinberger <richard@nod.at>
+    Cc: Jeff Dike <jdike@addtoit.com>
+    Cc: user-mode-linux-devel@lists.sourceforge.net
+    Signed-off-by: Nicolai Stange <nicstange@gmail.com>
+    Signed-off-by: John Stultz <john.stultz@linaro.org>
+
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+index ba87a27d6715..0b034ebbda2a 100644
+--- a/arch/um/kernel/time.c
++++ b/arch/um/kernel/time.c
+@@ -65,7 +65,9 @@ static struct clock_event_device timer_clockevent = {
+ 	.set_next_event		= itimer_next_event,
+ 	.shift			= 0,
+ 	.max_delta_ns		= 0xffffffff,
+-	.min_delta_ns		= TIMER_MIN_DELTA, //microsecond resolution should be enough for anyone, same as 640K RAM
++	.max_delta_ticks	= 0xffffffff,
++	.min_delta_ns		= TIMER_MIN_DELTA,
++	.min_delta_ticks	= TIMER_MIN_DELTA, // microsecond resolution should be enough for anyone, same as 640K RAM
+ 	.irq			= 0,
+ 	.mult			= 1,
+ };
+
+commit a5a1d1c2914b5316924c7893eb683a5420ebd3be
+Author: Thomas Gleixner <tglx@linutronix.de>
+Date:   Wed Dec 21 20:32:01 2016 +0100
+
+    clocksource: Use a plain u64 instead of cycle_t
+    
+    There is no point in having an extra type for extra confusion. u64 is
+    unambiguous.
+    
+    Conversion was done with the following coccinelle script:
+    
+    @rem@
+    @@
+    -typedef u64 cycle_t;
+    
+    @fix@
+    typedef cycle_t;
+    @@
+    -cycle_t
+    +u64
+    
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: John Stultz <john.stultz@linaro.org>
+
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+index 25c23666d592..ba87a27d6715 100644
+--- a/arch/um/kernel/time.c
++++ b/arch/um/kernel/time.c
+@@ -83,7 +83,7 @@ static irqreturn_t um_timer(int irq, void *dev)
+ 	return IRQ_HANDLED;
+ }
+ 
+-static cycle_t timer_read(struct clocksource *cs)
++static u64 timer_read(struct clocksource *cs)
+ {
+ 	return os_nsecs() / TIMER_MULTIPLIER;
+ }
+
+commit 2eb5f31bc4ea24bb293e82934cfa1cce9573304b
+Author: Anton Ivanov <aivanov@brocade.com>
+Date:   Mon Nov 2 16:16:37 2015 +0000
+
+    um: Switch clocksource to hrtimers
+    
+    UML is using an obsolete itimer call for
+    all timers and "polls" for kernel space timer firing
+    in its userspace portion resulting in a long list
+    of bugs and incorrect behaviour(s). It also uses
+    ITIMER_VIRTUAL for its timer which results in the
+    timer being dependent on it running and the cpu
+    load.
+    
+    This patch fixes this by moving to posix high resolution
+    timers firing off CLOCK_MONOTONIC and relaying the timer
+    correctly to the UML userspace.
+    
+    Fixes:
+     - crashes when hosts suspends/resumes
+     - broken userspace timers - effecive ~40Hz instead
+       of what they should be. Note - this modifies skas behavior
+       by no longer setting an itimer per clone(). Timer events
+       are relayed instead.
+     - kernel network packet scheduling disciplines
+     - tcp behaviour especially under load
+     - various timer related corner cases
+    
+    Finally, overall responsiveness of userspace is better.
+    
+    Signed-off-by: Thomas Meyer <thomas@m3y3r.de>
+    Signed-off-by: Anton Ivanov <aivanov@brocade.com>
+    [rw: massaged commit message]
+    Signed-off-by: Richard Weinberger <richard@nod.at>
+
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+index 5af441efb377..25c23666d592 100644
+--- a/arch/um/kernel/time.c
++++ b/arch/um/kernel/time.c
+@@ -1,4 +1,7 @@
+ /*
++ * Copyright (C) 2015 Anton Ivanov (aivanov@{brocade.com,kot-begemot.co.uk})
++ * Copyright (C) 2015 Thomas Meyer (thomas@m3y3r.de)
++ * Copyright (C) 2012-2014 Cisco Systems
+  * Copyright (C) 2000 - 2007 Jeff Dike (jdike@{addtoit,linux.intel}.com)
+  * Licensed under the GPL
+  */
+@@ -7,11 +10,15 @@
+ #include <linux/init.h>
+ #include <linux/interrupt.h>
+ #include <linux/jiffies.h>
++#include <linux/mm.h>
++#include <linux/sched.h>
++#include <linux/spinlock.h>
+ #include <linux/threads.h>
+ #include <asm/irq.h>
+ #include <asm/param.h>
+ #include <kern_util.h>
+ #include <os.h>
++#include <timer-internal.h>
+ 
+ void timer_handler(int sig, struct siginfo *unused_si, struct uml_pt_regs *regs)
+ {
+@@ -24,81 +31,97 @@ void timer_handler(int sig, struct siginfo *unused_si, struct uml_pt_regs *regs)
+ 
+ static int itimer_shutdown(struct clock_event_device *evt)
+ {
+-	disable_timer();
++	os_timer_disable();
+ 	return 0;
+ }
+ 
+ static int itimer_set_periodic(struct clock_event_device *evt)
+ {
+-	set_interval();
++	os_timer_set_interval(NULL, NULL);
+ 	return 0;
+ }
+ 
+ static int itimer_next_event(unsigned long delta,
+ 			     struct clock_event_device *evt)
+ {
+-	return timer_one_shot(delta + 1);
++	return os_timer_one_shot(delta);
+ }
+ 
+-static struct clock_event_device itimer_clockevent = {
+-	.name			= "itimer",
++static int itimer_one_shot(struct clock_event_device *evt)
++{
++	os_timer_one_shot(1);
++	return 0;
++}
++
++static struct clock_event_device timer_clockevent = {
++	.name			= "posix-timer",
+ 	.rating			= 250,
+ 	.cpumask		= cpu_all_mask,
+ 	.features		= CLOCK_EVT_FEAT_PERIODIC |
+ 				  CLOCK_EVT_FEAT_ONESHOT,
+ 	.set_state_shutdown	= itimer_shutdown,
+ 	.set_state_periodic	= itimer_set_periodic,
+-	.set_state_oneshot	= itimer_shutdown,
++	.set_state_oneshot	= itimer_one_shot,
+ 	.set_next_event		= itimer_next_event,
+-	.shift			= 32,
++	.shift			= 0,
++	.max_delta_ns		= 0xffffffff,
++	.min_delta_ns		= TIMER_MIN_DELTA, //microsecond resolution should be enough for anyone, same as 640K RAM
+ 	.irq			= 0,
++	.mult			= 1,
+ };
+ 
+ static irqreturn_t um_timer(int irq, void *dev)
+ {
+-	(*itimer_clockevent.event_handler)(&itimer_clockevent);
++	if (get_current()->mm != NULL)
++	{
++        /* userspace - relay signal, results in correct userspace timers */
++		os_alarm_process(get_current()->mm->context.id.u.pid);
++	}
++
++	(*timer_clockevent.event_handler)(&timer_clockevent);
+ 
+ 	return IRQ_HANDLED;
+ }
+ 
+-static cycle_t itimer_read(struct clocksource *cs)
++static cycle_t timer_read(struct clocksource *cs)
+ {
+-	return os_nsecs() / 1000;
++	return os_nsecs() / TIMER_MULTIPLIER;
+ }
+ 
+-static struct clocksource itimer_clocksource = {
+-	.name		= "itimer",
++static struct clocksource timer_clocksource = {
++	.name		= "timer",
+ 	.rating		= 300,
+-	.read		= itimer_read,
++	.read		= timer_read,
+ 	.mask		= CLOCKSOURCE_MASK(64),
+ 	.flags		= CLOCK_SOURCE_IS_CONTINUOUS,
+ };
+ 
+-static void __init setup_itimer(void)
++static void __init timer_setup(void)
+ {
+ 	int err;
+ 
+-	err = request_irq(TIMER_IRQ, um_timer, 0, "timer", NULL);
++	err = request_irq(TIMER_IRQ, um_timer, IRQF_TIMER, "hr timer", NULL);
+ 	if (err != 0)
+ 		printk(KERN_ERR "register_timer : request_irq failed - "
+ 		       "errno = %d\n", -err);
+ 
+-	itimer_clockevent.mult = div_sc(HZ, NSEC_PER_SEC, 32);
+-	itimer_clockevent.max_delta_ns =
+-		clockevent_delta2ns(60 * HZ, &itimer_clockevent);
+-	itimer_clockevent.min_delta_ns =
+-		clockevent_delta2ns(1, &itimer_clockevent);
+-	err = clocksource_register_hz(&itimer_clocksource, USEC_PER_SEC);
++	err = os_timer_create(NULL);
++	if (err != 0) {
++		printk(KERN_ERR "creation of timer failed - errno = %d\n", -err);
++		return;
++	}
++
++	err = clocksource_register_hz(&timer_clocksource, NSEC_PER_SEC/TIMER_MULTIPLIER);
+ 	if (err) {
+ 		printk(KERN_ERR "clocksource_register_hz returned %d\n", err);
+ 		return;
+ 	}
+-	clockevents_register_device(&itimer_clockevent);
++	clockevents_register_device(&timer_clockevent);
+ }
+ 
+ void read_persistent_clock(struct timespec *ts)
+ {
+-	long long nsecs = os_nsecs();
++	long long nsecs = os_persistent_clock_emulation();
+ 
+ 	set_normalized_timespec(ts, nsecs / NSEC_PER_SEC,
+ 				nsecs % NSEC_PER_SEC);
+@@ -106,6 +129,6 @@ void read_persistent_clock(struct timespec *ts)
+ 
+ void __init time_init(void)
+ {
+-	timer_init();
+-	late_time_init = setup_itimer;
++	timer_set_signal_handler();
++	late_time_init = timer_setup;
+ }
+
+commit 71b5280b79359ca3c6c21d46b6b14a3ae93d8330
+Author: Viresh Kumar <viresh.kumar@linaro.org>
+Date:   Thu Jul 16 16:56:31 2015 +0530
+
+    um/time: Migrate to new 'set-state' interface
+    
+    Migrate um driver to the new 'set-state' interface provided by
+    clockevents core, the earlier 'set-mode' interface is marked obsolete
+    now.
+    
+    This also enables us to implement callbacks for new states of clockevent
+    devices, for example: ONESHOT_STOPPED.
+    
+    Cc: Jeff Dike <jdike@addtoit.com>
+    Cc: Richard Weinberger <richard@nod.at>
+    Cc: user-mode-linux-devel@lists.sourceforge.net
+    Cc: user-mode-linux-user@lists.sourceforge.net
+    Signed-off-by: Viresh Kumar <viresh.kumar@linaro.org>
+    Signed-off-by: Daniel Lezcano <daniel.lezcano@linaro.org>
+
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+index 117568d4f64a..5af441efb377 100644
+--- a/arch/um/kernel/time.c
++++ b/arch/um/kernel/time.c
+@@ -22,23 +22,16 @@ void timer_handler(int sig, struct siginfo *unused_si, struct uml_pt_regs *regs)
+ 	local_irq_restore(flags);
+ }
+ 
+-static void itimer_set_mode(enum clock_event_mode mode,
+-			    struct clock_event_device *evt)
++static int itimer_shutdown(struct clock_event_device *evt)
+ {
+-	switch (mode) {
+-	case CLOCK_EVT_MODE_PERIODIC:
+-		set_interval();
+-		break;
+-
+-	case CLOCK_EVT_MODE_SHUTDOWN:
+-	case CLOCK_EVT_MODE_UNUSED:
+-	case CLOCK_EVT_MODE_ONESHOT:
+-		disable_timer();
+-		break;
+-
+-	case CLOCK_EVT_MODE_RESUME:
+-		break;
+-	}
++	disable_timer();
++	return 0;
++}
++
++static int itimer_set_periodic(struct clock_event_device *evt)
++{
++	set_interval();
++	return 0;
+ }
+ 
+ static int itimer_next_event(unsigned long delta,
+@@ -48,14 +41,17 @@ static int itimer_next_event(unsigned long delta,
+ }
+ 
+ static struct clock_event_device itimer_clockevent = {
+-	.name		= "itimer",
+-	.rating		= 250,
+-	.cpumask	= cpu_all_mask,
+-	.features	= CLOCK_EVT_FEAT_PERIODIC | CLOCK_EVT_FEAT_ONESHOT,
+-	.set_mode	= itimer_set_mode,
+-	.set_next_event = itimer_next_event,
+-	.shift		= 32,
+-	.irq		= 0,
++	.name			= "itimer",
++	.rating			= 250,
++	.cpumask		= cpu_all_mask,
++	.features		= CLOCK_EVT_FEAT_PERIODIC |
++				  CLOCK_EVT_FEAT_ONESHOT,
++	.set_state_shutdown	= itimer_shutdown,
++	.set_state_periodic	= itimer_set_periodic,
++	.set_state_oneshot	= itimer_shutdown,
++	.set_next_event		= itimer_next_event,
++	.shift			= 32,
++	.irq			= 0,
+ };
+ 
+ static irqreturn_t um_timer(int irq, void *dev)
+
+commit 37185b33240870719b6b5913a46e6a441f1ae96f
+Author: Al Viro <viro@ZenIV.linux.org.uk>
+Date:   Mon Oct 8 03:27:32 2012 +0100
+
+    um: get rid of pointless include "..." where include <...> will do
+    
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+    Signed-off-by: Richard Weinberger <richard@nod.at>
+
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+index 5f76d4ba151c..117568d4f64a 100644
+--- a/arch/um/kernel/time.c
++++ b/arch/um/kernel/time.c
+@@ -10,8 +10,8 @@
+ #include <linux/threads.h>
+ #include <asm/irq.h>
+ #include <asm/param.h>
+-#include "kern_util.h"
+-#include "os.h"
++#include <kern_util.h>
++#include <os.h>
+ 
+ void timer_handler(int sig, struct siginfo *unused_si, struct uml_pt_regs *regs)
+ {
+
+commit d3c1cfcdb43e023ab1b1c7a555cd9e929026500a
+Author: Martin Pärtel <martin.partel@gmail.com>
+Date:   Thu Aug 2 00:49:17 2012 +0200
+
+    um: pass siginfo to guest process
+    
+    UML guest processes now get correct siginfo_t for SIGTRAP, SIGFPE,
+    SIGILL and SIGBUS. Specifically, si_addr and si_code are now correct
+    where previously they were si_addr = NULL and si_code = 128.
+    
+    Signed-off-by: Martin Pärtel <martin.partel@gmail.com>
+    Signed-off-by: Richard Weinberger <richard@nod.at>
+
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+index d1a23fb3190d..5f76d4ba151c 100644
+--- a/arch/um/kernel/time.c
++++ b/arch/um/kernel/time.c
+@@ -13,7 +13,7 @@
+ #include "kern_util.h"
+ #include "os.h"
+ 
+-void timer_handler(int sig, struct uml_pt_regs *regs)
++void timer_handler(int sig, struct siginfo *unused_si, struct uml_pt_regs *regs)
+ {
+ 	unsigned long flags;
+ 
+
+commit c0b79a90b1556a7e51d7a49a655eb60306f6258d
+Author: Yong Zhang <yong.zhang0@gmail.com>
+Date:   Thu Sep 22 16:58:46 2011 +0800
+
+    um: irq: Remove IRQF_DISABLED
+    
+    Since commit [e58aa3d2: genirq: Run irq handlers with interrupts disabled],
+    We run all interrupt handlers with interrupts disabled
+    and we even check and yell when an interrupt handler
+    returns with interrupts enabled (see commit [b738a50a:
+    genirq: Warn when handler enables interrupts]).
+    
+    So now this flag is a NOOP and can be removed.
+    
+    Signed-off-by: Yong Zhang <yong.zhang0@gmail.com>
+    Signed-off-by: Richard Weinberger <richard@nod.at>
+
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+index 82a6e22f1f35..d1a23fb3190d 100644
+--- a/arch/um/kernel/time.c
++++ b/arch/um/kernel/time.c
+@@ -82,7 +82,7 @@ static void __init setup_itimer(void)
+ {
+ 	int err;
+ 
+-	err = request_irq(TIMER_IRQ, um_timer, IRQF_DISABLED, "timer", NULL);
++	err = request_irq(TIMER_IRQ, um_timer, 0, "timer", NULL);
+ 	if (err != 0)
+ 		printk(KERN_ERR "register_timer : request_irq failed - "
+ 		       "errno = %d\n", -err);
+
+commit 60d687e7d4724a7e8826f6579ca036d4343a5386
+Author: John Stultz <johnstul@us.ibm.com>
+Date:   Mon Apr 26 20:25:16 2010 -0700
+
+    clocksource: um: Convert to clocksource_register_hz/khz
+    
+    This converts the um clocksource to use clocksource_register_hz/khz
+    
+    This is untested, so any assistance in testing would be appreciated!
+    
+    CC: Jeff Dike <jdike@addtoit.com>
+    CC: Thomas Gleixner <tglx@linutronix.de>
+    Signed-off-by: John Stultz <johnstul@us.ibm.com>
+
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+index a08d9fab81f2..82a6e22f1f35 100644
+--- a/arch/um/kernel/time.c
++++ b/arch/um/kernel/time.c
+@@ -75,8 +75,6 @@ static struct clocksource itimer_clocksource = {
+ 	.rating		= 300,
+ 	.read		= itimer_read,
+ 	.mask		= CLOCKSOURCE_MASK(64),
+-	.mult		= 1000,
+-	.shift		= 0,
+ 	.flags		= CLOCK_SOURCE_IS_CONTINUOUS,
+ };
+ 
+@@ -94,9 +92,9 @@ static void __init setup_itimer(void)
+ 		clockevent_delta2ns(60 * HZ, &itimer_clockevent);
+ 	itimer_clockevent.min_delta_ns =
+ 		clockevent_delta2ns(1, &itimer_clockevent);
+-	err = clocksource_register(&itimer_clocksource);
++	err = clocksource_register_hz(&itimer_clocksource, USEC_PER_SEC);
+ 	if (err) {
+-		printk(KERN_ERR "clocksource_register returned %d\n", err);
++		printk(KERN_ERR "clocksource_register_hz returned %d\n", err);
+ 		return;
+ 	}
+ 	clockevents_register_device(&itimer_clockevent);
+
+commit b29230769e3482bbd62a07d6d9485371ee66a18f
+Author: Thomas Gleixner <tglx@linutronix.de>
+Date:   Tue Aug 3 20:34:48 2010 +0200
+
+    um: Fix read_persistent_clock fallout
+    
+    commit 9f31f57(um: Convert to use read_persistent_clock) moved the
+    code, but not the variable.
+    
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+index 2b8b262e5c23..a08d9fab81f2 100644
+--- a/arch/um/kernel/time.c
++++ b/arch/um/kernel/time.c
+@@ -104,15 +104,14 @@ static void __init setup_itimer(void)
+ 
+ void read_persistent_clock(struct timespec *ts)
+ {
+-	nsecs = os_nsecs();
++	long long nsecs = os_nsecs();
++
+ 	set_normalized_timespec(ts, nsecs / NSEC_PER_SEC,
+ 				nsecs % NSEC_PER_SEC);
+ }
+ 
+ void __init time_init(void)
+ {
+-	long long nsecs;
+-
+ 	timer_init();
+ 	late_time_init = setup_itimer;
+ }
+
+commit 9f31f5774961a735687fee17953ab505b3df3abf
+Author: John Stultz <johnstul@us.ibm.com>
+Date:   Tue Jul 13 17:56:24 2010 -0700
+
+    um: Convert to use read_persistent_clock
+    
+    This patch converts the um arch to use read_persistent_clock().
+    This allows it to avoid accessing xtime and wall_to_monotonic
+    directly.
+    
+    Signed-off-by: John Stultz <johnstul@us.ibm.com>
+    Cc: Jeff Dike <jdike@addtoit.com>
+    LKML-Reference: <1279068988-21864-8-git-send-email-johnstul@us.ibm.com>
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+index c8b9c469fcd7..2b8b262e5c23 100644
+--- a/arch/um/kernel/time.c
++++ b/arch/um/kernel/time.c
+@@ -102,16 +102,17 @@ static void __init setup_itimer(void)
+ 	clockevents_register_device(&itimer_clockevent);
+ }
+ 
++void read_persistent_clock(struct timespec *ts)
++{
++	nsecs = os_nsecs();
++	set_normalized_timespec(ts, nsecs / NSEC_PER_SEC,
++				nsecs % NSEC_PER_SEC);
++}
++
+ void __init time_init(void)
+ {
+ 	long long nsecs;
+ 
+ 	timer_init();
+-
+-	nsecs = os_nsecs();
+-	set_normalized_timespec(&wall_to_monotonic, -nsecs / NSEC_PER_SEC,
+-				-nsecs % NSEC_PER_SEC);
+-	set_normalized_timespec(&xtime, nsecs / NSEC_PER_SEC,
+-				nsecs % NSEC_PER_SEC);
+ 	late_time_init = setup_itimer;
+ }
+
+commit 8e19608e8b5c001e4a66ce482edc474f05fb7355
+Author: Magnus Damm <damm@igel.co.jp>
+Date:   Tue Apr 21 12:24:00 2009 -0700
+
+    clocksource: pass clocksource to read() callback
+    
+    Pass clocksource pointer to the read() callback for clocksources.  This
+    allows us to share the callback between multiple instances.
+    
+    [hugh@veritas.com: fix powerpc build of clocksource pass clocksource mods]
+    [akpm@linux-foundation.org: cleanup]
+    Signed-off-by: Magnus Damm <damm@igel.co.jp>
+    Acked-by: John Stultz <johnstul@us.ibm.com>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Signed-off-by: Hugh Dickins <hugh@veritas.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+index b13a87a3ec95..c8b9c469fcd7 100644
+--- a/arch/um/kernel/time.c
++++ b/arch/um/kernel/time.c
+@@ -65,7 +65,7 @@ static irqreturn_t um_timer(int irq, void *dev)
+ 	return IRQ_HANDLED;
+ }
+ 
+-static cycle_t itimer_read(void)
++static cycle_t itimer_read(struct clocksource *cs)
+ {
+ 	return os_nsecs() / 1000;
+ }
+
+commit 320ab2b0b1e08e3805a3e1084a2f0eb1938d5d67
+Author: Rusty Russell <rusty@rustcorp.com.au>
+Date:   Sat Dec 13 21:20:26 2008 +1030
+
+    cpumask: convert struct clock_event_device to cpumask pointers.
+    
+    Impact: change calling convention of existing clock_event APIs
+    
+    struct clock_event_timer's cpumask field gets changed to take pointer,
+    as does the ->broadcast function.
+    
+    Another single-patch change.  For safety, we BUG_ON() in
+    clockevents_register_device() if it's not set.
+    
+    Signed-off-by: Rusty Russell <rusty@rustcorp.com.au>
+    Cc: Ingo Molnar <mingo@elte.hu>
+
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+index 47f04f4a3464..b13a87a3ec95 100644
+--- a/arch/um/kernel/time.c
++++ b/arch/um/kernel/time.c
+@@ -50,7 +50,7 @@ static int itimer_next_event(unsigned long delta,
+ static struct clock_event_device itimer_clockevent = {
+ 	.name		= "itimer",
+ 	.rating		= 250,
+-	.cpumask	= CPU_MASK_ALL,
++	.cpumask	= cpu_all_mask,
+ 	.features	= CLOCK_EVT_FEAT_PERIODIC | CLOCK_EVT_FEAT_ONESHOT,
+ 	.set_mode	= itimer_set_mode,
+ 	.set_next_event = itimer_next_event,
+
+commit 99764fa4ceeecba8b9e0a8a5565b418a2e94f83b
+Author: WANG Cong <xiyou.wangcong@gmail.com>
+Date:   Wed Jul 23 21:28:49 2008 -0700
+
+    UML: make several more things static
+    
+    - Make some variables and functions static, since they don't need to be
+      global.
+    
+    - Remove an unused function - arch/um/kernel/time.c::sched_clock().
+    
+    - Clean the style a bit as complained by checkpatch.pl.
+    
+    Cc: Jeff Dike <jdike@addtoit.com>
+    Signed-off-by: WANG Cong <wangcong@zeuux.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+index c3e2f369c33c..47f04f4a3464 100644
+--- a/arch/um/kernel/time.c
++++ b/arch/um/kernel/time.c
+@@ -13,14 +13,6 @@
+ #include "kern_util.h"
+ #include "os.h"
+ 
+-/*
+- * Scheduler clock - returns current time in nanosec units.
+- */
+-unsigned long long sched_clock(void)
+-{
+-	return (unsigned long long)jiffies_64 * (NSEC_PER_SEC / HZ);
+-}
+-
+ void timer_handler(int sig, struct uml_pt_regs *regs)
+ {
+ 	unsigned long flags;
+
+commit cfd28f6695d0fc047478480791a21bdd4967f98e
+Author: Jeff Dike <jdike@addtoit.com>
+Date:   Mon May 12 14:01:53 2008 -0700
+
+    uml: fix bad NTP interaction with clock
+    
+    UML's supposed nanosecond clock interacts badly with NTP when NTP
+    decides that the clock has drifted ahead and needs to be slowed down.
+    Slowing down the clock is done by decrementing the cycle-to-nanosecond
+    multiplier, which is 1.  Decrementing that gives you 0 and time is
+    stopped.
+    
+    This is fixed by switching to a microsecond clock, with a multiplier
+    of 1000.
+    
+    Signed-off-by: Jeff Dike <jdike@linux.intel.com>
+    Cc: WANG Cong <xiyou.wangcong@gmail.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+index 0d0cea2ac98d..c3e2f369c33c 100644
+--- a/arch/um/kernel/time.c
++++ b/arch/um/kernel/time.c
+@@ -75,7 +75,7 @@ static irqreturn_t um_timer(int irq, void *dev)
+ 
+ static cycle_t itimer_read(void)
+ {
+-	return os_nsecs();
++	return os_nsecs() / 1000;
+ }
+ 
+ static struct clocksource itimer_clocksource = {
+@@ -83,7 +83,7 @@ static struct clocksource itimer_clocksource = {
+ 	.rating		= 300,
+ 	.read		= itimer_read,
+ 	.mask		= CLOCKSOURCE_MASK(64),
+-	.mult		= 1,
++	.mult		= 1000,
+ 	.shift		= 0,
+ 	.flags		= CLOCK_SOURCE_IS_CONTINUOUS,
+ };
+
+commit 7d195a5409120277b800c42e846ee29cc667b777
+Author: Adrian Bunk <bunk@kernel.org>
+Date:   Tue Apr 29 00:59:18 2008 -0700
+
+    proper extern for late_time_init
+    
+    Add a proper extern for late_time_init in include/linux/init.h
+    
+    Signed-off-by: Adrian Bunk <bunk@kernel.org>
+    Acked-by: Ingo Molnar <mingo@elte.hu>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: john stultz <johnstul@us.ibm.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+index e066e84493b1..0d0cea2ac98d 100644
+--- a/arch/um/kernel/time.c
++++ b/arch/um/kernel/time.c
+@@ -4,6 +4,7 @@
+  */
+ 
+ #include <linux/clockchips.h>
++#include <linux/init.h>
+ #include <linux/interrupt.h>
+ #include <linux/jiffies.h>
+ #include <linux/threads.h>
+@@ -109,8 +110,6 @@ static void __init setup_itimer(void)
+ 	clockevents_register_device(&itimer_clockevent);
+ }
+ 
+-extern void (*late_time_init)(void);
+-
+ void __init time_init(void)
+ {
+ 	long long nsecs;
+
+commit c5d4bb171cab17576779a51d23d313abcb3db102
+Author: Jeff Dike <jdike@addtoit.com>
+Date:   Mon Feb 4 22:31:14 2008 -0800
+
+    uml: style fixes in arch/um/kernel
+    
+    Joe Perches noticed some printks in smp.c that needed fixing.
+    
+    While I was in there, I did the usual tidying in arch/um/kernel, which
+    should be fairly style-clean at this point:
+            copyright updates
+            emacs formatting comments removal
+            include tidying
+            style fixes
+    
+    Cc: Joe Perches <joe@perches.com>
+    Signed-off-by: Jeff Dike <jdike@linux.intel.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+index 1ac746a9eae1..e066e84493b1 100644
+--- a/arch/um/kernel/time.c
++++ b/arch/um/kernel/time.c
+@@ -3,12 +3,12 @@
+  * Licensed under the GPL
+  */
+ 
+-#include "linux/clockchips.h"
+-#include "linux/interrupt.h"
+-#include "linux/jiffies.h"
+-#include "linux/threads.h"
+-#include "asm/irq.h"
+-#include "asm/param.h"
++#include <linux/clockchips.h>
++#include <linux/interrupt.h>
++#include <linux/jiffies.h>
++#include <linux/threads.h>
++#include <asm/irq.h>
++#include <asm/param.h>
+ #include "kern_util.h"
+ #include "os.h"
+ 
+@@ -32,7 +32,7 @@ void timer_handler(int sig, struct uml_pt_regs *regs)
+ static void itimer_set_mode(enum clock_event_mode mode,
+ 			    struct clock_event_device *evt)
+ {
+-	switch(mode) {
++	switch (mode) {
+ 	case CLOCK_EVT_MODE_PERIODIC:
+ 		set_interval();
+ 		break;
+
+commit 1a80521990a0e30e61a92994a009adc52161b070
+Author: Jeff Dike <jdike@addtoit.com>
+Date:   Tue Oct 16 01:27:28 2007 -0700
+
+    uml: use *SEC_PER_*SEC constants
+    
+    There are various uses of powers of 1000, plus the odd BILLION constant in the
+    time code.  However, there are perfectly good definitions of *SEC_PER_*SEC in
+    linux/time.h which can be used instaed.
+    
+    These are replaced directly in kernel code.  Userspace code imports those
+    constants as UM_*SEC_PER_*SEC and uses these.
+    
+    Signed-off-by: Jeff Dike <jdike@linux.intel.com>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+index 2acdc7efb2ac..1ac746a9eae1 100644
+--- a/arch/um/kernel/time.c
++++ b/arch/um/kernel/time.c
+@@ -17,7 +17,7 @@
+  */
+ unsigned long long sched_clock(void)
+ {
+-	return (unsigned long long)jiffies_64 * (1000000000 / HZ);
++	return (unsigned long long)jiffies_64 * (NSEC_PER_SEC / HZ);
+ }
+ 
+ void timer_handler(int sig, struct uml_pt_regs *regs)
+@@ -118,8 +118,9 @@ void __init time_init(void)
+ 	timer_init();
+ 
+ 	nsecs = os_nsecs();
+-	set_normalized_timespec(&wall_to_monotonic, -nsecs / BILLION,
+-				-nsecs % BILLION);
+-	set_normalized_timespec(&xtime, nsecs / BILLION, nsecs % BILLION);
++	set_normalized_timespec(&wall_to_monotonic, -nsecs / NSEC_PER_SEC,
++				-nsecs % NSEC_PER_SEC);
++	set_normalized_timespec(&xtime, nsecs / NSEC_PER_SEC,
++				nsecs % NSEC_PER_SEC);
+ 	late_time_init = setup_itimer;
+ }
+
+commit d2753a6d199791a6abc75d9f657e3457fe61705f
+Author: Jeff Dike <jdike@addtoit.com>
+Date:   Tue Oct 16 01:27:25 2007 -0700
+
+    uml: tickless support
+    
+    Enable tickless support.
+    
+    CONFIG_TICK_ONESHOT and CONFIG_NO_HZ are enabled.
+    
+    itimer_clockevent gets CLOCK_EVT_FEAT_ONESHOT and an implementation of
+    .set_next_event.
+    
+    CONFIG_UML_REAL_TIME_CLOCK goes away because it only makes sense when there is
+    a clock ticking away all the time.  timer_handler now just calls do_IRQ once
+    without trying to figure out how many ticks to emulate.
+    
+    The idle loop now needs to turn ticking on and off.
+    
+    Userspace ticks keep happening as usual.  However, the userspace loop keep
+    track of when the next wakeup should happen and suppresses process ticks until
+    that happens.
+    
+    Signed-off-by: Jeff Dike <jdike@linux.intel.com>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+index 3cb7135e5c47..2acdc7efb2ac 100644
+--- a/arch/um/kernel/time.c
++++ b/arch/um/kernel/time.c
+@@ -20,41 +20,12 @@ unsigned long long sched_clock(void)
+ 	return (unsigned long long)jiffies_64 * (1000000000 / HZ);
+ }
+ 
+-#ifdef CONFIG_UML_REAL_TIME_CLOCK
+-static unsigned long long prev_nsecs[NR_CPUS];
+-static long long delta[NR_CPUS];		/* Deviation per interval */
+-#endif
+-
+ void timer_handler(int sig, struct uml_pt_regs *regs)
+ {
+-	unsigned long long ticks = 0;
+ 	unsigned long flags;
+-#ifdef CONFIG_UML_REAL_TIME_CLOCK
+-	int c = cpu();
+-	if (prev_nsecs[c]) {
+-		/* We've had 1 tick */
+-		unsigned long long nsecs = os_nsecs();
+-
+-		delta[c] += nsecs - prev_nsecs[c];
+-		prev_nsecs[c] = nsecs;
+-
+-		/* Protect against the host clock being set backwards */
+-		if (delta[c] < 0)
+-			delta[c] = 0;
+-
+-		ticks += (delta[c] * HZ) / BILLION;
+-		delta[c] -= (ticks * BILLION) / HZ;
+-	}
+-	else prev_nsecs[c] = os_nsecs();
+-#else
+-	ticks = 1;
+-#endif
+ 
+ 	local_irq_save(flags);
+-	while (ticks > 0) {
+-		do_IRQ(TIMER_IRQ, regs);
+-		ticks--;
+-	}
++	do_IRQ(TIMER_IRQ, regs);
+ 	local_irq_restore(flags);
+ }
+ 
+@@ -68,10 +39,8 @@ static void itimer_set_mode(enum clock_event_mode mode,
+ 
+ 	case CLOCK_EVT_MODE_SHUTDOWN:
+ 	case CLOCK_EVT_MODE_UNUSED:
+-		disable_timer();
+-		break;
+ 	case CLOCK_EVT_MODE_ONESHOT:
+-		BUG();
++		disable_timer();
+ 		break;
+ 
+ 	case CLOCK_EVT_MODE_RESUME:
+@@ -79,13 +48,19 @@ static void itimer_set_mode(enum clock_event_mode mode,
+ 	}
+ }
+ 
++static int itimer_next_event(unsigned long delta,
++			     struct clock_event_device *evt)
++{
++	return timer_one_shot(delta + 1);
++}
++
+ static struct clock_event_device itimer_clockevent = {
+ 	.name		= "itimer",
+ 	.rating		= 250,
+ 	.cpumask	= CPU_MASK_ALL,
+-	.features	= CLOCK_EVT_FEAT_PERIODIC,
++	.features	= CLOCK_EVT_FEAT_PERIODIC | CLOCK_EVT_FEAT_ONESHOT,
+ 	.set_mode	= itimer_set_mode,
+-	.set_next_event = NULL,
++	.set_next_event = itimer_next_event,
+ 	.shift		= 32,
+ 	.irq		= 0,
+ };
+
+commit 791a644a8d73a9b95515f074afbb3caa0a9964fa
+Author: Jeff Dike <jdike@addtoit.com>
+Date:   Tue Oct 16 01:27:25 2007 -0700
+
+    uml: clocksource support
+    
+    Add clocksource support.
+    
+    Signed-off-by: Jeff Dike <jdike@linux.intel.com>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+index 01678487b999..3cb7135e5c47 100644
+--- a/arch/um/kernel/time.c
++++ b/arch/um/kernel/time.c
+@@ -97,6 +97,21 @@ static irqreturn_t um_timer(int irq, void *dev)
+ 	return IRQ_HANDLED;
+ }
+ 
++static cycle_t itimer_read(void)
++{
++	return os_nsecs();
++}
++
++static struct clocksource itimer_clocksource = {
++	.name		= "itimer",
++	.rating		= 300,
++	.read		= itimer_read,
++	.mask		= CLOCKSOURCE_MASK(64),
++	.mult		= 1,
++	.shift		= 0,
++	.flags		= CLOCK_SOURCE_IS_CONTINUOUS,
++};
++
+ static void __init setup_itimer(void)
+ {
+ 	int err;
+@@ -111,6 +126,11 @@ static void __init setup_itimer(void)
+ 		clockevent_delta2ns(60 * HZ, &itimer_clockevent);
+ 	itimer_clockevent.min_delta_ns =
+ 		clockevent_delta2ns(1, &itimer_clockevent);
++	err = clocksource_register(&itimer_clocksource);
++	if (err) {
++		printk(KERN_ERR "clocksource_register returned %d\n", err);
++		return;
++	}
+ 	clockevents_register_device(&itimer_clockevent);
+ }
+ 
+
+commit 31ccc1f524b626abcf5e043ad32b881219223c34
+Author: Jeff Dike <jdike@addtoit.com>
+Date:   Tue Oct 16 01:27:24 2007 -0700
+
+    uml: GENERIC_CLOCKEVENTS support
+    
+    Enable CONFIG_GENERIC_CLOCKEVENTS.
+    
+    timer_irq gets its name changed to timer_handler, and becomes the recipient of
+    timer signals.
+    
+    The clock_event_device is set up to imitate the current ticking clock, i.e.
+    CLOCK_EVT_FEAT_ONESHOT is not enabled yet.
+    
+    disable_timer now doesn't ignore SIGALRM and SIGVTALRM because that breaks
+    delay calibration.
+    
+    Signed-off-by: Jeff Dike <jdike@linux.intel.com>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+index 7678bcf830ba..01678487b999 100644
+--- a/arch/um/kernel/time.c
++++ b/arch/um/kernel/time.c
+@@ -3,6 +3,7 @@
+  * Licensed under the GPL
+  */
+ 
++#include "linux/clockchips.h"
+ #include "linux/interrupt.h"
+ #include "linux/jiffies.h"
+ #include "linux/threads.h"
+@@ -24,9 +25,10 @@ static unsigned long long prev_nsecs[NR_CPUS];
+ static long long delta[NR_CPUS];		/* Deviation per interval */
+ #endif
+ 
+-void timer_irq(struct uml_pt_regs *regs)
++void timer_handler(int sig, struct uml_pt_regs *regs)
+ {
+ 	unsigned long long ticks = 0;
++	unsigned long flags;
+ #ifdef CONFIG_UML_REAL_TIME_CLOCK
+ 	int c = cpu();
+ 	if (prev_nsecs[c]) {
+@@ -47,89 +49,82 @@ void timer_irq(struct uml_pt_regs *regs)
+ #else
+ 	ticks = 1;
+ #endif
++
++	local_irq_save(flags);
+ 	while (ticks > 0) {
+ 		do_IRQ(TIMER_IRQ, regs);
+ 		ticks--;
+ 	}
++	local_irq_restore(flags);
+ }
+ 
+-/* Protects local_offset */
+-static DEFINE_SPINLOCK(timer_spinlock);
+-static unsigned long long local_offset = 0;
+-
+-static inline unsigned long long get_time(void)
++static void itimer_set_mode(enum clock_event_mode mode,
++			    struct clock_event_device *evt)
+ {
+-	unsigned long long nsecs;
+-	unsigned long flags;
+-
+-	spin_lock_irqsave(&timer_spinlock, flags);
+-	nsecs = os_nsecs();
+-	nsecs += local_offset;
+-	spin_unlock_irqrestore(&timer_spinlock, flags);
+-
+-	return nsecs;
++	switch(mode) {
++	case CLOCK_EVT_MODE_PERIODIC:
++		set_interval();
++		break;
++
++	case CLOCK_EVT_MODE_SHUTDOWN:
++	case CLOCK_EVT_MODE_UNUSED:
++		disable_timer();
++		break;
++	case CLOCK_EVT_MODE_ONESHOT:
++		BUG();
++		break;
++
++	case CLOCK_EVT_MODE_RESUME:
++		break;
++	}
+ }
+ 
+-irqreturn_t um_timer(int irq, void *dev)
++static struct clock_event_device itimer_clockevent = {
++	.name		= "itimer",
++	.rating		= 250,
++	.cpumask	= CPU_MASK_ALL,
++	.features	= CLOCK_EVT_FEAT_PERIODIC,
++	.set_mode	= itimer_set_mode,
++	.set_next_event = NULL,
++	.shift		= 32,
++	.irq		= 0,
++};
++
++static irqreturn_t um_timer(int irq, void *dev)
+ {
+-	unsigned long long nsecs;
+-	unsigned long flags;
+-
+-	write_seqlock_irqsave(&xtime_lock, flags);
+-
+-	do_timer(1);
+-
+-#ifdef CONFIG_UML_REAL_TIME_CLOCK
+-	nsecs = get_time();
+-#else
+-	nsecs = (unsigned long long) xtime.tv_sec * BILLION + xtime.tv_nsec +
+-		BILLION / HZ;
+-#endif
+-	xtime.tv_sec = nsecs / NSEC_PER_SEC;
+-	xtime.tv_nsec = nsecs - xtime.tv_sec * NSEC_PER_SEC;
+-
+-	write_sequnlock_irqrestore(&xtime_lock, flags);
++	(*itimer_clockevent.event_handler)(&itimer_clockevent);
+ 
+ 	return IRQ_HANDLED;
+ }
+ 
+-static void register_timer(void)
++static void __init setup_itimer(void)
+ {
+ 	int err;
+ 
+-	timer_init();
+-
+ 	err = request_irq(TIMER_IRQ, um_timer, IRQF_DISABLED, "timer", NULL);
+ 	if (err != 0)
+ 		printk(KERN_ERR "register_timer : request_irq failed - "
+ 		       "errno = %d\n", -err);
+ 
+-	err = set_interval();
+-	if (err != 0)
+-		printk(KERN_ERR "register_timer : set_interval failed - "
+-		       "errno = %d\n", -err);
++	itimer_clockevent.mult = div_sc(HZ, NSEC_PER_SEC, 32);
++	itimer_clockevent.max_delta_ns =
++		clockevent_delta2ns(60 * HZ, &itimer_clockevent);
++	itimer_clockevent.min_delta_ns =
++		clockevent_delta2ns(1, &itimer_clockevent);
++	clockevents_register_device(&itimer_clockevent);
+ }
+ 
+ extern void (*late_time_init)(void);
+ 
+-void time_init(void)
++void __init time_init(void)
+ {
+ 	long long nsecs;
+ 
++	timer_init();
++
+ 	nsecs = os_nsecs();
+ 	set_normalized_timespec(&wall_to_monotonic, -nsecs / BILLION,
+ 				-nsecs % BILLION);
+ 	set_normalized_timespec(&xtime, nsecs / BILLION, nsecs % BILLION);
+-	late_time_init = register_timer;
+-}
+-
+-void timer_handler(int sig, struct uml_pt_regs *regs)
+-{
+-	if (current_thread->cpu == 0)
+-		timer_irq(regs);
+-	local_irq_disable();
+-	irq_enter();
+-	update_process_times(regs->is_user);
+-	irq_exit();
+-	local_irq_enable();
++	late_time_init = setup_itimer;
+ }
+
+commit d83d2aa9485d996cfd89f04389b419c6727faacb
+Author: Jeff Dike <jdike@addtoit.com>
+Date:   Tue Oct 16 01:27:23 2007 -0700
+
+    uml: GENERIC_TIME support
+    
+    Enable CONFIG_GENERIC_TIME.
+    
+    As a side-effect of this, the UML implementations of do_gettimeofday and
+    do_settimeofday go away, as these are provided by generic code.  set_time also
+    goes away since it was only used by do_settimeofday.
+    
+    Signed-off-by: Jeff Dike <jdike@linux.intel.com>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+index 758d4f9cb22a..7678bcf830ba 100644
+--- a/arch/um/kernel/time.c
++++ b/arch/um/kernel/time.c
+@@ -123,46 +123,6 @@ void time_init(void)
+ 	late_time_init = register_timer;
+ }
+ 
+-void do_gettimeofday(struct timeval *tv)
+-{
+-#ifdef CONFIG_UML_REAL_TIME_CLOCK
+-	unsigned long long nsecs = get_time();
+-#else
+-	unsigned long long nsecs = (unsigned long long) xtime.tv_sec * BILLION +
+-		xtime.tv_nsec;
+-#endif
+-	tv->tv_sec = nsecs / NSEC_PER_SEC;
+-	/*
+-	 * Careful about calculations here - this was originally done as
+-	 * (nsecs - tv->tv_sec * NSEC_PER_SEC) / NSEC_PER_USEC
+-	 * which gave bogus (> 1000000) values.  Dunno why, suspect gcc
+-	 * (4.0.0) miscompiled it, or there's a subtle 64/32-bit conversion
+-	 * problem that I missed.
+-	 */
+-	nsecs -= tv->tv_sec * NSEC_PER_SEC;
+-	tv->tv_usec = (unsigned long) nsecs / NSEC_PER_USEC;
+-}
+-
+-static inline void set_time(unsigned long long nsecs)
+-{
+-	unsigned long long now;
+-	unsigned long flags;
+-
+-	spin_lock_irqsave(&timer_spinlock, flags);
+-	now = os_nsecs();
+-	local_offset = nsecs - now;
+-	spin_unlock_irqrestore(&timer_spinlock, flags);
+-
+-	clock_was_set();
+-}
+-
+-int do_settimeofday(struct timespec *tv)
+-{
+-	set_time((unsigned long long) tv->tv_sec * NSEC_PER_SEC + tv->tv_nsec);
+-
+-	return 0;
+-}
+-
+ void timer_handler(int sig, struct uml_pt_regs *regs)
+ {
+ 	if (current_thread->cpu == 0)
+
+commit 78a26e25ce4837a03ac3b6c32cdae1958e547639
+Author: Jeff Dike <jdike@addtoit.com>
+Date:   Tue Oct 16 01:27:23 2007 -0700
+
+    uml: separate timer initialization
+    
+    Move timer signal initialization from init_irq_signals to a new function,
+    timer_init.
+    
+    Signed-off-by: Jeff Dike <jdike@linux.intel.com>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+index 2bda07dcd345..758d4f9cb22a 100644
+--- a/arch/um/kernel/time.c
++++ b/arch/um/kernel/time.c
+@@ -97,6 +97,8 @@ static void register_timer(void)
+ {
+ 	int err;
+ 
++	timer_init();
++
+ 	err = request_irq(TIMER_IRQ, um_timer, IRQF_DISABLED, "timer", NULL);
+ 	if (err != 0)
+ 		printk(KERN_ERR "register_timer : request_irq failed - "
+
+commit a2f018bf389422a55f1455ab8b9b5eedc5ea1803
+Author: Jeff Dike <jdike@addtoit.com>
+Date:   Tue Oct 16 01:27:22 2007 -0700
+
+    uml: simplify interval setting
+    
+    set_interval took a timer type as an argument, but it always specified a
+    virtual timer.  So, it is not needed, and it is gone, and set_interval is
+    simplified appropriately.
+    
+    Signed-off-by: Jeff Dike <jdike@linux.intel.com>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+index 633b673d5778..2bda07dcd345 100644
+--- a/arch/um/kernel/time.c
++++ b/arch/um/kernel/time.c
+@@ -102,7 +102,7 @@ static void register_timer(void)
+ 		printk(KERN_ERR "register_timer : request_irq failed - "
+ 		       "errno = %d\n", -err);
+ 
+-	err = set_interval(1);
++	err = set_interval();
+ 	if (err != 0)
+ 		printk(KERN_ERR "register_timer : set_interval failed - "
+ 		       "errno = %d\n", -err);
+
+commit 532d0fa4d104ca3e37dd38bc5073376fcc3c2712
+Author: Jeff Dike <jdike@addtoit.com>
+Date:   Tue Oct 16 01:27:21 2007 -0700
+
+    uml: eliminate hz()
+    
+    Eliminate hz() since its only purpose was to provide a kernel-space constant
+    to userspace code.  This can be done instead by providing the constant
+    directly through kernel_constants.h.
+    
+    Signed-off-by: Jeff Dike <jdike@linux.intel.com>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+index 4fc8c2586b70..633b673d5778 100644
+--- a/arch/um/kernel/time.c
++++ b/arch/um/kernel/time.c
+@@ -11,11 +11,6 @@
+ #include "kern_util.h"
+ #include "os.h"
+ 
+-int hz(void)
+-{
+-	return HZ;
+-}
+-
+ /*
+  * Scheduler clock - returns current time in nanosec units.
+  */
+
+commit ba180fd437156f7fd8cfb2fdd021d949eeef08d6
+Author: Jeff Dike <jdike@addtoit.com>
+Date:   Tue Oct 16 01:27:00 2007 -0700
+
+    uml: style fixes pass 3
+    
+    Formatting changes in the files which have been changed in the course
+    of folding foo_skas functions into their callers.  These include:
+            copyright updates
+            header file trimming
+            style fixes
+            adding severity to printks
+    
+    These changes should be entirely non-functional.
+    
+    Signed-off-by: Jeff Dike <jdike@linux.intel.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+index 90e24e2dbeaa..4fc8c2586b70 100644
+--- a/arch/um/kernel/time.c
++++ b/arch/um/kernel/time.c
+@@ -1,28 +1,19 @@
+ /*
+- * Copyright (C) 2000 Jeff Dike (jdike@karaya.com)
++ * Copyright (C) 2000 - 2007 Jeff Dike (jdike@{addtoit,linux.intel}.com)
+  * Licensed under the GPL
+  */
+ 
+-#include "linux/kernel.h"
+-#include "linux/module.h"
+-#include "linux/unistd.h"
+-#include "linux/stddef.h"
+-#include "linux/spinlock.h"
+-#include "linux/time.h"
+-#include "linux/sched.h"
+ #include "linux/interrupt.h"
+-#include "linux/init.h"
+-#include "linux/delay.h"
+-#include "linux/hrtimer.h"
++#include "linux/jiffies.h"
++#include "linux/threads.h"
+ #include "asm/irq.h"
+ #include "asm/param.h"
+-#include "asm/current.h"
+ #include "kern_util.h"
+ #include "os.h"
+ 
+ int hz(void)
+ {
+-	return(HZ);
++	return HZ;
+ }
+ 
+ /*
+@@ -43,7 +34,7 @@ void timer_irq(struct uml_pt_regs *regs)
+ 	unsigned long long ticks = 0;
+ #ifdef CONFIG_UML_REAL_TIME_CLOCK
+ 	int c = cpu();
+-	if(prev_nsecs[c]){
++	if (prev_nsecs[c]) {
+ 		/* We've had 1 tick */
+ 		unsigned long long nsecs = os_nsecs();
+ 
+@@ -51,7 +42,7 @@ void timer_irq(struct uml_pt_regs *regs)
+ 		prev_nsecs[c] = nsecs;
+ 
+ 		/* Protect against the host clock being set backwards */
+-		if(delta[c] < 0)
++		if (delta[c] < 0)
+ 			delta[c] = 0;
+ 
+ 		ticks += (delta[c] * HZ) / BILLION;
+@@ -61,7 +52,7 @@ void timer_irq(struct uml_pt_regs *regs)
+ #else
+ 	ticks = 1;
+ #endif
+-	while(ticks > 0){
++	while (ticks > 0) {
+ 		do_IRQ(TIMER_IRQ, regs);
+ 		ticks--;
+ 	}
+@@ -112,12 +103,12 @@ static void register_timer(void)
+ 	int err;
+ 
+ 	err = request_irq(TIMER_IRQ, um_timer, IRQF_DISABLED, "timer", NULL);
+-	if(err != 0)
++	if (err != 0)
+ 		printk(KERN_ERR "register_timer : request_irq failed - "
+ 		       "errno = %d\n", -err);
+ 
+ 	err = set_interval(1);
+-	if(err != 0)
++	if (err != 0)
+ 		printk(KERN_ERR "register_timer : set_interval failed - "
+ 		       "errno = %d\n", -err);
+ }
+@@ -144,7 +135,8 @@ void do_gettimeofday(struct timeval *tv)
+ 		xtime.tv_nsec;
+ #endif
+ 	tv->tv_sec = nsecs / NSEC_PER_SEC;
+-	/* Careful about calculations here - this was originally done as
++	/*
++	 * Careful about calculations here - this was originally done as
+ 	 * (nsecs - tv->tv_sec * NSEC_PER_SEC) / NSEC_PER_USEC
+ 	 * which gave bogus (> 1000000) values.  Dunno why, suspect gcc
+ 	 * (4.0.0) miscompiled it, or there's a subtle 64/32-bit conversion
+@@ -176,7 +168,7 @@ int do_settimeofday(struct timespec *tv)
+ 
+ void timer_handler(int sig, struct uml_pt_regs *regs)
+ {
+-	if(current_thread->cpu == 0)
++	if (current_thread->cpu == 0)
+ 		timer_irq(regs);
+ 	local_irq_disable();
+ 	irq_enter();
+
+commit 77bf4400319db9d2a8af6b00c2be6faa0f3d07cb
+Author: Jeff Dike <jdike@addtoit.com>
+Date:   Tue Oct 16 01:26:58 2007 -0700
+
+    uml: remove code made redundant by CHOOSE_MODE removal
+    
+    This patch makes a number of simplifications enabled by the removal of
+    CHOOSE_MODE.  There were lots of functions that looked like
+    
+            int foo(args){
+                    foo_skas(args);
+            }
+    
+    The bodies of foo_skas are now folded into foo, and their declarations (and
+    sometimes entire header files) are deleted.
+    
+    In addition, the union uml_pt_regs, which was a union between the tt and skas
+    register formats, is now a struct, with the tt-mode arm of the union being
+    removed.
+    
+    It turns out that usr2_handler was unused, so it is gone.
+    
+    Signed-off-by: Jeff Dike <jdike@linux.intel.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+index 3571703a7cb4..90e24e2dbeaa 100644
+--- a/arch/um/kernel/time.c
++++ b/arch/um/kernel/time.c
+@@ -18,7 +18,6 @@
+ #include "asm/param.h"
+ #include "asm/current.h"
+ #include "kern_util.h"
+-#include "mode.h"
+ #include "os.h"
+ 
+ int hz(void)
+@@ -39,7 +38,7 @@ static unsigned long long prev_nsecs[NR_CPUS];
+ static long long delta[NR_CPUS];		/* Deviation per interval */
+ #endif
+ 
+-void timer_irq(union uml_pt_regs *regs)
++void timer_irq(struct uml_pt_regs *regs)
+ {
+ 	unsigned long long ticks = 0;
+ #ifdef CONFIG_UML_REAL_TIME_CLOCK
+@@ -175,13 +174,13 @@ int do_settimeofday(struct timespec *tv)
+ 	return 0;
+ }
+ 
+-void timer_handler(int sig, union uml_pt_regs *regs)
++void timer_handler(int sig, struct uml_pt_regs *regs)
+ {
+ 	if(current_thread->cpu == 0)
+ 		timer_irq(regs);
+ 	local_irq_disable();
+ 	irq_enter();
+-	update_process_times((regs)->skas.is_user);
++	update_process_times(regs->is_user);
+ 	irq_exit();
+ 	local_irq_enable();
+ }
+
+commit 6aa802ce6acc9b1f0b34114b3f7c21c84872cc3a
+Author: Jeff Dike <jdike@addtoit.com>
+Date:   Tue Oct 16 01:26:56 2007 -0700
+
+    uml: throw out CHOOSE_MODE
+    
+    The next stage after removing code which depends on CONFIG_MODE_TT is removing
+    the CHOOSE_MODE abstraction, which provided both compile-time and run-time
+    branching to either tt-mode or skas-mode code.
+    
+    This patch removes choose-mode.h and all inclusions of it, and replaces all
+    CHOOSE_MODE invocations with the skas branch.  This leaves a number of trivial
+    functions which will be dealt with in a later patch.
+    
+    There are some changes in the uaccess and tls support which go somewhat beyond
+    this and eliminate some of the now-redundant functions.
+    
+    Signed-off-by: Jeff Dike <jdike@linux.intel.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+index 259c49da7ff5..3571703a7cb4 100644
+--- a/arch/um/kernel/time.c
++++ b/arch/um/kernel/time.c
+@@ -181,9 +181,7 @@ void timer_handler(int sig, union uml_pt_regs *regs)
+ 		timer_irq(regs);
+ 	local_irq_disable();
+ 	irq_enter();
+-	update_process_times(CHOOSE_MODE(
+-	                     (UPT_SC(regs) && user_context(UPT_SP(regs))),
+-			     (regs)->skas.is_user));
++	update_process_times((regs)->skas.is_user);
+ 	irq_exit();
+ 	local_irq_enable();
+ }
+
+commit c83e44842074a87614c78eca70fa6467b0bc3c4a
+Author: Jeff Dike <jdike@addtoit.com>
+Date:   Tue May 8 00:23:22 2007 -0700
+
+    uml: an idle system should have zero load average
+    
+    The ever-vigilant users of linode.com noticed that an idle 2.6 UML has a
+    persistent load average of ~.4.
+    
+    It turns out that because the UML timer handler processed softirqs before
+    actually delivering the tick, the tick was counted in the context of the idle
+    thread about half the time.
+    
+    Signed-off-by: Jeff Dike <jdike@linux.intel.com>
+    Cc: Paolo 'Blaisorblade' Giarrusso <blaisorblade@yahoo.it>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+index cd7349de8ca6..259c49da7ff5 100644
+--- a/arch/um/kernel/time.c
++++ b/arch/um/kernel/time.c
+@@ -177,6 +177,8 @@ int do_settimeofday(struct timespec *tv)
+ 
+ void timer_handler(int sig, union uml_pt_regs *regs)
+ {
++	if(current_thread->cpu == 0)
++		timer_irq(regs);
+ 	local_irq_disable();
+ 	irq_enter();
+ 	update_process_times(CHOOSE_MODE(
+@@ -184,6 +186,4 @@ void timer_handler(int sig, union uml_pt_regs *regs)
+ 			     (regs)->skas.is_user));
+ 	irq_exit();
+ 	local_irq_enable();
+-	if(current_thread->cpu == 0)
+-		timer_irq(regs);
+ }
+
+commit b7ec15bd004f4524bf091f851348da2ccb519e4f
+Author: Jeff Dike <jdike@addtoit.com>
+Date:   Sun May 6 14:51:51 2007 -0700
+
+    uml: virtualized time fix
+    
+    With the current timekeeping, !CONFIG_UML_REAL_TIME_CLOCK has
+    inconsistent behavior.  Previously, gettimeofday could be (and was)
+    isolated from the clock ticking.  Now, it's not, so when
+    CONFIG_UML_REAL_TIME_CLOCK is disabled, gettimeofday must progress in
+    lockstep with the clock, making it fully virtual.
+    
+    Signed-off-by: Jeff Dike <jdike@linux.intel.com>
+    Cc: Paolo 'Blaisorblade' Giarrusso <blaisorblade@yahoo.it>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+index 9fd80ee3eef6..cd7349de8ca6 100644
+--- a/arch/um/kernel/time.c
++++ b/arch/um/kernel/time.c
+@@ -34,8 +34,8 @@ unsigned long long sched_clock(void)
+ 	return (unsigned long long)jiffies_64 * (1000000000 / HZ);
+ }
+ 
+-static unsigned long long prev_nsecs[NR_CPUS];
+ #ifdef CONFIG_UML_REAL_TIME_CLOCK
++static unsigned long long prev_nsecs[NR_CPUS];
+ static long long delta[NR_CPUS];		/* Deviation per interval */
+ #endif
+ 
+@@ -94,7 +94,12 @@ irqreturn_t um_timer(int irq, void *dev)
+ 
+ 	do_timer(1);
+ 
++#ifdef CONFIG_UML_REAL_TIME_CLOCK
+ 	nsecs = get_time();
++#else
++	nsecs = (unsigned long long) xtime.tv_sec * BILLION + xtime.tv_nsec +
++		BILLION / HZ;
++#endif
+ 	xtime.tv_sec = nsecs / NSEC_PER_SEC;
+ 	xtime.tv_nsec = nsecs - xtime.tv_sec * NSEC_PER_SEC;
+ 
+@@ -127,13 +132,18 @@ void time_init(void)
+ 	nsecs = os_nsecs();
+ 	set_normalized_timespec(&wall_to_monotonic, -nsecs / BILLION,
+ 				-nsecs % BILLION);
++	set_normalized_timespec(&xtime, nsecs / BILLION, nsecs % BILLION);
+ 	late_time_init = register_timer;
+ }
+ 
+ void do_gettimeofday(struct timeval *tv)
+ {
++#ifdef CONFIG_UML_REAL_TIME_CLOCK
+ 	unsigned long long nsecs = get_time();
+-
++#else
++	unsigned long long nsecs = (unsigned long long) xtime.tv_sec * BILLION +
++		xtime.tv_nsec;
++#endif
+ 	tv->tv_sec = nsecs / NSEC_PER_SEC;
+ 	/* Careful about calculations here - this was originally done as
+ 	 * (nsecs - tv->tv_sec * NSEC_PER_SEC) / NSEC_PER_USEC
+
+commit 9218b1714949095bff9d9739d80f431d58e561d6
+Author: Jeff Dike <jdike@addtoit.com>
+Date:   Sun May 6 14:51:10 2007 -0700
+
+    uml: remove user_util.h
+    
+    user_util.h isn't needed any more, so delete it and remove all includes of it.
+    
+    Signed-off-by: Jeff Dike <jdike@linux.intel.com>
+    Cc: Paolo 'Blaisorblade' Giarrusso <blaisorblade@yahoo.it>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+index b1f8b0752419..9fd80ee3eef6 100644
+--- a/arch/um/kernel/time.c
++++ b/arch/um/kernel/time.c
+@@ -18,7 +18,6 @@
+ #include "asm/param.h"
+ #include "asm/current.h"
+ #include "kern_util.h"
+-#include "user_util.h"
+ #include "mode.h"
+ #include "os.h"
+ 
+
+commit 490ba1714b31a131cdc6318231aa227d19bf0761
+Author: Jeff Dike <jdike@addtoit.com>
+Date:   Sat Feb 10 01:44:12 2007 -0800
+
+    [PATCH] uml: make time data per-cpu
+    
+    prev_nsecs and delta need to be arrays, and indexed by CPU number.
+    
+    Signed-off-by: Jeff Dike <jdike@addtoit.com>
+    Cc: Paolo 'Blaisorblade' Giarrusso <blaisorblade@yahoo.it>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+index 2e354b3ca060..b1f8b0752419 100644
+--- a/arch/um/kernel/time.c
++++ b/arch/um/kernel/time.c
+@@ -35,31 +35,31 @@ unsigned long long sched_clock(void)
+ 	return (unsigned long long)jiffies_64 * (1000000000 / HZ);
+ }
+ 
+-static unsigned long long prev_nsecs;
++static unsigned long long prev_nsecs[NR_CPUS];
+ #ifdef CONFIG_UML_REAL_TIME_CLOCK
+-static long long delta;   		/* Deviation per interval */
++static long long delta[NR_CPUS];		/* Deviation per interval */
+ #endif
+ 
+ void timer_irq(union uml_pt_regs *regs)
+ {
+ 	unsigned long long ticks = 0;
+-
+ #ifdef CONFIG_UML_REAL_TIME_CLOCK
+-	if(prev_nsecs){
++	int c = cpu();
++	if(prev_nsecs[c]){
+ 		/* We've had 1 tick */
+ 		unsigned long long nsecs = os_nsecs();
+ 
+-		delta += nsecs - prev_nsecs;
+-		prev_nsecs = nsecs;
++		delta[c] += nsecs - prev_nsecs[c];
++		prev_nsecs[c] = nsecs;
+ 
+ 		/* Protect against the host clock being set backwards */
+-		if(delta < 0)
+-			delta = 0;
++		if(delta[c] < 0)
++			delta[c] = 0;
+ 
+-		ticks += (delta * HZ) / BILLION;
+-		delta -= (ticks * BILLION) / HZ;
++		ticks += (delta[c] * HZ) / BILLION;
++		delta[c] -= (ticks * BILLION) / HZ;
+ 	}
+-	else prev_nsecs = os_nsecs();
++	else prev_nsecs[c] = os_nsecs();
+ #else
+ 	ticks = 1;
+ #endif
+@@ -69,8 +69,8 @@ void timer_irq(union uml_pt_regs *regs)
+ 	}
+ }
+ 
++/* Protects local_offset */
+ static DEFINE_SPINLOCK(timer_spinlock);
+-
+ static unsigned long long local_offset = 0;
+ 
+ static inline unsigned long long get_time(void)
+
+commit 7bea96fd22a8fd19f90817405b4abe032317a0e3
+Author: Al Viro <viro@ftp.linux.org.uk>
+Date:   Sun Oct 8 22:49:34 2006 +0100
+
+    [PATCH] uml pt_regs fixes
+    
+    Real fix for UML pt_regs stuff.  Note set_irq_regs() logics in there...
+    
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+    Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+index a92965f8f9cd..2e354b3ca060 100644
+--- a/arch/um/kernel/time.c
++++ b/arch/um/kernel/time.c
+@@ -86,7 +86,7 @@ static inline unsigned long long get_time(void)
+ 	return nsecs;
+ }
+ 
+-irqreturn_t um_timer(int irq, void *dev, struct pt_regs *regs)
++irqreturn_t um_timer(int irq, void *dev)
+ {
+ 	unsigned long long nsecs;
+ 	unsigned long flags;
+
+commit 3171a0305d62e6627a24bff35af4f997e4988a80
+Author: Atsushi Nemoto <anemo@mba.ocn.ne.jp>
+Date:   Fri Sep 29 02:00:32 2006 -0700
+
+    [PATCH] simplify update_times (avoid jiffies/jiffies_64 aliasing problem)
+    
+    Pass ticks to do_timer() and update_times(), and adjust x86_64 and s390
+    timer interrupt handler with this change.
+    
+    Currently update_times() calculates ticks by "jiffies - wall_jiffies", but
+    callers of do_timer() should know how many ticks to update.  Passing ticks
+    get rid of this redundant calculation.  Also there are another redundancy
+    pointed out by Martin Schwidefsky.
+    
+    This cleanup make a barrier added by
+    5aee405c662ca644980c184774277fc6d0769a84 needless.  So this patch removes
+    it.
+    
+    As a bonus, this cleanup make wall_jiffies can be removed easily, since now
+    wall_jiffies is always synced with jiffies.  (This patch does not really
+    remove wall_jiffies.  It would be another cleanup patch)
+    
+    Signed-off-by: Atsushi Nemoto <anemo@mba.ocn.ne.jp>
+    Cc: Martin Schwidefsky <schwidefsky@de.ibm.com>
+    Cc: "Eric W. Biederman" <ebiederm@xmission.com>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Ingo Molnar <mingo@elte.hu>
+    Cc: john stultz <johnstul@us.ibm.com>
+    Cc: Andi Kleen <ak@muc.de>
+    Cc: Paul Mackerras <paulus@samba.org>
+    Cc: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+    Cc: Richard Henderson <rth@twiddle.net>
+    Cc: Ivan Kokshaysky <ink@jurassic.park.msu.ru>
+    Acked-by: Russell King <rmk@arm.linux.org.uk>
+    Cc: Ian Molton <spyro@f2s.com>
+    Cc: Mikael Starvik <starvik@axis.com>
+    Acked-by: David Howells <dhowells@redhat.com>
+    Cc: Yoshinori Sato <ysato@users.sourceforge.jp>
+    Cc: Hirokazu Takata <takata.hirokazu@renesas.com>
+    Acked-by: Ralf Baechle <ralf@linux-mips.org>
+    Cc: Kyle McMartin <kyle@mcmartin.ca>
+    Cc: Heiko Carstens <heiko.carstens@de.ibm.com>
+    Cc: Martin Schwidefsky <schwidefsky@de.ibm.com>
+    Cc: Paul Mundt <lethal@linux-sh.org>
+    Cc: Kazumoto Kojima <kkojima@rr.iij4u.or.jp>
+    Cc: Richard Curnow <rc@rc0.org.uk>
+    Cc: William Lee Irwin III <wli@holomorphy.com>
+    Cc: "David S. Miller" <davem@davemloft.net>
+    Cc: Jeff Dike <jdike@addtoit.com>
+    Cc: Paolo 'Blaisorblade' Giarrusso <blaisorblade@yahoo.it>
+    Cc: Miles Bader <uclinux-v850@lsi.nec.co.jp>
+    Cc: Chris Zankel <chris@zankel.net>
+    Acked-by: "Luck, Tony" <tony.luck@intel.com>
+    Cc: Geert Uytterhoeven <geert@linux-m68k.org>
+    Cc: Roman Zippel <zippel@linux-m68k.org>
+    Signed-off-by: Andrew Morton <akpm@osdl.org>
+    Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+index 820affbf3e16..a92965f8f9cd 100644
+--- a/arch/um/kernel/time.c
++++ b/arch/um/kernel/time.c
+@@ -93,7 +93,7 @@ irqreturn_t um_timer(int irq, void *dev, struct pt_regs *regs)
+ 
+ 	write_seqlock_irqsave(&xtime_lock, flags);
+ 
+-	do_timer(regs);
++	do_timer(1);
+ 
+ 	nsecs = get_time();
+ 	xtime.tv_sec = nsecs / NSEC_PER_SEC;
+
+commit c1b4098d4852f823ecf1abb2d369cb1beb902653
+Author: Jeff Dike <jdike@addtoit.com>
+Date:   Wed Sep 27 01:50:42 2006 -0700
+
+    [PATCH] uml: fix sleep length bug
+    
+    um_timer shouldn't add local_offset to the host time since get_time already
+    did it.  This threw off sleep when a settimeofday or equivalent had happened.
+    
+    Signed-off-by: Jeff Dike <jdike@addtoit.com>
+    Signed-off-by: Andrew Morton <akpm@osdl.org>
+    Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+index 2454bbd9555d..820affbf3e16 100644
+--- a/arch/um/kernel/time.c
++++ b/arch/um/kernel/time.c
+@@ -95,7 +95,7 @@ irqreturn_t um_timer(int irq, void *dev, struct pt_regs *regs)
+ 
+ 	do_timer(regs);
+ 
+-	nsecs = get_time() + local_offset;
++	nsecs = get_time();
+ 	xtime.tv_sec = nsecs / NSEC_PER_SEC;
+ 	xtime.tv_nsec = nsecs - xtime.tv_sec * NSEC_PER_SEC;
+ 
+
+commit 602cc2418177a5b80f533f569e5a42c4495988c9
+Author: Jeff Dike <jdike@addtoit.com>
+Date:   Mon Sep 25 23:33:06 2006 -0700
+
+    [PATCH] uml: Remove unused variable
+    
+    timer_irq_inited was useless, so it is removed.
+    
+    Signed-off-by: Jeff Dike <jdike@addtoit.com>
+    Signed-off-by: Andrew Morton <akpm@osdl.org>
+    Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+index d1d799346e04..2454bbd9555d 100644
+--- a/arch/um/kernel/time.c
++++ b/arch/um/kernel/time.c
+@@ -35,9 +35,6 @@ unsigned long long sched_clock(void)
+ 	return (unsigned long long)jiffies_64 * (1000000000 / HZ);
+ }
+ 
+-/* Changed at early boot */
+-int timer_irq_inited = 0;
+-
+ static unsigned long long prev_nsecs;
+ #ifdef CONFIG_UML_REAL_TIME_CLOCK
+ static long long delta;   		/* Deviation per interval */
+@@ -116,8 +113,6 @@ static void register_timer(void)
+ 		printk(KERN_ERR "register_timer : request_irq failed - "
+ 		       "errno = %d\n", -err);
+ 
+-	timer_irq_inited = 1;
+-
+ 	err = set_interval(1);
+ 	if(err != 0)
+ 		printk(KERN_ERR "register_timer : set_interval failed - "
+
+commit 537ae946e808d0f22d660f7a3500832fe0c07d14
+Author: Jeff Dike <jdike@addtoit.com>
+Date:   Mon Sep 25 23:33:05 2006 -0700
+
+    [PATCH] uml: timer cleanups
+    
+    set_interval returns an error instead of panicing if setitimer fails.  Some of
+    its callers now check the return.
+    
+    enable_timer is largely tt-mode-specific, so it is marked as such, and the
+    only skas-mode caller is made to call set-interval instead.
+    
+    user_time_init was a no-value-added wrapper around set_interval, so it is
+    gone.
+    
+    Since set_interval is now called from kernel code, callers no longer pass
+    ITIMER_* to it.  Instead, they pass a flag which is converted into ITIMER_REAL
+    or ITIMER_VIRTUAL.
+    
+    Signed-off-by: Jeff Dike <jdike@addtoit.com>
+    Signed-off-by: Andrew Morton <akpm@osdl.org>
+    Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+index 552ca1cb9847..d1d799346e04 100644
+--- a/arch/um/kernel/time.c
++++ b/arch/um/kernel/time.c
+@@ -113,12 +113,15 @@ static void register_timer(void)
+ 
+ 	err = request_irq(TIMER_IRQ, um_timer, IRQF_DISABLED, "timer", NULL);
+ 	if(err != 0)
+-		printk(KERN_ERR "timer_init : request_irq failed - "
++		printk(KERN_ERR "register_timer : request_irq failed - "
+ 		       "errno = %d\n", -err);
+ 
+ 	timer_irq_inited = 1;
+ 
+-	user_time_init();
++	err = set_interval(1);
++	if(err != 0)
++		printk(KERN_ERR "register_timer : set_interval failed - "
++		       "errno = %d\n", -err);
+ }
+ 
+ extern void (*late_time_init)(void);
+
+commit 1d3468a6643a6a5905e2ac9ae1fa1aefc06d882a
+Author: Jeff Dike <jdike@addtoit.com>
+Date:   Mon Jul 10 04:45:13 2006 -0700
+
+    [PATCH] uml: move _kern.c files
+    
+    Move most *_kern.c files in arch/um/kernel to *.c.  This makes UML somewhat
+    more closely resemble the other arches.
+    
+    [akpm@osdl.org: use the new INTF_* flags]
+    Signed-off-by: Jeff Dike <jdike@addtoit.com>
+    Cc: Paolo 'Blaisorblade' Giarrusso <blaisorblade@yahoo.it>
+    Signed-off-by: Andrew Morton <akpm@osdl.org>
+    Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+new file mode 100644
+index 000000000000..552ca1cb9847
+--- /dev/null
++++ b/arch/um/kernel/time.c
+@@ -0,0 +1,182 @@
++/*
++ * Copyright (C) 2000 Jeff Dike (jdike@karaya.com)
++ * Licensed under the GPL
++ */
++
++#include "linux/kernel.h"
++#include "linux/module.h"
++#include "linux/unistd.h"
++#include "linux/stddef.h"
++#include "linux/spinlock.h"
++#include "linux/time.h"
++#include "linux/sched.h"
++#include "linux/interrupt.h"
++#include "linux/init.h"
++#include "linux/delay.h"
++#include "linux/hrtimer.h"
++#include "asm/irq.h"
++#include "asm/param.h"
++#include "asm/current.h"
++#include "kern_util.h"
++#include "user_util.h"
++#include "mode.h"
++#include "os.h"
++
++int hz(void)
++{
++	return(HZ);
++}
++
++/*
++ * Scheduler clock - returns current time in nanosec units.
++ */
++unsigned long long sched_clock(void)
++{
++	return (unsigned long long)jiffies_64 * (1000000000 / HZ);
++}
++
++/* Changed at early boot */
++int timer_irq_inited = 0;
++
++static unsigned long long prev_nsecs;
++#ifdef CONFIG_UML_REAL_TIME_CLOCK
++static long long delta;   		/* Deviation per interval */
++#endif
++
++void timer_irq(union uml_pt_regs *regs)
++{
++	unsigned long long ticks = 0;
++
++#ifdef CONFIG_UML_REAL_TIME_CLOCK
++	if(prev_nsecs){
++		/* We've had 1 tick */
++		unsigned long long nsecs = os_nsecs();
++
++		delta += nsecs - prev_nsecs;
++		prev_nsecs = nsecs;
++
++		/* Protect against the host clock being set backwards */
++		if(delta < 0)
++			delta = 0;
++
++		ticks += (delta * HZ) / BILLION;
++		delta -= (ticks * BILLION) / HZ;
++	}
++	else prev_nsecs = os_nsecs();
++#else
++	ticks = 1;
++#endif
++	while(ticks > 0){
++		do_IRQ(TIMER_IRQ, regs);
++		ticks--;
++	}
++}
++
++static DEFINE_SPINLOCK(timer_spinlock);
++
++static unsigned long long local_offset = 0;
++
++static inline unsigned long long get_time(void)
++{
++	unsigned long long nsecs;
++	unsigned long flags;
++
++	spin_lock_irqsave(&timer_spinlock, flags);
++	nsecs = os_nsecs();
++	nsecs += local_offset;
++	spin_unlock_irqrestore(&timer_spinlock, flags);
++
++	return nsecs;
++}
++
++irqreturn_t um_timer(int irq, void *dev, struct pt_regs *regs)
++{
++	unsigned long long nsecs;
++	unsigned long flags;
++
++	write_seqlock_irqsave(&xtime_lock, flags);
++
++	do_timer(regs);
++
++	nsecs = get_time() + local_offset;
++	xtime.tv_sec = nsecs / NSEC_PER_SEC;
++	xtime.tv_nsec = nsecs - xtime.tv_sec * NSEC_PER_SEC;
++
++	write_sequnlock_irqrestore(&xtime_lock, flags);
++
++	return IRQ_HANDLED;
++}
++
++static void register_timer(void)
++{
++	int err;
++
++	err = request_irq(TIMER_IRQ, um_timer, IRQF_DISABLED, "timer", NULL);
++	if(err != 0)
++		printk(KERN_ERR "timer_init : request_irq failed - "
++		       "errno = %d\n", -err);
++
++	timer_irq_inited = 1;
++
++	user_time_init();
++}
++
++extern void (*late_time_init)(void);
++
++void time_init(void)
++{
++	long long nsecs;
++
++	nsecs = os_nsecs();
++	set_normalized_timespec(&wall_to_monotonic, -nsecs / BILLION,
++				-nsecs % BILLION);
++	late_time_init = register_timer;
++}
++
++void do_gettimeofday(struct timeval *tv)
++{
++	unsigned long long nsecs = get_time();
++
++	tv->tv_sec = nsecs / NSEC_PER_SEC;
++	/* Careful about calculations here - this was originally done as
++	 * (nsecs - tv->tv_sec * NSEC_PER_SEC) / NSEC_PER_USEC
++	 * which gave bogus (> 1000000) values.  Dunno why, suspect gcc
++	 * (4.0.0) miscompiled it, or there's a subtle 64/32-bit conversion
++	 * problem that I missed.
++	 */
++	nsecs -= tv->tv_sec * NSEC_PER_SEC;
++	tv->tv_usec = (unsigned long) nsecs / NSEC_PER_USEC;
++}
++
++static inline void set_time(unsigned long long nsecs)
++{
++	unsigned long long now;
++	unsigned long flags;
++
++	spin_lock_irqsave(&timer_spinlock, flags);
++	now = os_nsecs();
++	local_offset = nsecs - now;
++	spin_unlock_irqrestore(&timer_spinlock, flags);
++
++	clock_was_set();
++}
++
++int do_settimeofday(struct timespec *tv)
++{
++	set_time((unsigned long long) tv->tv_sec * NSEC_PER_SEC + tv->tv_nsec);
++
++	return 0;
++}
++
++void timer_handler(int sig, union uml_pt_regs *regs)
++{
++	local_irq_disable();
++	irq_enter();
++	update_process_times(CHOOSE_MODE(
++	                     (UPT_SC(regs) && user_context(UPT_SP(regs))),
++			     (regs)->skas.is_user));
++	irq_exit();
++	local_irq_enable();
++	if(current_thread->cpu == 0)
++		timer_irq(regs);
++}
+
+commit d115ec0f0f094683dc2588818cb28134dd75e6d1
+Author: Jeff Dike <jdike@addtoit.com>
+Date:   Fri Jun 30 01:55:57 2006 -0700
+
+    [PATCH] uml: remove stray file
+    
+    Forgot to remove arch/um/kernel/time.c when it was mostly moved to
+    arch/um/os-Linux.
+    
+    Signed-off-by: Jeff Dike <jdike@addtoit.com>
+    Cc: Paolo 'Blaisorblade' Giarrusso <blaisorblade@yahoo.it>
+    Signed-off-by: Andrew Morton <akpm@osdl.org>
+    Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+deleted file mode 100644
+index 8fa2ae7f3026..000000000000
+--- a/arch/um/kernel/time.c
++++ /dev/null
+@@ -1,172 +0,0 @@
+-/* 
+- * Copyright (C) 2000, 2001, 2002 Jeff Dike (jdike@karaya.com)
+- * Licensed under the GPL
+- */
+-
+-#include <stdio.h>
+-#include <stdlib.h>
+-#include <unistd.h>
+-#include <time.h>
+-#include <sys/time.h>
+-#include <signal.h>
+-#include <errno.h>
+-#include "user_util.h"
+-#include "kern_util.h"
+-#include "user.h"
+-#include "process.h"
+-#include "time_user.h"
+-#include "kern_constants.h"
+-#include "os.h"
+-
+-/* XXX This really needs to be declared and initialized in a kernel file since
+- * it's in <linux/time.h>
+- */
+-extern struct timespec wall_to_monotonic;
+-
+-extern struct timeval xtime;
+-
+-struct timeval local_offset = { 0, 0 };
+-
+-void timer(void)
+-{
+-	gettimeofday(&xtime, NULL);
+-	timeradd(&xtime, &local_offset, &xtime);
+-}
+-
+-static void set_interval(int timer_type)
+-{
+-	int usec = 1000000/hz();
+-	struct itimerval interval = ((struct itimerval) { { 0, usec },
+-							  { 0, usec } });
+-
+-	if(setitimer(timer_type, &interval, NULL) == -1)
+-		panic("setitimer failed - errno = %d\n", errno);
+-}
+-
+-void enable_timer(void)
+-{
+-	set_interval(ITIMER_VIRTUAL);
+-}
+-
+-void prepare_timer(void * ptr)
+-{
+-	int usec = 1000000/hz();
+-	*(struct itimerval *)ptr = ((struct itimerval) { { 0, usec },
+-							 { 0, usec }});
+-}
+-
+-void disable_timer(void)
+-{
+-	struct itimerval disable = ((struct itimerval) { { 0, 0 }, { 0, 0 }});
+-	if((setitimer(ITIMER_VIRTUAL, &disable, NULL) < 0) ||
+-	   (setitimer(ITIMER_REAL, &disable, NULL) < 0))
+-		printk("disnable_timer - setitimer failed, errno = %d\n",
+-		       errno);
+-	/* If there are signals already queued, after unblocking ignore them */
+-	set_handler(SIGALRM, SIG_IGN, 0, -1);
+-	set_handler(SIGVTALRM, SIG_IGN, 0, -1);
+-}
+-
+-void switch_timers(int to_real)
+-{
+-	struct itimerval disable = ((struct itimerval) { { 0, 0 }, { 0, 0 }});
+-	struct itimerval enable = ((struct itimerval) { { 0, 1000000/hz() },
+-							{ 0, 1000000/hz() }});
+-	int old, new;
+-
+-	if(to_real){
+-		old = ITIMER_VIRTUAL;
+-		new = ITIMER_REAL;
+-	}
+-	else {
+-		old = ITIMER_REAL;
+-		new = ITIMER_VIRTUAL;
+-	}
+-
+-	if((setitimer(old, &disable, NULL) < 0) ||
+-	   (setitimer(new, &enable, NULL)))
+-		printk("switch_timers - setitimer failed, errno = %d\n",
+-		       errno);
+-}
+-
+-void uml_idle_timer(void)
+-{
+-	if(signal(SIGVTALRM, SIG_IGN) == SIG_ERR)
+-		panic("Couldn't unset SIGVTALRM handler");
+-	
+-	set_handler(SIGALRM, (__sighandler_t) alarm_handler, 
+-		    SA_RESTART, SIGUSR1, SIGIO, SIGWINCH, SIGVTALRM, -1);
+-	set_interval(ITIMER_REAL);
+-}
+-
+-extern void ktime_get_ts(struct timespec *ts);
+-#define do_posix_clock_monotonic_gettime(ts) ktime_get_ts(ts)
+-
+-void time_init(void)
+-{
+-	struct timespec now;
+-
+-	if(signal(SIGVTALRM, boot_timer_handler) == SIG_ERR)
+-		panic("Couldn't set SIGVTALRM handler");
+-	set_interval(ITIMER_VIRTUAL);
+-
+-	do_posix_clock_monotonic_gettime(&now);
+-	wall_to_monotonic.tv_sec = -now.tv_sec;
+-	wall_to_monotonic.tv_nsec = -now.tv_nsec;
+-}
+-
+-/* Defined in linux/ktimer.h, which can't be included here */
+-#define clock_was_set()		do { } while (0)
+-
+-void do_gettimeofday(struct timeval *tv)
+-{
+-	unsigned long flags;
+-
+-	flags = time_lock();
+-	gettimeofday(tv, NULL);
+-	timeradd(tv, &local_offset, tv);
+-	time_unlock(flags);
+-	clock_was_set();
+-}
+-
+-int do_settimeofday(struct timespec *tv)
+-{
+-	struct timeval now;
+-	unsigned long flags;
+-	struct timeval tv_in;
+-
+-	if ((unsigned long) tv->tv_nsec >= UM_NSEC_PER_SEC)
+-		return -EINVAL;
+-
+-	tv_in.tv_sec = tv->tv_sec;
+-	tv_in.tv_usec = tv->tv_nsec / 1000;
+-
+-	flags = time_lock();
+-	gettimeofday(&now, NULL);
+-	timersub(&tv_in, &now, &local_offset);
+-	time_unlock(flags);
+-
+-	return(0);
+-}
+-
+-void idle_sleep(int secs)
+-{
+-	struct timespec ts;
+-
+-	ts.tv_sec = secs;
+-	ts.tv_nsec = 0;
+-	nanosleep(&ts, NULL);
+-}
+-
+-/* XXX This partly duplicates init_irq_signals */
+-
+-void user_time_init(void)
+-{
+-	set_handler(SIGVTALRM, (__sighandler_t) alarm_handler,
+-		    SA_ONSTACK | SA_RESTART, SIGUSR1, SIGIO, SIGWINCH,
+-		    SIGALRM, SIGUSR2, -1);
+-	set_handler(SIGALRM, (__sighandler_t) alarm_handler,
+-		    SA_ONSTACK | SA_RESTART, SIGUSR1, SIGIO, SIGWINCH,
+-		    SIGVTALRM, SIGUSR2, -1);
+-	set_interval(ITIMER_VIRTUAL);
+-}
+
+commit becf8b5d00f4b47e847f98322cdaf8cd16243861
+Author: Thomas Gleixner <tglx@linutronix.de>
+Date:   Mon Jan 9 20:52:38 2006 -0800
+
+    [PATCH] hrtimer: convert posix timers completely
+    
+    - convert posix-timers.c to use hrtimers
+    
+    - remove the now obsolete abslist code
+    
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Signed-off-by: Ingo Molnar <mingo@elte.hu>
+    Signed-off-by: Miklos Szeredi <miklos@szeredi.hu>
+    Signed-off-by: Andrew Morton <akpm@osdl.org>
+    Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+index 11f518a7e156..8fa2ae7f3026 100644
+--- a/arch/um/kernel/time.c
++++ b/arch/um/kernel/time.c
+@@ -99,7 +99,8 @@ void uml_idle_timer(void)
+ 	set_interval(ITIMER_REAL);
+ }
+ 
+-extern int do_posix_clock_monotonic_gettime(struct timespec *tp);
++extern void ktime_get_ts(struct timespec *ts);
++#define do_posix_clock_monotonic_gettime(ts) ktime_get_ts(ts)
+ 
+ void time_init(void)
+ {
+@@ -114,8 +115,8 @@ void time_init(void)
+ 	wall_to_monotonic.tv_nsec = -now.tv_nsec;
+ }
+ 
+-/* Declared in linux/time.h, which can't be included here */
+-extern void clock_was_set(void);
++/* Defined in linux/ktimer.h, which can't be included here */
++#define clock_was_set()		do { } while (0)
+ 
+ void do_gettimeofday(struct timeval *tv)
+ {
+
+commit 0805d89c151b4800eade4c2f50d39c5253d7d054
+Author: Gennady Sharapov <Gennady.V.Sharapov@intel.com>
+Date:   Sun Jan 8 01:01:29 2006 -0800
+
+    [PATCH] uml: move libc-dependent code from signal_user.c
+    
+    The serial UML OS-abstraction layer patch (um/kernel dir).
+    
+    This moves all systemcalls from signal_user.c file under os-Linux dir
+    
+    Signed-off-by: Gennady Sharapov <Gennady.V.Sharapov@intel.com>
+    Signed-off-by: Jeff Dike <jdike@addtoit.com>
+    Cc: Paolo 'Blaisorblade' Giarrusso <blaisorblade@yahoo.it>
+    Signed-off-by: Andrew Morton <akpm@osdl.org>
+    Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+index c40b611e3d93..11f518a7e156 100644
+--- a/arch/um/kernel/time.c
++++ b/arch/um/kernel/time.c
+@@ -14,9 +14,9 @@
+ #include "kern_util.h"
+ #include "user.h"
+ #include "process.h"
+-#include "signal_user.h"
+ #include "time_user.h"
+ #include "kern_constants.h"
++#include "os.h"
+ 
+ /* XXX This really needs to be declared and initialized in a kernel file since
+  * it's in <linux/time.h>
+
+commit 9786a8f3cbc61f990266e23ffdb338ee3118b03d
+Author: Bodo Stroesser <bstroesser@fujitsu-siemens.com>
+Date:   Thu Jul 7 17:56:50 2005 -0700
+
+    [PATCH] uml: Proper clone support for skas0
+    
+    This patch implements the clone-stub mechanism, which allows skas0 to run
+    with proc_mm==0, even if the clib in UML uses modify_ldt.
+    
+    Note: There is a bug in skas3.v7 host patch, that avoids UML-skas from
+    running properly on a SMP-box.  In full skas3, I never really saw problems,
+    but in skas0 they showed up.
+    
+    More commentary by jdike - What this patch does is makes sure that the host
+    parent of each new host process matches the UML parent of the corresponding
+    UML process.  This ensures that any changed LDTs are inherited.  This is
+    done by having clone actually called by the UML process from its stub,
+    rather than by the kernel.  We have special syscall stubs that are loaded
+    onto the stub code page because that code must be completely
+    self-contained.  These stubs are given C interfaces, and used like normal C
+    functions, but there are subtleties.  Principally, we have to be careful
+    about stack variables in stub_clone_handler after the clone.  The code is
+    written so that there aren't any - everything boils down to a fixed
+    address.  If there were any locals, references to them after the clone
+    would be wrong because the stack just changed.
+    
+    Signed-off-by: Bodo Stroesser <bstroesser@fujitsu-siemens.com>
+    Signed-off-by: Jeff Dike <jdike@addtoit.com>
+    Signed-off-by: Andrew Morton <akpm@osdl.org>
+    Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+index f829b309b63c..c40b611e3d93 100644
+--- a/arch/um/kernel/time.c
++++ b/arch/um/kernel/time.c
+@@ -48,6 +48,13 @@ void enable_timer(void)
+ 	set_interval(ITIMER_VIRTUAL);
+ }
+ 
++void prepare_timer(void * ptr)
++{
++	int usec = 1000000/hz();
++	*(struct itimerval *)ptr = ((struct itimerval) { { 0, usec },
++							 { 0, usec }});
++}
++
+ void disable_timer(void)
+ {
+ 	struct itimerval disable = ((struct itimerval) { { 0, 0 }, { 0, 0 }});
+
+commit fc47a0d18a1994b4a18d2235fcde1b75dfa72552
+Author: Jeff Dike <jdike@addtoit.com>
+Date:   Sat Jun 25 14:55:24 2005 -0700
+
+    [PATCH] uml: time initialization tidying
+    
+    user_time_init_skas and user_time_init_tt were essentially the same.  So, this
+    merges them, deleting the mode-specific functions and declarations.
+    
+    Signed-off-by: Jeff Dike <jdike@addtoit.com>
+    Cc: Paolo Giarrusso <blaisorblade@yahoo.it>
+    Signed-off-by: Andrew Morton <akpm@osdl.org>
+    Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+index c40c86a3f918..f829b309b63c 100644
+--- a/arch/um/kernel/time.c
++++ b/arch/um/kernel/time.c
+@@ -33,7 +33,7 @@ void timer(void)
+ 	timeradd(&xtime, &local_offset, &xtime);
+ }
+ 
+-void set_interval(int timer_type)
++static void set_interval(int timer_type)
+ {
+ 	int usec = 1000000/hz();
+ 	struct itimerval interval = ((struct itimerval) { { 0, usec },
+@@ -45,12 +45,7 @@ void set_interval(int timer_type)
+ 
+ void enable_timer(void)
+ {
+-	int usec = 1000000/hz();
+-	struct itimerval enable = ((struct itimerval) { { 0, usec },
+-							{ 0, usec }});
+-	if(setitimer(ITIMER_VIRTUAL, &enable, NULL))
+-		printk("enable_timer - setitimer failed, errno = %d\n",
+-		       errno);
++	set_interval(ITIMER_VIRTUAL);
+ }
+ 
+ void disable_timer(void)
+@@ -155,13 +150,15 @@ void idle_sleep(int secs)
+ 	nanosleep(&ts, NULL);
+ }
+ 
+-/*
+- * Overrides for Emacs so that we follow Linus's tabbing style.
+- * Emacs will notice this stuff at the end of the file and automatically
+- * adjust the settings for this buffer only.  This must remain at the end
+- * of the file.
+- * ---------------------------------------------------------------------------
+- * Local variables:
+- * c-file-style: "linux"
+- * End:
+- */
++/* XXX This partly duplicates init_irq_signals */
++
++void user_time_init(void)
++{
++	set_handler(SIGVTALRM, (__sighandler_t) alarm_handler,
++		    SA_ONSTACK | SA_RESTART, SIGUSR1, SIGIO, SIGWINCH,
++		    SIGALRM, SIGUSR2, -1);
++	set_handler(SIGALRM, (__sighandler_t) alarm_handler,
++		    SA_ONSTACK | SA_RESTART, SIGUSR1, SIGIO, SIGWINCH,
++		    SIGVTALRM, SIGUSR2, -1);
++	set_interval(ITIMER_VIRTUAL);
++}
+
+commit 1da177e4c3f41524e886b7f1b8a0c1fc7321cac2
+Author: Linus Torvalds <torvalds@ppc970.osdl.org>
+Date:   Sat Apr 16 15:20:36 2005 -0700
+
+    Linux-2.6.12-rc2
+    
+    Initial git repository build. I'm not bothering with the full history,
+    even though we have it. We can create a separate "historical" git
+    archive of that later if we want to, and in the meantime it's about
+    3.2GB when imported into git - space that would just make the early
+    git days unnecessarily complicated, when we don't have a lot of good
+    infrastructure for it.
+    
+    Let it rip!
+
+diff --git a/arch/um/kernel/time.c b/arch/um/kernel/time.c
+new file mode 100644
+index 000000000000..c40c86a3f918
+--- /dev/null
++++ b/arch/um/kernel/time.c
+@@ -0,0 +1,167 @@
++/* 
++ * Copyright (C) 2000, 2001, 2002 Jeff Dike (jdike@karaya.com)
++ * Licensed under the GPL
++ */
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <unistd.h>
++#include <time.h>
++#include <sys/time.h>
++#include <signal.h>
++#include <errno.h>
++#include "user_util.h"
++#include "kern_util.h"
++#include "user.h"
++#include "process.h"
++#include "signal_user.h"
++#include "time_user.h"
++#include "kern_constants.h"
++
++/* XXX This really needs to be declared and initialized in a kernel file since
++ * it's in <linux/time.h>
++ */
++extern struct timespec wall_to_monotonic;
++
++extern struct timeval xtime;
++
++struct timeval local_offset = { 0, 0 };
++
++void timer(void)
++{
++	gettimeofday(&xtime, NULL);
++	timeradd(&xtime, &local_offset, &xtime);
++}
++
++void set_interval(int timer_type)
++{
++	int usec = 1000000/hz();
++	struct itimerval interval = ((struct itimerval) { { 0, usec },
++							  { 0, usec } });
++
++	if(setitimer(timer_type, &interval, NULL) == -1)
++		panic("setitimer failed - errno = %d\n", errno);
++}
++
++void enable_timer(void)
++{
++	int usec = 1000000/hz();
++	struct itimerval enable = ((struct itimerval) { { 0, usec },
++							{ 0, usec }});
++	if(setitimer(ITIMER_VIRTUAL, &enable, NULL))
++		printk("enable_timer - setitimer failed, errno = %d\n",
++		       errno);
++}
++
++void disable_timer(void)
++{
++	struct itimerval disable = ((struct itimerval) { { 0, 0 }, { 0, 0 }});
++	if((setitimer(ITIMER_VIRTUAL, &disable, NULL) < 0) ||
++	   (setitimer(ITIMER_REAL, &disable, NULL) < 0))
++		printk("disnable_timer - setitimer failed, errno = %d\n",
++		       errno);
++	/* If there are signals already queued, after unblocking ignore them */
++	set_handler(SIGALRM, SIG_IGN, 0, -1);
++	set_handler(SIGVTALRM, SIG_IGN, 0, -1);
++}
++
++void switch_timers(int to_real)
++{
++	struct itimerval disable = ((struct itimerval) { { 0, 0 }, { 0, 0 }});
++	struct itimerval enable = ((struct itimerval) { { 0, 1000000/hz() },
++							{ 0, 1000000/hz() }});
++	int old, new;
++
++	if(to_real){
++		old = ITIMER_VIRTUAL;
++		new = ITIMER_REAL;
++	}
++	else {
++		old = ITIMER_REAL;
++		new = ITIMER_VIRTUAL;
++	}
++
++	if((setitimer(old, &disable, NULL) < 0) ||
++	   (setitimer(new, &enable, NULL)))
++		printk("switch_timers - setitimer failed, errno = %d\n",
++		       errno);
++}
++
++void uml_idle_timer(void)
++{
++	if(signal(SIGVTALRM, SIG_IGN) == SIG_ERR)
++		panic("Couldn't unset SIGVTALRM handler");
++	
++	set_handler(SIGALRM, (__sighandler_t) alarm_handler, 
++		    SA_RESTART, SIGUSR1, SIGIO, SIGWINCH, SIGVTALRM, -1);
++	set_interval(ITIMER_REAL);
++}
++
++extern int do_posix_clock_monotonic_gettime(struct timespec *tp);
++
++void time_init(void)
++{
++	struct timespec now;
++
++	if(signal(SIGVTALRM, boot_timer_handler) == SIG_ERR)
++		panic("Couldn't set SIGVTALRM handler");
++	set_interval(ITIMER_VIRTUAL);
++
++	do_posix_clock_monotonic_gettime(&now);
++	wall_to_monotonic.tv_sec = -now.tv_sec;
++	wall_to_monotonic.tv_nsec = -now.tv_nsec;
++}
++
++/* Declared in linux/time.h, which can't be included here */
++extern void clock_was_set(void);
++
++void do_gettimeofday(struct timeval *tv)
++{
++	unsigned long flags;
++
++	flags = time_lock();
++	gettimeofday(tv, NULL);
++	timeradd(tv, &local_offset, tv);
++	time_unlock(flags);
++	clock_was_set();
++}
++
++int do_settimeofday(struct timespec *tv)
++{
++	struct timeval now;
++	unsigned long flags;
++	struct timeval tv_in;
++
++	if ((unsigned long) tv->tv_nsec >= UM_NSEC_PER_SEC)
++		return -EINVAL;
++
++	tv_in.tv_sec = tv->tv_sec;
++	tv_in.tv_usec = tv->tv_nsec / 1000;
++
++	flags = time_lock();
++	gettimeofday(&now, NULL);
++	timersub(&tv_in, &now, &local_offset);
++	time_unlock(flags);
++
++	return(0);
++}
++
++void idle_sleep(int secs)
++{
++	struct timespec ts;
++
++	ts.tv_sec = secs;
++	ts.tv_nsec = 0;
++	nanosleep(&ts, NULL);
++}
++
++/*
++ * Overrides for Emacs so that we follow Linus's tabbing style.
++ * Emacs will notice this stuff at the end of the file and automatically
++ * adjust the settings for this buffer only.  This must remain at the end
++ * of the file.
++ * ---------------------------------------------------------------------------
++ * Local variables:
++ * c-file-style: "linux"
++ * End:
++ */

@@ -1,0 +1,1853 @@
+commit c7ff819aefea04944dfcec5f0731b97277df6a9c
+Author: Yamin Friedman <yaminf@mellanox.com>
+Date:   Wed May 27 11:34:53 2020 +0300
+
+    RDMA/core: Introduce shared CQ pool API
+    
+    Allow a ULP to ask the core to provide a completion queue based on a
+    least-used search on a per-device CQ pools. The device CQ pools grow in a
+    lazy fashion when more CQs are requested.
+    
+    This feature reduces the amount of interrupts when using many QPs.  Using
+    shared CQs allows for more effcient completion handling. It also reduces
+    the amount of overhead needed for CQ contexts.
+    
+    Test setup:
+    Intel(R) Xeon(R) Platinum 8176M CPU @ 2.10GHz servers.
+    Running NVMeoF 4KB read IOs over ConnectX-5EX across Spectrum switch.
+    TX-depth = 32. The patch was applied in the nvme driver on both the target
+    and initiator. Four controllers are accessed from each core. In the
+    current test case we have exposed sixteen NVMe namespaces using four
+    different subsystems (four namespaces per subsystem) from one NVM port.
+    Each controller allocated X queues (RDMA QPs) and attached to Y CQs.
+    Before this series we had X == Y, i.e for four controllers we've created
+    total of 4X QPs and 4X CQs. In the shared case, we've created 4X QPs and
+    only X CQs which means that we have four controllers that share a
+    completion queue per core. Until fourteen cores there is no significant
+    change in performance and the number of interrupts per second is less than
+    a million in the current case.
+    ==================================================
+    |Cores|Current KIOPs  |Shared KIOPs  |improvement|
+    |-----|---------------|--------------|-----------|
+    |14   |2332           |2723          |16.7%      |
+    |-----|---------------|--------------|-----------|
+    |20   |2086           |2712          |30%        |
+    |-----|---------------|--------------|-----------|
+    |28   |1971           |2669          |35.4%      |
+    |=================================================
+    |Cores|Current avg lat|Shared avg lat|improvement|
+    |-----|---------------|--------------|-----------|
+    |14   |767us          |657us         |14.3%      |
+    |-----|---------------|--------------|-----------|
+    |20   |1225us         |943us         |23%        |
+    |-----|---------------|--------------|-----------|
+    |28   |1816us         |1341us        |26.1%      |
+    ========================================================
+    |Cores|Current interrupts|Shared interrupts|improvement|
+    |-----|------------------|-----------------|-----------|
+    |14   |1.6M/sec          |0.4M/sec         |72%        |
+    |-----|------------------|-----------------|-----------|
+    |20   |2.8M/sec          |0.6M/sec         |72.4%      |
+    |-----|------------------|-----------------|-----------|
+    |28   |2.9M/sec          |0.8M/sec         |63.4%      |
+    ====================================================================
+    |Cores|Current 99.99th PCTL lat|Shared 99.99th PCTL lat|improvement|
+    |-----|------------------------|-----------------------|-----------|
+    |14   |67ms                    |6ms                    |90.9%      |
+    |-----|------------------------|-----------------------|-----------|
+    |20   |5ms                     |6ms                    |-10%       |
+    |-----|------------------------|-----------------------|-----------|
+    |28   |8.7ms                   |6ms                    |25.9%      |
+    |===================================================================
+    
+    Performance improvement with sixteen disks (sixteen CQs per core) is
+    comparable.
+    
+    Link: https://lore.kernel.org/r/1590568495-101621-3-git-send-email-yaminf@mellanox.com
+    Signed-off-by: Yamin Friedman <yaminf@mellanox.com>
+    Reviewed-by: Or Gerlitz <ogerlitz@mellanox.com>
+    Reviewed-by: Max Gurtovoy <maxg@mellanox.com>
+    Reviewed-by: Leon Romanovsky <leonro@mellanox.com>
+    Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+
+diff --git a/drivers/infiniband/core/cq.c b/drivers/infiniband/core/cq.c
+index 4f25b2400694..655795bfa0ee 100644
+--- a/drivers/infiniband/core/cq.c
++++ b/drivers/infiniband/core/cq.c
+@@ -7,7 +7,11 @@
+ #include <linux/slab.h>
+ #include <rdma/ib_verbs.h>
+ 
++#include "core_priv.h"
++
+ #include <trace/events/rdma_core.h>
++/* Max size for shared CQ, may require tuning */
++#define IB_MAX_SHARED_CQ_SZ		4096U
+ 
+ /* # of WCs to poll for with a single call to ib_poll_cq */
+ #define IB_POLL_BATCH			16
+@@ -218,6 +222,7 @@ struct ib_cq *__ib_alloc_cq_user(struct ib_device *dev, void *private,
+ 	cq->cq_context = private;
+ 	cq->poll_ctx = poll_ctx;
+ 	atomic_set(&cq->usecnt, 0);
++	cq->comp_vector = comp_vector;
+ 
+ 	cq->wc = kmalloc_array(IB_POLL_BATCH, sizeof(*cq->wc), GFP_KERNEL);
+ 	if (!cq->wc)
+@@ -309,6 +314,8 @@ void ib_free_cq_user(struct ib_cq *cq, struct ib_udata *udata)
+ {
+ 	if (WARN_ON_ONCE(atomic_read(&cq->usecnt)))
+ 		return;
++	if (WARN_ON_ONCE(cq->cqe_used))
++		return;
+ 
+ 	switch (cq->poll_ctx) {
+ 	case IB_POLL_DIRECT:
+@@ -334,3 +341,169 @@ void ib_free_cq_user(struct ib_cq *cq, struct ib_udata *udata)
+ 	kfree(cq);
+ }
+ EXPORT_SYMBOL(ib_free_cq_user);
++
++void ib_cq_pool_init(struct ib_device *dev)
++{
++	unsigned int i;
++
++	spin_lock_init(&dev->cq_pools_lock);
++	for (i = 0; i < ARRAY_SIZE(dev->cq_pools); i++)
++		INIT_LIST_HEAD(&dev->cq_pools[i]);
++}
++
++void ib_cq_pool_destroy(struct ib_device *dev)
++{
++	struct ib_cq *cq, *n;
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(dev->cq_pools); i++) {
++		list_for_each_entry_safe(cq, n, &dev->cq_pools[i],
++					 pool_entry) {
++			WARN_ON(cq->cqe_used);
++			cq->shared = false;
++			ib_free_cq(cq);
++		}
++	}
++}
++
++static int ib_alloc_cqs(struct ib_device *dev, unsigned int nr_cqes,
++			enum ib_poll_context poll_ctx)
++{
++	LIST_HEAD(tmp_list);
++	unsigned int nr_cqs, i;
++	struct ib_cq *cq;
++	int ret;
++
++	if (poll_ctx > IB_POLL_LAST_POOL_TYPE) {
++		WARN_ON_ONCE(poll_ctx > IB_POLL_LAST_POOL_TYPE);
++		return -EINVAL;
++	}
++
++	/*
++	 * Allocate at least as many CQEs as requested, and otherwise
++	 * a reasonable batch size so that we can share CQs between
++	 * multiple users instead of allocating a larger number of CQs.
++	 */
++	nr_cqes = min_t(unsigned int, dev->attrs.max_cqe,
++			max(nr_cqes, IB_MAX_SHARED_CQ_SZ));
++	nr_cqs = min_t(unsigned int, dev->num_comp_vectors, num_online_cpus());
++	for (i = 0; i < nr_cqs; i++) {
++		cq = ib_alloc_cq(dev, NULL, nr_cqes, i, poll_ctx);
++		if (IS_ERR(cq)) {
++			ret = PTR_ERR(cq);
++			goto out_free_cqs;
++		}
++		cq->shared = true;
++		list_add_tail(&cq->pool_entry, &tmp_list);
++	}
++
++	spin_lock_irq(&dev->cq_pools_lock);
++	list_splice(&tmp_list, &dev->cq_pools[poll_ctx]);
++	spin_unlock_irq(&dev->cq_pools_lock);
++
++	return 0;
++
++out_free_cqs:
++	list_for_each_entry(cq, &tmp_list, pool_entry) {
++		cq->shared = false;
++		ib_free_cq(cq);
++	}
++	return ret;
++}
++
++/**
++ * ib_cq_pool_get() - Find the least used completion queue that matches
++ *   a given cpu hint (or least used for wild card affinity) and fits
++ *   nr_cqe.
++ * @dev: rdma device
++ * @nr_cqe: number of needed cqe entries
++ * @comp_vector_hint: completion vector hint (-1) for the driver to assign
++ *   a comp vector based on internal counter
++ * @poll_ctx: cq polling context
++ *
++ * Finds a cq that satisfies @comp_vector_hint and @nr_cqe requirements and
++ * claim entries in it for us.  In case there is no available cq, allocate
++ * a new cq with the requirements and add it to the device pool.
++ * IB_POLL_DIRECT cannot be used for shared cqs so it is not a valid value
++ * for @poll_ctx.
++ */
++struct ib_cq *ib_cq_pool_get(struct ib_device *dev, unsigned int nr_cqe,
++			     int comp_vector_hint,
++			     enum ib_poll_context poll_ctx)
++{
++	static unsigned int default_comp_vector;
++	unsigned int vector, num_comp_vectors;
++	struct ib_cq *cq, *found = NULL;
++	int ret;
++
++	if (poll_ctx > IB_POLL_LAST_POOL_TYPE) {
++		WARN_ON_ONCE(poll_ctx > IB_POLL_LAST_POOL_TYPE);
++		return ERR_PTR(-EINVAL);
++	}
++
++	num_comp_vectors =
++		min_t(unsigned int, dev->num_comp_vectors, num_online_cpus());
++	/* Project the affinty to the device completion vector range */
++	if (comp_vector_hint < 0) {
++		comp_vector_hint =
++			(READ_ONCE(default_comp_vector) + 1) % num_comp_vectors;
++		WRITE_ONCE(default_comp_vector, comp_vector_hint);
++	}
++	vector = comp_vector_hint % num_comp_vectors;
++
++	/*
++	 * Find the least used CQ with correct affinity and
++	 * enough free CQ entries
++	 */
++	while (!found) {
++		spin_lock_irq(&dev->cq_pools_lock);
++		list_for_each_entry(cq, &dev->cq_pools[poll_ctx],
++				    pool_entry) {
++			/*
++			 * Check to see if we have found a CQ with the
++			 * correct completion vector
++			 */
++			if (vector != cq->comp_vector)
++				continue;
++			if (cq->cqe_used + nr_cqe > cq->cqe)
++				continue;
++			found = cq;
++			break;
++		}
++
++		if (found) {
++			found->cqe_used += nr_cqe;
++			spin_unlock_irq(&dev->cq_pools_lock);
++
++			return found;
++		}
++		spin_unlock_irq(&dev->cq_pools_lock);
++
++		/*
++		 * Didn't find a match or ran out of CQs in the device
++		 * pool, allocate a new array of CQs.
++		 */
++		ret = ib_alloc_cqs(dev, nr_cqe, poll_ctx);
++		if (ret)
++			return ERR_PTR(ret);
++	}
++
++	return found;
++}
++EXPORT_SYMBOL(ib_cq_pool_get);
++
++/**
++ * ib_cq_pool_put - Return a CQ taken from a shared pool.
++ * @cq: The CQ to return.
++ * @nr_cqe: The max number of cqes that the user had requested.
++ */
++void ib_cq_pool_put(struct ib_cq *cq, unsigned int nr_cqe)
++{
++	if (WARN_ON_ONCE(nr_cqe > cq->cqe_used))
++		return;
++
++	spin_lock_irq(&cq->device->cq_pools_lock);
++	cq->cqe_used -= nr_cqe;
++	spin_unlock_irq(&cq->device->cq_pools_lock);
++}
++EXPORT_SYMBOL(ib_cq_pool_put);
+
+commit 3e5901cbfcc15da54f6ad148add754e7a2b2a558
+Author: Chuck Lever <chuck.lever@oracle.com>
+Date:   Wed Dec 18 15:18:15 2019 -0500
+
+    RDMA/core: Trace points for diagnosing completion queue issues
+    
+    Sample trace events:
+    
+       kworker/u29:0-300   [007]   120.042217: cq_alloc:             cq.id=4 nr_cqe=161 comp_vector=2 poll_ctx=WORKQUEUE
+              <idle>-0     [002]   120.056292: cq_schedule:          cq.id=4
+        kworker/2:1H-482   [002]   120.056402: cq_process:           cq.id=4 wake-up took 109 [us] from interrupt
+        kworker/2:1H-482   [002]   120.056407: cq_poll:              cq.id=4 requested 16, returned 1
+              <idle>-0     [002]   120.067503: cq_schedule:          cq.id=4
+        kworker/2:1H-482   [002]   120.067537: cq_process:           cq.id=4 wake-up took 34 [us] from interrupt
+        kworker/2:1H-482   [002]   120.067541: cq_poll:              cq.id=4 requested 16, returned 1
+              <idle>-0     [002]   120.067657: cq_schedule:          cq.id=4
+        kworker/2:1H-482   [002]   120.067672: cq_process:           cq.id=4 wake-up took 15 [us] from interrupt
+        kworker/2:1H-482   [002]   120.067674: cq_poll:              cq.id=4 requested 16, returned 1
+    
+     ...
+    
+             systemd-1     [002]   122.392653: cq_schedule:          cq.id=4
+        kworker/2:1H-482   [002]   122.392688: cq_process:           cq.id=4 wake-up took 35 [us] from interrupt
+        kworker/2:1H-482   [002]   122.392693: cq_poll:              cq.id=4 requested 16, returned 16
+        kworker/2:1H-482   [002]   122.392836: cq_poll:              cq.id=4 requested 16, returned 16
+        kworker/2:1H-482   [002]   122.392970: cq_poll:              cq.id=4 requested 16, returned 16
+        kworker/2:1H-482   [002]   122.393083: cq_poll:              cq.id=4 requested 16, returned 16
+        kworker/2:1H-482   [002]   122.393195: cq_poll:              cq.id=4 requested 16, returned 3
+    
+    Several features to note in this output:
+     - The WCE count and context type are reported at allocation time
+     - The CPU and kworker for each CQ is evident
+     - The CQ's restracker ID is tagged on each trace event
+     - CQ poll scheduling latency is measured
+     - Details about how often single completions occur versus multiple
+       completions are evident
+     - The cost of the ULP's completion handler is recorded
+    
+    Link: https://lore.kernel.org/r/20191218201815.30584.3481.stgit@manet.1015granger.net
+    Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+    Reviewed-by: Parav Pandit <parav@mellanox.com>
+    Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+
+diff --git a/drivers/infiniband/core/cq.c b/drivers/infiniband/core/cq.c
+index bbfded6d5d3d..4f25b2400694 100644
+--- a/drivers/infiniband/core/cq.c
++++ b/drivers/infiniband/core/cq.c
+@@ -7,6 +7,8 @@
+ #include <linux/slab.h>
+ #include <rdma/ib_verbs.h>
+ 
++#include <trace/events/rdma_core.h>
++
+ /* # of WCs to poll for with a single call to ib_poll_cq */
+ #define IB_POLL_BATCH			16
+ #define IB_POLL_BATCH_DIRECT		8
+@@ -41,6 +43,7 @@ static void ib_cq_rdma_dim_work(struct work_struct *w)
+ 
+ 	dim->state = DIM_START_MEASURE;
+ 
++	trace_cq_modify(cq, comps, usec);
+ 	cq->device->ops.modify_cq(cq, comps, usec);
+ }
+ 
+@@ -65,18 +68,29 @@ static void rdma_dim_init(struct ib_cq *cq)
+ 	INIT_WORK(&dim->work, ib_cq_rdma_dim_work);
+ }
+ 
++static int __poll_cq(struct ib_cq *cq, int num_entries, struct ib_wc *wc)
++{
++	int rc;
++
++	rc = ib_poll_cq(cq, num_entries, wc);
++	trace_cq_poll(cq, num_entries, rc);
++	return rc;
++}
++
+ static int __ib_process_cq(struct ib_cq *cq, int budget, struct ib_wc *wcs,
+ 			   int batch)
+ {
+ 	int i, n, completed = 0;
+ 
++	trace_cq_process(cq);
++
+ 	/*
+ 	 * budget might be (-1) if the caller does not
+ 	 * want to bound this call, thus we need unsigned
+ 	 * minimum here.
+ 	 */
+-	while ((n = ib_poll_cq(cq, min_t(u32, batch,
+-					 budget - completed), wcs)) > 0) {
++	while ((n = __poll_cq(cq, min_t(u32, batch,
++					budget - completed), wcs)) > 0) {
+ 		for (i = 0; i < n; i++) {
+ 			struct ib_wc *wc = &wcs[i];
+ 
+@@ -131,8 +145,10 @@ static int ib_poll_handler(struct irq_poll *iop, int budget)
+ 	completed = __ib_process_cq(cq, budget, cq->wc, IB_POLL_BATCH);
+ 	if (completed < budget) {
+ 		irq_poll_complete(&cq->iop);
+-		if (ib_req_notify_cq(cq, IB_POLL_FLAGS) > 0)
++		if (ib_req_notify_cq(cq, IB_POLL_FLAGS) > 0) {
++			trace_cq_reschedule(cq);
+ 			irq_poll_sched(&cq->iop);
++		}
+ 	}
+ 
+ 	if (dim)
+@@ -143,6 +159,7 @@ static int ib_poll_handler(struct irq_poll *iop, int budget)
+ 
+ static void ib_cq_completion_softirq(struct ib_cq *cq, void *private)
+ {
++	trace_cq_schedule(cq);
+ 	irq_poll_sched(&cq->iop);
+ }
+ 
+@@ -162,6 +179,7 @@ static void ib_cq_poll_work(struct work_struct *work)
+ 
+ static void ib_cq_completion_workqueue(struct ib_cq *cq, void *private)
+ {
++	trace_cq_schedule(cq);
+ 	queue_work(cq->comp_wq, &cq->work);
+ }
+ 
+@@ -239,6 +257,7 @@ struct ib_cq *__ib_alloc_cq_user(struct ib_device *dev, void *private,
+ 		goto out_destroy_cq;
+ 	}
+ 
++	trace_cq_alloc(cq, nr_cqe, comp_vector, poll_ctx);
+ 	return cq;
+ 
+ out_destroy_cq:
+@@ -248,6 +267,7 @@ struct ib_cq *__ib_alloc_cq_user(struct ib_device *dev, void *private,
+ 	kfree(cq->wc);
+ out_free_cq:
+ 	kfree(cq);
++	trace_cq_alloc_error(nr_cqe, comp_vector, poll_ctx, ret);
+ 	return ERR_PTR(ret);
+ }
+ EXPORT_SYMBOL(__ib_alloc_cq_user);
+@@ -304,6 +324,7 @@ void ib_free_cq_user(struct ib_cq *cq, struct ib_udata *udata)
+ 		WARN_ON_ONCE(1);
+ 	}
+ 
++	trace_cq_free(cq);
+ 	rdma_restrack_del(&cq->res);
+ 	cq->device->ops.destroy_cq(cq, udata);
+ 	if (cq->dim)
+
+commit 20cf4e026730104892fa1268de0371a631cee294
+Author: Chuck Lever <chuck.lever@oracle.com>
+Date:   Mon Jul 29 13:22:09 2019 -0400
+
+    rdma: Enable ib_alloc_cq to spread work over a device's comp_vectors
+    
+    Send and Receive completion is handled on a single CPU selected at
+    the time each Completion Queue is allocated. Typically this is when
+    an initiator instantiates an RDMA transport, or when a target
+    accepts an RDMA connection.
+    
+    Some ULPs cannot open a connection per CPU to spread completion
+    workload across available CPUs and MSI vectors. For such ULPs,
+    provide an API that allows the RDMA core to select a completion
+    vector based on the device's complement of available comp_vecs.
+    
+    ULPs that invoke ib_alloc_cq() with only comp_vector 0 are converted
+    to use the new API so that their completion workloads interfere less
+    with each other.
+    
+    Suggested-by: Håkon Bugge <haakon.bugge@oracle.com>
+    Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+    Reviewed-by: Leon Romanovsky <leonro@mellanox.com>
+    Cc: <linux-cifs@vger.kernel.org>
+    Cc: <v9fs-developer@lists.sourceforge.net>
+    Link: https://lore.kernel.org/r/20190729171923.13428.52555.stgit@manet.1015granger.net
+    Signed-off-by: Doug Ledford <dledford@redhat.com>
+
+diff --git a/drivers/infiniband/core/cq.c b/drivers/infiniband/core/cq.c
+index 7c599878ccf7..bbfded6d5d3d 100644
+--- a/drivers/infiniband/core/cq.c
++++ b/drivers/infiniband/core/cq.c
+@@ -252,6 +252,34 @@ struct ib_cq *__ib_alloc_cq_user(struct ib_device *dev, void *private,
+ }
+ EXPORT_SYMBOL(__ib_alloc_cq_user);
+ 
++/**
++ * __ib_alloc_cq_any - allocate a completion queue
++ * @dev:		device to allocate the CQ for
++ * @private:		driver private data, accessible from cq->cq_context
++ * @nr_cqe:		number of CQEs to allocate
++ * @poll_ctx:		context to poll the CQ from
++ * @caller:		module owner name
++ *
++ * Attempt to spread ULP Completion Queues over each device's interrupt
++ * vectors. A simple best-effort mechanism is used.
++ */
++struct ib_cq *__ib_alloc_cq_any(struct ib_device *dev, void *private,
++				int nr_cqe, enum ib_poll_context poll_ctx,
++				const char *caller)
++{
++	static atomic_t counter;
++	int comp_vector = 0;
++
++	if (dev->num_comp_vectors > 1)
++		comp_vector =
++			atomic_inc_return(&counter) %
++			min_t(int, dev->num_comp_vectors, num_online_cpus());
++
++	return __ib_alloc_cq_user(dev, private, nr_cqe, comp_vector, poll_ctx,
++				  caller, NULL);
++}
++EXPORT_SYMBOL(__ib_alloc_cq_any);
++
+ /**
+  * ib_free_cq_user - free a completion queue
+  * @cq:		completion queue to free.
+
+commit bedc0fd0f9b517698193d644f914b33951856fd2
+Author: Qian Cai <cai@lca.pw>
+Date:   Thu Jul 11 09:55:56 2019 -0400
+
+    RDMA/core: Fix -Wunused-const-variable warnings
+    
+    The commit below introduced a few compilation warnings.
+    
+    In file included from ./include/rdma/ib_verbs.h:64,
+                     from ./include/linux/mlx5/device.h:37,
+                     from ./include/linux/mlx5/driver.h:51,
+                     from drivers/net/ethernet/mellanox/mlx5/core/uar.c:36:
+    ./include/linux/dim.h:378:1: warning: 'rdma_dim_prof' defined but not
+    used [-Wunused-const-variable=]
+     rdma_dim_prof[RDMA_DIM_PARAMS_NUM_PROFILES] = {
+     ^~~~~~~~~~~~~
+    In file included from ./include/rdma/ib_verbs.h:64,
+                     from ./include/linux/mlx5/device.h:37,
+                     from ./include/linux/mlx5/driver.h:51,
+                     from
+    drivers/net/ethernet/mellanox/mlx5/core/pagealloc.c:37:
+    ./include/linux/dim.h:378:1: warning: 'rdma_dim_prof' defined but not
+    used [-Wunused-const-variable=]
+     rdma_dim_prof[RDMA_DIM_PARAMS_NUM_PROFILES] = {
+     ^~~~~~~~~~~~~
+    
+    Since only ib_cq_rdma_dim_work() in drivers/infiniband/core/cq.c uses it,
+    just move the definition over there.
+    
+    Fixes: f4915455dcf0 ("linux/dim: Implement RDMA adaptive moderation (DIM)")
+    Signed-off-by: Qian Cai <cai@lca.pw>
+    Reviewed-by: Jason Gunthorpe <jgg@mellanox.com>
+    Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+
+diff --git a/drivers/infiniband/core/cq.c b/drivers/infiniband/core/cq.c
+index ffd6e24109d5..7c599878ccf7 100644
+--- a/drivers/infiniband/core/cq.c
++++ b/drivers/infiniband/core/cq.c
+@@ -18,6 +18,19 @@
+ #define IB_POLL_FLAGS \
+ 	(IB_CQ_NEXT_COMP | IB_CQ_REPORT_MISSED_EVENTS)
+ 
++static const struct dim_cq_moder
++rdma_dim_prof[RDMA_DIM_PARAMS_NUM_PROFILES] = {
++	{1,   0, 1,  0},
++	{1,   0, 4,  0},
++	{2,   0, 4,  0},
++	{2,   0, 8,  0},
++	{4,   0, 8,  0},
++	{16,  0, 8,  0},
++	{16,  0, 16, 0},
++	{32,  0, 16, 0},
++	{32,  0, 32, 0},
++};
++
+ static void ib_cq_rdma_dim_work(struct work_struct *w)
+ {
+ 	struct dim *dim = container_of(w, struct dim, work);
+
+commit da6629793aa6944db6c8a908ca1a52d87f1489aa
+Author: Yamin Friedman <yaminf@mellanox.com>
+Date:   Mon Jul 8 13:59:03 2019 +0300
+
+    RDMA/core: Provide RDMA DIM support for ULPs
+    
+    Added the interface in the infiniband driver that applies the rdma_dim
+    adaptive moderation. There is now a special function for allocating an
+    ib_cq that uses rdma_dim.
+    
+    Performance improvement (ConnectX-5 100GbE, x86) running FIO benchmark over
+    NVMf between two equal end-hosts with 56 cores across a Mellanox switch
+    using null_blk device:
+    
+    READS without DIM:
+    blk size | BW       | IOPS | 99th percentile latency  | 99.99th latency
+    512B     | 3.8GiB/s | 7.7M | 1401  usec               | 2442  usec
+    4k       | 7.0GiB/s | 1.8M | 4817  usec               | 6587  usec
+    64k      | 10.7GiB/s| 175k | 9896  usec               | 10028 usec
+    
+    IO WRITES without DIM:
+    blk size | BW       | IOPS | 99th percentile latency  | 99.99th latency
+    512B     | 3.6GiB/s | 7.5M | 1434  usec               | 2474  usec
+    4k       | 6.3GiB/s | 1.6M | 938   usec               | 1221  usec
+    64k      | 10.7GiB/s| 175k | 8979  usec               | 12780 usec
+    
+    IO READS with DIM:
+    blk size | BW       | IOPS | 99th percentile latency  | 99.99th latency
+    512B     | 4GiB/s   | 8.2M | 816    usec              | 889   usec
+    4k       | 10.1GiB/s| 2.65M| 3359   usec              | 5080  usec
+    64k      | 10.7GiB/s| 175k | 9896   usec              | 10028 usec
+    
+    IO WRITES with DIM:
+    blk size | BW       | IOPS  | 99th percentile latency | 99.99th latency
+    512B     | 3.9GiB/s | 8.1M  | 799   usec              | 922   usec
+    4k       | 9.6GiB/s | 2.5M  | 717   usec              | 1004  usec
+    64k      | 10.7GiB/s| 176k  | 8586  usec              | 12256 usec
+    
+    The rdma_dim algorithm was designed to measure the effectiveness of
+    moderation on the flow in a general way and thus should be appropriate
+    for all RDMA storage protocols.
+    
+    rdma_dim is configured to be the default option based on performance
+    improvement seen after extensive tests.
+    
+    Signed-off-by: Yamin Friedman <yaminf@mellanox.com>
+    Reviewed-by: Max Gurtovoy <maxg@mellanox.com>
+    Reviewed-by: Sagi Grimberg <sagi@grimberg.me>
+    Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+    Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+    Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+
+diff --git a/drivers/infiniband/core/cq.c b/drivers/infiniband/core/cq.c
+index 00d70f166209..ffd6e24109d5 100644
+--- a/drivers/infiniband/core/cq.c
++++ b/drivers/infiniband/core/cq.c
+@@ -18,6 +18,40 @@
+ #define IB_POLL_FLAGS \
+ 	(IB_CQ_NEXT_COMP | IB_CQ_REPORT_MISSED_EVENTS)
+ 
++static void ib_cq_rdma_dim_work(struct work_struct *w)
++{
++	struct dim *dim = container_of(w, struct dim, work);
++	struct ib_cq *cq = dim->priv;
++
++	u16 usec = rdma_dim_prof[dim->profile_ix].usec;
++	u16 comps = rdma_dim_prof[dim->profile_ix].comps;
++
++	dim->state = DIM_START_MEASURE;
++
++	cq->device->ops.modify_cq(cq, comps, usec);
++}
++
++static void rdma_dim_init(struct ib_cq *cq)
++{
++	struct dim *dim;
++
++	if (!cq->device->ops.modify_cq || !cq->device->use_cq_dim ||
++	    cq->poll_ctx == IB_POLL_DIRECT)
++		return;
++
++	dim = kzalloc(sizeof(struct dim), GFP_KERNEL);
++	if (!dim)
++		return;
++
++	dim->state = DIM_START_MEASURE;
++	dim->tune_state = DIM_GOING_RIGHT;
++	dim->profile_ix = RDMA_DIM_START_PROFILE;
++	dim->priv = cq;
++	cq->dim = dim;
++
++	INIT_WORK(&dim->work, ib_cq_rdma_dim_work);
++}
++
+ static int __ib_process_cq(struct ib_cq *cq, int budget, struct ib_wc *wcs,
+ 			   int batch)
+ {
+@@ -78,6 +112,7 @@ static void ib_cq_completion_direct(struct ib_cq *cq, void *private)
+ static int ib_poll_handler(struct irq_poll *iop, int budget)
+ {
+ 	struct ib_cq *cq = container_of(iop, struct ib_cq, iop);
++	struct dim *dim = cq->dim;
+ 	int completed;
+ 
+ 	completed = __ib_process_cq(cq, budget, cq->wc, IB_POLL_BATCH);
+@@ -87,6 +122,9 @@ static int ib_poll_handler(struct irq_poll *iop, int budget)
+ 			irq_poll_sched(&cq->iop);
+ 	}
+ 
++	if (dim)
++		rdma_dim(dim, completed);
++
+ 	return completed;
+ }
+ 
+@@ -105,6 +143,8 @@ static void ib_cq_poll_work(struct work_struct *work)
+ 	if (completed >= IB_POLL_BUDGET_WORKQUEUE ||
+ 	    ib_req_notify_cq(cq, IB_POLL_FLAGS) > 0)
+ 		queue_work(cq->comp_wq, &cq->work);
++	else if (cq->dim)
++		rdma_dim(cq->dim, completed);
+ }
+ 
+ static void ib_cq_completion_workqueue(struct ib_cq *cq, void *private)
+@@ -161,6 +201,8 @@ struct ib_cq *__ib_alloc_cq_user(struct ib_device *dev, void *private,
+ 
+ 	rdma_restrack_kadd(&cq->res);
+ 
++	rdma_dim_init(cq);
++
+ 	switch (cq->poll_ctx) {
+ 	case IB_POLL_DIRECT:
+ 		cq->comp_handler = ib_cq_completion_direct;
+@@ -223,6 +265,9 @@ void ib_free_cq_user(struct ib_cq *cq, struct ib_udata *udata)
+ 
+ 	rdma_restrack_del(&cq->res);
+ 	cq->device->ops.destroy_cq(cq, udata);
++	if (cq->dim)
++		cancel_work_sync(&cq->dim->work);
++	kfree(cq->dim);
+ 	kfree(cq->wc);
+ 	kfree(cq);
+ }
+
+commit 371bb62158d53c1fc33e2fb9b6aeb9522caf6cf4
+Merge: 10dcc7448e9e 4b972a01a7da
+Author: Jason Gunthorpe <jgg@mellanox.com>
+Date:   Fri Jun 28 21:18:23 2019 -0300
+
+    Merge tag 'v5.2-rc6' into rdma.git for-next
+    
+    For dependencies in next patches.
+    
+    Resolve conflicts:
+    - Use uverbs_get_cleared_udata() with new cq allocation flow
+    - Continue to delete nes despite SPDX conflict
+    - Resolve list appends in mlx5_command_str()
+    - Use u16 for vport_rule stuff
+    - Resolve list appends in struct ib_client
+    
+    Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+
+commit e39afe3d6dbd908d8fd189571a3c1561088a86c2
+Author: Leon Romanovsky <leonro@mellanox.com>
+Date:   Tue May 28 14:37:29 2019 +0300
+
+    RDMA: Convert CQ allocations to be under core responsibility
+    
+    Ensure that CQ is allocated and freed by IB/core and not by drivers.
+    
+    Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+    Acked-by: Gal Pressman <galpress@amazon.com>
+    Reviewed-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+    Tested-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+    Signed-off-by: Doug Ledford <dledford@redhat.com>
+
+diff --git a/drivers/infiniband/core/cq.c b/drivers/infiniband/core/cq.c
+index 6ee62600a812..3b9412c69565 100644
+--- a/drivers/infiniband/core/cq.c
++++ b/drivers/infiniband/core/cq.c
+@@ -147,23 +147,26 @@ struct ib_cq *__ib_alloc_cq_user(struct ib_device *dev, void *private,
+ 	struct ib_cq *cq;
+ 	int ret = -ENOMEM;
+ 
+-	cq = dev->ops.create_cq(dev, &cq_attr, NULL);
+-	if (IS_ERR(cq))
+-		return cq;
++	cq = rdma_zalloc_drv_obj(dev, ib_cq);
++	if (!cq)
++		return ERR_PTR(ret);
+ 
+ 	cq->device = dev;
+-	cq->uobject = NULL;
+-	cq->event_handler = NULL;
+ 	cq->cq_context = private;
+ 	cq->poll_ctx = poll_ctx;
+ 	atomic_set(&cq->usecnt, 0);
+ 
+ 	cq->wc = kmalloc_array(IB_POLL_BATCH, sizeof(*cq->wc), GFP_KERNEL);
+ 	if (!cq->wc)
+-		goto out_destroy_cq;
++		goto out_free_cq;
+ 
+ 	cq->res.type = RDMA_RESTRACK_CQ;
+ 	rdma_restrack_set_task(&cq->res, caller);
++
++	ret = dev->ops.create_cq(cq, &cq_attr, NULL);
++	if (ret)
++		goto out_free_wc;
++
+ 	rdma_restrack_kadd(&cq->res);
+ 
+ 	switch (cq->poll_ctx) {
+@@ -186,16 +189,18 @@ struct ib_cq *__ib_alloc_cq_user(struct ib_device *dev, void *private,
+ 		break;
+ 	default:
+ 		ret = -EINVAL;
+-		goto out_free_wc;
++		goto out_destroy_cq;
+ 	}
+ 
+ 	return cq;
+ 
+-out_free_wc:
+-	kfree(cq->wc);
+-	rdma_restrack_del(&cq->res);
+ out_destroy_cq:
++	rdma_restrack_del(&cq->res);
+ 	cq->device->ops.destroy_cq(cq, udata);
++out_free_wc:
++	kfree(cq->wc);
++out_free_cq:
++	kfree(cq);
+ 	return ERR_PTR(ret);
+ }
+ EXPORT_SYMBOL(__ib_alloc_cq_user);
+@@ -224,8 +229,9 @@ void ib_free_cq_user(struct ib_cq *cq, struct ib_udata *udata)
+ 		WARN_ON_ONCE(1);
+ 	}
+ 
+-	kfree(cq->wc);
+ 	rdma_restrack_del(&cq->res);
+ 	cq->device->ops.destroy_cq(cq, udata);
++	kfree(cq->wc);
++	kfree(cq);
+ }
+ EXPORT_SYMBOL(ib_free_cq_user);
+
+commit a52c8e2469c30cf7ac453d624aed9c168b23d1af
+Author: Leon Romanovsky <leonro@mellanox.com>
+Date:   Tue May 28 14:37:28 2019 +0300
+
+    RDMA: Clean destroy CQ in drivers do not return errors
+    
+    Like all other destroy commands, .destroy_cq() call is not supposed
+    to fail. In all flows, the attempt to return earlier caused to memory
+    leaks.
+    
+    This patch converts .destroy_cq() to do not return any errors.
+    
+    Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+    Acked-by: Gal Pressman <galpress@amazon.com>
+    Acked-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+    Signed-off-by: Doug Ledford <dledford@redhat.com>
+
+diff --git a/drivers/infiniband/core/cq.c b/drivers/infiniband/core/cq.c
+index cb72aa4985a4..6ee62600a812 100644
+--- a/drivers/infiniband/core/cq.c
++++ b/drivers/infiniband/core/cq.c
+@@ -207,8 +207,6 @@ EXPORT_SYMBOL(__ib_alloc_cq_user);
+  */
+ void ib_free_cq_user(struct ib_cq *cq, struct ib_udata *udata)
+ {
+-	int ret;
+-
+ 	if (WARN_ON_ONCE(atomic_read(&cq->usecnt)))
+ 		return;
+ 
+@@ -228,7 +226,6 @@ void ib_free_cq_user(struct ib_cq *cq, struct ib_udata *udata)
+ 
+ 	kfree(cq->wc);
+ 	rdma_restrack_del(&cq->res);
+-	ret = cq->device->ops.destroy_cq(cq, udata);
+-	WARN_ON_ONCE(ret);
++	cq->device->ops.destroy_cq(cq, udata);
+ }
+ EXPORT_SYMBOL(ib_free_cq_user);
+
+commit 2025cf9e193de05b0654570dd639acb49ebd3adf
+Author: Thomas Gleixner <tglx@linutronix.de>
+Date:   Wed May 29 07:18:02 2019 -0700
+
+    treewide: Replace GPLv2 boilerplate/reference with SPDX - rule 288
+    
+    Based on 1 normalized pattern(s):
+    
+      this program is free software you can redistribute it and or modify
+      it under the terms and conditions of the gnu general public license
+      version 2 as published by the free software foundation this program
+      is distributed in the hope it will be useful but without any
+      warranty without even the implied warranty of merchantability or
+      fitness for a particular purpose see the gnu general public license
+      for more details
+    
+    extracted by the scancode license scanner the SPDX license identifier
+    
+      GPL-2.0-only
+    
+    has been chosen to replace the boilerplate/reference in 263 file(s).
+    
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Reviewed-by: Allison Randal <allison@lohutok.net>
+    Reviewed-by: Alexios Zavras <alexios.zavras@intel.com>
+    Cc: linux-spdx@vger.kernel.org
+    Link: https://lkml.kernel.org/r/20190529141901.208660670@linutronix.de
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/infiniband/core/cq.c b/drivers/infiniband/core/cq.c
+index a4c81992267c..a24c900fbdf6 100644
+--- a/drivers/infiniband/core/cq.c
++++ b/drivers/infiniband/core/cq.c
+@@ -1,14 +1,6 @@
++// SPDX-License-Identifier: GPL-2.0-only
+ /*
+  * Copyright (c) 2015 HGST, a Western Digital Company.
+- *
+- * This program is free software; you can redistribute it and/or modify it
+- * under the terms and conditions of the GNU General Public License,
+- * version 2, as published by the Free Software Foundation.
+- *
+- * This program is distributed in the hope it will be useful, but WITHOUT
+- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+- * more details.
+  */
+ #include <linux/module.h>
+ #include <linux/err.h>
+
+commit 91f571293e26af3e17e209eed89e2d5777192819
+Author: Israel Rukshin <israelr@mellanox.com>
+Date:   Wed May 15 13:49:31 2019 +0300
+
+    RDMA/core: Fix doc typo
+    
+    Use the correct function names.
+    
+    Fixes: c4367a26357b ("IB: Pass uverbs_attr_bundle down ib_x destroy path")
+    Signed-off-by: Israel Rukshin <israelr@mellanox.com>
+    Reviewed-by: Max Gurtovoy <maxg@mellanox.com>
+    Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+
+diff --git a/drivers/infiniband/core/cq.c b/drivers/infiniband/core/cq.c
+index a4c81992267c..cb72aa4985a4 100644
+--- a/drivers/infiniband/core/cq.c
++++ b/drivers/infiniband/core/cq.c
+@@ -121,7 +121,7 @@ static void ib_cq_completion_workqueue(struct ib_cq *cq, void *private)
+ }
+ 
+ /**
+- * __ib_alloc_cq - allocate a completion queue
++ * __ib_alloc_cq_user - allocate a completion queue
+  * @dev:		device to allocate the CQ for
+  * @private:		driver private data, accessible from cq->cq_context
+  * @nr_cqe:		number of CQEs to allocate
+@@ -201,7 +201,7 @@ struct ib_cq *__ib_alloc_cq_user(struct ib_device *dev, void *private,
+ EXPORT_SYMBOL(__ib_alloc_cq_user);
+ 
+ /**
+- * ib_free_cq - free a completion queue
++ * ib_free_cq_user - free a completion queue
+  * @cq:		completion queue to free.
+  * @udata:	User data or NULL for kernel object
+  */
+
+commit ff23dfa134576e071ace69e91761d229a0f73139
+Author: Shamir Rabinovitch <shamir.rabinovitch@oracle.com>
+Date:   Sun Mar 31 19:10:07 2019 +0300
+
+    IB: Pass only ib_udata in function prototypes
+    
+    Now when ib_udata is passed to all the driver's object create/destroy APIs
+    the ib_udata will carry the ib_ucontext for every user command. There is
+    no need to also pass the ib_ucontext via the functions prototypes.
+    
+    Make ib_udata the only argument psssed.
+    
+    Signed-off-by: Shamir Rabinovitch <shamir.rabinovitch@oracle.com>
+    Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+
+diff --git a/drivers/infiniband/core/cq.c b/drivers/infiniband/core/cq.c
+index 4797eef549c3..a4c81992267c 100644
+--- a/drivers/infiniband/core/cq.c
++++ b/drivers/infiniband/core/cq.c
+@@ -147,7 +147,7 @@ struct ib_cq *__ib_alloc_cq_user(struct ib_device *dev, void *private,
+ 	struct ib_cq *cq;
+ 	int ret = -ENOMEM;
+ 
+-	cq = dev->ops.create_cq(dev, &cq_attr, NULL, NULL);
++	cq = dev->ops.create_cq(dev, &cq_attr, NULL);
+ 	if (IS_ERR(cq))
+ 		return cq;
+ 
+
+commit c4367a26357be501338e41ceae7ebb7ce57064e5
+Author: Shamir Rabinovitch <shamir.rabinovitch@oracle.com>
+Date:   Sun Mar 31 19:10:05 2019 +0300
+
+    IB: Pass uverbs_attr_bundle down ib_x destroy path
+    
+    The uverbs_attr_bundle with the ucontext is sent down to the drivers ib_x
+    destroy path as ib_udata. The next patch will use the ib_udata to free the
+    drivers destroy path from the dependency in 'uobject->context' as we
+    already did for the create path.
+    
+    Signed-off-by: Shamir Rabinovitch <shamir.rabinovitch@oracle.com>
+    Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+
+diff --git a/drivers/infiniband/core/cq.c b/drivers/infiniband/core/cq.c
+index d61e5e1427c2..4797eef549c3 100644
+--- a/drivers/infiniband/core/cq.c
++++ b/drivers/infiniband/core/cq.c
+@@ -128,15 +128,17 @@ static void ib_cq_completion_workqueue(struct ib_cq *cq, void *private)
+  * @comp_vector:	HCA completion vectors for this CQ
+  * @poll_ctx:		context to poll the CQ from.
+  * @caller:		module owner name.
++ * @udata:		Valid user data or NULL for kernel object
+  *
+  * This is the proper interface to allocate a CQ for in-kernel users. A
+  * CQ allocated with this interface will automatically be polled from the
+  * specified context. The ULP must use wr->wr_cqe instead of wr->wr_id
+  * to use this CQ abstraction.
+  */
+-struct ib_cq *__ib_alloc_cq(struct ib_device *dev, void *private,
+-			    int nr_cqe, int comp_vector,
+-			    enum ib_poll_context poll_ctx, const char *caller)
++struct ib_cq *__ib_alloc_cq_user(struct ib_device *dev, void *private,
++				 int nr_cqe, int comp_vector,
++				 enum ib_poll_context poll_ctx,
++				 const char *caller, struct ib_udata *udata)
+ {
+ 	struct ib_cq_init_attr cq_attr = {
+ 		.cqe		= nr_cqe,
+@@ -193,16 +195,17 @@ struct ib_cq *__ib_alloc_cq(struct ib_device *dev, void *private,
+ 	kfree(cq->wc);
+ 	rdma_restrack_del(&cq->res);
+ out_destroy_cq:
+-	cq->device->ops.destroy_cq(cq);
++	cq->device->ops.destroy_cq(cq, udata);
+ 	return ERR_PTR(ret);
+ }
+-EXPORT_SYMBOL(__ib_alloc_cq);
++EXPORT_SYMBOL(__ib_alloc_cq_user);
+ 
+ /**
+  * ib_free_cq - free a completion queue
+  * @cq:		completion queue to free.
++ * @udata:	User data or NULL for kernel object
+  */
+-void ib_free_cq(struct ib_cq *cq)
++void ib_free_cq_user(struct ib_cq *cq, struct ib_udata *udata)
+ {
+ 	int ret;
+ 
+@@ -225,7 +228,7 @@ void ib_free_cq(struct ib_cq *cq)
+ 
+ 	kfree(cq->wc);
+ 	rdma_restrack_del(&cq->res);
+-	ret = cq->device->ops.destroy_cq(cq);
++	ret = cq->device->ops.destroy_cq(cq, udata);
+ 	WARN_ON_ONCE(ret);
+ }
+-EXPORT_SYMBOL(ib_free_cq);
++EXPORT_SYMBOL(ib_free_cq_user);
+
+commit af8d70375d562034d375ca7a8b08997422223258
+Author: Shamir Rabinovitch <shamir.rabinovitch@oracle.com>
+Date:   Mon Dec 17 17:15:16 2018 +0200
+
+    RDMA/restrack: Resource-tracker should not use uobject pointers
+    
+    Having uobject pointer embedded in ib core objects is not aligned with a
+    future shared ib_x model. The resource tracker only does this to keep
+    track of user/kernel objects - track this directly instead.
+    
+    Signed-off-by: Shamir Rabinovitch <shamir.rabinovitch@oracle.com>
+    Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+
+diff --git a/drivers/infiniband/core/cq.c b/drivers/infiniband/core/cq.c
+index 7fb4f64ae933..d61e5e1427c2 100644
+--- a/drivers/infiniband/core/cq.c
++++ b/drivers/infiniband/core/cq.c
+@@ -162,7 +162,7 @@ struct ib_cq *__ib_alloc_cq(struct ib_device *dev, void *private,
+ 
+ 	cq->res.type = RDMA_RESTRACK_CQ;
+ 	rdma_restrack_set_task(&cq->res, caller);
+-	rdma_restrack_add(&cq->res);
++	rdma_restrack_kadd(&cq->res);
+ 
+ 	switch (cq->poll_ctx) {
+ 	case IB_POLL_DIRECT:
+
+commit 3023a1e93656c02b8d6a3a46e712b815843fa514
+Author: Kamal Heib <kamalheib1@gmail.com>
+Date:   Mon Dec 10 21:09:48 2018 +0200
+
+    RDMA: Start use ib_device_ops
+    
+    Make all the required change to start use the ib_device_ops structure.
+    
+    Signed-off-by: Kamal Heib <kamalheib1@gmail.com>
+    Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+
+diff --git a/drivers/infiniband/core/cq.c b/drivers/infiniband/core/cq.c
+index b1e5365ddafa..7fb4f64ae933 100644
+--- a/drivers/infiniband/core/cq.c
++++ b/drivers/infiniband/core/cq.c
+@@ -145,7 +145,7 @@ struct ib_cq *__ib_alloc_cq(struct ib_device *dev, void *private,
+ 	struct ib_cq *cq;
+ 	int ret = -ENOMEM;
+ 
+-	cq = dev->create_cq(dev, &cq_attr, NULL, NULL);
++	cq = dev->ops.create_cq(dev, &cq_attr, NULL, NULL);
+ 	if (IS_ERR(cq))
+ 		return cq;
+ 
+@@ -193,7 +193,7 @@ struct ib_cq *__ib_alloc_cq(struct ib_device *dev, void *private,
+ 	kfree(cq->wc);
+ 	rdma_restrack_del(&cq->res);
+ out_destroy_cq:
+-	cq->device->destroy_cq(cq);
++	cq->device->ops.destroy_cq(cq);
+ 	return ERR_PTR(ret);
+ }
+ EXPORT_SYMBOL(__ib_alloc_cq);
+@@ -225,7 +225,7 @@ void ib_free_cq(struct ib_cq *cq)
+ 
+ 	kfree(cq->wc);
+ 	rdma_restrack_del(&cq->res);
+-	ret = cq->device->destroy_cq(cq);
++	ret = cq->device->ops.destroy_cq(cq);
+ 	WARN_ON_ONCE(ret);
+ }
+ EXPORT_SYMBOL(ib_free_cq);
+
+commit 2165fc264079ecb7fbfa5e8b330a92eb3f0fcbe1
+Author: Leon Romanovsky <leonro@mellanox.com>
+Date:   Tue Oct 2 11:48:02 2018 +0300
+
+    RDMA/restrack: Consolidate task name updates in one place
+    
+    Unify task update and kernel name set in one place.
+    
+    Reviewed-by: Artemy Kovalyov <artemyko@mellanox.com>
+    Reviewed-by: Yossi Itigin <yosefe@mellanox.com>
+    Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+    Reviewed-by: Steve Wise <swise@opengridcomputing.com>
+    Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+
+diff --git a/drivers/infiniband/core/cq.c b/drivers/infiniband/core/cq.c
+index 9271f7290005..b1e5365ddafa 100644
+--- a/drivers/infiniband/core/cq.c
++++ b/drivers/infiniband/core/cq.c
+@@ -161,7 +161,7 @@ struct ib_cq *__ib_alloc_cq(struct ib_device *dev, void *private,
+ 		goto out_destroy_cq;
+ 
+ 	cq->res.type = RDMA_RESTRACK_CQ;
+-	cq->res.kern_name = caller;
++	rdma_restrack_set_task(&cq->res, caller);
+ 	rdma_restrack_add(&cq->res);
+ 
+ 	switch (cq->poll_ctx) {
+
+commit f794809a7259dfaa3d47d90ef5a86007cf48b1ce
+Author: Jack Morgenstein <jackm@dev.mellanox.co.il>
+Date:   Mon Aug 27 08:35:55 2018 +0300
+
+    IB/core: Add an unbound WQ type to the new CQ API
+    
+    The upstream kernel commit cited below modified the workqueue in the
+    new CQ API to be bound to a specific CPU (instead of being unbound).
+    This caused ALL users of the new CQ API to use the same bound WQ.
+    
+    Specifically, MAD handling was severely delayed when the CPU bound
+    to the WQ was busy handling (higher priority) interrupts.
+    
+    This caused a delay in the MAD "heartbeat" response handling,
+    which resulted in ports being incorrectly classified as "down".
+    
+    To fix this, add a new "unbound" WQ type to the new CQ API, so that users
+    have the option to choose either a bound WQ or an unbound WQ.
+    
+    For MADs, choose the new "unbound" WQ.
+    
+    Fixes: b7363e67b23e ("IB/device: Convert ib-comp-wq to be CPU-bound")
+    Signed-off-by: Jack Morgenstein <jackm@dev.mellanox.co.il>
+    Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+    Reviewed-by: Sagi Grimberg <sagi@grimberg.m>
+    Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+
+diff --git a/drivers/infiniband/core/cq.c b/drivers/infiniband/core/cq.c
+index af5ad6a56ae4..9271f7290005 100644
+--- a/drivers/infiniband/core/cq.c
++++ b/drivers/infiniband/core/cq.c
+@@ -112,12 +112,12 @@ static void ib_cq_poll_work(struct work_struct *work)
+ 				    IB_POLL_BATCH);
+ 	if (completed >= IB_POLL_BUDGET_WORKQUEUE ||
+ 	    ib_req_notify_cq(cq, IB_POLL_FLAGS) > 0)
+-		queue_work(ib_comp_wq, &cq->work);
++		queue_work(cq->comp_wq, &cq->work);
+ }
+ 
+ static void ib_cq_completion_workqueue(struct ib_cq *cq, void *private)
+ {
+-	queue_work(ib_comp_wq, &cq->work);
++	queue_work(cq->comp_wq, &cq->work);
+ }
+ 
+ /**
+@@ -175,9 +175,12 @@ struct ib_cq *__ib_alloc_cq(struct ib_device *dev, void *private,
+ 		ib_req_notify_cq(cq, IB_CQ_NEXT_COMP);
+ 		break;
+ 	case IB_POLL_WORKQUEUE:
++	case IB_POLL_UNBOUND_WORKQUEUE:
+ 		cq->comp_handler = ib_cq_completion_workqueue;
+ 		INIT_WORK(&cq->work, ib_cq_poll_work);
+ 		ib_req_notify_cq(cq, IB_CQ_NEXT_COMP);
++		cq->comp_wq = (cq->poll_ctx == IB_POLL_WORKQUEUE) ?
++				ib_comp_wq : ib_comp_unbound_wq;
+ 		break;
+ 	default:
+ 		ret = -EINVAL;
+@@ -213,6 +216,7 @@ void ib_free_cq(struct ib_cq *cq)
+ 		irq_poll_disable(&cq->iop);
+ 		break;
+ 	case IB_POLL_WORKQUEUE:
++	case IB_POLL_UNBOUND_WORKQUEUE:
+ 		cancel_work_sync(&cq->work);
+ 		break;
+ 	default:
+
+commit d3b9e8ad425cfd5b9116732e057f1b48e4d3bcb8
+Author: Max Gurtovoy <maxg@mellanox.com>
+Date:   Mon Mar 5 20:09:48 2018 +0200
+
+    RDMA/core: Reduce poll batch for direct cq polling
+    
+    Fix warning limit for kernel stack consumption:
+    
+    drivers/infiniband/core/cq.c: In function 'ib_process_cq_direct':
+    drivers/infiniband/core/cq.c:78:1: error: the frame size of 1032 bytes
+    is larger than 1024 bytes [-Werror=frame-larger-than=]
+    
+    Using smaller ib_wc array on the stack brings us comfortably below that
+    limit again.
+    
+    Fixes: 246d8b184c10 ("IB/cq: Don't force IB_POLL_DIRECT poll context for ib_process_cq_direct")
+    Reported-by: Arnd Bergmann <arnd@arndb.de>
+    Reviewed-by: Sergey Gorenko <sergeygo@mellanox.com>
+    Signed-off-by: Max Gurtovoy <maxg@mellanox.com>
+    Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+    Reviewed-by: Bart Van Assche <bart.vanassche@wdc.com>
+    Acked-by: Arnd Bergmann <arnd@arndb.de>
+    Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+
+diff --git a/drivers/infiniband/core/cq.c b/drivers/infiniband/core/cq.c
+index bc79ca8215d7..af5ad6a56ae4 100644
+--- a/drivers/infiniband/core/cq.c
++++ b/drivers/infiniband/core/cq.c
+@@ -17,6 +17,7 @@
+ 
+ /* # of WCs to poll for with a single call to ib_poll_cq */
+ #define IB_POLL_BATCH			16
++#define IB_POLL_BATCH_DIRECT		8
+ 
+ /* # of WCs to iterate over before yielding */
+ #define IB_POLL_BUDGET_IRQ		256
+@@ -25,18 +26,18 @@
+ #define IB_POLL_FLAGS \
+ 	(IB_CQ_NEXT_COMP | IB_CQ_REPORT_MISSED_EVENTS)
+ 
+-static int __ib_process_cq(struct ib_cq *cq, int budget, struct ib_wc *poll_wc)
++static int __ib_process_cq(struct ib_cq *cq, int budget, struct ib_wc *wcs,
++			   int batch)
+ {
+ 	int i, n, completed = 0;
+-	struct ib_wc *wcs = poll_wc ? : cq->wc;
+ 
+ 	/*
+ 	 * budget might be (-1) if the caller does not
+ 	 * want to bound this call, thus we need unsigned
+ 	 * minimum here.
+ 	 */
+-	while ((n = ib_poll_cq(cq, min_t(u32, IB_POLL_BATCH,
+-			budget - completed), wcs)) > 0) {
++	while ((n = ib_poll_cq(cq, min_t(u32, batch,
++					 budget - completed), wcs)) > 0) {
+ 		for (i = 0; i < n; i++) {
+ 			struct ib_wc *wc = &wcs[i];
+ 
+@@ -48,8 +49,7 @@ static int __ib_process_cq(struct ib_cq *cq, int budget, struct ib_wc *poll_wc)
+ 
+ 		completed += n;
+ 
+-		if (n != IB_POLL_BATCH ||
+-		    (budget != -1 && completed >= budget))
++		if (n != batch || (budget != -1 && completed >= budget))
+ 			break;
+ 	}
+ 
+@@ -72,9 +72,9 @@ static int __ib_process_cq(struct ib_cq *cq, int budget, struct ib_wc *poll_wc)
+  */
+ int ib_process_cq_direct(struct ib_cq *cq, int budget)
+ {
+-	struct ib_wc wcs[IB_POLL_BATCH];
++	struct ib_wc wcs[IB_POLL_BATCH_DIRECT];
+ 
+-	return __ib_process_cq(cq, budget, wcs);
++	return __ib_process_cq(cq, budget, wcs, IB_POLL_BATCH_DIRECT);
+ }
+ EXPORT_SYMBOL(ib_process_cq_direct);
+ 
+@@ -88,7 +88,7 @@ static int ib_poll_handler(struct irq_poll *iop, int budget)
+ 	struct ib_cq *cq = container_of(iop, struct ib_cq, iop);
+ 	int completed;
+ 
+-	completed = __ib_process_cq(cq, budget, NULL);
++	completed = __ib_process_cq(cq, budget, cq->wc, IB_POLL_BATCH);
+ 	if (completed < budget) {
+ 		irq_poll_complete(&cq->iop);
+ 		if (ib_req_notify_cq(cq, IB_POLL_FLAGS) > 0)
+@@ -108,7 +108,8 @@ static void ib_cq_poll_work(struct work_struct *work)
+ 	struct ib_cq *cq = container_of(work, struct ib_cq, work);
+ 	int completed;
+ 
+-	completed = __ib_process_cq(cq, IB_POLL_BUDGET_WORKQUEUE, NULL);
++	completed = __ib_process_cq(cq, IB_POLL_BUDGET_WORKQUEUE, cq->wc,
++				    IB_POLL_BATCH);
+ 	if (completed >= IB_POLL_BUDGET_WORKQUEUE ||
+ 	    ib_req_notify_cq(cq, IB_POLL_FLAGS) > 0)
+ 		queue_work(ib_comp_wq, &cq->work);
+
+commit 08f294a1524bc3211a28091daa6c7513828c7d33
+Author: Leon Romanovsky <leonro@mellanox.com>
+Date:   Sun Jan 28 11:17:22 2018 +0200
+
+    RDMA/core: Add resource tracking for create and destroy CQs
+    
+    Track create and destroy operations of CQ objects.
+    
+    Reviewed-by: Mark Bloch <markb@mellanox.com>
+    Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+    Reviewed-by: Steve Wise <swise@opengridcomputing.com>
+    Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+
+diff --git a/drivers/infiniband/core/cq.c b/drivers/infiniband/core/cq.c
+index d99565dbd12f..bc79ca8215d7 100644
+--- a/drivers/infiniband/core/cq.c
++++ b/drivers/infiniband/core/cq.c
+@@ -159,6 +159,10 @@ struct ib_cq *__ib_alloc_cq(struct ib_device *dev, void *private,
+ 	if (!cq->wc)
+ 		goto out_destroy_cq;
+ 
++	cq->res.type = RDMA_RESTRACK_CQ;
++	cq->res.kern_name = caller;
++	rdma_restrack_add(&cq->res);
++
+ 	switch (cq->poll_ctx) {
+ 	case IB_POLL_DIRECT:
+ 		cq->comp_handler = ib_cq_completion_direct;
+@@ -183,6 +187,7 @@ struct ib_cq *__ib_alloc_cq(struct ib_device *dev, void *private,
+ 
+ out_free_wc:
+ 	kfree(cq->wc);
++	rdma_restrack_del(&cq->res);
+ out_destroy_cq:
+ 	cq->device->destroy_cq(cq);
+ 	return ERR_PTR(ret);
+@@ -214,6 +219,7 @@ void ib_free_cq(struct ib_cq *cq)
+ 	}
+ 
+ 	kfree(cq->wc);
++	rdma_restrack_del(&cq->res);
+ 	ret = cq->device->destroy_cq(cq);
+ 	WARN_ON_ONCE(ret);
+ }
+
+commit f66c8ba4c9fa193481fdb8030504287bf5ad4d69
+Author: Leon Romanovsky <leonro@mellanox.com>
+Date:   Sun Jan 28 11:17:19 2018 +0200
+
+    RDMA/core: Save kernel caller name when creating PD and CQ objects
+    
+    The KBUILD_MODNAME variable contains the module name and it is known for
+    kernel users during compilation, so let's reuse it to track the owners.
+    
+    Followup patches will store this for resource tracking.
+    
+    Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+    Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+
+diff --git a/drivers/infiniband/core/cq.c b/drivers/infiniband/core/cq.c
+index c8c5a5a7f433..d99565dbd12f 100644
+--- a/drivers/infiniband/core/cq.c
++++ b/drivers/infiniband/core/cq.c
+@@ -120,20 +120,22 @@ static void ib_cq_completion_workqueue(struct ib_cq *cq, void *private)
+ }
+ 
+ /**
+- * ib_alloc_cq - allocate a completion queue
++ * __ib_alloc_cq - allocate a completion queue
+  * @dev:		device to allocate the CQ for
+  * @private:		driver private data, accessible from cq->cq_context
+  * @nr_cqe:		number of CQEs to allocate
+  * @comp_vector:	HCA completion vectors for this CQ
+  * @poll_ctx:		context to poll the CQ from.
++ * @caller:		module owner name.
+  *
+  * This is the proper interface to allocate a CQ for in-kernel users. A
+  * CQ allocated with this interface will automatically be polled from the
+  * specified context. The ULP must use wr->wr_cqe instead of wr->wr_id
+  * to use this CQ abstraction.
+  */
+-struct ib_cq *ib_alloc_cq(struct ib_device *dev, void *private,
+-		int nr_cqe, int comp_vector, enum ib_poll_context poll_ctx)
++struct ib_cq *__ib_alloc_cq(struct ib_device *dev, void *private,
++			    int nr_cqe, int comp_vector,
++			    enum ib_poll_context poll_ctx, const char *caller)
+ {
+ 	struct ib_cq_init_attr cq_attr = {
+ 		.cqe		= nr_cqe,
+@@ -185,7 +187,7 @@ struct ib_cq *ib_alloc_cq(struct ib_device *dev, void *private,
+ 	cq->device->destroy_cq(cq);
+ 	return ERR_PTR(ret);
+ }
+-EXPORT_SYMBOL(ib_alloc_cq);
++EXPORT_SYMBOL(__ib_alloc_cq);
+ 
+ /**
+  * ib_free_cq - free a completion queue
+
+commit 246d8b184c100e8eb6b4e8c88f232c2ed2a4e672
+Author: Sagi Grimberg <sagi@grimberg.me>
+Date:   Sun Jan 14 17:07:50 2018 +0200
+
+    IB/cq: Don't force IB_POLL_DIRECT poll context for ib_process_cq_direct
+    
+    polling the completion queue directly does not interfere
+    with the existing polling logic, hence drop the requirement.
+    Be aware that running ib_process_cq_direct with non IB_POLL_DIRECT
+    CQ may trigger concurrent CQ processing.
+    
+    This can be used for polling mode ULPs.
+    
+    Cc: Bart Van Assche <bart.vanassche@wdc.com>
+    Reported-by: Steve Wise <swise@opengridcomputing.com>
+    Signed-off-by: Sagi Grimberg <sagi@grimberg.me>
+    [maxg: added wcs array argument to __ib_process_cq]
+    Signed-off-by: Max Gurtovoy <maxg@mellanox.com>
+    Signed-off-by: Doug Ledford <dledford@redhat.com>
+
+diff --git a/drivers/infiniband/core/cq.c b/drivers/infiniband/core/cq.c
+index f2ae75fa3128..c8c5a5a7f433 100644
+--- a/drivers/infiniband/core/cq.c
++++ b/drivers/infiniband/core/cq.c
+@@ -25,9 +25,10 @@
+ #define IB_POLL_FLAGS \
+ 	(IB_CQ_NEXT_COMP | IB_CQ_REPORT_MISSED_EVENTS)
+ 
+-static int __ib_process_cq(struct ib_cq *cq, int budget)
++static int __ib_process_cq(struct ib_cq *cq, int budget, struct ib_wc *poll_wc)
+ {
+ 	int i, n, completed = 0;
++	struct ib_wc *wcs = poll_wc ? : cq->wc;
+ 
+ 	/*
+ 	 * budget might be (-1) if the caller does not
+@@ -35,9 +36,9 @@ static int __ib_process_cq(struct ib_cq *cq, int budget)
+ 	 * minimum here.
+ 	 */
+ 	while ((n = ib_poll_cq(cq, min_t(u32, IB_POLL_BATCH,
+-			budget - completed), cq->wc)) > 0) {
++			budget - completed), wcs)) > 0) {
+ 		for (i = 0; i < n; i++) {
+-			struct ib_wc *wc = &cq->wc[i];
++			struct ib_wc *wc = &wcs[i];
+ 
+ 			if (wc->wr_cqe)
+ 				wc->wr_cqe->done(cq, wc);
+@@ -60,18 +61,20 @@ static int __ib_process_cq(struct ib_cq *cq, int budget)
+  * @cq:		CQ to process
+  * @budget:	number of CQEs to poll for
+  *
+- * This function is used to process all outstanding CQ entries on a
+- * %IB_POLL_DIRECT CQ.  It does not offload CQ processing to a different
+- * context and does not ask for completion interrupts from the HCA.
++ * This function is used to process all outstanding CQ entries.
++ * It does not offload CQ processing to a different context and does
++ * not ask for completion interrupts from the HCA.
++ * Using direct processing on CQ with non IB_POLL_DIRECT type may trigger
++ * concurrent processing.
+  *
+  * Note: do not pass -1 as %budget unless it is guaranteed that the number
+  * of completions that will be processed is small.
+  */
+ int ib_process_cq_direct(struct ib_cq *cq, int budget)
+ {
+-	WARN_ON_ONCE(cq->poll_ctx != IB_POLL_DIRECT);
++	struct ib_wc wcs[IB_POLL_BATCH];
+ 
+-	return __ib_process_cq(cq, budget);
++	return __ib_process_cq(cq, budget, wcs);
+ }
+ EXPORT_SYMBOL(ib_process_cq_direct);
+ 
+@@ -85,7 +88,7 @@ static int ib_poll_handler(struct irq_poll *iop, int budget)
+ 	struct ib_cq *cq = container_of(iop, struct ib_cq, iop);
+ 	int completed;
+ 
+-	completed = __ib_process_cq(cq, budget);
++	completed = __ib_process_cq(cq, budget, NULL);
+ 	if (completed < budget) {
+ 		irq_poll_complete(&cq->iop);
+ 		if (ib_req_notify_cq(cq, IB_POLL_FLAGS) > 0)
+@@ -105,7 +108,7 @@ static void ib_cq_poll_work(struct work_struct *work)
+ 	struct ib_cq *cq = container_of(work, struct ib_cq, work);
+ 	int completed;
+ 
+-	completed = __ib_process_cq(cq, IB_POLL_BUDGET_WORKQUEUE);
++	completed = __ib_process_cq(cq, IB_POLL_BUDGET_WORKQUEUE, NULL);
+ 	if (completed >= IB_POLL_BUDGET_WORKQUEUE ||
+ 	    ib_req_notify_cq(cq, IB_POLL_FLAGS) > 0)
+ 		queue_work(ib_comp_wq, &cq->work);
+
+commit fedd9e1f75828992ace5833379116f38c66ad7bb
+Author: Sagi Grimberg <sagi@grimberg.me>
+Date:   Thu Mar 16 18:57:00 2017 +0200
+
+    IB/cq: Don't process more than the given budget
+    
+    The caller might not want this overhead.
+    
+    Reviewed-by: Bart Van Assche <bart.vanassche@sandisk.com>
+    Reviewed-by: Leon Romanovsky <leonro@mellanox.com>
+    Signed-off-by: Sagi Grimberg <sagi@grimberg.me>
+    Reviewed-by: Yuval Shaia <yuval.shaia@oracle.com>
+    Signed-off-by: Doug Ledford <dledford@redhat.com>
+
+diff --git a/drivers/infiniband/core/cq.c b/drivers/infiniband/core/cq.c
+index 2746d2eb3d52..f2ae75fa3128 100644
+--- a/drivers/infiniband/core/cq.c
++++ b/drivers/infiniband/core/cq.c
+@@ -29,7 +29,13 @@ static int __ib_process_cq(struct ib_cq *cq, int budget)
+ {
+ 	int i, n, completed = 0;
+ 
+-	while ((n = ib_poll_cq(cq, IB_POLL_BATCH, cq->wc)) > 0) {
++	/*
++	 * budget might be (-1) if the caller does not
++	 * want to bound this call, thus we need unsigned
++	 * minimum here.
++	 */
++	while ((n = ib_poll_cq(cq, min_t(u32, IB_POLL_BATCH,
++			budget - completed), cq->wc)) > 0) {
+ 		for (i = 0; i < n; i++) {
+ 			struct ib_wc *wc = &cq->wc[i];
+ 
+
+commit 86f46aba8d1ac3ed0904542158a9b9cb9c7a143c
+Author: Sagi Grimberg <sagi@grimberg.me>
+Date:   Wed Mar 8 22:00:52 2017 +0200
+
+    IB/core: Protect against self-requeue of a cq work item
+    
+    We need to make sure that the cq work item does not
+    run when we are destroying the cq. Unlike flush_work,
+    cancel_work_sync protects against self-requeue of the
+    work item (which we can do in ib_cq_poll_work).
+    
+    Signed-off-by: Sagi Grimberg <sagi@grimberg.me>
+    Reviewed-by: Christoph Hellwig <hch@lst.de>
+    Reviewed-by: Bart Van Assche <bart.vanassche@sandisk.com>--
+    Reviewed-by: Leon Romanovsky <leonro@mellanox.com>
+    Signed-off-by: Doug Ledford <dledford@redhat.com>
+
+diff --git a/drivers/infiniband/core/cq.c b/drivers/infiniband/core/cq.c
+index e95510117a6d..2746d2eb3d52 100644
+--- a/drivers/infiniband/core/cq.c
++++ b/drivers/infiniband/core/cq.c
+@@ -196,7 +196,7 @@ void ib_free_cq(struct ib_cq *cq)
+ 		irq_poll_disable(&cq->iop);
+ 		break;
+ 	case IB_POLL_WORKQUEUE:
+-		flush_work(&cq->work);
++		cancel_work_sync(&cq->work);
+ 		break;
+ 	default:
+ 		WARN_ON_ONCE(1);
+
+commit f039f44fc331a7c6f828dfed97d5df0588602fd8
+Author: Bart Van Assche <bart.vanassche@sandisk.com>
+Date:   Tue Feb 14 10:56:35 2017 -0800
+
+    IB/core: Add support for draining IB_POLL_DIRECT completion queues
+    
+    Signed-off-by: Bart Van Assche <bart.vanassche@sandisk.com>
+    Cc: Steve Wise <swise@opengridcomputing.com>
+    Cc: Chuck Lever <chuck.lever@oracle.com>
+    Cc: Christoph Hellwig <hch@lst.de>
+    Cc: Max Gurtovoy <maxg@mellanox.com>
+    Reviewed-by: Steve Wise <swise@opengridcomputing.com>
+    Reviewed-by: Leon Romanovsky <leonro@mellanox.com>
+    Signed-off-by: Doug Ledford <dledford@redhat.com>
+
+diff --git a/drivers/infiniband/core/cq.c b/drivers/infiniband/core/cq.c
+index 838147ef727f..e95510117a6d 100644
+--- a/drivers/infiniband/core/cq.c
++++ b/drivers/infiniband/core/cq.c
+@@ -58,8 +58,8 @@ static int __ib_process_cq(struct ib_cq *cq, int budget)
+  * %IB_POLL_DIRECT CQ.  It does not offload CQ processing to a different
+  * context and does not ask for completion interrupts from the HCA.
+  *
+- * Note: for compatibility reasons -1 can be passed in %budget for unlimited
+- * polling.  Do not use this feature in new code, it will be removed soon.
++ * Note: do not pass -1 as %budget unless it is guaranteed that the number
++ * of completions that will be processed is small.
+  */
+ int ib_process_cq_direct(struct ib_cq *cq, int budget)
+ {
+
+commit 6c6e51a617df3ef6acdbdb550d61c70899e6033e
+Author: Yuval Shaia <yuval.shaia@oracle.com>
+Date:   Wed Jan 4 22:17:14 2017 +0200
+
+    IB/core: Fix typo in comment
+    
+    Signed-off-by: Yuval Shaia <yuval.shaia@oracle.com>
+    Reviewed-by: Leon Romanovsky <leonro@mellanox.com>
+    Signed-off-by: Doug Ledford <dledford@redhat.com>
+
+diff --git a/drivers/infiniband/core/cq.c b/drivers/infiniband/core/cq.c
+index a754fc727de5..838147ef727f 100644
+--- a/drivers/infiniband/core/cq.c
++++ b/drivers/infiniband/core/cq.c
+@@ -120,7 +120,7 @@ static void ib_cq_completion_workqueue(struct ib_cq *cq, void *private)
+  *
+  * This is the proper interface to allocate a CQ for in-kernel users. A
+  * CQ allocated with this interface will automatically be polled from the
+- * specified context.  The ULP needs must use wr->wr_cqe instead of wr->wr_id
++ * specified context. The ULP must use wr->wr_cqe instead of wr->wr_id
+  * to use this CQ abstraction.
+  */
+ struct ib_cq *ib_alloc_cq(struct ib_device *dev, void *private,
+
+commit 14d3a3b2498edadec344cb11e60e66091f5daf63
+Author: Christoph Hellwig <hch@lst.de>
+Date:   Fri Dec 11 11:53:03 2015 -0800
+
+    IB: add a proper completion queue abstraction
+    
+    This adds an abstraction that allows ULPs to simply pass a completion
+    object and completion callback with each submitted WR and let the RDMA
+    core handle the nitty gritty details of how to handle completion
+    interrupts and poll the CQ.
+    
+    In detail there is a new ib_cqe structure which just contains the
+    completion callback, and which can be used to get at the containing
+    object using container_of.  It is pointed to by the WR and WC as an
+    alternative to the wr_id field, similar to how many ULPs already use
+    the field to store a pointer using casts.
+    
+    A driver using the new completion callbacks allocates it's CQs using
+    the new ib_create_cq API, which in addition to the number of CQEs and
+    the completion vectors also takes a mode on how we poll for CQEs.
+    Three modes are available: direct for drivers that never take CQ
+    interrupts and just poll for them, softirq to poll from softirq context
+    using the to be renamed blk-iopoll infrastructure which takes care of
+    rearming and budgeting, or a workqueue for consumer who want to be
+    called from user context.
+    
+    Thanks a lot to Sagi Grimberg who helped reviewing the API, wrote
+    the current version of the workqueue code because my two previous
+    attempts sucked too much and converted the iSER initiator to the new
+    API.
+    
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+
+diff --git a/drivers/infiniband/core/cq.c b/drivers/infiniband/core/cq.c
+new file mode 100644
+index 000000000000..a754fc727de5
+--- /dev/null
++++ b/drivers/infiniband/core/cq.c
+@@ -0,0 +1,209 @@
++/*
++ * Copyright (c) 2015 HGST, a Western Digital Company.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms and conditions of the GNU General Public License,
++ * version 2, as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ */
++#include <linux/module.h>
++#include <linux/err.h>
++#include <linux/slab.h>
++#include <rdma/ib_verbs.h>
++
++/* # of WCs to poll for with a single call to ib_poll_cq */
++#define IB_POLL_BATCH			16
++
++/* # of WCs to iterate over before yielding */
++#define IB_POLL_BUDGET_IRQ		256
++#define IB_POLL_BUDGET_WORKQUEUE	65536
++
++#define IB_POLL_FLAGS \
++	(IB_CQ_NEXT_COMP | IB_CQ_REPORT_MISSED_EVENTS)
++
++static int __ib_process_cq(struct ib_cq *cq, int budget)
++{
++	int i, n, completed = 0;
++
++	while ((n = ib_poll_cq(cq, IB_POLL_BATCH, cq->wc)) > 0) {
++		for (i = 0; i < n; i++) {
++			struct ib_wc *wc = &cq->wc[i];
++
++			if (wc->wr_cqe)
++				wc->wr_cqe->done(cq, wc);
++			else
++				WARN_ON_ONCE(wc->status == IB_WC_SUCCESS);
++		}
++
++		completed += n;
++
++		if (n != IB_POLL_BATCH ||
++		    (budget != -1 && completed >= budget))
++			break;
++	}
++
++	return completed;
++}
++
++/**
++ * ib_process_direct_cq - process a CQ in caller context
++ * @cq:		CQ to process
++ * @budget:	number of CQEs to poll for
++ *
++ * This function is used to process all outstanding CQ entries on a
++ * %IB_POLL_DIRECT CQ.  It does not offload CQ processing to a different
++ * context and does not ask for completion interrupts from the HCA.
++ *
++ * Note: for compatibility reasons -1 can be passed in %budget for unlimited
++ * polling.  Do not use this feature in new code, it will be removed soon.
++ */
++int ib_process_cq_direct(struct ib_cq *cq, int budget)
++{
++	WARN_ON_ONCE(cq->poll_ctx != IB_POLL_DIRECT);
++
++	return __ib_process_cq(cq, budget);
++}
++EXPORT_SYMBOL(ib_process_cq_direct);
++
++static void ib_cq_completion_direct(struct ib_cq *cq, void *private)
++{
++	WARN_ONCE(1, "got unsolicited completion for CQ 0x%p\n", cq);
++}
++
++static int ib_poll_handler(struct irq_poll *iop, int budget)
++{
++	struct ib_cq *cq = container_of(iop, struct ib_cq, iop);
++	int completed;
++
++	completed = __ib_process_cq(cq, budget);
++	if (completed < budget) {
++		irq_poll_complete(&cq->iop);
++		if (ib_req_notify_cq(cq, IB_POLL_FLAGS) > 0)
++			irq_poll_sched(&cq->iop);
++	}
++
++	return completed;
++}
++
++static void ib_cq_completion_softirq(struct ib_cq *cq, void *private)
++{
++	irq_poll_sched(&cq->iop);
++}
++
++static void ib_cq_poll_work(struct work_struct *work)
++{
++	struct ib_cq *cq = container_of(work, struct ib_cq, work);
++	int completed;
++
++	completed = __ib_process_cq(cq, IB_POLL_BUDGET_WORKQUEUE);
++	if (completed >= IB_POLL_BUDGET_WORKQUEUE ||
++	    ib_req_notify_cq(cq, IB_POLL_FLAGS) > 0)
++		queue_work(ib_comp_wq, &cq->work);
++}
++
++static void ib_cq_completion_workqueue(struct ib_cq *cq, void *private)
++{
++	queue_work(ib_comp_wq, &cq->work);
++}
++
++/**
++ * ib_alloc_cq - allocate a completion queue
++ * @dev:		device to allocate the CQ for
++ * @private:		driver private data, accessible from cq->cq_context
++ * @nr_cqe:		number of CQEs to allocate
++ * @comp_vector:	HCA completion vectors for this CQ
++ * @poll_ctx:		context to poll the CQ from.
++ *
++ * This is the proper interface to allocate a CQ for in-kernel users. A
++ * CQ allocated with this interface will automatically be polled from the
++ * specified context.  The ULP needs must use wr->wr_cqe instead of wr->wr_id
++ * to use this CQ abstraction.
++ */
++struct ib_cq *ib_alloc_cq(struct ib_device *dev, void *private,
++		int nr_cqe, int comp_vector, enum ib_poll_context poll_ctx)
++{
++	struct ib_cq_init_attr cq_attr = {
++		.cqe		= nr_cqe,
++		.comp_vector	= comp_vector,
++	};
++	struct ib_cq *cq;
++	int ret = -ENOMEM;
++
++	cq = dev->create_cq(dev, &cq_attr, NULL, NULL);
++	if (IS_ERR(cq))
++		return cq;
++
++	cq->device = dev;
++	cq->uobject = NULL;
++	cq->event_handler = NULL;
++	cq->cq_context = private;
++	cq->poll_ctx = poll_ctx;
++	atomic_set(&cq->usecnt, 0);
++
++	cq->wc = kmalloc_array(IB_POLL_BATCH, sizeof(*cq->wc), GFP_KERNEL);
++	if (!cq->wc)
++		goto out_destroy_cq;
++
++	switch (cq->poll_ctx) {
++	case IB_POLL_DIRECT:
++		cq->comp_handler = ib_cq_completion_direct;
++		break;
++	case IB_POLL_SOFTIRQ:
++		cq->comp_handler = ib_cq_completion_softirq;
++
++		irq_poll_init(&cq->iop, IB_POLL_BUDGET_IRQ, ib_poll_handler);
++		ib_req_notify_cq(cq, IB_CQ_NEXT_COMP);
++		break;
++	case IB_POLL_WORKQUEUE:
++		cq->comp_handler = ib_cq_completion_workqueue;
++		INIT_WORK(&cq->work, ib_cq_poll_work);
++		ib_req_notify_cq(cq, IB_CQ_NEXT_COMP);
++		break;
++	default:
++		ret = -EINVAL;
++		goto out_free_wc;
++	}
++
++	return cq;
++
++out_free_wc:
++	kfree(cq->wc);
++out_destroy_cq:
++	cq->device->destroy_cq(cq);
++	return ERR_PTR(ret);
++}
++EXPORT_SYMBOL(ib_alloc_cq);
++
++/**
++ * ib_free_cq - free a completion queue
++ * @cq:		completion queue to free.
++ */
++void ib_free_cq(struct ib_cq *cq)
++{
++	int ret;
++
++	if (WARN_ON_ONCE(atomic_read(&cq->usecnt)))
++		return;
++
++	switch (cq->poll_ctx) {
++	case IB_POLL_DIRECT:
++		break;
++	case IB_POLL_SOFTIRQ:
++		irq_poll_disable(&cq->iop);
++		break;
++	case IB_POLL_WORKQUEUE:
++		flush_work(&cq->work);
++		break;
++	default:
++		WARN_ON_ONCE(1);
++	}
++
++	kfree(cq->wc);
++	ret = cq->device->destroy_cq(cq);
++	WARN_ON_ONCE(ret);
++}
++EXPORT_SYMBOL(ib_free_cq);

@@ -1,0 +1,856 @@
+commit ef2c41cf38a7559bbf91af42d5b6a4429db8fc68
+Author: Christian Brauner <christian.brauner@ubuntu.com>
+Date:   Wed Feb 5 14:26:22 2020 +0100
+
+    clone3: allow spawning processes into cgroups
+    
+    This adds support for creating a process in a different cgroup than its
+    parent. Callers can limit and account processes and threads right from
+    the moment they are spawned:
+    - A service manager can directly spawn new services into dedicated
+      cgroups.
+    - A process can be directly created in a frozen cgroup and will be
+      frozen as well.
+    - The initial accounting jitter experienced by process supervisors and
+      daemons is eliminated with this.
+    - Threaded applications or even thread implementations can choose to
+      create a specific cgroup layout where each thread is spawned
+      directly into a dedicated cgroup.
+    
+    This feature is limited to the unified hierarchy. Callers need to pass
+    a directory file descriptor for the target cgroup. The caller can
+    choose to pass an O_PATH file descriptor. All usual migration
+    restrictions apply, i.e. there can be no processes in inner nodes. In
+    general, creating a process directly in a target cgroup adheres to all
+    migration restrictions.
+    
+    One of the biggest advantages of this feature is that CLONE_INTO_GROUP does
+    not need to grab the write side of the cgroup cgroup_threadgroup_rwsem.
+    This global lock makes moving tasks/threads around super expensive. With
+    clone3() this lock is avoided.
+    
+    Cc: Tejun Heo <tj@kernel.org>
+    Cc: Ingo Molnar <mingo@redhat.com>
+    Cc: Oleg Nesterov <oleg@redhat.com>
+    Cc: Johannes Weiner <hannes@cmpxchg.org>
+    Cc: Li Zefan <lizefan@huawei.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: cgroups@vger.kernel.org
+    Signed-off-by: Christian Brauner <christian.brauner@ubuntu.com>
+    Signed-off-by: Tejun Heo <tj@kernel.org>
+
+diff --git a/kernel/cgroup/pids.c b/kernel/cgroup/pids.c
+index 138059eb730d..511af87f685e 100644
+--- a/kernel/cgroup/pids.c
++++ b/kernel/cgroup/pids.c
+@@ -33,6 +33,7 @@
+ #include <linux/atomic.h>
+ #include <linux/cgroup.h>
+ #include <linux/slab.h>
++#include <linux/sched/task.h>
+ 
+ #define PIDS_MAX (PID_MAX_LIMIT + 1ULL)
+ #define PIDS_MAX_STR "max"
+@@ -214,13 +215,16 @@ static void pids_cancel_attach(struct cgroup_taskset *tset)
+  * task_css_check(true) in pids_can_fork() and pids_cancel_fork() relies
+  * on cgroup_threadgroup_change_begin() held by the copy_process().
+  */
+-static int pids_can_fork(struct task_struct *task)
++static int pids_can_fork(struct task_struct *task, struct css_set *cset)
+ {
+ 	struct cgroup_subsys_state *css;
+ 	struct pids_cgroup *pids;
+ 	int err;
+ 
+-	css = task_css_check(current, pids_cgrp_id, true);
++	if (cset)
++		css = cset->subsys[pids_cgrp_id];
++	else
++		css = task_css_check(current, pids_cgrp_id, true);
+ 	pids = css_pids(css);
+ 	err = pids_try_charge(pids, 1);
+ 	if (err) {
+@@ -235,12 +239,15 @@ static int pids_can_fork(struct task_struct *task)
+ 	return err;
+ }
+ 
+-static void pids_cancel_fork(struct task_struct *task)
++static void pids_cancel_fork(struct task_struct *task, struct css_set *cset)
+ {
+ 	struct cgroup_subsys_state *css;
+ 	struct pids_cgroup *pids;
+ 
+-	css = task_css_check(current, pids_cgrp_id, true);
++	if (cset)
++		css = cset->subsys[pids_cgrp_id];
++	else
++		css = task_css_check(current, pids_cgrp_id, true);
+ 	pids = css_pids(css);
+ 	pids_uncharge(pids, 1);
+ }
+
+commit a713af394cf382a30dd28a1015cbe572f1b9ca75
+Author: Aleksa Sarai <cyphar@cyphar.com>
+Date:   Thu Oct 17 02:50:01 2019 +1100
+
+    cgroup: pids: use atomic64_t for pids->limit
+    
+    Because pids->limit can be changed concurrently (but we don't want to
+    take a lock because it would be needlessly expensive), use atomic64_ts
+    instead.
+    
+    Fixes: commit 49b786ea146f ("cgroup: implement the PIDs subsystem")
+    Cc: stable@vger.kernel.org # v4.3+
+    Signed-off-by: Aleksa Sarai <cyphar@cyphar.com>
+    Signed-off-by: Tejun Heo <tj@kernel.org>
+
+diff --git a/kernel/cgroup/pids.c b/kernel/cgroup/pids.c
+index 8e513a573fe9..138059eb730d 100644
+--- a/kernel/cgroup/pids.c
++++ b/kernel/cgroup/pids.c
+@@ -45,7 +45,7 @@ struct pids_cgroup {
+ 	 * %PIDS_MAX = (%PID_MAX_LIMIT + 1).
+ 	 */
+ 	atomic64_t			counter;
+-	int64_t				limit;
++	atomic64_t			limit;
+ 
+ 	/* Handle for "pids.events" */
+ 	struct cgroup_file		events_file;
+@@ -73,8 +73,8 @@ pids_css_alloc(struct cgroup_subsys_state *parent)
+ 	if (!pids)
+ 		return ERR_PTR(-ENOMEM);
+ 
+-	pids->limit = PIDS_MAX;
+ 	atomic64_set(&pids->counter, 0);
++	atomic64_set(&pids->limit, PIDS_MAX);
+ 	atomic64_set(&pids->events_limit, 0);
+ 	return &pids->css;
+ }
+@@ -146,13 +146,14 @@ static int pids_try_charge(struct pids_cgroup *pids, int num)
+ 
+ 	for (p = pids; parent_pids(p); p = parent_pids(p)) {
+ 		int64_t new = atomic64_add_return(num, &p->counter);
++		int64_t limit = atomic64_read(&p->limit);
+ 
+ 		/*
+ 		 * Since new is capped to the maximum number of pid_t, if
+ 		 * p->limit is %PIDS_MAX then we know that this test will never
+ 		 * fail.
+ 		 */
+-		if (new > p->limit)
++		if (new > limit)
+ 			goto revert;
+ 	}
+ 
+@@ -277,7 +278,7 @@ static ssize_t pids_max_write(struct kernfs_open_file *of, char *buf,
+ 	 * Limit updates don't need to be mutex'd, since it isn't
+ 	 * critical that any racing fork()s follow the new limit.
+ 	 */
+-	pids->limit = limit;
++	atomic64_set(&pids->limit, limit);
+ 	return nbytes;
+ }
+ 
+@@ -285,7 +286,7 @@ static int pids_max_show(struct seq_file *sf, void *v)
+ {
+ 	struct cgroup_subsys_state *css = seq_css(sf);
+ 	struct pids_cgroup *pids = css_pids(css);
+-	int64_t limit = pids->limit;
++	int64_t limit = atomic64_read(&pids->limit);
+ 
+ 	if (limit >= PIDS_MAX)
+ 		seq_printf(sf, "%s\n", PIDS_MAX_STR);
+
+commit f85d208658468b1a298f31daddb05a7684969cd4
+Author: Thomas Gleixner <tglx@linutronix.de>
+Date:   Tue Jun 4 10:10:45 2019 +0200
+
+    treewide: Replace GPLv2 boilerplate/reference with SPDX - rule 451
+    
+    Based on 1 normalized pattern(s):
+    
+      this file is subject to the terms and conditions of version 2 of the
+      gnu general public license see the file copying in the main
+      directory of the linux distribution for more details
+    
+    extracted by the scancode license scanner the SPDX license identifier
+    
+      GPL-2.0-only
+    
+    has been chosen to replace the boilerplate/reference in 5 file(s).
+    
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Reviewed-by: Enrico Weigelt <info@metux.net>
+    Reviewed-by: Allison Randal <allison@lohutok.net>
+    Cc: linux-spdx@vger.kernel.org
+    Link: https://lkml.kernel.org/r/20190604081200.872755311@linutronix.de
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/kernel/cgroup/pids.c b/kernel/cgroup/pids.c
+index c9960baaa14f..8e513a573fe9 100644
+--- a/kernel/cgroup/pids.c
++++ b/kernel/cgroup/pids.c
+@@ -1,3 +1,4 @@
++// SPDX-License-Identifier: GPL-2.0-only
+ /*
+  * Process number limiting controller for cgroups.
+  *
+@@ -25,10 +26,6 @@
+  * a superset of parent/child/pids.current.
+  *
+  * Copyright (C) 2015 Aleksa Sarai <cyphar@cyphar.com>
+- *
+- * This file is subject to the terms and conditions of version 2 of the GNU
+- * General Public License.  See the file COPYING in the main directory of the
+- * Linux distribution for more details.
+  */
+ 
+ #include <linux/kernel.h>
+
+commit 51bee5abeab2058ea5813c5615d6197a23dbf041
+Author: Oleg Nesterov <oleg@redhat.com>
+Date:   Mon Jan 28 17:00:13 2019 +0100
+
+    cgroup/pids: turn cgroup_subsys->free() into cgroup_subsys->release() to fix the accounting
+    
+    The only user of cgroup_subsys->free() callback is pids_cgrp_subsys which
+    needs pids_free() to uncharge the pid.
+    
+    However, ->free() is called from __put_task_struct()->cgroup_free() and this
+    is too late. Even the trivial program which does
+    
+            for (;;) {
+                    int pid = fork();
+                    assert(pid >= 0);
+                    if (pid)
+                            wait(NULL);
+                    else
+                            exit(0);
+            }
+    
+    can run out of limits because release_task()->call_rcu(delayed_put_task_struct)
+    implies an RCU gp after the task/pid goes away and before the final put().
+    
+    Test-case:
+    
+            mkdir -p /tmp/CG
+            mount -t cgroup2 none /tmp/CG
+            echo '+pids' > /tmp/CG/cgroup.subtree_control
+    
+            mkdir /tmp/CG/PID
+            echo 2 > /tmp/CG/PID/pids.max
+    
+            perl -e 'while ($p = fork) { wait; } $p // die "fork failed: $!\n"' &
+            echo $! > /tmp/CG/PID/cgroup.procs
+    
+    Without this patch the forking process fails soon after migration.
+    
+    Rename cgroup_subsys->free() to cgroup_subsys->release() and move the callsite
+    into the new helper, cgroup_release(), called by release_task() which actually
+    frees the pid(s).
+    
+    Reported-by: Herton R. Krzesinski <hkrzesin@redhat.com>
+    Reported-by: Jan Stancek <jstancek@redhat.com>
+    Signed-off-by: Oleg Nesterov <oleg@redhat.com>
+    Signed-off-by: Tejun Heo <tj@kernel.org>
+
+diff --git a/kernel/cgroup/pids.c b/kernel/cgroup/pids.c
+index 9829c67ebc0a..c9960baaa14f 100644
+--- a/kernel/cgroup/pids.c
++++ b/kernel/cgroup/pids.c
+@@ -247,7 +247,7 @@ static void pids_cancel_fork(struct task_struct *task)
+ 	pids_uncharge(pids, 1);
+ }
+ 
+-static void pids_free(struct task_struct *task)
++static void pids_release(struct task_struct *task)
+ {
+ 	struct pids_cgroup *pids = css_pids(task_css(task, pids_cgrp_id));
+ 
+@@ -342,7 +342,7 @@ struct cgroup_subsys pids_cgrp_subsys = {
+ 	.cancel_attach 	= pids_cancel_attach,
+ 	.can_fork	= pids_can_fork,
+ 	.cancel_fork	= pids_cancel_fork,
+-	.free		= pids_free,
++	.release	= pids_release,
+ 	.legacy_cftypes	= pids_files,
+ 	.dfl_cftypes	= pids_files,
+ 	.threaded	= true,
+
+commit 8cfd8147df67e741d93b8783a3ea8f3c74f93a0e
+Author: Tejun Heo <tj@kernel.org>
+Date:   Fri Jul 21 11:14:51 2017 -0400
+
+    cgroup: implement cgroup v2 thread support
+    
+    This patch implements cgroup v2 thread support.  The goal of the
+    thread mode is supporting hierarchical accounting and control at
+    thread granularity while staying inside the resource domain model
+    which allows coordination across different resource controllers and
+    handling of anonymous resource consumptions.
+    
+    A cgroup is always created as a domain and can be made threaded by
+    writing to the "cgroup.type" file.  When a cgroup becomes threaded, it
+    becomes a member of a threaded subtree which is anchored at the
+    closest ancestor which isn't threaded.
+    
+    The threads of the processes which are in a threaded subtree can be
+    placed anywhere without being restricted by process granularity or
+    no-internal-process constraint.  Note that the threads aren't allowed
+    to escape to a different threaded subtree.  To be used inside a
+    threaded subtree, a controller should explicitly support threaded mode
+    and be able to handle internal competition in the way which is
+    appropriate for the resource.
+    
+    The root of a threaded subtree, the nearest ancestor which isn't
+    threaded, is called the threaded domain and serves as the resource
+    domain for the whole subtree.  This is the last cgroup where domain
+    controllers are operational and where all the domain-level resource
+    consumptions in the subtree are accounted.  This allows threaded
+    controllers to operate at thread granularity when requested while
+    staying inside the scope of system-level resource distribution.
+    
+    As the root cgroup is exempt from the no-internal-process constraint,
+    it can serve as both a threaded domain and a parent to normal cgroups,
+    so, unlike non-root cgroups, the root cgroup can have both domain and
+    threaded children.
+    
+    Internally, in a threaded subtree, each css_set has its ->dom_cset
+    pointing to a matching css_set which belongs to the threaded domain.
+    This ensures that thread root level cgroup_subsys_state for all
+    threaded controllers are readily accessible for domain-level
+    operations.
+    
+    This patch enables threaded mode for the pids and perf_events
+    controllers.  Neither has to worry about domain-level resource
+    consumptions and it's enough to simply set the flag.
+    
+    For more details on the interface and behavior of the thread mode,
+    please refer to the section 2-2-2 in Documentation/cgroup-v2.txt added
+    by this patch.
+    
+    v5: - Dropped silly no-op ->dom_cgrp init from cgroup_create().
+          Spotted by Waiman.
+        - Documentation updated as suggested by Waiman.
+        - cgroup.type content slightly reformatted.
+        - Mark the debug controller threaded.
+    
+    v4: - Updated to the general idea of marking specific cgroups
+          domain/threaded as suggested by PeterZ.
+    
+    v3: - Dropped "join" and always make mixed children join the parent's
+          threaded subtree.
+    
+    v2: - After discussions with Waiman, support for mixed thread mode is
+          added.  This should address the issue that Peter pointed out
+          where any nesting should be avoided for thread subtrees while
+          coexisting with other domain cgroups.
+        - Enabling / disabling thread mode now piggy backs on the existing
+          control mask update mechanism.
+        - Bug fixes and cleanup.
+    
+    Signed-off-by: Tejun Heo <tj@kernel.org>
+    Cc: Waiman Long <longman@redhat.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+
+diff --git a/kernel/cgroup/pids.c b/kernel/cgroup/pids.c
+index 2237201d66d5..9829c67ebc0a 100644
+--- a/kernel/cgroup/pids.c
++++ b/kernel/cgroup/pids.c
+@@ -345,4 +345,5 @@ struct cgroup_subsys pids_cgrp_subsys = {
+ 	.free		= pids_free,
+ 	.legacy_cftypes	= pids_files,
+ 	.dfl_cftypes	= pids_files,
++	.threaded	= true,
+ };
+
+commit 1d18c2747f937f1b5ec65ce6bf4ccb9ca1aea9e8
+Author: Tejun Heo <tj@kernel.org>
+Date:   Wed Mar 1 15:39:07 2017 -0500
+
+    cgroup/pids: remove spurious suspicious RCU usage warning
+    
+    pids_can_fork() is special in that the css association is guaranteed
+    to be stable throughout the function and thus doesn't need RCU
+    protection around task_css access.  When determining the css to charge
+    the pid, task_css_check() is used to override the RCU sanity check.
+    
+    While adding a warning message on fork rejection from pids limit,
+    135b8b37bd91 ("cgroup: Add pids controller event when fork fails
+    because of pid limit") incorrectly added a task_css access which is
+    neither RCU protected or explicitly annotated.  This triggers the
+    following suspicious RCU usage warning when RCU debugging is enabled.
+    
+      cgroup: fork rejected by pids controller in
+    
+      ===============================
+      [ ERR: suspicious RCU usage.  ]
+      4.10.0-work+ #1 Not tainted
+      -------------------------------
+      ./include/linux/cgroup.h:435 suspicious rcu_dereference_check() usage!
+    
+      other info that might help us debug this:
+    
+      rcu_scheduler_active = 2, debug_locks = 0
+      1 lock held by bash/1748:
+       #0:  (&cgroup_threadgroup_rwsem){+++++.}, at: [<ffffffff81052c96>] _do_fork+0xe6/0x6e0
+    
+      stack backtrace:
+      CPU: 3 PID: 1748 Comm: bash Not tainted 4.10.0-work+ #1
+      Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS 1.9.3-1.fc25 04/01/2014
+      Call Trace:
+       dump_stack+0x68/0x93
+       lockdep_rcu_suspicious+0xd7/0x110
+       pids_can_fork+0x1c7/0x1d0
+       cgroup_can_fork+0x67/0xc0
+       copy_process.part.58+0x1709/0x1e90
+       _do_fork+0xe6/0x6e0
+       SyS_clone+0x19/0x20
+       do_syscall_64+0x5c/0x140
+       entry_SYSCALL64_slow_path+0x25/0x25
+      RIP: 0033:0x7f7853fab93a
+      RSP: 002b:00007ffc12d05c90 EFLAGS: 00000246 ORIG_RAX: 0000000000000038
+      RAX: ffffffffffffffda RBX: 0000000000000000 RCX: 00007f7853fab93a
+      RDX: 0000000000000000 RSI: 0000000000000000 RDI: 0000000001200011
+      RBP: 00007ffc12d05cc0 R08: 0000000000000000 R09: 00007f78548db700
+      R10: 00007f78548db9d0 R11: 0000000000000246 R12: 00000000000006d4
+      R13: 0000000000000001 R14: 0000000000000000 R15: 000055e3ebe2c04d
+      /asdf
+    
+    There's no reason to dereference task_css again here when the
+    associated css is already available.  Fix it by replacing the
+    task_cgroup() call with css->cgroup.
+    
+    Signed-off-by: Tejun Heo <tj@kernel.org>
+    Reported-by: Mike Galbraith <efault@gmx.de>
+    Fixes: 135b8b37bd91 ("cgroup: Add pids controller event when fork fails because of pid limit")
+    Cc: Kenny Yu <kennyyu@fb.com>
+    Cc: stable@vger.kernel.org # v4.8+
+    Signed-off-by: Tejun Heo <tj@kernel.org>
+
+diff --git a/kernel/cgroup/pids.c b/kernel/cgroup/pids.c
+index e756dae49300..2237201d66d5 100644
+--- a/kernel/cgroup/pids.c
++++ b/kernel/cgroup/pids.c
+@@ -229,7 +229,7 @@ static int pids_can_fork(struct task_struct *task)
+ 		/* Only log the first time events_limit is incremented. */
+ 		if (atomic64_inc_return(&pids->events_limit) == 1) {
+ 			pr_info("cgroup: fork rejected by pids controller in ");
+-			pr_cont_cgroup_path(task_cgroup(current, pids_cgrp_id));
++			pr_cont_cgroup_path(css->cgroup);
+ 			pr_cont("\n");
+ 		}
+ 		cgroup_file_notify(&pids->events_file);
+
+commit 780de9dd2720debc14c501dab4dc80d1f75ad50e
+Author: Ingo Molnar <mingo@kernel.org>
+Date:   Thu Feb 2 11:50:56 2017 +0100
+
+    sched/headers, cgroups: Remove the threadgroup_change_*() wrappery
+    
+    threadgroup_change_begin()/end() is a pointless wrapper around
+    cgroup_threadgroup_change_begin()/end(), minus a might_sleep()
+    in the !CONFIG_CGROUPS=y case.
+    
+    Remove the wrappery, move the might_sleep() (the down_read()
+    already has a might_sleep() check).
+    
+    This debloats <linux/sched.h> a bit and simplifies this API.
+    
+    Update all call sites.
+    
+    No change in functionality.
+    
+    Acked-by: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Mike Galbraith <efault@gmx.de>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: linux-kernel@vger.kernel.org
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/kernel/cgroup/pids.c b/kernel/cgroup/pids.c
+index 2bd673783f1a..e756dae49300 100644
+--- a/kernel/cgroup/pids.c
++++ b/kernel/cgroup/pids.c
+@@ -214,7 +214,7 @@ static void pids_cancel_attach(struct cgroup_taskset *tset)
+ 
+ /*
+  * task_css_check(true) in pids_can_fork() and pids_cancel_fork() relies
+- * on threadgroup_change_begin() held by the copy_process().
++ * on cgroup_threadgroup_change_begin() held by the copy_process().
+  */
+ static int pids_can_fork(struct task_struct *task)
+ {
+
+commit 201af4c0fab02876ef0311e7f7b4083aa138930c
+Author: Tejun Heo <tj@kernel.org>
+Date:   Tue Dec 27 14:49:05 2016 -0500
+
+    cgroup: move cgroup files under kernel/cgroup/
+    
+    They're growing to be too many and planned to get split further.  Move
+    them under their own directory.
+    
+     kernel/cgroup.c                -> kernel/cgroup/cgroup.c
+     kernel/cgroup_freezer.c        -> kernel/cgroup/freezer.c
+     kernel/cgroup_pids.c           -> kernel/cgroup/pids.c
+     kernel/cpuset.c                -> kernel/cgroup/cpuset.c
+    
+    Signed-off-by: Tejun Heo <tj@kernel.org>
+    Acked-by: Acked-by: Zefan Li <lizefan@huawei.com>
+
+diff --git a/kernel/cgroup/pids.c b/kernel/cgroup/pids.c
+new file mode 100644
+index 000000000000..2bd673783f1a
+--- /dev/null
++++ b/kernel/cgroup/pids.c
+@@ -0,0 +1,348 @@
++/*
++ * Process number limiting controller for cgroups.
++ *
++ * Used to allow a cgroup hierarchy to stop any new processes from fork()ing
++ * after a certain limit is reached.
++ *
++ * Since it is trivial to hit the task limit without hitting any kmemcg limits
++ * in place, PIDs are a fundamental resource. As such, PID exhaustion must be
++ * preventable in the scope of a cgroup hierarchy by allowing resource limiting
++ * of the number of tasks in a cgroup.
++ *
++ * In order to use the `pids` controller, set the maximum number of tasks in
++ * pids.max (this is not available in the root cgroup for obvious reasons). The
++ * number of processes currently in the cgroup is given by pids.current.
++ * Organisational operations are not blocked by cgroup policies, so it is
++ * possible to have pids.current > pids.max. However, it is not possible to
++ * violate a cgroup policy through fork(). fork() will return -EAGAIN if forking
++ * would cause a cgroup policy to be violated.
++ *
++ * To set a cgroup to have no limit, set pids.max to "max". This is the default
++ * for all new cgroups (N.B. that PID limits are hierarchical, so the most
++ * stringent limit in the hierarchy is followed).
++ *
++ * pids.current tracks all child cgroup hierarchies, so parent/pids.current is
++ * a superset of parent/child/pids.current.
++ *
++ * Copyright (C) 2015 Aleksa Sarai <cyphar@cyphar.com>
++ *
++ * This file is subject to the terms and conditions of version 2 of the GNU
++ * General Public License.  See the file COPYING in the main directory of the
++ * Linux distribution for more details.
++ */
++
++#include <linux/kernel.h>
++#include <linux/threads.h>
++#include <linux/atomic.h>
++#include <linux/cgroup.h>
++#include <linux/slab.h>
++
++#define PIDS_MAX (PID_MAX_LIMIT + 1ULL)
++#define PIDS_MAX_STR "max"
++
++struct pids_cgroup {
++	struct cgroup_subsys_state	css;
++
++	/*
++	 * Use 64-bit types so that we can safely represent "max" as
++	 * %PIDS_MAX = (%PID_MAX_LIMIT + 1).
++	 */
++	atomic64_t			counter;
++	int64_t				limit;
++
++	/* Handle for "pids.events" */
++	struct cgroup_file		events_file;
++
++	/* Number of times fork failed because limit was hit. */
++	atomic64_t			events_limit;
++};
++
++static struct pids_cgroup *css_pids(struct cgroup_subsys_state *css)
++{
++	return container_of(css, struct pids_cgroup, css);
++}
++
++static struct pids_cgroup *parent_pids(struct pids_cgroup *pids)
++{
++	return css_pids(pids->css.parent);
++}
++
++static struct cgroup_subsys_state *
++pids_css_alloc(struct cgroup_subsys_state *parent)
++{
++	struct pids_cgroup *pids;
++
++	pids = kzalloc(sizeof(struct pids_cgroup), GFP_KERNEL);
++	if (!pids)
++		return ERR_PTR(-ENOMEM);
++
++	pids->limit = PIDS_MAX;
++	atomic64_set(&pids->counter, 0);
++	atomic64_set(&pids->events_limit, 0);
++	return &pids->css;
++}
++
++static void pids_css_free(struct cgroup_subsys_state *css)
++{
++	kfree(css_pids(css));
++}
++
++/**
++ * pids_cancel - uncharge the local pid count
++ * @pids: the pid cgroup state
++ * @num: the number of pids to cancel
++ *
++ * This function will WARN if the pid count goes under 0, because such a case is
++ * a bug in the pids controller proper.
++ */
++static void pids_cancel(struct pids_cgroup *pids, int num)
++{
++	/*
++	 * A negative count (or overflow for that matter) is invalid,
++	 * and indicates a bug in the `pids` controller proper.
++	 */
++	WARN_ON_ONCE(atomic64_add_negative(-num, &pids->counter));
++}
++
++/**
++ * pids_uncharge - hierarchically uncharge the pid count
++ * @pids: the pid cgroup state
++ * @num: the number of pids to uncharge
++ */
++static void pids_uncharge(struct pids_cgroup *pids, int num)
++{
++	struct pids_cgroup *p;
++
++	for (p = pids; parent_pids(p); p = parent_pids(p))
++		pids_cancel(p, num);
++}
++
++/**
++ * pids_charge - hierarchically charge the pid count
++ * @pids: the pid cgroup state
++ * @num: the number of pids to charge
++ *
++ * This function does *not* follow the pid limit set. It cannot fail and the new
++ * pid count may exceed the limit. This is only used for reverting failed
++ * attaches, where there is no other way out than violating the limit.
++ */
++static void pids_charge(struct pids_cgroup *pids, int num)
++{
++	struct pids_cgroup *p;
++
++	for (p = pids; parent_pids(p); p = parent_pids(p))
++		atomic64_add(num, &p->counter);
++}
++
++/**
++ * pids_try_charge - hierarchically try to charge the pid count
++ * @pids: the pid cgroup state
++ * @num: the number of pids to charge
++ *
++ * This function follows the set limit. It will fail if the charge would cause
++ * the new value to exceed the hierarchical limit. Returns 0 if the charge
++ * succeeded, otherwise -EAGAIN.
++ */
++static int pids_try_charge(struct pids_cgroup *pids, int num)
++{
++	struct pids_cgroup *p, *q;
++
++	for (p = pids; parent_pids(p); p = parent_pids(p)) {
++		int64_t new = atomic64_add_return(num, &p->counter);
++
++		/*
++		 * Since new is capped to the maximum number of pid_t, if
++		 * p->limit is %PIDS_MAX then we know that this test will never
++		 * fail.
++		 */
++		if (new > p->limit)
++			goto revert;
++	}
++
++	return 0;
++
++revert:
++	for (q = pids; q != p; q = parent_pids(q))
++		pids_cancel(q, num);
++	pids_cancel(p, num);
++
++	return -EAGAIN;
++}
++
++static int pids_can_attach(struct cgroup_taskset *tset)
++{
++	struct task_struct *task;
++	struct cgroup_subsys_state *dst_css;
++
++	cgroup_taskset_for_each(task, dst_css, tset) {
++		struct pids_cgroup *pids = css_pids(dst_css);
++		struct cgroup_subsys_state *old_css;
++		struct pids_cgroup *old_pids;
++
++		/*
++		 * No need to pin @old_css between here and cancel_attach()
++		 * because cgroup core protects it from being freed before
++		 * the migration completes or fails.
++		 */
++		old_css = task_css(task, pids_cgrp_id);
++		old_pids = css_pids(old_css);
++
++		pids_charge(pids, 1);
++		pids_uncharge(old_pids, 1);
++	}
++
++	return 0;
++}
++
++static void pids_cancel_attach(struct cgroup_taskset *tset)
++{
++	struct task_struct *task;
++	struct cgroup_subsys_state *dst_css;
++
++	cgroup_taskset_for_each(task, dst_css, tset) {
++		struct pids_cgroup *pids = css_pids(dst_css);
++		struct cgroup_subsys_state *old_css;
++		struct pids_cgroup *old_pids;
++
++		old_css = task_css(task, pids_cgrp_id);
++		old_pids = css_pids(old_css);
++
++		pids_charge(old_pids, 1);
++		pids_uncharge(pids, 1);
++	}
++}
++
++/*
++ * task_css_check(true) in pids_can_fork() and pids_cancel_fork() relies
++ * on threadgroup_change_begin() held by the copy_process().
++ */
++static int pids_can_fork(struct task_struct *task)
++{
++	struct cgroup_subsys_state *css;
++	struct pids_cgroup *pids;
++	int err;
++
++	css = task_css_check(current, pids_cgrp_id, true);
++	pids = css_pids(css);
++	err = pids_try_charge(pids, 1);
++	if (err) {
++		/* Only log the first time events_limit is incremented. */
++		if (atomic64_inc_return(&pids->events_limit) == 1) {
++			pr_info("cgroup: fork rejected by pids controller in ");
++			pr_cont_cgroup_path(task_cgroup(current, pids_cgrp_id));
++			pr_cont("\n");
++		}
++		cgroup_file_notify(&pids->events_file);
++	}
++	return err;
++}
++
++static void pids_cancel_fork(struct task_struct *task)
++{
++	struct cgroup_subsys_state *css;
++	struct pids_cgroup *pids;
++
++	css = task_css_check(current, pids_cgrp_id, true);
++	pids = css_pids(css);
++	pids_uncharge(pids, 1);
++}
++
++static void pids_free(struct task_struct *task)
++{
++	struct pids_cgroup *pids = css_pids(task_css(task, pids_cgrp_id));
++
++	pids_uncharge(pids, 1);
++}
++
++static ssize_t pids_max_write(struct kernfs_open_file *of, char *buf,
++			      size_t nbytes, loff_t off)
++{
++	struct cgroup_subsys_state *css = of_css(of);
++	struct pids_cgroup *pids = css_pids(css);
++	int64_t limit;
++	int err;
++
++	buf = strstrip(buf);
++	if (!strcmp(buf, PIDS_MAX_STR)) {
++		limit = PIDS_MAX;
++		goto set_limit;
++	}
++
++	err = kstrtoll(buf, 0, &limit);
++	if (err)
++		return err;
++
++	if (limit < 0 || limit >= PIDS_MAX)
++		return -EINVAL;
++
++set_limit:
++	/*
++	 * Limit updates don't need to be mutex'd, since it isn't
++	 * critical that any racing fork()s follow the new limit.
++	 */
++	pids->limit = limit;
++	return nbytes;
++}
++
++static int pids_max_show(struct seq_file *sf, void *v)
++{
++	struct cgroup_subsys_state *css = seq_css(sf);
++	struct pids_cgroup *pids = css_pids(css);
++	int64_t limit = pids->limit;
++
++	if (limit >= PIDS_MAX)
++		seq_printf(sf, "%s\n", PIDS_MAX_STR);
++	else
++		seq_printf(sf, "%lld\n", limit);
++
++	return 0;
++}
++
++static s64 pids_current_read(struct cgroup_subsys_state *css,
++			     struct cftype *cft)
++{
++	struct pids_cgroup *pids = css_pids(css);
++
++	return atomic64_read(&pids->counter);
++}
++
++static int pids_events_show(struct seq_file *sf, void *v)
++{
++	struct pids_cgroup *pids = css_pids(seq_css(sf));
++
++	seq_printf(sf, "max %lld\n", (s64)atomic64_read(&pids->events_limit));
++	return 0;
++}
++
++static struct cftype pids_files[] = {
++	{
++		.name = "max",
++		.write = pids_max_write,
++		.seq_show = pids_max_show,
++		.flags = CFTYPE_NOT_ON_ROOT,
++	},
++	{
++		.name = "current",
++		.read_s64 = pids_current_read,
++		.flags = CFTYPE_NOT_ON_ROOT,
++	},
++	{
++		.name = "events",
++		.seq_show = pids_events_show,
++		.file_offset = offsetof(struct pids_cgroup, events_file),
++		.flags = CFTYPE_NOT_ON_ROOT,
++	},
++	{ }	/* terminate */
++};
++
++struct cgroup_subsys pids_cgrp_subsys = {
++	.css_alloc	= pids_css_alloc,
++	.css_free	= pids_css_free,
++	.can_attach 	= pids_can_attach,
++	.cancel_attach 	= pids_cancel_attach,
++	.can_fork	= pids_can_fork,
++	.cancel_fork	= pids_cancel_fork,
++	.free		= pids_free,
++	.legacy_cftypes	= pids_files,
++	.dfl_cftypes	= pids_files,
++};

@@ -1,0 +1,2366 @@
+commit b8ded9de8db34dd209a3dece94cf54fc414e78f7
+Author: Karsten Graul <kgraul@linux.ibm.com>
+Date:   Sat May 30 16:42:37 2020 +0200
+
+    net/smc: pre-fetch send buffer outside of send_lock
+    
+    Pre-fetch send buffer for the CDC validation message before entering the
+    send_lock. Without that the send call might fail with -EBUSY because
+    there are no free buffers and waiting for buffers is not possible under
+    send_lock.
+    
+    Signed-off-by: Karsten Graul <kgraul@linux.ibm.com>
+    Reviewed-by: Ursula Braun <ubraun@linux.ibm.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/smc/smc_cdc.c b/net/smc/smc_cdc.c
+index b2b85e1be72c..a47e8855e045 100644
+--- a/net/smc/smc_cdc.c
++++ b/net/smc/smc_cdc.c
+@@ -116,19 +116,15 @@ int smc_cdc_msg_send(struct smc_connection *conn,
+ }
+ 
+ /* send a validation msg indicating the move of a conn to an other QP link */
+-int smcr_cdc_msg_send_validation(struct smc_connection *conn)
++int smcr_cdc_msg_send_validation(struct smc_connection *conn,
++				 struct smc_cdc_tx_pend *pend,
++				 struct smc_wr_buf *wr_buf)
+ {
+ 	struct smc_host_cdc_msg *local = &conn->local_tx_ctrl;
+ 	struct smc_link *link = conn->lnk;
+-	struct smc_cdc_tx_pend *pend;
+-	struct smc_wr_buf *wr_buf;
+ 	struct smc_cdc_msg *peer;
+ 	int rc;
+ 
+-	rc = smc_cdc_get_free_slot(conn, link, &wr_buf, NULL, &pend);
+-	if (rc)
+-		return rc;
+-
+ 	peer = (struct smc_cdc_msg *)wr_buf;
+ 	peer->common.type = local->common.type;
+ 	peer->len = local->len;
+
+commit b286a0651e4404ab96cdfdcdad8a839a26b3751e
+Author: Karsten Graul <kgraul@linux.ibm.com>
+Date:   Mon May 4 14:18:40 2020 +0200
+
+    net/smc: handle incoming CDC validation message
+    
+    Call smc_cdc_msg_validate() when a CDC message with the failover
+    validation bit enabled was received. Validate that the sequence number
+    sent with the message is one we already have received. If not, messages
+    were lost and the connection is terminated using a new abort_work.
+    
+    Signed-off-by: Karsten Graul <kgraul@linux.ibm.com>
+    Reviewed-by: Ursula Braun <ubraun@linux.ibm.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/smc/smc_cdc.c b/net/smc/smc_cdc.c
+index e6b7eef71831..b2b85e1be72c 100644
+--- a/net/smc/smc_cdc.c
++++ b/net/smc/smc_cdc.c
+@@ -282,6 +282,28 @@ static void smc_cdc_handle_urg_data_arrival(struct smc_sock *smc,
+ 	sk_send_sigurg(&smc->sk);
+ }
+ 
++static void smc_cdc_msg_validate(struct smc_sock *smc, struct smc_cdc_msg *cdc,
++				 struct smc_link *link)
++{
++	struct smc_connection *conn = &smc->conn;
++	u16 recv_seq = ntohs(cdc->seqno);
++	s16 diff;
++
++	/* check that seqnum was seen before */
++	diff = conn->local_rx_ctrl.seqno - recv_seq;
++	if (diff < 0) { /* diff larger than 0x7fff */
++		/* drop connection */
++		conn->out_of_sync = 1;	/* prevent any further receives */
++		spin_lock_bh(&conn->send_lock);
++		conn->local_tx_ctrl.conn_state_flags.peer_conn_abort = 1;
++		conn->lnk = link;
++		spin_unlock_bh(&conn->send_lock);
++		sock_hold(&smc->sk); /* sock_put in abort_work */
++		if (!schedule_work(&conn->abort_work))
++			sock_put(&smc->sk);
++	}
++}
++
+ static void smc_cdc_msg_recv_action(struct smc_sock *smc,
+ 				    struct smc_cdc_msg *cdc)
+ {
+@@ -412,16 +434,19 @@ static void smc_cdc_rx_handler(struct ib_wc *wc, void *buf)
+ 	read_lock_bh(&lgr->conns_lock);
+ 	conn = smc_lgr_find_conn(ntohl(cdc->token), lgr);
+ 	read_unlock_bh(&lgr->conns_lock);
+-	if (!conn)
++	if (!conn || conn->out_of_sync)
+ 		return;
+ 	smc = container_of(conn, struct smc_sock, conn);
+ 
+-	if (!cdc->prod_flags.failover_validation) {
+-		if (smc_cdc_before(ntohs(cdc->seqno),
+-				   conn->local_rx_ctrl.seqno))
+-			/* received seqno is old */
+-			return;
++	if (cdc->prod_flags.failover_validation) {
++		smc_cdc_msg_validate(smc, cdc, link);
++		return;
+ 	}
++	if (smc_cdc_before(ntohs(cdc->seqno),
++			   conn->local_rx_ctrl.seqno))
++		/* received seqno is old */
++		return;
++
+ 	smc_cdc_msg_recv(smc, cdc);
+ }
+ 
+
+commit 29bd73dba4f72970895a2459f7190d388f5204f7
+Author: Karsten Graul <kgraul@linux.ibm.com>
+Date:   Mon May 4 14:18:39 2020 +0200
+
+    net/smc: send failover validation message
+    
+    When a connection is switched to a new link then a link validation
+    message must be sent to the peer over the new link, containing the
+    sequence number of the last CDC message that was sent over the old link.
+    The peer will validate if this sequence number is the same or lower then
+    the number he received, and abort the connection if messages were lost.
+    Add smcr_cdc_msg_send_validation() to send the message validation
+    message and call it when a connection was switched in
+    smc_switch_cursor().
+    
+    Signed-off-by: Karsten Graul <kgraul@linux.ibm.com>
+    Reviewed-by: Ursula Braun <ubraun@linux.ibm.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/smc/smc_cdc.c b/net/smc/smc_cdc.c
+index 3ca986066f32..e6b7eef71831 100644
+--- a/net/smc/smc_cdc.c
++++ b/net/smc/smc_cdc.c
+@@ -115,6 +115,31 @@ int smc_cdc_msg_send(struct smc_connection *conn,
+ 	return rc;
+ }
+ 
++/* send a validation msg indicating the move of a conn to an other QP link */
++int smcr_cdc_msg_send_validation(struct smc_connection *conn)
++{
++	struct smc_host_cdc_msg *local = &conn->local_tx_ctrl;
++	struct smc_link *link = conn->lnk;
++	struct smc_cdc_tx_pend *pend;
++	struct smc_wr_buf *wr_buf;
++	struct smc_cdc_msg *peer;
++	int rc;
++
++	rc = smc_cdc_get_free_slot(conn, link, &wr_buf, NULL, &pend);
++	if (rc)
++		return rc;
++
++	peer = (struct smc_cdc_msg *)wr_buf;
++	peer->common.type = local->common.type;
++	peer->len = local->len;
++	peer->seqno = htons(conn->tx_cdc_seq_fin); /* seqno last compl. tx */
++	peer->token = htonl(local->token);
++	peer->prod_flags.failover_validation = 1;
++
++	rc = smc_wr_tx_send(link, (struct smc_wr_tx_pend_priv *)pend);
++	return rc;
++}
++
+ static int smcr_cdc_get_slot_and_msg_send(struct smc_connection *conn)
+ {
+ 	struct smc_cdc_tx_pend *pend;
+
+commit c6f02ebeea3a0ff4bddddf0fd82303190ebb3dd1
+Author: Karsten Graul <kgraul@linux.ibm.com>
+Date:   Mon May 4 14:18:38 2020 +0200
+
+    net/smc: switch connections to alternate link
+    
+    Add smc_switch_conns() to switch all connections from a link that is
+    going down. Find an other link to switch the connections to, and
+    switch each connection to the new link. smc_switch_cursor() updates the
+    cursors of a connection to the state of the last successfully sent CDC
+    message. When there is no link to switch to, terminate the link group.
+    Call smc_switch_conns() when a link is going down.
+    And with the possibility that links of connections can switch adapt CDC
+    and TX functions to detect and handle link switches.
+    
+    Signed-off-by: Karsten Graul <kgraul@linux.ibm.com>
+    Reviewed-by: Ursula Braun <ubraun@linux.ibm.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/smc/smc_cdc.c b/net/smc/smc_cdc.c
+index c5e33296e55c..3ca986066f32 100644
+--- a/net/smc/smc_cdc.c
++++ b/net/smc/smc_cdc.c
+@@ -56,11 +56,11 @@ static void smc_cdc_tx_handler(struct smc_wr_tx_pend_priv *pnd_snd,
+ }
+ 
+ int smc_cdc_get_free_slot(struct smc_connection *conn,
++			  struct smc_link *link,
+ 			  struct smc_wr_buf **wr_buf,
+ 			  struct smc_rdma_wr **wr_rdma_buf,
+ 			  struct smc_cdc_tx_pend **pend)
+ {
+-	struct smc_link *link = conn->lnk;
+ 	int rc;
+ 
+ 	rc = smc_wr_tx_get_free_slot(link, smc_cdc_tx_handler, wr_buf,
+@@ -119,13 +119,27 @@ static int smcr_cdc_get_slot_and_msg_send(struct smc_connection *conn)
+ {
+ 	struct smc_cdc_tx_pend *pend;
+ 	struct smc_wr_buf *wr_buf;
++	struct smc_link *link;
++	bool again = false;
+ 	int rc;
+ 
+-	rc = smc_cdc_get_free_slot(conn, &wr_buf, NULL, &pend);
++again:
++	link = conn->lnk;
++	rc = smc_cdc_get_free_slot(conn, link, &wr_buf, NULL, &pend);
+ 	if (rc)
+ 		return rc;
+ 
+ 	spin_lock_bh(&conn->send_lock);
++	if (link != conn->lnk) {
++		/* link of connection changed, try again one time*/
++		spin_unlock_bh(&conn->send_lock);
++		smc_wr_tx_put_slot(link,
++				   (struct smc_wr_tx_pend_priv *)pend);
++		if (again)
++			return -ENOLINK;
++		again = true;
++		goto again;
++	}
+ 	rc = smc_cdc_msg_send(conn, wr_buf, pend);
+ 	spin_unlock_bh(&conn->send_lock);
+ 	return rc;
+
+commit f0ec4f1d32ad49a23b93156949208dd9348e3590
+Author: Karsten Graul <kgraul@linux.ibm.com>
+Date:   Mon May 4 14:18:37 2020 +0200
+
+    net/smc: save state of last sent CDC message
+    
+    When a link goes down and all connections of this link need to be
+    switched to an other link then the producer cursor and the sequence of
+    the last successfully sent CDC message must be known. Add the two fields
+    to the SMC connection and update it in the tx completion handler.
+    And to allow matching of sequences in error cases reset the seqno to the
+    old value in smc_cdc_msg_send() when the actual send failed.
+    
+    Signed-off-by: Karsten Graul <kgraul@linux.ibm.com>
+    Reviewed-by: Ursula Braun <ubraun@linux.ibm.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/smc/smc_cdc.c b/net/smc/smc_cdc.c
+index f64589d823aa..c5e33296e55c 100644
+--- a/net/smc/smc_cdc.c
++++ b/net/smc/smc_cdc.c
+@@ -47,6 +47,9 @@ static void smc_cdc_tx_handler(struct smc_wr_tx_pend_priv *pnd_snd,
+ 		/* guarantee 0 <= sndbuf_space <= sndbuf_desc->len */
+ 		smp_mb__after_atomic();
+ 		smc_curs_copy(&conn->tx_curs_fin, &cdcpend->cursor, conn);
++		smc_curs_copy(&conn->local_tx_ctrl_fin, &cdcpend->p_cursor,
++			      conn);
++		conn->tx_cdc_seq_fin = cdcpend->ctrl_seq;
+ 	}
+ 	smc_tx_sndbuf_nonfull(smc);
+ 	bh_unlock_sock(&smc->sk);
+@@ -104,6 +107,9 @@ int smc_cdc_msg_send(struct smc_connection *conn,
+ 	if (!rc) {
+ 		smc_curs_copy(&conn->rx_curs_confirmed, &cfed, conn);
+ 		conn->local_rx_ctrl.prod_flags.cons_curs_upd_req = 0;
++	} else {
++		conn->tx_cdc_seq--;
++		conn->local_tx_ctrl.seqno = conn->tx_cdc_seq;
+ 	}
+ 
+ 	return rc;
+
+commit 387707fdf48697c667dd5e9715ac4feb41602d15
+Author: Karsten Graul <kgraul@linux.ibm.com>
+Date:   Wed Apr 29 17:10:40 2020 +0200
+
+    net/smc: convert static link ID to dynamic references
+    
+    As a preparation for the support of multiple links remove the usage of
+    a static link id (SMC_SINGLE_LINK) and allow dynamic link ids.
+    
+    Signed-off-by: Karsten Graul <kgraul@linux.ibm.com>
+    Reviewed-by: Ursula Braun <ubraun@linux.ibm.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/smc/smc_cdc.c b/net/smc/smc_cdc.c
+index 164f1584861b..f64589d823aa 100644
+--- a/net/smc/smc_cdc.c
++++ b/net/smc/smc_cdc.c
+@@ -57,7 +57,7 @@ int smc_cdc_get_free_slot(struct smc_connection *conn,
+ 			  struct smc_rdma_wr **wr_rdma_buf,
+ 			  struct smc_cdc_tx_pend **pend)
+ {
+-	struct smc_link *link = &conn->lgr->lnk[SMC_SINGLE_LINK];
++	struct smc_link *link = conn->lnk;
+ 	int rc;
+ 
+ 	rc = smc_wr_tx_get_free_slot(link, smc_cdc_tx_handler, wr_buf,
+@@ -91,12 +91,10 @@ int smc_cdc_msg_send(struct smc_connection *conn,
+ 		     struct smc_wr_buf *wr_buf,
+ 		     struct smc_cdc_tx_pend *pend)
+ {
++	struct smc_link *link = conn->lnk;
+ 	union smc_host_cursor cfed;
+-	struct smc_link *link;
+ 	int rc;
+ 
+-	link = &conn->lgr->lnk[SMC_SINGLE_LINK];
+-
+ 	smc_cdc_add_pending_send(conn, pend);
+ 
+ 	conn->tx_cdc_seq++;
+@@ -165,7 +163,7 @@ static void smc_cdc_tx_dismisser(struct smc_wr_tx_pend_priv *tx_pend)
+ 
+ void smc_cdc_tx_dismiss_slots(struct smc_connection *conn)
+ {
+-	struct smc_link *link = &conn->lgr->lnk[SMC_SINGLE_LINK];
++	struct smc_link *link = conn->lnk;
+ 
+ 	smc_wr_tx_dismiss_slots(link, SMC_CDC_MSG_TYPE,
+ 				smc_cdc_tx_filter, smc_cdc_tx_dismisser,
+
+commit 50c6b20eff8e10cb91f06262d8003a5d9be3dfab
+Author: Ursula Braun <ubraun@linux.ibm.com>
+Date:   Thu Nov 14 13:02:40 2019 +0100
+
+    net/smc: fix final cleanup sequence for SMCD devices
+    
+    If peer announces shutdown, use the link group terminate worker for
+    local cleanup of link groups and connections to terminate link group
+    in proper context.
+    
+    Make sure link groups are cleaned up first before destroying the
+    event queue of the SMCD device, because link group cleanup may
+    raise events.
+    
+    Send signal shutdown only if peer has not done it already.
+    
+    Send socket abort or close only, if peer has not already announced
+    shutdown.
+    
+    Signed-off-by: Ursula Braun <ubraun@linux.ibm.com>
+    Signed-off-by: Karsten Graul <kgraul@linux.ibm.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/smc/smc_cdc.c b/net/smc/smc_cdc.c
+index 7dc07ec2379b..164f1584861b 100644
+--- a/net/smc/smc_cdc.c
++++ b/net/smc/smc_cdc.c
+@@ -131,6 +131,9 @@ int smc_cdc_get_slot_and_msg_send(struct smc_connection *conn)
+ {
+ 	int rc;
+ 
++	if (!conn->lgr || (conn->lgr->is_smcd && conn->lgr->peer_shutdown))
++		return -EPIPE;
++
+ 	if (conn->lgr->is_smcd) {
+ 		spin_lock_bh(&conn->send_lock);
+ 		rc = smcd_cdc_msg_send(conn);
+
+commit b290098092e4aeaa1712d3326bf5b64d2751c740
+Author: Ursula Braun <ubraun@linux.ibm.com>
+Date:   Mon Oct 21 16:13:08 2019 +0200
+
+    net/smc: cancel send and receive for terminated socket
+    
+    The resources for a terminated socket are being cleaned up.
+    This patch makes sure
+    * no more data is received for an actively terminated socket
+    * no more data is sent for an actively or passively terminated socket
+    
+    Signed-off-by: Ursula Braun <ubraun@linux.ibm.com>
+    Signed-off-by: Karsten Graul <kgraul@linux.ibm.com>
+    Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+
+diff --git a/net/smc/smc_cdc.c b/net/smc/smc_cdc.c
+index d0b0f4c865b4..7dc07ec2379b 100644
+--- a/net/smc/smc_cdc.c
++++ b/net/smc/smc_cdc.c
+@@ -63,7 +63,7 @@ int smc_cdc_get_free_slot(struct smc_connection *conn,
+ 	rc = smc_wr_tx_get_free_slot(link, smc_cdc_tx_handler, wr_buf,
+ 				     wr_rdma_buf,
+ 				     (struct smc_wr_tx_pend_priv **)pend);
+-	if (!conn->alert_token_local)
++	if (conn->killed)
+ 		/* abnormal termination */
+ 		rc = -EPIPE;
+ 	return rc;
+@@ -328,7 +328,7 @@ static void smcd_cdc_rx_tsklet(unsigned long data)
+ 	struct smcd_cdc_msg cdc;
+ 	struct smc_sock *smc;
+ 
+-	if (!conn)
++	if (!conn || conn->killed)
+ 		return;
+ 
+ 	data_cdc = (struct smcd_cdc_msg *)conn->rmb_desc->cpu_addr;
+
+commit 3313da8188cc346a205783c22c37e821b4b7016d
+Merge: 50f444aa50a4 24f0a48743a2
+Author: David S. Miller <davem@davemloft.net>
+Date:   Fri Feb 15 12:38:38 2019 -0800
+
+    Merge git://git.kernel.org/pub/scm/linux/kernel/git/davem/net
+    
+    The netfilter conflicts were rather simple overlapping
+    changes.
+    
+    However, the cls_tcindex.c stuff was a bit more complex.
+    
+    On the 'net' side, Cong is fixing several races and memory
+    leaks.  Whilst on the 'net-next' side we have Vlad adding
+    the rtnl-ness support.
+    
+    What I've decided to do, in order to resolve this, is revert the
+    conversion over to using a workqueue that Cong did, bringing us back
+    to pure RCU.  I did it this way because I believe that either Cong's
+    races don't apply with have Vlad did things, or Cong will have to
+    implement the race fix slightly differently.
+    
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+commit cf0cfe535845cf60830e1482f7e618d80140e8d9
+Author: Karsten Graul <kgraul@linux.ibm.com>
+Date:   Tue Feb 12 16:29:53 2019 +0100
+
+    net/smc: reduce amount of status updates to peer
+    
+    In smc_cdc_msg_recv_action() the received cdc message is evaluated.
+    To reduce the number of messaged triggered by this evaluation the logic
+    is streamlined. For the write_blocked condition we do not need to send
+    a response immediately. The remaining conditions can be put together
+    into one if clause.
+    
+    Signed-off-by: Karsten Graul <kgraul@linux.ibm.com>
+    Signed-off-by: Ursula Braun <ubraun@linux.ibm.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/smc/smc_cdc.c b/net/smc/smc_cdc.c
+index 780b36c69292..28bbdb04bc35 100644
+--- a/net/smc/smc_cdc.c
++++ b/net/smc/smc_cdc.c
+@@ -273,24 +273,18 @@ static void smc_cdc_msg_recv_action(struct smc_sock *smc,
+ 		smp_mb__after_atomic();
+ 		smc->sk.sk_data_ready(&smc->sk);
+ 	} else {
+-		if (conn->local_rx_ctrl.prod_flags.write_blocked ||
+-		    conn->local_rx_ctrl.prod_flags.cons_curs_upd_req ||
+-		    conn->local_rx_ctrl.prod_flags.urg_data_pending) {
+-			if (conn->local_rx_ctrl.prod_flags.urg_data_pending)
+-				conn->urg_state = SMC_URG_NOTYET;
+-			/* force immediate tx of current consumer cursor, but
+-			 * under send_lock to guarantee arrival in seqno-order
+-			 */
+-			if (smc->sk.sk_state != SMC_INIT)
+-				smc_tx_sndbuf_nonempty(conn);
+-		}
++		if (conn->local_rx_ctrl.prod_flags.write_blocked)
++			smc->sk.sk_data_ready(&smc->sk);
++		if (conn->local_rx_ctrl.prod_flags.urg_data_pending)
++			conn->urg_state = SMC_URG_NOTYET;
+ 	}
+ 
+-	/* piggy backed tx info */
+ 	/* trigger sndbuf consumer: RDMA write into peer RMBE and CDC */
+-	if (diff_cons && smc_tx_prepared_sends(conn)) {
++	if ((diff_cons && smc_tx_prepared_sends(conn)) ||
++	    conn->local_rx_ctrl.prod_flags.cons_curs_upd_req ||
++	    conn->local_rx_ctrl.prod_flags.urg_data_pending)
+ 		smc_tx_sndbuf_nonempty(conn);
+-	}
++
+ 	if (diff_cons && conn->urg_tx_pend &&
+ 	    atomic_read(&conn->peer_rmbe_space) == conn->peer_rmbe_size) {
+ 		/* urg data confirmed by peer, indicate we're ready for more */
+
+commit 5bc056d8d0e3f5f896eb747d42d1e3aa8ceaf1b0
+Author: Karsten Graul <kgraul@linux.ibm.com>
+Date:   Tue Feb 12 16:29:51 2019 +0100
+
+    net/smc: move wake up of close waiter
+    
+    Move the call to smc_close_wake_tx_prepared() (which wakes up a possibly
+    waiting close processing that might wait for 'all data sent') to
+    smc_tx_sndbuf_nonempty() (which is the main function to send data).
+    
+    Signed-off-by: Karsten Graul <kgraul@linux.ibm.com>
+    Signed-off-by: Ursula Braun <ubraun@linux.ibm.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/smc/smc_cdc.c b/net/smc/smc_cdc.c
+index 99d9d6e85dfb..780b36c69292 100644
+--- a/net/smc/smc_cdc.c
++++ b/net/smc/smc_cdc.c
+@@ -290,8 +290,6 @@ static void smc_cdc_msg_recv_action(struct smc_sock *smc,
+ 	/* trigger sndbuf consumer: RDMA write into peer RMBE and CDC */
+ 	if (diff_cons && smc_tx_prepared_sends(conn)) {
+ 		smc_tx_sndbuf_nonempty(conn);
+-		/* trigger socket release if connection closed */
+-		smc_close_wake_tx_prepared(smc);
+ 	}
+ 	if (diff_cons && conn->urg_tx_pend &&
+ 	    atomic_read(&conn->peer_rmbe_space) == conn->peer_rmbe_size) {
+
+commit 4dff63c25ebf8963065323964cf1c24e290b6ced
+Author: Karsten Graul <kgraul@linux.ibm.com>
+Date:   Tue Feb 12 16:29:50 2019 +0100
+
+    net/smc: reset cursor update required flag
+    
+    When an updated rx_cursor_confirmed field was sent to the peer then
+    reset the cons_curs_upd_req flag. And remove the duplicate reset and
+    cursor update in smc_tx_consumer_update().
+    
+    Signed-off-by: Karsten Graul <kgraul@linux.ibm.com>
+    Signed-off-by: Ursula Braun <ubraun@linux.ibm.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/smc/smc_cdc.c b/net/smc/smc_cdc.c
+index a712c9f8699b..99d9d6e85dfb 100644
+--- a/net/smc/smc_cdc.c
++++ b/net/smc/smc_cdc.c
+@@ -105,8 +105,10 @@ int smc_cdc_msg_send(struct smc_connection *conn,
+ 			    &conn->local_tx_ctrl, conn);
+ 	smc_curs_copy(&cfed, &((struct smc_host_cdc_msg *)wr_buf)->cons, conn);
+ 	rc = smc_wr_tx_send(link, (struct smc_wr_tx_pend_priv *)pend);
+-	if (!rc)
++	if (!rc) {
+ 		smc_curs_copy(&conn->rx_curs_confirmed, &cfed, conn);
++		conn->local_rx_ctrl.prod_flags.cons_curs_upd_req = 0;
++	}
+ 
+ 	return rc;
+ }
+@@ -194,6 +196,7 @@ int smcd_cdc_msg_send(struct smc_connection *conn)
+ 	if (rc)
+ 		return rc;
+ 	smc_curs_copy(&conn->rx_curs_confirmed, &curs, conn);
++	conn->local_rx_ctrl.prod_flags.cons_curs_upd_req = 0;
+ 	/* Calculate transmitted data and increment free send buffer space */
+ 	diff = smc_curs_diff(conn->sndbuf_desc->len, &conn->tx_curs_fin,
+ 			     &conn->tx_curs_sent);
+
+commit ccc8ca9b90acb45a3309f922b2591b07b4e070ec
+Author: Ursula Braun <ubraun@linux.ibm.com>
+Date:   Thu Feb 7 14:52:54 2019 +0100
+
+    net/smc: fix byte_order for rx_curs_confirmed
+    
+    The recent change in the rx_curs_confirmed assignment disregards
+    byte order, which causes problems on little endian architectures.
+    This patch fixes it.
+    
+    Fixes: b8649efad879 ("net/smc: fix sender_free computation") (net-tree)
+    Signed-off-by: Ursula Braun <ubraun@linux.ibm.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/smc/smc_cdc.c b/net/smc/smc_cdc.c
+index a712c9f8699b..fb07ad8d69a6 100644
+--- a/net/smc/smc_cdc.c
++++ b/net/smc/smc_cdc.c
+@@ -101,9 +101,7 @@ int smc_cdc_msg_send(struct smc_connection *conn,
+ 
+ 	conn->tx_cdc_seq++;
+ 	conn->local_tx_ctrl.seqno = conn->tx_cdc_seq;
+-	smc_host_msg_to_cdc((struct smc_cdc_msg *)wr_buf,
+-			    &conn->local_tx_ctrl, conn);
+-	smc_curs_copy(&cfed, &((struct smc_host_cdc_msg *)wr_buf)->cons, conn);
++	smc_host_msg_to_cdc((struct smc_cdc_msg *)wr_buf, conn, &cfed);
+ 	rc = smc_wr_tx_send(link, (struct smc_wr_tx_pend_priv *)pend);
+ 	if (!rc)
+ 		smc_curs_copy(&conn->rx_curs_confirmed, &cfed, conn);
+
+commit b8649efad879c69c7ab1f19ce8814fcabef1f72b
+Author: Ursula Braun <ubraun@linux.ibm.com>
+Date:   Mon Feb 4 13:44:45 2019 +0100
+
+    net/smc: fix sender_free computation
+    
+    In some scenarios a separate consumer cursor update is necessary.
+    The decision is made in smc_tx_consumer_cursor_update(). The
+    sender_free computation could be wrong:
+    
+    The rx confirmed cursor is always smaller than or equal to the
+    rx producer cursor. The parameters in the smc_curs_diff() call
+    have to be exchanged, otherwise sender_free might even be negative.
+    
+    And if more data arrives local_rx_ctrl.prod might be updated, enabling
+    a cursor difference between local_rx_ctrl.prod and rx confirmed cursor
+    larger than the RMB size. This case is not covered by smc_curs_diff().
+    Thus function smc_curs_diff_large() is introduced here.
+    
+    If a recvmsg() is processed in parallel, local_tx_ctrl.cons might
+    change during smc_cdc_msg_send. Make sure rx_curs_confirmed is updated
+    with the actually sent local_tx_ctrl.cons value.
+    
+    Fixes: e82f2e31f559 ("net/smc: optimize consumer cursor updates")
+    Signed-off-by: Ursula Braun <ubraun@linux.ibm.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/smc/smc_cdc.c b/net/smc/smc_cdc.c
+index b80ef104ab4e..a712c9f8699b 100644
+--- a/net/smc/smc_cdc.c
++++ b/net/smc/smc_cdc.c
+@@ -91,6 +91,7 @@ int smc_cdc_msg_send(struct smc_connection *conn,
+ 		     struct smc_wr_buf *wr_buf,
+ 		     struct smc_cdc_tx_pend *pend)
+ {
++	union smc_host_cursor cfed;
+ 	struct smc_link *link;
+ 	int rc;
+ 
+@@ -102,10 +103,10 @@ int smc_cdc_msg_send(struct smc_connection *conn,
+ 	conn->local_tx_ctrl.seqno = conn->tx_cdc_seq;
+ 	smc_host_msg_to_cdc((struct smc_cdc_msg *)wr_buf,
+ 			    &conn->local_tx_ctrl, conn);
++	smc_curs_copy(&cfed, &((struct smc_host_cdc_msg *)wr_buf)->cons, conn);
+ 	rc = smc_wr_tx_send(link, (struct smc_wr_tx_pend_priv *)pend);
+ 	if (!rc)
+-		smc_curs_copy(&conn->rx_curs_confirmed,
+-			      &conn->local_tx_ctrl.cons, conn);
++		smc_curs_copy(&conn->rx_curs_confirmed, &cfed, conn);
+ 
+ 	return rc;
+ }
+
+commit ad6f317f720f4a3121756c23831a43dda9b095e5
+Author: Ursula Braun <ubraun@linux.ibm.com>
+Date:   Mon Feb 4 13:44:44 2019 +0100
+
+    net/smc: preallocated memory for rdma work requests
+    
+    The work requests for rdma writes are built in local variables within
+    function smc_tx_rdma_write(). This violates the rule that the work
+    request storage has to stay till the work request is confirmed by
+    a completion queue response.
+    This patch introduces preallocated memory for these work requests.
+    The storage is allocated, once a link (and thus a queue pair) is
+    established.
+    
+    Signed-off-by: Ursula Braun <ubraun@linux.ibm.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/smc/smc_cdc.c b/net/smc/smc_cdc.c
+index 1c5333d494e9..b80ef104ab4e 100644
+--- a/net/smc/smc_cdc.c
++++ b/net/smc/smc_cdc.c
+@@ -21,13 +21,6 @@
+ 
+ /********************************** send *************************************/
+ 
+-struct smc_cdc_tx_pend {
+-	struct smc_connection	*conn;		/* socket connection */
+-	union smc_host_cursor	cursor;	/* tx sndbuf cursor sent */
+-	union smc_host_cursor	p_cursor;	/* rx RMBE cursor produced */
+-	u16			ctrl_seq;	/* conn. tx sequence # */
+-};
+-
+ /* handler for send/transmission completion of a CDC msg */
+ static void smc_cdc_tx_handler(struct smc_wr_tx_pend_priv *pnd_snd,
+ 			       struct smc_link *link,
+@@ -61,12 +54,14 @@ static void smc_cdc_tx_handler(struct smc_wr_tx_pend_priv *pnd_snd,
+ 
+ int smc_cdc_get_free_slot(struct smc_connection *conn,
+ 			  struct smc_wr_buf **wr_buf,
++			  struct smc_rdma_wr **wr_rdma_buf,
+ 			  struct smc_cdc_tx_pend **pend)
+ {
+ 	struct smc_link *link = &conn->lgr->lnk[SMC_SINGLE_LINK];
+ 	int rc;
+ 
+ 	rc = smc_wr_tx_get_free_slot(link, smc_cdc_tx_handler, wr_buf,
++				     wr_rdma_buf,
+ 				     (struct smc_wr_tx_pend_priv **)pend);
+ 	if (!conn->alert_token_local)
+ 		/* abnormal termination */
+@@ -121,7 +116,7 @@ static int smcr_cdc_get_slot_and_msg_send(struct smc_connection *conn)
+ 	struct smc_wr_buf *wr_buf;
+ 	int rc;
+ 
+-	rc = smc_cdc_get_free_slot(conn, &wr_buf, &pend);
++	rc = smc_cdc_get_free_slot(conn, &wr_buf, NULL, &pend);
+ 	if (rc)
+ 		return rc;
+ 
+
+commit 2dee25af42f99b476d5916aeac5c994e4dcc910b
+Author: Karsten Graul <kgraul@linux.ibm.com>
+Date:   Wed Jan 30 18:51:06 2019 +0100
+
+    net/smc: call smc_cdc_msg_send() under send_lock
+    
+    Call smc_cdc_msg_send() under the connection send_lock to make sure all
+    send operations for one connection are serialized.
+    
+    Signed-off-by: Karsten Graul <kgraul@linux.ibm.com>
+    Signed-off-by: Ursula Braun <ubraun@linux.ibm.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/smc/smc_cdc.c b/net/smc/smc_cdc.c
+index db83332ac1c8..1c5333d494e9 100644
+--- a/net/smc/smc_cdc.c
++++ b/net/smc/smc_cdc.c
+@@ -125,7 +125,10 @@ static int smcr_cdc_get_slot_and_msg_send(struct smc_connection *conn)
+ 	if (rc)
+ 		return rc;
+ 
+-	return smc_cdc_msg_send(conn, wr_buf, pend);
++	spin_lock_bh(&conn->send_lock);
++	rc = smc_cdc_msg_send(conn, wr_buf, pend);
++	spin_unlock_bh(&conn->send_lock);
++	return rc;
+ }
+ 
+ int smc_cdc_get_slot_and_msg_send(struct smc_connection *conn)
+
+commit b9a22dd9811dbcddb5623c499e5b736400059df6
+Author: Ursula Braun <ubraun@linux.ibm.com>
+Date:   Tue Nov 20 16:46:42 2018 +0100
+
+    net/smc: atomic SMCD cursor handling
+    
+    Running uperf tests with SMCD on LPARs results in corrupted cursors.
+    SMCD cursors should be treated atomically to fix cursor corruption.
+    
+    Signed-off-by: Ursula Braun <ubraun@linux.ibm.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/smc/smc_cdc.c b/net/smc/smc_cdc.c
+index ed5dcf03fe0b..db83332ac1c8 100644
+--- a/net/smc/smc_cdc.c
++++ b/net/smc/smc_cdc.c
+@@ -81,7 +81,7 @@ static inline void smc_cdc_add_pending_send(struct smc_connection *conn,
+ 		sizeof(struct smc_cdc_msg) > SMC_WR_BUF_SIZE,
+ 		"must increase SMC_WR_BUF_SIZE to at least sizeof(struct smc_cdc_msg)");
+ 	BUILD_BUG_ON_MSG(
+-		sizeof(struct smc_cdc_msg) != SMC_WR_TX_SIZE,
++		offsetofend(struct smc_cdc_msg, reserved) > SMC_WR_TX_SIZE,
+ 		"must adapt SMC_WR_TX_SIZE to sizeof(struct smc_cdc_msg); if not all smc_wr upper layer protocols use the same message size any more, must start to set link->wr_tx_sges[i].length on each individual smc_wr_tx_send()");
+ 	BUILD_BUG_ON_MSG(
+ 		sizeof(struct smc_cdc_tx_pend) > SMC_WR_TX_PEND_PRIV_SIZE,
+@@ -177,23 +177,24 @@ void smc_cdc_tx_dismiss_slots(struct smc_connection *conn)
+ int smcd_cdc_msg_send(struct smc_connection *conn)
+ {
+ 	struct smc_sock *smc = container_of(conn, struct smc_sock, conn);
++	union smc_host_cursor curs;
+ 	struct smcd_cdc_msg cdc;
+ 	int rc, diff;
+ 
+ 	memset(&cdc, 0, sizeof(cdc));
+ 	cdc.common.type = SMC_CDC_MSG_TYPE;
+-	cdc.prod_wrap = conn->local_tx_ctrl.prod.wrap;
+-	cdc.prod_count = conn->local_tx_ctrl.prod.count;
+-
+-	cdc.cons_wrap = conn->local_tx_ctrl.cons.wrap;
+-	cdc.cons_count = conn->local_tx_ctrl.cons.count;
+-	cdc.prod_flags = conn->local_tx_ctrl.prod_flags;
+-	cdc.conn_state_flags = conn->local_tx_ctrl.conn_state_flags;
++	curs.acurs.counter = atomic64_read(&conn->local_tx_ctrl.prod.acurs);
++	cdc.prod.wrap = curs.wrap;
++	cdc.prod.count = curs.count;
++	curs.acurs.counter = atomic64_read(&conn->local_tx_ctrl.cons.acurs);
++	cdc.cons.wrap = curs.wrap;
++	cdc.cons.count = curs.count;
++	cdc.cons.prod_flags = conn->local_tx_ctrl.prod_flags;
++	cdc.cons.conn_state_flags = conn->local_tx_ctrl.conn_state_flags;
+ 	rc = smcd_tx_ism_write(conn, &cdc, sizeof(cdc), 0, 1);
+ 	if (rc)
+ 		return rc;
+-	smc_curs_copy(&conn->rx_curs_confirmed, &conn->local_tx_ctrl.cons,
+-		      conn);
++	smc_curs_copy(&conn->rx_curs_confirmed, &curs, conn);
+ 	/* Calculate transmitted data and increment free send buffer space */
+ 	diff = smc_curs_diff(conn->sndbuf_desc->len, &conn->tx_curs_fin,
+ 			     &conn->tx_curs_sent);
+@@ -331,13 +332,16 @@ static void smc_cdc_msg_recv(struct smc_sock *smc, struct smc_cdc_msg *cdc)
+ static void smcd_cdc_rx_tsklet(unsigned long data)
+ {
+ 	struct smc_connection *conn = (struct smc_connection *)data;
++	struct smcd_cdc_msg *data_cdc;
+ 	struct smcd_cdc_msg cdc;
+ 	struct smc_sock *smc;
+ 
+ 	if (!conn)
+ 		return;
+ 
+-	memcpy(&cdc, conn->rmb_desc->cpu_addr, sizeof(cdc));
++	data_cdc = (struct smcd_cdc_msg *)conn->rmb_desc->cpu_addr;
++	smcd_curs_copy(&cdc.prod, &data_cdc->prod, conn);
++	smcd_curs_copy(&cdc.cons, &data_cdc->cons, conn);
+ 	smc = container_of(conn, struct smc_sock, conn);
+ 	smc_cdc_msg_recv(smc, (struct smc_cdc_msg *)&cdc);
+ }
+
+commit c1c8626fcebed467184ffd8de0ab5c9f9d9c3594
+Merge: d89d41556141 1ffaddd029c8
+Author: David S. Miller <davem@davemloft.net>
+Date:   Sun Aug 5 13:04:31 2018 -0700
+
+    Merge ra.kernel.org:/pub/scm/linux/kernel/git/davem/net
+    
+    Lots of overlapping changes, mostly trivial in nature.
+    
+    The mlxsw conflict was resolving using the example
+    resolution at:
+    
+    https://github.com/jpirko/linux_mlxsw/blob/combined_queue/drivers/net/ethernet/mellanox/mlxsw/core_acl_flex_actions.c
+    
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+commit 5607016cd1bbec538050b495669c3c8c5a2cee80
+Author: Ursula Braun <ubraun@linux.ibm.com>
+Date:   Fri Aug 3 10:38:33 2018 +0200
+
+    net/smc: no cursor update send in state SMC_INIT
+    
+    If a writer blocked condition is received without data, the current
+    consumer cursor is immediately sent. Servers could already receive this
+    condition in state SMC_INIT without finished tx-setup. This patch
+    avoids sending a consumer cursor update in this case.
+    
+    Signed-off-by: Ursula Braun <ubraun@linux.ibm.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/smc/smc_cdc.c b/net/smc/smc_cdc.c
+index a7e8d63fc8ae..9bde1e4ca288 100644
+--- a/net/smc/smc_cdc.c
++++ b/net/smc/smc_cdc.c
+@@ -233,7 +233,8 @@ static void smc_cdc_msg_recv_action(struct smc_sock *smc,
+ 			/* force immediate tx of current consumer cursor, but
+ 			 * under send_lock to guarantee arrival in seqno-order
+ 			 */
+-			smc_tx_sndbuf_nonempty(conn);
++			if (smc->sk.sk_state != SMC_INIT)
++				smc_tx_sndbuf_nonempty(conn);
+ 		}
+ 	}
+ 
+
+commit 00e5fb263f9f5f2af60754b79b7dcec0d5e88154
+Author: Stefan Raspl <raspl@linux.ibm.com>
+Date:   Mon Jul 23 13:53:10 2018 +0200
+
+    net/smc: add function to get link group from link
+    
+    Replace a frequently used construct with a more readable variant,
+    reducing the code. Also might come handy when we start to support
+    more than a single per link group.
+    
+    Signed-off-by: Stefan Raspl <raspl@linux.ibm.com>
+    Signed-off-by: Ursula Braun <ubraun@linux.ibm.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/smc/smc_cdc.c b/net/smc/smc_cdc.c
+index f3a1497953ee..a7af2289cdff 100644
+--- a/net/smc/smc_cdc.c
++++ b/net/smc/smc_cdc.c
+@@ -365,7 +365,7 @@ static void smc_cdc_rx_handler(struct ib_wc *wc, void *buf)
+ 		return; /* invalid message */
+ 
+ 	/* lookup connection */
+-	lgr = container_of(link, struct smc_link_group, lnk[SMC_SINGLE_LINK]);
++	lgr = smc_get_lgr(link);
+ 	read_lock_bh(&lgr->conns_lock);
+ 	conn = smc_lgr_find_conn(ntohl(cdc->token), lgr);
+ 	read_unlock_bh(&lgr->conns_lock);
+
+commit bac6de7b637018f4caacfdf2b4ad8c8749de7420
+Author: Stefan Raspl <raspl@linux.ibm.com>
+Date:   Mon Jul 23 13:53:09 2018 +0200
+
+    net/smc: eliminate cursor read and write calls
+    
+    The functions to read and write cursors are exclusively used to copy
+    cursors. Therefore switch to a respective function instead.
+    
+    Signed-off-by: Stefan Raspl <raspl@linux.ibm.com>
+    Signed-off-by: Ursula Braun <ubraun@linux.ibm.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/smc/smc_cdc.c b/net/smc/smc_cdc.c
+index 621d8cca570b..f3a1497953ee 100644
+--- a/net/smc/smc_cdc.c
++++ b/net/smc/smc_cdc.c
+@@ -34,14 +34,15 @@ static void smc_cdc_tx_handler(struct smc_wr_tx_pend_priv *pnd_snd,
+ 			       enum ib_wc_status wc_status)
+ {
+ 	struct smc_cdc_tx_pend *cdcpend = (struct smc_cdc_tx_pend *)pnd_snd;
++	struct smc_connection *conn = cdcpend->conn;
+ 	struct smc_sock *smc;
+ 	int diff;
+ 
+-	if (!cdcpend->conn)
++	if (!conn)
+ 		/* already dismissed */
+ 		return;
+ 
+-	smc = container_of(cdcpend->conn, struct smc_sock, conn);
++	smc = container_of(conn, struct smc_sock, conn);
+ 	bh_lock_sock(&smc->sk);
+ 	if (!wc_status) {
+ 		diff = smc_curs_diff(cdcpend->conn->sndbuf_desc->len,
+@@ -52,9 +53,7 @@ static void smc_cdc_tx_handler(struct smc_wr_tx_pend_priv *pnd_snd,
+ 		atomic_add(diff, &cdcpend->conn->sndbuf_space);
+ 		/* guarantee 0 <= sndbuf_space <= sndbuf_desc->len */
+ 		smp_mb__after_atomic();
+-		smc_curs_write(&cdcpend->conn->tx_curs_fin,
+-			       smc_curs_read(&cdcpend->cursor, cdcpend->conn),
+-			       cdcpend->conn);
++		smc_curs_copy(&conn->tx_curs_fin, &cdcpend->cursor, conn);
+ 	}
+ 	smc_tx_sndbuf_nonfull(smc);
+ 	bh_unlock_sock(&smc->sk);
+@@ -110,9 +109,8 @@ int smc_cdc_msg_send(struct smc_connection *conn,
+ 			    &conn->local_tx_ctrl, conn);
+ 	rc = smc_wr_tx_send(link, (struct smc_wr_tx_pend_priv *)pend);
+ 	if (!rc)
+-		smc_curs_write(&conn->rx_curs_confirmed,
+-			       smc_curs_read(&conn->local_tx_ctrl.cons, conn),
+-			       conn);
++		smc_curs_copy(&conn->rx_curs_confirmed,
++			      &conn->local_tx_ctrl.cons, conn);
+ 
+ 	return rc;
+ }
+@@ -194,8 +192,8 @@ int smcd_cdc_msg_send(struct smc_connection *conn)
+ 	rc = smcd_tx_ism_write(conn, &cdc, sizeof(cdc), 0, 1);
+ 	if (rc)
+ 		return rc;
+-	smc_curs_write(&conn->rx_curs_confirmed,
+-		       smc_curs_read(&conn->local_tx_ctrl.cons, conn), conn);
++	smc_curs_copy(&conn->rx_curs_confirmed, &conn->local_tx_ctrl.cons,
++		      conn);
+ 	/* Calculate transmitted data and increment free send buffer space */
+ 	diff = smc_curs_diff(conn->sndbuf_desc->len, &conn->tx_curs_fin,
+ 			     &conn->tx_curs_sent);
+@@ -204,8 +202,7 @@ int smcd_cdc_msg_send(struct smc_connection *conn)
+ 	atomic_add(diff, &conn->sndbuf_space);
+ 	/* guarantee 0 <= sndbuf_space <= sndbuf_desc->len */
+ 	smp_mb__after_atomic();
+-	smc_curs_write(&conn->tx_curs_fin,
+-		       smc_curs_read(&conn->tx_curs_sent, conn), conn);
++	smc_curs_copy(&conn->tx_curs_fin, &conn->tx_curs_sent, conn);
+ 
+ 	smc_tx_sndbuf_nonfull(smc);
+ 	return rc;
+@@ -225,9 +222,7 @@ static void smc_cdc_handle_urg_data_arrival(struct smc_sock *smc,
+ 	char *base;
+ 
+ 	/* new data included urgent business */
+-	smc_curs_write(&conn->urg_curs,
+-		       smc_curs_read(&conn->local_rx_ctrl.prod, conn),
+-		       conn);
++	smc_curs_copy(&conn->urg_curs, &conn->local_rx_ctrl.prod, conn);
+ 	conn->urg_state = SMC_URG_VALID;
+ 	if (!sock_flag(&smc->sk, SOCK_URGINLINE))
+ 		/* we'll skip the urgent byte, so don't account for it */
+@@ -247,12 +242,8 @@ static void smc_cdc_msg_recv_action(struct smc_sock *smc,
+ 	struct smc_connection *conn = &smc->conn;
+ 	int diff_cons, diff_prod;
+ 
+-	smc_curs_write(&prod_old,
+-		       smc_curs_read(&conn->local_rx_ctrl.prod, conn),
+-		       conn);
+-	smc_curs_write(&cons_old,
+-		       smc_curs_read(&conn->local_rx_ctrl.cons, conn),
+-		       conn);
++	smc_curs_copy(&prod_old, &conn->local_rx_ctrl.prod, conn);
++	smc_curs_copy(&cons_old, &conn->local_rx_ctrl.cons, conn);
+ 	smc_cdc_msg_to_host(&conn->local_rx_ctrl, cdc, conn);
+ 
+ 	diff_cons = smc_curs_diff(conn->peer_rmbe_size, &cons_old,
+
+commit be244f28d22f77d939ba2b973c102ad2b49d3496
+Author: Hans Wippel <hwippel@linux.ibm.com>
+Date:   Thu Jun 28 19:05:10 2018 +0200
+
+    net/smc: add SMC-D support in data transfer
+    
+    The data transfer and CDC message headers differ in SMC-R and SMC-D.
+    This patch adds support for the SMC-D data transfer to the existing SMC
+    code. It consists of the following:
+    
+    * SMC-D CDC support
+    * SMC-D tx support
+    * SMC-D rx support
+    
+    The CDC header is stored at the beginning of the receive buffer. Thus, a
+    rx_offset variable is added for the CDC header offset within the buffer
+    (0 for SMC-R).
+    
+    Signed-off-by: Hans Wippel <hwippel@linux.ibm.com>
+    Signed-off-by: Ursula Braun <ubraun@linux.ibm.com>
+    Suggested-by: Thomas Richter <tmricht@linux.ibm.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/smc/smc_cdc.c b/net/smc/smc_cdc.c
+index a7e8d63fc8ae..621d8cca570b 100644
+--- a/net/smc/smc_cdc.c
++++ b/net/smc/smc_cdc.c
+@@ -117,7 +117,7 @@ int smc_cdc_msg_send(struct smc_connection *conn,
+ 	return rc;
+ }
+ 
+-int smc_cdc_get_slot_and_msg_send(struct smc_connection *conn)
++static int smcr_cdc_get_slot_and_msg_send(struct smc_connection *conn)
+ {
+ 	struct smc_cdc_tx_pend *pend;
+ 	struct smc_wr_buf *wr_buf;
+@@ -130,6 +130,21 @@ int smc_cdc_get_slot_and_msg_send(struct smc_connection *conn)
+ 	return smc_cdc_msg_send(conn, wr_buf, pend);
+ }
+ 
++int smc_cdc_get_slot_and_msg_send(struct smc_connection *conn)
++{
++	int rc;
++
++	if (conn->lgr->is_smcd) {
++		spin_lock_bh(&conn->send_lock);
++		rc = smcd_cdc_msg_send(conn);
++		spin_unlock_bh(&conn->send_lock);
++	} else {
++		rc = smcr_cdc_get_slot_and_msg_send(conn);
++	}
++
++	return rc;
++}
++
+ static bool smc_cdc_tx_filter(struct smc_wr_tx_pend_priv *tx_pend,
+ 			      unsigned long data)
+ {
+@@ -157,6 +172,45 @@ void smc_cdc_tx_dismiss_slots(struct smc_connection *conn)
+ 				(unsigned long)conn);
+ }
+ 
++/* Send a SMC-D CDC header.
++ * This increments the free space available in our send buffer.
++ * Also update the confirmed receive buffer with what was sent to the peer.
++ */
++int smcd_cdc_msg_send(struct smc_connection *conn)
++{
++	struct smc_sock *smc = container_of(conn, struct smc_sock, conn);
++	struct smcd_cdc_msg cdc;
++	int rc, diff;
++
++	memset(&cdc, 0, sizeof(cdc));
++	cdc.common.type = SMC_CDC_MSG_TYPE;
++	cdc.prod_wrap = conn->local_tx_ctrl.prod.wrap;
++	cdc.prod_count = conn->local_tx_ctrl.prod.count;
++
++	cdc.cons_wrap = conn->local_tx_ctrl.cons.wrap;
++	cdc.cons_count = conn->local_tx_ctrl.cons.count;
++	cdc.prod_flags = conn->local_tx_ctrl.prod_flags;
++	cdc.conn_state_flags = conn->local_tx_ctrl.conn_state_flags;
++	rc = smcd_tx_ism_write(conn, &cdc, sizeof(cdc), 0, 1);
++	if (rc)
++		return rc;
++	smc_curs_write(&conn->rx_curs_confirmed,
++		       smc_curs_read(&conn->local_tx_ctrl.cons, conn), conn);
++	/* Calculate transmitted data and increment free send buffer space */
++	diff = smc_curs_diff(conn->sndbuf_desc->len, &conn->tx_curs_fin,
++			     &conn->tx_curs_sent);
++	/* increased by confirmed number of bytes */
++	smp_mb__before_atomic();
++	atomic_add(diff, &conn->sndbuf_space);
++	/* guarantee 0 <= sndbuf_space <= sndbuf_desc->len */
++	smp_mb__after_atomic();
++	smc_curs_write(&conn->tx_curs_fin,
++		       smc_curs_read(&conn->tx_curs_sent, conn), conn);
++
++	smc_tx_sndbuf_nonfull(smc);
++	return rc;
++}
++
+ /********************************* receive ***********************************/
+ 
+ static inline bool smc_cdc_before(u16 seq1, u16 seq2)
+@@ -178,7 +232,7 @@ static void smc_cdc_handle_urg_data_arrival(struct smc_sock *smc,
+ 	if (!sock_flag(&smc->sk, SOCK_URGINLINE))
+ 		/* we'll skip the urgent byte, so don't account for it */
+ 		(*diff_prod)--;
+-	base = (char *)conn->rmb_desc->cpu_addr;
++	base = (char *)conn->rmb_desc->cpu_addr + conn->rx_off;
+ 	if (conn->urg_curs.count)
+ 		conn->urg_rx_byte = *(base + conn->urg_curs.count - 1);
+ 	else
+@@ -276,6 +330,34 @@ static void smc_cdc_msg_recv(struct smc_sock *smc, struct smc_cdc_msg *cdc)
+ 	sock_put(&smc->sk); /* no free sk in softirq-context */
+ }
+ 
++/* Schedule a tasklet for this connection. Triggered from the ISM device IRQ
++ * handler to indicate update in the DMBE.
++ *
++ * Context:
++ * - tasklet context
++ */
++static void smcd_cdc_rx_tsklet(unsigned long data)
++{
++	struct smc_connection *conn = (struct smc_connection *)data;
++	struct smcd_cdc_msg cdc;
++	struct smc_sock *smc;
++
++	if (!conn)
++		return;
++
++	memcpy(&cdc, conn->rmb_desc->cpu_addr, sizeof(cdc));
++	smc = container_of(conn, struct smc_sock, conn);
++	smc_cdc_msg_recv(smc, (struct smc_cdc_msg *)&cdc);
++}
++
++/* Initialize receive tasklet. Called from ISM device IRQ handler to start
++ * receiver side.
++ */
++void smcd_cdc_rx_init(struct smc_connection *conn)
++{
++	tasklet_init(&conn->rx_tsklet, smcd_cdc_rx_tsklet, (unsigned long)conn);
++}
++
+ /***************************** init, exit, misc ******************************/
+ 
+ static void smc_cdc_rx_handler(struct ib_wc *wc, void *buf)
+
+commit de8474eb9d50fd47b8c73816f34739dec5e96754
+Author: Stefan Raspl <raspl@linux.ibm.com>
+Date:   Wed May 23 16:38:11 2018 +0200
+
+    net/smc: urgent data support
+    
+    Add support for out of band data send and receive.
+    
+    Signed-off-by: Stefan Raspl <raspl@linux.ibm.com>
+    Signed-off-by: Ursula Braun <ubraun@linux.ibm.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/smc/smc_cdc.c b/net/smc/smc_cdc.c
+index 8d2c079c87b0..a7e8d63fc8ae 100644
+--- a/net/smc/smc_cdc.c
++++ b/net/smc/smc_cdc.c
+@@ -164,6 +164,28 @@ static inline bool smc_cdc_before(u16 seq1, u16 seq2)
+ 	return (s16)(seq1 - seq2) < 0;
+ }
+ 
++static void smc_cdc_handle_urg_data_arrival(struct smc_sock *smc,
++					    int *diff_prod)
++{
++	struct smc_connection *conn = &smc->conn;
++	char *base;
++
++	/* new data included urgent business */
++	smc_curs_write(&conn->urg_curs,
++		       smc_curs_read(&conn->local_rx_ctrl.prod, conn),
++		       conn);
++	conn->urg_state = SMC_URG_VALID;
++	if (!sock_flag(&smc->sk, SOCK_URGINLINE))
++		/* we'll skip the urgent byte, so don't account for it */
++		(*diff_prod)--;
++	base = (char *)conn->rmb_desc->cpu_addr;
++	if (conn->urg_curs.count)
++		conn->urg_rx_byte = *(base + conn->urg_curs.count - 1);
++	else
++		conn->urg_rx_byte = *(base + conn->rmb_desc->len - 1);
++	sk_send_sigurg(&smc->sk);
++}
++
+ static void smc_cdc_msg_recv_action(struct smc_sock *smc,
+ 				    struct smc_cdc_msg *cdc)
+ {
+@@ -194,15 +216,25 @@ static void smc_cdc_msg_recv_action(struct smc_sock *smc,
+ 	diff_prod = smc_curs_diff(conn->rmb_desc->len, &prod_old,
+ 				  &conn->local_rx_ctrl.prod);
+ 	if (diff_prod) {
++		if (conn->local_rx_ctrl.prod_flags.urg_data_present)
++			smc_cdc_handle_urg_data_arrival(smc, &diff_prod);
+ 		/* bytes_to_rcv is decreased in smc_recvmsg */
+ 		smp_mb__before_atomic();
+ 		atomic_add(diff_prod, &conn->bytes_to_rcv);
+ 		/* guarantee 0 <= bytes_to_rcv <= rmb_desc->len */
+ 		smp_mb__after_atomic();
+ 		smc->sk.sk_data_ready(&smc->sk);
+-	} else if ((conn->local_rx_ctrl.prod_flags.write_blocked) ||
+-		   (conn->local_rx_ctrl.prod_flags.cons_curs_upd_req)) {
+-		smc->sk.sk_data_ready(&smc->sk);
++	} else {
++		if (conn->local_rx_ctrl.prod_flags.write_blocked ||
++		    conn->local_rx_ctrl.prod_flags.cons_curs_upd_req ||
++		    conn->local_rx_ctrl.prod_flags.urg_data_pending) {
++			if (conn->local_rx_ctrl.prod_flags.urg_data_pending)
++				conn->urg_state = SMC_URG_NOTYET;
++			/* force immediate tx of current consumer cursor, but
++			 * under send_lock to guarantee arrival in seqno-order
++			 */
++			smc_tx_sndbuf_nonempty(conn);
++		}
+ 	}
+ 
+ 	/* piggy backed tx info */
+@@ -212,6 +244,12 @@ static void smc_cdc_msg_recv_action(struct smc_sock *smc,
+ 		/* trigger socket release if connection closed */
+ 		smc_close_wake_tx_prepared(smc);
+ 	}
++	if (diff_cons && conn->urg_tx_pend &&
++	    atomic_read(&conn->peer_rmbe_space) == conn->peer_rmbe_size) {
++		/* urg data confirmed by peer, indicate we're ready for more */
++		conn->urg_tx_pend = false;
++		smc->sk.sk_write_space(&smc->sk);
++	}
+ 
+ 	if (conn->local_rx_ctrl.conn_state_flags.peer_conn_abort) {
+ 		smc->sk.sk_err = ECONNRESET;
+
+commit d7b0e37c1ac152905b18a5b9506179091a35b0b6
+Author: Hans Wippel <hwippel@linux.ibm.com>
+Date:   Fri May 18 09:34:15 2018 +0200
+
+    net/smc: restructure CDC message reception
+    
+    This patch moves a CDC sanity check from smc_cdc_msg_recv_action() to
+    the other sanity checks in smc_cdc_rx_handler(). While doing this, it
+    simplifies smc_cdc_msg_recv() and removes unneeded function parameters.
+    
+    Signed-off-by: Hans Wippel <hwippel@linux.ibm.com>
+    Signed-off-by: Ursula Braun <ubraun@linux.ibm.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/smc/smc_cdc.c b/net/smc/smc_cdc.c
+index 2809f9902446..8d2c079c87b0 100644
+--- a/net/smc/smc_cdc.c
++++ b/net/smc/smc_cdc.c
+@@ -165,19 +165,12 @@ static inline bool smc_cdc_before(u16 seq1, u16 seq2)
+ }
+ 
+ static void smc_cdc_msg_recv_action(struct smc_sock *smc,
+-				    struct smc_link *link,
+ 				    struct smc_cdc_msg *cdc)
+ {
+ 	union smc_host_cursor cons_old, prod_old;
+ 	struct smc_connection *conn = &smc->conn;
+ 	int diff_cons, diff_prod;
+ 
+-	if (!cdc->prod_flags.failover_validation) {
+-		if (smc_cdc_before(ntohs(cdc->seqno),
+-				   conn->local_rx_ctrl.seqno))
+-			/* received seqno is old */
+-			return;
+-	}
+ 	smc_curs_write(&prod_old,
+ 		       smc_curs_read(&conn->local_rx_ctrl.prod, conn),
+ 		       conn);
+@@ -236,26 +229,11 @@ static void smc_cdc_msg_recv_action(struct smc_sock *smc,
+ }
+ 
+ /* called under tasklet context */
+-static inline void smc_cdc_msg_recv(struct smc_cdc_msg *cdc,
+-				    struct smc_link *link, u64 wr_id)
++static void smc_cdc_msg_recv(struct smc_sock *smc, struct smc_cdc_msg *cdc)
+ {
+-	struct smc_link_group *lgr = container_of(link, struct smc_link_group,
+-						  lnk[SMC_SINGLE_LINK]);
+-	struct smc_connection *connection;
+-	struct smc_sock *smc;
+-
+-	/* lookup connection */
+-	read_lock_bh(&lgr->conns_lock);
+-	connection = smc_lgr_find_conn(ntohl(cdc->token), lgr);
+-	if (!connection) {
+-		read_unlock_bh(&lgr->conns_lock);
+-		return;
+-	}
+-	smc = container_of(connection, struct smc_sock, conn);
+ 	sock_hold(&smc->sk);
+-	read_unlock_bh(&lgr->conns_lock);
+ 	bh_lock_sock(&smc->sk);
+-	smc_cdc_msg_recv_action(smc, link, cdc);
++	smc_cdc_msg_recv_action(smc, cdc);
+ 	bh_unlock_sock(&smc->sk);
+ 	sock_put(&smc->sk); /* no free sk in softirq-context */
+ }
+@@ -266,12 +244,31 @@ static void smc_cdc_rx_handler(struct ib_wc *wc, void *buf)
+ {
+ 	struct smc_link *link = (struct smc_link *)wc->qp->qp_context;
+ 	struct smc_cdc_msg *cdc = buf;
++	struct smc_connection *conn;
++	struct smc_link_group *lgr;
++	struct smc_sock *smc;
+ 
+ 	if (wc->byte_len < offsetof(struct smc_cdc_msg, reserved))
+ 		return; /* short message */
+ 	if (cdc->len != SMC_WR_TX_SIZE)
+ 		return; /* invalid message */
+-	smc_cdc_msg_recv(cdc, link, wc->wr_id);
++
++	/* lookup connection */
++	lgr = container_of(link, struct smc_link_group, lnk[SMC_SINGLE_LINK]);
++	read_lock_bh(&lgr->conns_lock);
++	conn = smc_lgr_find_conn(ntohl(cdc->token), lgr);
++	read_unlock_bh(&lgr->conns_lock);
++	if (!conn)
++		return;
++	smc = container_of(conn, struct smc_sock, conn);
++
++	if (!cdc->prod_flags.failover_validation) {
++		if (smc_cdc_before(ntohs(cdc->seqno),
++				   conn->local_rx_ctrl.seqno))
++			/* received seqno is old */
++			return;
++	}
++	smc_cdc_msg_recv(smc, cdc);
+ }
+ 
+ static struct smc_wr_rx_handler smc_cdc_rx_handlers[] = {
+
+commit 69cb7dc0218b2c54416722eddf181e720f24c305
+Author: Hans Wippel <hwippel@linux.ibm.com>
+Date:   Fri May 18 09:34:10 2018 +0200
+
+    net/smc: add common buffer size in send and receive buffer descriptors
+    
+    In addition to the buffer references, SMC currently stores the sizes of
+    the receive and send buffers in each connection as separate variables.
+    This patch introduces a buffer length variable in the common buffer
+    descriptor and uses this length instead.
+    
+    Signed-off-by: Hans Wippel <hwippel@linux.ibm.com>
+    Signed-off-by: Ursula Braun <ubraun@linux.ibm.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/smc/smc_cdc.c b/net/smc/smc_cdc.c
+index 42ad57365eca..2809f9902446 100644
+--- a/net/smc/smc_cdc.c
++++ b/net/smc/smc_cdc.c
+@@ -44,13 +44,13 @@ static void smc_cdc_tx_handler(struct smc_wr_tx_pend_priv *pnd_snd,
+ 	smc = container_of(cdcpend->conn, struct smc_sock, conn);
+ 	bh_lock_sock(&smc->sk);
+ 	if (!wc_status) {
+-		diff = smc_curs_diff(cdcpend->conn->sndbuf_size,
++		diff = smc_curs_diff(cdcpend->conn->sndbuf_desc->len,
+ 				     &cdcpend->conn->tx_curs_fin,
+ 				     &cdcpend->cursor);
+ 		/* sndbuf_space is decreased in smc_sendmsg */
+ 		smp_mb__before_atomic();
+ 		atomic_add(diff, &cdcpend->conn->sndbuf_space);
+-		/* guarantee 0 <= sndbuf_space <= sndbuf_size */
++		/* guarantee 0 <= sndbuf_space <= sndbuf_desc->len */
+ 		smp_mb__after_atomic();
+ 		smc_curs_write(&cdcpend->conn->tx_curs_fin,
+ 			       smc_curs_read(&cdcpend->cursor, cdcpend->conn),
+@@ -198,13 +198,13 @@ static void smc_cdc_msg_recv_action(struct smc_sock *smc,
+ 		smp_mb__after_atomic();
+ 	}
+ 
+-	diff_prod = smc_curs_diff(conn->rmbe_size, &prod_old,
++	diff_prod = smc_curs_diff(conn->rmb_desc->len, &prod_old,
+ 				  &conn->local_rx_ctrl.prod);
+ 	if (diff_prod) {
+ 		/* bytes_to_rcv is decreased in smc_recvmsg */
+ 		smp_mb__before_atomic();
+ 		atomic_add(diff_prod, &conn->bytes_to_rcv);
+-		/* guarantee 0 <= bytes_to_rcv <= rmbe_size */
++		/* guarantee 0 <= bytes_to_rcv <= rmb_desc->len */
+ 		smp_mb__after_atomic();
+ 		smc->sk.sk_data_ready(&smc->sk);
+ 	} else if ((conn->local_rx_ctrl.prod_flags.write_blocked) ||
+
+commit 3382576106014bf865d341efab3d94fb28d1fc63
+Author: Karsten Graul <kgraul@linux.ibm.com>
+Date:   Thu Apr 26 17:18:20 2018 +0200
+
+    net/smc: fix structure size
+    
+    The struct smc_cdc_msg must be defined as packed so the
+    size is 44 bytes.
+    And change the structure size check so sizeof is checked.
+    
+    Signed-off-by: Karsten Graul <kgraul@linux.ibm.com>
+    Signed-off-by: Ursula Braun <ubraun@linux.ibm.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/smc/smc_cdc.c b/net/smc/smc_cdc.c
+index b42395d24cba..42ad57365eca 100644
+--- a/net/smc/smc_cdc.c
++++ b/net/smc/smc_cdc.c
+@@ -82,7 +82,7 @@ static inline void smc_cdc_add_pending_send(struct smc_connection *conn,
+ 		sizeof(struct smc_cdc_msg) > SMC_WR_BUF_SIZE,
+ 		"must increase SMC_WR_BUF_SIZE to at least sizeof(struct smc_cdc_msg)");
+ 	BUILD_BUG_ON_MSG(
+-		offsetof(struct smc_cdc_msg, reserved) > SMC_WR_TX_SIZE,
++		sizeof(struct smc_cdc_msg) != SMC_WR_TX_SIZE,
+ 		"must adapt SMC_WR_TX_SIZE to sizeof(struct smc_cdc_msg); if not all smc_wr upper layer protocols use the same message size any more, must start to set link->wr_tx_sges[i].length on each individual smc_wr_tx_send()");
+ 	BUILD_BUG_ON_MSG(
+ 		sizeof(struct smc_cdc_tx_pend) > SMC_WR_TX_PEND_PRIV_SIZE,
+
+commit cbba07a726fb6b52b48d24ffd27e36f7278864e0
+Author: Karsten Graul <kgraul@linux.vnet.ibm.com>
+Date:   Wed Feb 28 12:44:07 2018 +0100
+
+    net/smc: use a constant for control message length
+    
+    The sizeof(struct smc_cdc_msg) evaluates to 48 bytes instead of the
+    required 44 bytes. We need to use the constant value of
+    SMC_WR_TX_SIZE to set and check the control message length.
+    
+    Signed-off-by: Karsten Graul <kgraul@linux.vnet.ibm.com>
+    Signed-off-by: Ursula Braun <ubraun@linux.vnet.ibm.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/smc/smc_cdc.c b/net/smc/smc_cdc.c
+index 3cd086e5bd28..b42395d24cba 100644
+--- a/net/smc/smc_cdc.c
++++ b/net/smc/smc_cdc.c
+@@ -269,7 +269,7 @@ static void smc_cdc_rx_handler(struct ib_wc *wc, void *buf)
+ 
+ 	if (wc->byte_len < offsetof(struct smc_cdc_msg, reserved))
+ 		return; /* short message */
+-	if (cdc->len != sizeof(*cdc))
++	if (cdc->len != SMC_WR_TX_SIZE)
+ 		return; /* invalid message */
+ 	smc_cdc_msg_recv(cdc, link, wc->wr_id);
+ }
+
+commit 51f1de79ad8ed3555fd01ae8fd432691d397684b
+Author: Ursula Braun <ubraun@linux.vnet.ibm.com>
+Date:   Fri Jan 26 09:28:48 2018 +0100
+
+    net/smc: replace sock_put worker by socket refcounting
+    
+    Proper socket refcounting makes the sock_put worker obsolete.
+    
+    Signed-off-by: Ursula Braun <ubraun@linux.vnet.ibm.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/smc/smc_cdc.c b/net/smc/smc_cdc.c
+index 6e8f5fbe0f09..3cd086e5bd28 100644
+--- a/net/smc/smc_cdc.c
++++ b/net/smc/smc_cdc.c
+@@ -212,6 +212,14 @@ static void smc_cdc_msg_recv_action(struct smc_sock *smc,
+ 		smc->sk.sk_data_ready(&smc->sk);
+ 	}
+ 
++	/* piggy backed tx info */
++	/* trigger sndbuf consumer: RDMA write into peer RMBE and CDC */
++	if (diff_cons && smc_tx_prepared_sends(conn)) {
++		smc_tx_sndbuf_nonempty(conn);
++		/* trigger socket release if connection closed */
++		smc_close_wake_tx_prepared(smc);
++	}
++
+ 	if (conn->local_rx_ctrl.conn_state_flags.peer_conn_abort) {
+ 		smc->sk.sk_err = ECONNRESET;
+ 		conn->local_tx_ctrl.conn_state_flags.peer_conn_abort = 1;
+@@ -221,15 +229,9 @@ static void smc_cdc_msg_recv_action(struct smc_sock *smc,
+ 		if (smc->clcsock && smc->clcsock->sk)
+ 			smc->clcsock->sk->sk_shutdown |= RCV_SHUTDOWN;
+ 		sock_set_flag(&smc->sk, SOCK_DONE);
+-		schedule_work(&conn->close_work);
+-	}
+-
+-	/* piggy backed tx info */
+-	/* trigger sndbuf consumer: RDMA write into peer RMBE and CDC */
+-	if (diff_cons && smc_tx_prepared_sends(conn)) {
+-		smc_tx_sndbuf_nonempty(conn);
+-		/* trigger socket release if connection closed */
+-		smc_close_wake_tx_prepared(smc);
++		sock_hold(&smc->sk); /* sock_put in close_work */
++		if (!schedule_work(&conn->close_work))
++			sock_put(&smc->sk);
+ 	}
+ }
+ 
+
+commit 1a0a04c7a82c4c4667ab5a9660dc37f6d365d9d3
+Author: Ursula Braun <ubraun@linux.vnet.ibm.com>
+Date:   Thu Jan 25 11:15:36 2018 +0100
+
+    net/smc: check for healthy link group resp. connections
+    
+    If a problem for at least one connection of a link group is detected,
+    the whole link group and all its connections are terminated.
+    This patch adds a check for healthy link group when trying to reserve
+    a work request, and checks for healthy connections before starting
+    a tx worker.
+    
+    Signed-off-by: Ursula Braun <ubraun@linux.vnet.ibm.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/smc/smc_cdc.c b/net/smc/smc_cdc.c
+index 51805334e001..6e8f5fbe0f09 100644
+--- a/net/smc/smc_cdc.c
++++ b/net/smc/smc_cdc.c
+@@ -65,9 +65,14 @@ int smc_cdc_get_free_slot(struct smc_connection *conn,
+ 			  struct smc_cdc_tx_pend **pend)
+ {
+ 	struct smc_link *link = &conn->lgr->lnk[SMC_SINGLE_LINK];
++	int rc;
+ 
+-	return smc_wr_tx_get_free_slot(link, smc_cdc_tx_handler, wr_buf,
+-				       (struct smc_wr_tx_pend_priv **)pend);
++	rc = smc_wr_tx_get_free_slot(link, smc_cdc_tx_handler, wr_buf,
++				     (struct smc_wr_tx_pend_priv **)pend);
++	if (!conn->alert_token_local)
++		/* abnormal termination */
++		rc = -EPIPE;
++	return rc;
+ }
+ 
+ static inline void smc_cdc_add_pending_send(struct smc_connection *conn,
+
+commit 8429c1343519d7452b8ccd9af9716147512831c9
+Author: Ursula Braun <ubraun@linux.vnet.ibm.com>
+Date:   Wed Jan 24 10:28:14 2018 +0100
+
+    net/smc: get rid of tx_pend waits in socket closing
+    
+    There is no need to wait for confirmation of pending tx requests
+    for a closing connection, since pending tx slots are dismissed
+    when finishing a connection.
+    
+    Signed-off-by: Ursula Braun <ubraun@linux.vnet.ibm.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/smc/smc_cdc.c b/net/smc/smc_cdc.c
+index d4155ff6acde..51805334e001 100644
+--- a/net/smc/smc_cdc.c
++++ b/net/smc/smc_cdc.c
+@@ -57,9 +57,6 @@ static void smc_cdc_tx_handler(struct smc_wr_tx_pend_priv *pnd_snd,
+ 			       cdcpend->conn);
+ 	}
+ 	smc_tx_sndbuf_nonfull(smc);
+-	if (smc->sk.sk_state != SMC_ACTIVE)
+-		/* wake up smc_close_wait_tx_pends() */
+-		smc->sk.sk_state_change(&smc->sk);
+ 	bh_unlock_sock(&smc->sk);
+ }
+ 
+@@ -155,14 +152,6 @@ void smc_cdc_tx_dismiss_slots(struct smc_connection *conn)
+ 				(unsigned long)conn);
+ }
+ 
+-bool smc_cdc_tx_has_pending(struct smc_connection *conn)
+-{
+-	struct smc_link *link = &conn->lgr->lnk[SMC_SINGLE_LINK];
+-
+-	return smc_wr_tx_has_pending(link, SMC_CDC_MSG_TYPE,
+-				     smc_cdc_tx_filter, (unsigned long)conn);
+-}
+-
+ /********************************* receive ***********************************/
+ 
+ static inline bool smc_cdc_before(u16 seq1, u16 seq2)
+
+commit 6b5771aa3c351b118b1eee7bc98e1483eb0c8ca8
+Author: Ursula Braun <ubraun@linux.vnet.ibm.com>
+Date:   Thu Dec 7 13:38:48 2017 +0100
+
+    smc: no consumer update in tasklet context
+    
+    The SMC protocol requires to send a separate consumer cursor update,
+    if it cannot be piggybacked to updates of the producer cursor.
+    When receiving a blocked signal from the sender, this update is sent
+    already in tasklet context. In addition consumer cursor updates are
+    sent after data receival.
+    Sending of cursor updates is controlled by sequence numbers.
+    Assuming receiving stray messages the receiver drops updates with older
+    sequence numbers than an already received cursor update with a higher
+    sequence number.
+    Sending consumer cursor updates in tasklet context may result in
+    wrong order sends and its corresponding drops at the receiver. Since
+    it is sufficient to send consumer cursor updates once the data is
+    received, this patch gets rid of the consumer cursor update in tasklet
+    context to guarantee in-sequence arrival of cursor updates.
+    
+    Signed-off-by: Ursula Braun <ubraun@linux.vnet.ibm.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/smc/smc_cdc.c b/net/smc/smc_cdc.c
+index 87f7bede6eab..d4155ff6acde 100644
+--- a/net/smc/smc_cdc.c
++++ b/net/smc/smc_cdc.c
+@@ -213,6 +213,9 @@ static void smc_cdc_msg_recv_action(struct smc_sock *smc,
+ 		/* guarantee 0 <= bytes_to_rcv <= rmbe_size */
+ 		smp_mb__after_atomic();
+ 		smc->sk.sk_data_ready(&smc->sk);
++	} else if ((conn->local_rx_ctrl.prod_flags.write_blocked) ||
++		   (conn->local_rx_ctrl.prod_flags.cons_curs_upd_req)) {
++		smc->sk.sk_data_ready(&smc->sk);
+ 	}
+ 
+ 	if (conn->local_rx_ctrl.conn_state_flags.peer_conn_abort) {
+@@ -234,15 +237,6 @@ static void smc_cdc_msg_recv_action(struct smc_sock *smc,
+ 		/* trigger socket release if connection closed */
+ 		smc_close_wake_tx_prepared(smc);
+ 	}
+-
+-	/* socket connected but not accepted */
+-	if (!smc->sk.sk_socket)
+-		return;
+-
+-	/* data available */
+-	if ((conn->local_rx_ctrl.prod_flags.write_blocked) ||
+-	    (conn->local_rx_ctrl.prod_flags.cons_curs_upd_req))
+-		smc_tx_consumer_update(conn);
+ }
+ 
+ /* called under tasklet context */
+
+commit 2a171788ba7bb61995e98e8163204fc7880f63b2
+Merge: bf5345882bd1 d4c2e9fca5b7
+Author: David S. Miller <davem@davemloft.net>
+Date:   Sat Nov 4 09:26:51 2017 +0900
+
+    Merge git://git.kernel.org/pub/scm/linux/kernel/git/davem/net
+    
+    Files removed in 'net-next' had their license header updated
+    in 'net'.  We take the remove from 'net-next'.
+    
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+commit b24413180f5600bcb3bb70fbed5cf186b60864bd
+Author: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Date:   Wed Nov 1 15:07:57 2017 +0100
+
+    License cleanup: add SPDX GPL-2.0 license identifier to files with no license
+    
+    Many source files in the tree are missing licensing information, which
+    makes it harder for compliance tools to determine the correct license.
+    
+    By default all files without license information are under the default
+    license of the kernel, which is GPL version 2.
+    
+    Update the files which contain no license information with the 'GPL-2.0'
+    SPDX license identifier.  The SPDX identifier is a legally binding
+    shorthand, which can be used instead of the full boiler plate text.
+    
+    This patch is based on work done by Thomas Gleixner and Kate Stewart and
+    Philippe Ombredanne.
+    
+    How this work was done:
+    
+    Patches were generated and checked against linux-4.14-rc6 for a subset of
+    the use cases:
+     - file had no licensing information it it.
+     - file was a */uapi/* one with no licensing information in it,
+     - file was a */uapi/* one with existing licensing information,
+    
+    Further patches will be generated in subsequent months to fix up cases
+    where non-standard license headers were used, and references to license
+    had to be inferred by heuristics based on keywords.
+    
+    The analysis to determine which SPDX License Identifier to be applied to
+    a file was done in a spreadsheet of side by side results from of the
+    output of two independent scanners (ScanCode & Windriver) producing SPDX
+    tag:value files created by Philippe Ombredanne.  Philippe prepared the
+    base worksheet, and did an initial spot review of a few 1000 files.
+    
+    The 4.13 kernel was the starting point of the analysis with 60,537 files
+    assessed.  Kate Stewart did a file by file comparison of the scanner
+    results in the spreadsheet to determine which SPDX license identifier(s)
+    to be applied to the file. She confirmed any determination that was not
+    immediately clear with lawyers working with the Linux Foundation.
+    
+    Criteria used to select files for SPDX license identifier tagging was:
+     - Files considered eligible had to be source code files.
+     - Make and config files were included as candidates if they contained >5
+       lines of source
+     - File already had some variant of a license header in it (even if <5
+       lines).
+    
+    All documentation files were explicitly excluded.
+    
+    The following heuristics were used to determine which SPDX license
+    identifiers to apply.
+    
+     - when both scanners couldn't find any license traces, file was
+       considered to have no license information in it, and the top level
+       COPYING file license applied.
+    
+       For non */uapi/* files that summary was:
+    
+       SPDX license identifier                            # files
+       ---------------------------------------------------|-------
+       GPL-2.0                                              11139
+    
+       and resulted in the first patch in this series.
+    
+       If that file was a */uapi/* path one, it was "GPL-2.0 WITH
+       Linux-syscall-note" otherwise it was "GPL-2.0".  Results of that was:
+    
+       SPDX license identifier                            # files
+       ---------------------------------------------------|-------
+       GPL-2.0 WITH Linux-syscall-note                        930
+    
+       and resulted in the second patch in this series.
+    
+     - if a file had some form of licensing information in it, and was one
+       of the */uapi/* ones, it was denoted with the Linux-syscall-note if
+       any GPL family license was found in the file or had no licensing in
+       it (per prior point).  Results summary:
+    
+       SPDX license identifier                            # files
+       ---------------------------------------------------|------
+       GPL-2.0 WITH Linux-syscall-note                       270
+       GPL-2.0+ WITH Linux-syscall-note                      169
+       ((GPL-2.0 WITH Linux-syscall-note) OR BSD-2-Clause)    21
+       ((GPL-2.0 WITH Linux-syscall-note) OR BSD-3-Clause)    17
+       LGPL-2.1+ WITH Linux-syscall-note                      15
+       GPL-1.0+ WITH Linux-syscall-note                       14
+       ((GPL-2.0+ WITH Linux-syscall-note) OR BSD-3-Clause)    5
+       LGPL-2.0+ WITH Linux-syscall-note                       4
+       LGPL-2.1 WITH Linux-syscall-note                        3
+       ((GPL-2.0 WITH Linux-syscall-note) OR MIT)              3
+       ((GPL-2.0 WITH Linux-syscall-note) AND MIT)             1
+    
+       and that resulted in the third patch in this series.
+    
+     - when the two scanners agreed on the detected license(s), that became
+       the concluded license(s).
+    
+     - when there was disagreement between the two scanners (one detected a
+       license but the other didn't, or they both detected different
+       licenses) a manual inspection of the file occurred.
+    
+     - In most cases a manual inspection of the information in the file
+       resulted in a clear resolution of the license that should apply (and
+       which scanner probably needed to revisit its heuristics).
+    
+     - When it was not immediately clear, the license identifier was
+       confirmed with lawyers working with the Linux Foundation.
+    
+     - If there was any question as to the appropriate license identifier,
+       the file was flagged for further research and to be revisited later
+       in time.
+    
+    In total, over 70 hours of logged manual review was done on the
+    spreadsheet to determine the SPDX license identifiers to apply to the
+    source files by Kate, Philippe, Thomas and, in some cases, confirmation
+    by lawyers working with the Linux Foundation.
+    
+    Kate also obtained a third independent scan of the 4.13 code base from
+    FOSSology, and compared selected files where the other two scanners
+    disagreed against that SPDX file, to see if there was new insights.  The
+    Windriver scanner is based on an older version of FOSSology in part, so
+    they are related.
+    
+    Thomas did random spot checks in about 500 files from the spreadsheets
+    for the uapi headers and agreed with SPDX license identifier in the
+    files he inspected. For the non-uapi files Thomas did random spot checks
+    in about 15000 files.
+    
+    In initial set of patches against 4.14-rc6, 3 files were found to have
+    copy/paste license identifier errors, and have been fixed to reflect the
+    correct identifier.
+    
+    Additionally Philippe spent 10 hours this week doing a detailed manual
+    inspection and review of the 12,461 patched files from the initial patch
+    version early this week with:
+     - a full scancode scan run, collecting the matched texts, detected
+       license ids and scores
+     - reviewing anything where there was a license detected (about 500+
+       files) to ensure that the applied SPDX license was correct
+     - reviewing anything where there was no detection but the patch license
+       was not GPL-2.0 WITH Linux-syscall-note to ensure that the applied
+       SPDX license was correct
+    
+    This produced a worksheet with 20 files needing minor correction.  This
+    worksheet was then exported into 3 different .csv files for the
+    different types of files to be modified.
+    
+    These .csv files were then reviewed by Greg.  Thomas wrote a script to
+    parse the csv files and add the proper SPDX tag to the file, in the
+    format that the file expected.  This script was further refined by Greg
+    based on the output to detect more types of files automatically and to
+    distinguish between header and source .c files (which need different
+    comment types.)  Finally Greg ran the script using the .csv files to
+    generate the patches.
+    
+    Reviewed-by: Kate Stewart <kstewart@linuxfoundation.org>
+    Reviewed-by: Philippe Ombredanne <pombredanne@nexb.com>
+    Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/net/smc/smc_cdc.c b/net/smc/smc_cdc.c
+index a7294edbc221..535e72cfc64b 100644
+--- a/net/smc/smc_cdc.c
++++ b/net/smc/smc_cdc.c
+@@ -1,3 +1,4 @@
++// SPDX-License-Identifier: GPL-2.0
+ /*
+  * Shared Memory Communications over RDMA (SMC-R) and RoCE
+  *
+
+commit 51957bc53aa7ca60d63f1ba0d9e3d887562b1723
+Author: Ursula Braun <ubraun@linux.vnet.ibm.com>
+Date:   Thu Sep 21 09:17:34 2017 +0200
+
+    net/smc: parameter cleanup in smc_cdc_get_free_slot()
+    
+    Use the smc_connection as first parameter with smc_cdc_get_free_slot().
+    This is just a small code cleanup, no functional change.
+    
+    Signed-off-by: Ursula Braun <ubraun@linux.vnet.ibm.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/smc/smc_cdc.c b/net/smc/smc_cdc.c
+index a7294edbc221..5ef97e5a5f78 100644
+--- a/net/smc/smc_cdc.c
++++ b/net/smc/smc_cdc.c
+@@ -62,10 +62,12 @@ static void smc_cdc_tx_handler(struct smc_wr_tx_pend_priv *pnd_snd,
+ 	bh_unlock_sock(&smc->sk);
+ }
+ 
+-int smc_cdc_get_free_slot(struct smc_link *link,
++int smc_cdc_get_free_slot(struct smc_connection *conn,
+ 			  struct smc_wr_buf **wr_buf,
+ 			  struct smc_cdc_tx_pend **pend)
+ {
++	struct smc_link *link = &conn->lgr->lnk[SMC_SINGLE_LINK];
++
+ 	return smc_wr_tx_get_free_slot(link, smc_cdc_tx_handler, wr_buf,
+ 				       (struct smc_wr_tx_pend_priv **)pend);
+ }
+@@ -118,8 +120,7 @@ int smc_cdc_get_slot_and_msg_send(struct smc_connection *conn)
+ 	struct smc_wr_buf *wr_buf;
+ 	int rc;
+ 
+-	rc = smc_cdc_get_free_slot(&conn->lgr->lnk[SMC_SINGLE_LINK], &wr_buf,
+-				   &pend);
++	rc = smc_cdc_get_free_slot(conn, &wr_buf, &pend);
+ 	if (rc)
+ 		return rc;
+ 
+
+commit 46c28dbd4c23c3f7fa37f5ea48772af79c9cc40e
+Author: Ursula Braun <ubraun@linux.vnet.ibm.com>
+Date:   Mon Apr 10 14:58:01 2017 +0200
+
+    net/smc: no socket state changes in tasklet context
+    
+    Several state changes occur during SMC socket closing. Currently
+    state changes triggered locally occur in process context with
+    lock_sock() taken while state changes triggered by peer occur in
+    tasklet context with bh_lock_sock() taken. bh_lock_sock() does not
+    wait till a lock_sock(() task in process context is finished. This
+    may lead to races in socket state transitions resulting in dangling
+    SMC-sockets, or it may lead to duplicate SMC socket freeing.
+    This patch introduces a closing worker to run all state changes under
+    lock_sock().
+    
+    Signed-off-by: Ursula Braun <ubraun@linux.vnet.ibm.com>
+    Reviewed-by: Thomas Richter <tmricht@linux.vnet.ibm.com>
+    Reported-by: Dave Jones <davej@codemonkey.org.uk>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/smc/smc_cdc.c b/net/smc/smc_cdc.c
+index 4c9c2f6cd021..a7294edbc221 100644
+--- a/net/smc/smc_cdc.c
++++ b/net/smc/smc_cdc.c
+@@ -217,8 +217,13 @@ static void smc_cdc_msg_recv_action(struct smc_sock *smc,
+ 		smc->sk.sk_err = ECONNRESET;
+ 		conn->local_tx_ctrl.conn_state_flags.peer_conn_abort = 1;
+ 	}
+-	if (smc_cdc_rxed_any_close_or_senddone(conn))
+-		smc_close_passive_received(smc);
++	if (smc_cdc_rxed_any_close_or_senddone(conn)) {
++		smc->sk.sk_shutdown |= RCV_SHUTDOWN;
++		if (smc->clcsock && smc->clcsock->sk)
++			smc->clcsock->sk->sk_shutdown |= RCV_SHUTDOWN;
++		sock_set_flag(&smc->sk, SOCK_DONE);
++		schedule_work(&conn->close_work);
++	}
+ 
+ 	/* piggy backed tx info */
+ 	/* trigger sndbuf consumer: RDMA write into peer RMBE and CDC */
+
+commit 3c22e8f3200227d64fc4b1795b12b2cdc9099cd6
+Author: Ursula Braun <ubraun@linux.vnet.ibm.com>
+Date:   Mon Apr 10 14:57:56 2017 +0200
+
+    net/smc: get rid of old comment
+    
+    This patch removes an outdated comment.
+    
+    Signed-off-by: Ursula Braun <ubraun@linux.vnet.ibm.com>
+    Reviewed-by: Thomas Richter <tmricht@linux.vnet.ibm.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/smc/smc_cdc.c b/net/smc/smc_cdc.c
+index 5a339493872e..4c9c2f6cd021 100644
+--- a/net/smc/smc_cdc.c
++++ b/net/smc/smc_cdc.c
+@@ -228,8 +228,6 @@ static void smc_cdc_msg_recv_action(struct smc_sock *smc,
+ 		smc_close_wake_tx_prepared(smc);
+ 	}
+ 
+-	/* subsequent patch: trigger socket release if connection closed */
+-
+ 	/* socket connected but not accepted */
+ 	if (!smc->sk.sk_socket)
+ 		return;
+
+commit b38d732477e4211351b2680e805d944f66bceec9
+Author: Ursula Braun <ubraun@linux.vnet.ibm.com>
+Date:   Mon Jan 9 16:55:25 2017 +0100
+
+    smc: socket closing and linkgroup cleanup
+    
+    smc_shutdown() and smc_release() handling
+    delayed linkgroup cleanup for linkgroups without connections
+    
+    Signed-off-by: Ursula Braun <ubraun@linux.vnet.ibm.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/smc/smc_cdc.c b/net/smc/smc_cdc.c
+index c0a69300b2f4..5a339493872e 100644
+--- a/net/smc/smc_cdc.c
++++ b/net/smc/smc_cdc.c
+@@ -16,6 +16,7 @@
+ #include "smc_cdc.h"
+ #include "smc_tx.h"
+ #include "smc_rx.h"
++#include "smc_close.h"
+ 
+ /********************************** send *************************************/
+ 
+@@ -55,6 +56,9 @@ static void smc_cdc_tx_handler(struct smc_wr_tx_pend_priv *pnd_snd,
+ 			       cdcpend->conn);
+ 	}
+ 	smc_tx_sndbuf_nonfull(smc);
++	if (smc->sk.sk_state != SMC_ACTIVE)
++		/* wake up smc_close_wait_tx_pends() */
++		smc->sk.sk_state_change(&smc->sk);
+ 	bh_unlock_sock(&smc->sk);
+ }
+ 
+@@ -149,6 +153,14 @@ void smc_cdc_tx_dismiss_slots(struct smc_connection *conn)
+ 				(unsigned long)conn);
+ }
+ 
++bool smc_cdc_tx_has_pending(struct smc_connection *conn)
++{
++	struct smc_link *link = &conn->lgr->lnk[SMC_SINGLE_LINK];
++
++	return smc_wr_tx_has_pending(link, SMC_CDC_MSG_TYPE,
++				     smc_cdc_tx_filter, (unsigned long)conn);
++}
++
+ /********************************* receive ***********************************/
+ 
+ static inline bool smc_cdc_before(u16 seq1, u16 seq2)
+@@ -201,15 +213,20 @@ static void smc_cdc_msg_recv_action(struct smc_sock *smc,
+ 		smc->sk.sk_data_ready(&smc->sk);
+ 	}
+ 
+-	if (conn->local_rx_ctrl.conn_state_flags.peer_conn_abort)
++	if (conn->local_rx_ctrl.conn_state_flags.peer_conn_abort) {
+ 		smc->sk.sk_err = ECONNRESET;
++		conn->local_tx_ctrl.conn_state_flags.peer_conn_abort = 1;
++	}
+ 	if (smc_cdc_rxed_any_close_or_senddone(conn))
+-		/* subsequent patch: terminate connection */
++		smc_close_passive_received(smc);
+ 
+ 	/* piggy backed tx info */
+ 	/* trigger sndbuf consumer: RDMA write into peer RMBE and CDC */
+-	if (diff_cons && smc_tx_prepared_sends(conn))
++	if (diff_cons && smc_tx_prepared_sends(conn)) {
+ 		smc_tx_sndbuf_nonempty(conn);
++		/* trigger socket release if connection closed */
++		smc_close_wake_tx_prepared(smc);
++	}
+ 
+ 	/* subsequent patch: trigger socket release if connection closed */
+ 
+
+commit 952310ccf2d861966cfb8706f16d5e4eb585edb7
+Author: Ursula Braun <ubraun@linux.vnet.ibm.com>
+Date:   Mon Jan 9 16:55:24 2017 +0100
+
+    smc: receive data from RMBE
+    
+    move RMBE data into user space buffer and update managing cursors
+    
+    Signed-off-by: Ursula Braun <ubraun@linux.vnet.ibm.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/smc/smc_cdc.c b/net/smc/smc_cdc.c
+index 77fe16967376..c0a69300b2f4 100644
+--- a/net/smc/smc_cdc.c
++++ b/net/smc/smc_cdc.c
+@@ -15,6 +15,7 @@
+ #include "smc_wr.h"
+ #include "smc_cdc.h"
+ #include "smc_tx.h"
++#include "smc_rx.h"
+ 
+ /********************************** send *************************************/
+ 
+@@ -197,6 +198,7 @@ static void smc_cdc_msg_recv_action(struct smc_sock *smc,
+ 		atomic_add(diff_prod, &conn->bytes_to_rcv);
+ 		/* guarantee 0 <= bytes_to_rcv <= rmbe_size */
+ 		smp_mb__after_atomic();
++		smc->sk.sk_data_ready(&smc->sk);
+ 	}
+ 
+ 	if (conn->local_rx_ctrl.conn_state_flags.peer_conn_abort)
+@@ -216,7 +218,9 @@ static void smc_cdc_msg_recv_action(struct smc_sock *smc,
+ 		return;
+ 
+ 	/* data available */
+-	/* subsequent patch: send delayed ack, wake receivers */
++	if ((conn->local_rx_ctrl.prod_flags.write_blocked) ||
++	    (conn->local_rx_ctrl.prod_flags.cons_curs_upd_req))
++		smc_tx_consumer_update(conn);
+ }
+ 
+ /* called under tasklet context */
+
+commit e6727f39004bd95725342b3b343a14c7d59df07f
+Author: Ursula Braun <ubraun@linux.vnet.ibm.com>
+Date:   Mon Jan 9 16:55:23 2017 +0100
+
+    smc: send data (through RDMA)
+    
+    copy data to kernel send buffer, and trigger RDMA write
+    
+    Signed-off-by: Ursula Braun <ubraun@linux.vnet.ibm.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/smc/smc_cdc.c b/net/smc/smc_cdc.c
+index 111d23ff9e17..77fe16967376 100644
+--- a/net/smc/smc_cdc.c
++++ b/net/smc/smc_cdc.c
+@@ -14,6 +14,7 @@
+ #include "smc.h"
+ #include "smc_wr.h"
+ #include "smc_cdc.h"
++#include "smc_tx.h"
+ 
+ /********************************** send *************************************/
+ 
+@@ -52,7 +53,7 @@ static void smc_cdc_tx_handler(struct smc_wr_tx_pend_priv *pnd_snd,
+ 			       smc_curs_read(&cdcpend->cursor, cdcpend->conn),
+ 			       cdcpend->conn);
+ 	}
+-	/* subsequent patch: wake if send buffer space available */
++	smc_tx_sndbuf_nonfull(smc);
+ 	bh_unlock_sock(&smc->sk);
+ }
+ 
+@@ -204,7 +205,9 @@ static void smc_cdc_msg_recv_action(struct smc_sock *smc,
+ 		/* subsequent patch: terminate connection */
+ 
+ 	/* piggy backed tx info */
+-	/* subsequent patch: wake receivers if receive buffer space available */
++	/* trigger sndbuf consumer: RDMA write into peer RMBE and CDC */
++	if (diff_cons && smc_tx_prepared_sends(conn))
++		smc_tx_sndbuf_nonempty(conn);
+ 
+ 	/* subsequent patch: trigger socket release if connection closed */
+ 
+
+commit 5f08318f617b05b6ee389d8bd174c7af921ebf19
+Author: Ursula Braun <ubraun@linux.vnet.ibm.com>
+Date:   Mon Jan 9 16:55:22 2017 +0100
+
+    smc: connection data control (CDC)
+    
+    send and receive CDC messages (via IB message send and CQE)
+    
+    Signed-off-by: Ursula Braun <ubraun@linux.vnet.ibm.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/smc/smc_cdc.c b/net/smc/smc_cdc.c
+new file mode 100644
+index 000000000000..111d23ff9e17
+--- /dev/null
++++ b/net/smc/smc_cdc.c
+@@ -0,0 +1,280 @@
++/*
++ * Shared Memory Communications over RDMA (SMC-R) and RoCE
++ *
++ * Connection Data Control (CDC)
++ * handles flow control
++ *
++ * Copyright IBM Corp. 2016
++ *
++ * Author(s):  Ursula Braun <ubraun@linux.vnet.ibm.com>
++ */
++
++#include <linux/spinlock.h>
++
++#include "smc.h"
++#include "smc_wr.h"
++#include "smc_cdc.h"
++
++/********************************** send *************************************/
++
++struct smc_cdc_tx_pend {
++	struct smc_connection	*conn;		/* socket connection */
++	union smc_host_cursor	cursor;	/* tx sndbuf cursor sent */
++	union smc_host_cursor	p_cursor;	/* rx RMBE cursor produced */
++	u16			ctrl_seq;	/* conn. tx sequence # */
++};
++
++/* handler for send/transmission completion of a CDC msg */
++static void smc_cdc_tx_handler(struct smc_wr_tx_pend_priv *pnd_snd,
++			       struct smc_link *link,
++			       enum ib_wc_status wc_status)
++{
++	struct smc_cdc_tx_pend *cdcpend = (struct smc_cdc_tx_pend *)pnd_snd;
++	struct smc_sock *smc;
++	int diff;
++
++	if (!cdcpend->conn)
++		/* already dismissed */
++		return;
++
++	smc = container_of(cdcpend->conn, struct smc_sock, conn);
++	bh_lock_sock(&smc->sk);
++	if (!wc_status) {
++		diff = smc_curs_diff(cdcpend->conn->sndbuf_size,
++				     &cdcpend->conn->tx_curs_fin,
++				     &cdcpend->cursor);
++		/* sndbuf_space is decreased in smc_sendmsg */
++		smp_mb__before_atomic();
++		atomic_add(diff, &cdcpend->conn->sndbuf_space);
++		/* guarantee 0 <= sndbuf_space <= sndbuf_size */
++		smp_mb__after_atomic();
++		smc_curs_write(&cdcpend->conn->tx_curs_fin,
++			       smc_curs_read(&cdcpend->cursor, cdcpend->conn),
++			       cdcpend->conn);
++	}
++	/* subsequent patch: wake if send buffer space available */
++	bh_unlock_sock(&smc->sk);
++}
++
++int smc_cdc_get_free_slot(struct smc_link *link,
++			  struct smc_wr_buf **wr_buf,
++			  struct smc_cdc_tx_pend **pend)
++{
++	return smc_wr_tx_get_free_slot(link, smc_cdc_tx_handler, wr_buf,
++				       (struct smc_wr_tx_pend_priv **)pend);
++}
++
++static inline void smc_cdc_add_pending_send(struct smc_connection *conn,
++					    struct smc_cdc_tx_pend *pend)
++{
++	BUILD_BUG_ON_MSG(
++		sizeof(struct smc_cdc_msg) > SMC_WR_BUF_SIZE,
++		"must increase SMC_WR_BUF_SIZE to at least sizeof(struct smc_cdc_msg)");
++	BUILD_BUG_ON_MSG(
++		offsetof(struct smc_cdc_msg, reserved) > SMC_WR_TX_SIZE,
++		"must adapt SMC_WR_TX_SIZE to sizeof(struct smc_cdc_msg); if not all smc_wr upper layer protocols use the same message size any more, must start to set link->wr_tx_sges[i].length on each individual smc_wr_tx_send()");
++	BUILD_BUG_ON_MSG(
++		sizeof(struct smc_cdc_tx_pend) > SMC_WR_TX_PEND_PRIV_SIZE,
++		"must increase SMC_WR_TX_PEND_PRIV_SIZE to at least sizeof(struct smc_cdc_tx_pend)");
++	pend->conn = conn;
++	pend->cursor = conn->tx_curs_sent;
++	pend->p_cursor = conn->local_tx_ctrl.prod;
++	pend->ctrl_seq = conn->tx_cdc_seq;
++}
++
++int smc_cdc_msg_send(struct smc_connection *conn,
++		     struct smc_wr_buf *wr_buf,
++		     struct smc_cdc_tx_pend *pend)
++{
++	struct smc_link *link;
++	int rc;
++
++	link = &conn->lgr->lnk[SMC_SINGLE_LINK];
++
++	smc_cdc_add_pending_send(conn, pend);
++
++	conn->tx_cdc_seq++;
++	conn->local_tx_ctrl.seqno = conn->tx_cdc_seq;
++	smc_host_msg_to_cdc((struct smc_cdc_msg *)wr_buf,
++			    &conn->local_tx_ctrl, conn);
++	rc = smc_wr_tx_send(link, (struct smc_wr_tx_pend_priv *)pend);
++	if (!rc)
++		smc_curs_write(&conn->rx_curs_confirmed,
++			       smc_curs_read(&conn->local_tx_ctrl.cons, conn),
++			       conn);
++
++	return rc;
++}
++
++int smc_cdc_get_slot_and_msg_send(struct smc_connection *conn)
++{
++	struct smc_cdc_tx_pend *pend;
++	struct smc_wr_buf *wr_buf;
++	int rc;
++
++	rc = smc_cdc_get_free_slot(&conn->lgr->lnk[SMC_SINGLE_LINK], &wr_buf,
++				   &pend);
++	if (rc)
++		return rc;
++
++	return smc_cdc_msg_send(conn, wr_buf, pend);
++}
++
++static bool smc_cdc_tx_filter(struct smc_wr_tx_pend_priv *tx_pend,
++			      unsigned long data)
++{
++	struct smc_connection *conn = (struct smc_connection *)data;
++	struct smc_cdc_tx_pend *cdc_pend =
++		(struct smc_cdc_tx_pend *)tx_pend;
++
++	return cdc_pend->conn == conn;
++}
++
++static void smc_cdc_tx_dismisser(struct smc_wr_tx_pend_priv *tx_pend)
++{
++	struct smc_cdc_tx_pend *cdc_pend =
++		(struct smc_cdc_tx_pend *)tx_pend;
++
++	cdc_pend->conn = NULL;
++}
++
++void smc_cdc_tx_dismiss_slots(struct smc_connection *conn)
++{
++	struct smc_link *link = &conn->lgr->lnk[SMC_SINGLE_LINK];
++
++	smc_wr_tx_dismiss_slots(link, SMC_CDC_MSG_TYPE,
++				smc_cdc_tx_filter, smc_cdc_tx_dismisser,
++				(unsigned long)conn);
++}
++
++/********************************* receive ***********************************/
++
++static inline bool smc_cdc_before(u16 seq1, u16 seq2)
++{
++	return (s16)(seq1 - seq2) < 0;
++}
++
++static void smc_cdc_msg_recv_action(struct smc_sock *smc,
++				    struct smc_link *link,
++				    struct smc_cdc_msg *cdc)
++{
++	union smc_host_cursor cons_old, prod_old;
++	struct smc_connection *conn = &smc->conn;
++	int diff_cons, diff_prod;
++
++	if (!cdc->prod_flags.failover_validation) {
++		if (smc_cdc_before(ntohs(cdc->seqno),
++				   conn->local_rx_ctrl.seqno))
++			/* received seqno is old */
++			return;
++	}
++	smc_curs_write(&prod_old,
++		       smc_curs_read(&conn->local_rx_ctrl.prod, conn),
++		       conn);
++	smc_curs_write(&cons_old,
++		       smc_curs_read(&conn->local_rx_ctrl.cons, conn),
++		       conn);
++	smc_cdc_msg_to_host(&conn->local_rx_ctrl, cdc, conn);
++
++	diff_cons = smc_curs_diff(conn->peer_rmbe_size, &cons_old,
++				  &conn->local_rx_ctrl.cons);
++	if (diff_cons) {
++		/* peer_rmbe_space is decreased during data transfer with RDMA
++		 * write
++		 */
++		smp_mb__before_atomic();
++		atomic_add(diff_cons, &conn->peer_rmbe_space);
++		/* guarantee 0 <= peer_rmbe_space <= peer_rmbe_size */
++		smp_mb__after_atomic();
++	}
++
++	diff_prod = smc_curs_diff(conn->rmbe_size, &prod_old,
++				  &conn->local_rx_ctrl.prod);
++	if (diff_prod) {
++		/* bytes_to_rcv is decreased in smc_recvmsg */
++		smp_mb__before_atomic();
++		atomic_add(diff_prod, &conn->bytes_to_rcv);
++		/* guarantee 0 <= bytes_to_rcv <= rmbe_size */
++		smp_mb__after_atomic();
++	}
++
++	if (conn->local_rx_ctrl.conn_state_flags.peer_conn_abort)
++		smc->sk.sk_err = ECONNRESET;
++	if (smc_cdc_rxed_any_close_or_senddone(conn))
++		/* subsequent patch: terminate connection */
++
++	/* piggy backed tx info */
++	/* subsequent patch: wake receivers if receive buffer space available */
++
++	/* subsequent patch: trigger socket release if connection closed */
++
++	/* socket connected but not accepted */
++	if (!smc->sk.sk_socket)
++		return;
++
++	/* data available */
++	/* subsequent patch: send delayed ack, wake receivers */
++}
++
++/* called under tasklet context */
++static inline void smc_cdc_msg_recv(struct smc_cdc_msg *cdc,
++				    struct smc_link *link, u64 wr_id)
++{
++	struct smc_link_group *lgr = container_of(link, struct smc_link_group,
++						  lnk[SMC_SINGLE_LINK]);
++	struct smc_connection *connection;
++	struct smc_sock *smc;
++
++	/* lookup connection */
++	read_lock_bh(&lgr->conns_lock);
++	connection = smc_lgr_find_conn(ntohl(cdc->token), lgr);
++	if (!connection) {
++		read_unlock_bh(&lgr->conns_lock);
++		return;
++	}
++	smc = container_of(connection, struct smc_sock, conn);
++	sock_hold(&smc->sk);
++	read_unlock_bh(&lgr->conns_lock);
++	bh_lock_sock(&smc->sk);
++	smc_cdc_msg_recv_action(smc, link, cdc);
++	bh_unlock_sock(&smc->sk);
++	sock_put(&smc->sk); /* no free sk in softirq-context */
++}
++
++/***************************** init, exit, misc ******************************/
++
++static void smc_cdc_rx_handler(struct ib_wc *wc, void *buf)
++{
++	struct smc_link *link = (struct smc_link *)wc->qp->qp_context;
++	struct smc_cdc_msg *cdc = buf;
++
++	if (wc->byte_len < offsetof(struct smc_cdc_msg, reserved))
++		return; /* short message */
++	if (cdc->len != sizeof(*cdc))
++		return; /* invalid message */
++	smc_cdc_msg_recv(cdc, link, wc->wr_id);
++}
++
++static struct smc_wr_rx_handler smc_cdc_rx_handlers[] = {
++	{
++		.handler	= smc_cdc_rx_handler,
++		.type		= SMC_CDC_MSG_TYPE
++	},
++	{
++		.handler	= NULL,
++	}
++};
++
++int __init smc_cdc_init(void)
++{
++	struct smc_wr_rx_handler *handler;
++	int rc = 0;
++
++	for (handler = smc_cdc_rx_handlers; handler->handler; handler++) {
++		INIT_HLIST_NODE(&handler->list);
++		rc = smc_wr_rx_register_handler(handler);
++		if (rc)
++			break;
++	}
++	return rc;
++}

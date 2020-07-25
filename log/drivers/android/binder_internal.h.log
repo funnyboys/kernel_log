@@ -1,0 +1,758 @@
+commit f0fe2c0f050d31babcad7d65f1d550d462a40064
+Author: Christian Brauner <christian.brauner@ubuntu.com>
+Date:   Tue Mar 3 17:43:40 2020 +0100
+
+    binder: prevent UAF for binderfs devices II
+    
+    This is a necessary follow up to the first fix I proposed and we merged
+    in 2669b8b0c79 ("binder: prevent UAF for binderfs devices"). I have been
+    overly optimistic that the simple fix I proposed would work. But alas,
+    ihold() + iput() won't work since the inodes won't survive the
+    destruction of the superblock.
+    So all we get with my prior fix is a different race with a tinier
+    race-window but it doesn't solve the issue. Fwiw, the problem lies with
+    generic_shutdown_super(). It even has this cozy Al-style comment:
+    
+              if (!list_empty(&sb->s_inodes)) {
+                      printk("VFS: Busy inodes after unmount of %s. "
+                         "Self-destruct in 5 seconds.  Have a nice day...\n",
+                         sb->s_id);
+              }
+    
+    On binder_release(), binder_defer_work(proc, BINDER_DEFERRED_RELEASE) is
+    called which punts the actual cleanup operation to a workqueue. At some
+    point, binder_deferred_func() will be called which will end up calling
+    binder_deferred_release() which will retrieve and cleanup the
+    binder_context attach to this struct binder_proc.
+    
+    If we trace back where this binder_context is attached to binder_proc we
+    see that it is set in binder_open() and is taken from the struct
+    binder_device it is associated with. This obviously assumes that the
+    struct binder_device that context is attached to is _never_ freed. While
+    that might be true for devtmpfs binder devices it is most certainly
+    wrong for binderfs binder devices.
+    
+    So, assume binder_open() is called on a binderfs binder devices. We now
+    stash away the struct binder_context associated with that struct
+    binder_devices:
+            proc->context = &binder_dev->context;
+            /* binderfs stashes devices in i_private */
+            if (is_binderfs_device(nodp)) {
+                    binder_dev = nodp->i_private;
+                    info = nodp->i_sb->s_fs_info;
+                    binder_binderfs_dir_entry_proc = info->proc_log_dir;
+            } else {
+            .
+            .
+            .
+            proc->context = &binder_dev->context;
+    
+    Now let's assume that the binderfs instance for that binder devices is
+    shutdown via umount() and/or the mount namespace associated with it goes
+    away. As long as there is still an fd open for that binderfs binder
+    device things are fine. But let's assume we now close the last fd for
+    that binderfs binder device. Now binder_release() is called and punts to
+    the workqueue. Assume that the workqueue has quite a bit of stuff to do
+    and doesn't get to cleaning up the struct binder_proc and the associated
+    struct binder_context with it for that binderfs binder device right
+    away. In the meantime, the VFS is killing the super block and is
+    ultimately calling sb->evict_inode() which means it will call
+    binderfs_evict_inode() which does:
+    
+    static void binderfs_evict_inode(struct inode *inode)
+    {
+            struct binder_device *device = inode->i_private;
+            struct binderfs_info *info = BINDERFS_I(inode);
+    
+            clear_inode(inode);
+    
+            if (!S_ISCHR(inode->i_mode) || !device)
+                    return;
+    
+            mutex_lock(&binderfs_minors_mutex);
+            --info->device_count;
+            ida_free(&binderfs_minors, device->miscdev.minor);
+            mutex_unlock(&binderfs_minors_mutex);
+    
+            kfree(device->context.name);
+            kfree(device);
+    }
+    
+    thereby freeing the struct binder_device including struct
+    binder_context.
+    
+    Now the workqueue finally has time to get around to cleaning up struct
+    binder_proc and is now trying to access the associate struct
+    binder_context. Since it's already freed it will OOPs.
+    
+    Fix this by introducing a refounct on binder devices.
+    
+    This is an alternative fix to 51d8a7eca677 ("binder: prevent UAF read in
+    print_binder_transaction_log_entry()").
+    
+    Fixes: 3ad20fe393b3 ("binder: implement binderfs")
+    Fixes: 2669b8b0c798 ("binder: prevent UAF for binderfs devices")
+    Fixes: 03e2e07e3814 ("binder: Make transaction_log available in binderfs")
+    Related : 51d8a7eca677 ("binder: prevent UAF read in print_binder_transaction_log_entry()")
+    Cc: stable@vger.kernel.org
+    Signed-off-by: Christian Brauner <christian.brauner@ubuntu.com>
+    Acked-by: Todd Kjos <tkjos@google.com>
+    Link: https://lore.kernel.org/r/20200303164340.670054-1-christian.brauner@ubuntu.com
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/android/binder_internal.h b/drivers/android/binder_internal.h
+index 73941d3382f3..283d3cb9c16e 100644
+--- a/drivers/android/binder_internal.h
++++ b/drivers/android/binder_internal.h
+@@ -8,6 +8,7 @@
+ #include <linux/list.h>
+ #include <linux/miscdevice.h>
+ #include <linux/mutex.h>
++#include <linux/refcount.h>
+ #include <linux/stddef.h>
+ #include <linux/types.h>
+ #include <linux/uidgid.h>
+@@ -33,21 +34,9 @@ struct binder_device {
+ 	struct miscdevice miscdev;
+ 	struct binder_context context;
+ 	struct inode *binderfs_inode;
++	refcount_t ref;
+ };
+ 
+-static inline struct binder_device *binderfs_device_get(struct binder_device *dev)
+-{
+-	if (dev->binderfs_inode)
+-		ihold(dev->binderfs_inode);
+-	return dev;
+-}
+-
+-static inline void binderfs_device_put(struct binder_device *dev)
+-{
+-	if (dev->binderfs_inode)
+-		iput(dev->binderfs_inode);
+-}
+-
+ /**
+  * binderfs_mount_opts - mount options for binderfs
+  * @max: maximum number of allocatable binderfs binder devices
+
+commit 2669b8b0c798fbe1a31d49e07aa33233d469ad9b
+Author: Christian Brauner <christian.brauner@ubuntu.com>
+Date:   Fri Feb 21 19:01:24 2020 +0100
+
+    binder: prevent UAF for binderfs devices
+    
+    On binder_release(), binder_defer_work(proc, BINDER_DEFERRED_RELEASE) is
+    called which punts the actual cleanup operation to a workqueue. At some
+    point, binder_deferred_func() will be called which will end up calling
+    binder_deferred_release() which will retrieve and cleanup the
+    binder_context attach to this struct binder_proc.
+    
+    If we trace back where this binder_context is attached to binder_proc we
+    see that it is set in binder_open() and is taken from the struct
+    binder_device it is associated with. This obviously assumes that the
+    struct binder_device that context is attached to is _never_ freed. While
+    that might be true for devtmpfs binder devices it is most certainly
+    wrong for binderfs binder devices.
+    
+    So, assume binder_open() is called on a binderfs binder devices. We now
+    stash away the struct binder_context associated with that struct
+    binder_devices:
+            proc->context = &binder_dev->context;
+            /* binderfs stashes devices in i_private */
+            if (is_binderfs_device(nodp)) {
+                    binder_dev = nodp->i_private;
+                    info = nodp->i_sb->s_fs_info;
+                    binder_binderfs_dir_entry_proc = info->proc_log_dir;
+            } else {
+            .
+            .
+            .
+            proc->context = &binder_dev->context;
+    
+    Now let's assume that the binderfs instance for that binder devices is
+    shutdown via umount() and/or the mount namespace associated with it goes
+    away. As long as there is still an fd open for that binderfs binder
+    device things are fine. But let's assume we now close the last fd for
+    that binderfs binder device. Now binder_release() is called and punts to
+    the workqueue. Assume that the workqueue has quite a bit of stuff to do
+    and doesn't get to cleaning up the struct binder_proc and the associated
+    struct binder_context with it for that binderfs binder device right
+    away. In the meantime, the VFS is killing the super block and is
+    ultimately calling sb->evict_inode() which means it will call
+    binderfs_evict_inode() which does:
+    
+    static void binderfs_evict_inode(struct inode *inode)
+    {
+            struct binder_device *device = inode->i_private;
+            struct binderfs_info *info = BINDERFS_I(inode);
+    
+            clear_inode(inode);
+    
+            if (!S_ISCHR(inode->i_mode) || !device)
+                    return;
+    
+            mutex_lock(&binderfs_minors_mutex);
+            --info->device_count;
+            ida_free(&binderfs_minors, device->miscdev.minor);
+            mutex_unlock(&binderfs_minors_mutex);
+    
+            kfree(device->context.name);
+            kfree(device);
+    }
+    
+    thereby freeing the struct binder_device including struct
+    binder_context.
+    
+    Now the workqueue finally has time to get around to cleaning up struct
+    binder_proc and is now trying to access the associate struct
+    binder_context. Since it's already freed it will OOPs.
+    
+    Fix this by holding an additional reference to the inode that is only
+    released once the workqueue is done cleaning up struct binder_proc. This
+    is an easy alternative to introducing separate refcounting on struct
+    binder_device which we can always do later if it becomes necessary.
+    
+    This is an alternative fix to 51d8a7eca677 ("binder: prevent UAF read in
+    print_binder_transaction_log_entry()").
+    
+    Fixes: 3ad20fe393b3 ("binder: implement binderfs")
+    Fixes: 03e2e07e3814 ("binder: Make transaction_log available in binderfs")
+    Related : 51d8a7eca677 ("binder: prevent UAF read in print_binder_transaction_log_entry()")
+    Cc: stable@vger.kernel.org
+    Signed-off-by: Christian Brauner <christian.brauner@ubuntu.com>
+    Acked-by: Todd Kjos <tkjos@google.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/android/binder_internal.h b/drivers/android/binder_internal.h
+index ae991097d14d..73941d3382f3 100644
+--- a/drivers/android/binder_internal.h
++++ b/drivers/android/binder_internal.h
+@@ -35,6 +35,19 @@ struct binder_device {
+ 	struct inode *binderfs_inode;
+ };
+ 
++static inline struct binder_device *binderfs_device_get(struct binder_device *dev)
++{
++	if (dev->binderfs_inode)
++		ihold(dev->binderfs_inode);
++	return dev;
++}
++
++static inline void binderfs_device_put(struct binder_device *dev)
++{
++	if (dev->binderfs_inode)
++		iput(dev->binderfs_inode);
++}
++
+ /**
+  * binderfs_mount_opts - mount options for binderfs
+  * @max: maximum number of allocatable binderfs binder devices
+
+commit 51d8a7eca67784b155a07aeab4bfb9f63ebaaf9e
+Author: Christian Brauner <christian.brauner@ubuntu.com>
+Date:   Tue Oct 8 15:01:59 2019 +0200
+
+    binder: prevent UAF read in print_binder_transaction_log_entry()
+    
+    When a binder transaction is initiated on a binder device coming from a
+    binderfs instance, a pointer to the name of the binder device is stashed
+    in the binder_transaction_log_entry's context_name member. Later on it
+    is used to print the name in print_binder_transaction_log_entry(). By
+    the time print_binder_transaction_log_entry() accesses context_name
+    binderfs_evict_inode() might have already freed the associated memory
+    thereby causing a UAF. Do the simple thing and prevent this by copying
+    the name of the binder device instead of stashing a pointer to it.
+    
+    Reported-by: Jann Horn <jannh@google.com>
+    Fixes: 03e2e07e3814 ("binder: Make transaction_log available in binderfs")
+    Link: https://lore.kernel.org/r/CAG48ez14Q0-F8LqsvcNbyR2o6gPW8SHXsm4u5jmD9MpsteM2Tw@mail.gmail.com
+    Signed-off-by: Christian Brauner <christian.brauner@ubuntu.com>
+    Reviewed-by: Joel Fernandes (Google) <joel@joelfernandes.org>
+    Acked-by: Todd Kjos <tkjos@google.com>
+    Reviewed-by: Hridya Valsaraju <hridya@google.com>
+    Link: https://lore.kernel.org/r/20191008130159.10161-1-christian.brauner@ubuntu.com
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/android/binder_internal.h b/drivers/android/binder_internal.h
+index bd47f7f72075..ae991097d14d 100644
+--- a/drivers/android/binder_internal.h
++++ b/drivers/android/binder_internal.h
+@@ -130,7 +130,7 @@ struct binder_transaction_log_entry {
+ 	int return_error_line;
+ 	uint32_t return_error;
+ 	uint32_t return_error_param;
+-	const char *context_name;
++	char context_name[BINDERFS_MAX_NAME + 1];
+ };
+ 
+ struct binder_transaction_log {
+
+commit 4feb80faf428a02d407a9ea1952004af01308765
+Author: Hridya Valsaraju <hridya@google.com>
+Date:   Tue Sep 3 09:16:55 2019 -0700
+
+    binder: Add binder_proc logging to binderfs
+    
+    Currently /sys/kernel/debug/binder/proc contains
+    the debug data for every binder_proc instance.
+    This patch makes this information also available
+    in a binderfs instance mounted with a mount option
+    "stats=global" in addition to debugfs. The patch does
+    not affect the presence of the file in debugfs.
+    
+    If a binderfs instance is mounted at path /dev/binderfs,
+    this file would be present at /dev/binderfs/binder_logs/proc.
+    This change provides an alternate way to access this file when debugfs
+    is not mounted.
+    
+    Acked-by: Christian Brauner <christian.brauner@ubuntu.com>
+    Signed-off-by: Hridya Valsaraju <hridya@google.com>
+    Link: https://lore.kernel.org/r/20190903161655.107408-5-hridya@google.com
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/android/binder_internal.h b/drivers/android/binder_internal.h
+index b9be42d9464c..bd47f7f72075 100644
+--- a/drivers/android/binder_internal.h
++++ b/drivers/android/binder_internal.h
+@@ -35,17 +35,63 @@ struct binder_device {
+ 	struct inode *binderfs_inode;
+ };
+ 
++/**
++ * binderfs_mount_opts - mount options for binderfs
++ * @max: maximum number of allocatable binderfs binder devices
++ * @stats_mode: enable binder stats in binderfs.
++ */
++struct binderfs_mount_opts {
++	int max;
++	int stats_mode;
++};
++
++/**
++ * binderfs_info - information about a binderfs mount
++ * @ipc_ns:         The ipc namespace the binderfs mount belongs to.
++ * @control_dentry: This records the dentry of this binderfs mount
++ *                  binder-control device.
++ * @root_uid:       uid that needs to be used when a new binder device is
++ *                  created.
++ * @root_gid:       gid that needs to be used when a new binder device is
++ *                  created.
++ * @mount_opts:     The mount options in use.
++ * @device_count:   The current number of allocated binder devices.
++ * @proc_log_dir:   Pointer to the directory dentry containing process-specific
++ *                  logs.
++ */
++struct binderfs_info {
++	struct ipc_namespace *ipc_ns;
++	struct dentry *control_dentry;
++	kuid_t root_uid;
++	kgid_t root_gid;
++	struct binderfs_mount_opts mount_opts;
++	int device_count;
++	struct dentry *proc_log_dir;
++};
++
+ extern const struct file_operations binder_fops;
+ 
+ extern char *binder_devices_param;
+ 
+ #ifdef CONFIG_ANDROID_BINDERFS
+ extern bool is_binderfs_device(const struct inode *inode);
++extern struct dentry *binderfs_create_file(struct dentry *dir, const char *name,
++					   const struct file_operations *fops,
++					   void *data);
++extern void binderfs_remove_file(struct dentry *dentry);
+ #else
+ static inline bool is_binderfs_device(const struct inode *inode)
+ {
+ 	return false;
+ }
++static inline struct dentry *binderfs_create_file(struct dentry *dir,
++					   const char *name,
++					   const struct file_operations *fops,
++					   void *data)
++{
++	return NULL;
++}
++static inline void binderfs_remove_file(struct dentry *dentry) {}
+ #endif
+ 
+ #ifdef CONFIG_ANDROID_BINDERFS
+
+commit 03e2e07e38147917482d595ad3cf193212ded8ac
+Author: Hridya Valsaraju <hridya@google.com>
+Date:   Tue Sep 3 09:16:54 2019 -0700
+
+    binder: Make transaction_log available in binderfs
+    
+    Currently, the binder transaction log files 'transaction_log'
+    and 'failed_transaction_log' live in debugfs at the following locations:
+    
+    /sys/kernel/debug/binder/failed_transaction_log
+    /sys/kernel/debug/binder/transaction_log
+    
+    This patch makes these files also available in a binderfs instance
+    mounted with the mount option "stats=global".
+    It does not affect the presence of these files in debugfs.
+    If a binderfs instance is mounted at path /dev/binderfs, the location of
+    these files will be as follows:
+    
+    /dev/binderfs/binder_logs/failed_transaction_log
+    /dev/binderfs/binder_logs/transaction_log
+    
+    This change provides an alternate option to access these files when
+    debugfs is not mounted.
+    
+    Acked-by: Christian Brauner <christian.brauner@ubuntu.com>
+    Signed-off-by: Hridya Valsaraju <hridya@google.com>
+    Link: https://lore.kernel.org/r/20190903161655.107408-4-hridya@google.com
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/android/binder_internal.h b/drivers/android/binder_internal.h
+index 12ef96f256c6..b9be42d9464c 100644
+--- a/drivers/android/binder_internal.h
++++ b/drivers/android/binder_internal.h
+@@ -65,4 +65,34 @@ DEFINE_SHOW_ATTRIBUTE(binder_state);
+ 
+ int binder_transactions_show(struct seq_file *m, void *unused);
+ DEFINE_SHOW_ATTRIBUTE(binder_transactions);
++
++int binder_transaction_log_show(struct seq_file *m, void *unused);
++DEFINE_SHOW_ATTRIBUTE(binder_transaction_log);
++
++struct binder_transaction_log_entry {
++	int debug_id;
++	int debug_id_done;
++	int call_type;
++	int from_proc;
++	int from_thread;
++	int target_handle;
++	int to_proc;
++	int to_thread;
++	int to_node;
++	int data_size;
++	int offsets_size;
++	int return_error_line;
++	uint32_t return_error;
++	uint32_t return_error_param;
++	const char *context_name;
++};
++
++struct binder_transaction_log {
++	atomic_t cur;
++	bool full;
++	struct binder_transaction_log_entry entry[32];
++};
++
++extern struct binder_transaction_log binder_transaction_log;
++extern struct binder_transaction_log binder_transaction_log_failed;
+ #endif /* _LINUX_BINDER_INTERNAL_H */
+
+commit 0e13e452dafc009049a9a5a4153e2f9e51b23915
+Author: Hridya Valsaraju <hridya@google.com>
+Date:   Tue Sep 3 09:16:53 2019 -0700
+
+    binder: Add stats, state and transactions files
+    
+    The following binder stat files currently live in debugfs.
+    
+    /sys/kernel/debug/binder/state
+    /sys/kernel/debug/binder/stats
+    /sys/kernel/debug/binder/transactions
+    
+    This patch makes these files available in a binderfs instance
+    mounted with the mount option 'stats=global'. For example, if a binderfs
+    instance is mounted at path /dev/binderfs, the above files will be
+    available at the following locations:
+    
+    /dev/binderfs/binder_logs/state
+    /dev/binderfs/binder_logs/stats
+    /dev/binderfs/binder_logs/transactions
+    
+    This provides a way to access them even when debugfs is not mounted.
+    
+    Acked-by: Christian Brauner <christian.brauner@ubuntu.com>
+    Signed-off-by: Hridya Valsaraju <hridya@google.com>
+    Acked-by: Christian Brauner <christian.brauner@ubuntu.com>
+    Link: https://lore.kernel.org/r/20190903161655.107408-3-hridya@google.com
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/android/binder_internal.h b/drivers/android/binder_internal.h
+index fe8c745dc8e0..12ef96f256c6 100644
+--- a/drivers/android/binder_internal.h
++++ b/drivers/android/binder_internal.h
+@@ -57,4 +57,12 @@ static inline int __init init_binderfs(void)
+ }
+ #endif
+ 
++int binder_stats_show(struct seq_file *m, void *unused);
++DEFINE_SHOW_ATTRIBUTE(binder_stats);
++
++int binder_state_show(struct seq_file *m, void *unused);
++DEFINE_SHOW_ATTRIBUTE(binder_state);
++
++int binder_transactions_show(struct seq_file *m, void *unused);
++DEFINE_SHOW_ATTRIBUTE(binder_transactions);
+ #endif /* _LINUX_BINDER_INTERNAL_H */
+
+commit ca2864c6e8965c37df97f11e6f99e83e09806b1c
+Author: Hridya Valsaraju <hridya@google.com>
+Date:   Wed Sep 4 13:07:03 2019 +0200
+
+    binder: Add default binder devices through binderfs when configured
+    
+    Currently, since each binderfs instance needs its own
+    private binder devices, every time a binderfs instance is
+    mounted, all the default binder devices need to be created
+    via the BINDER_CTL_ADD IOCTL. This patch aims to
+    add a solution to automatically create the default binder
+    devices for each binderfs instance that gets mounted.
+    To achieve this goal, when CONFIG_ANDROID_BINDERFS is set,
+    the default binder devices specified by CONFIG_ANDROID_BINDER_DEVICES
+    are created in each binderfs instance instead of global devices
+    being created by the binder driver.
+    
+    Co-developed-by: Christian Brauner <christian.brauner@ubuntu.com>
+    Signed-off-by: Christian Brauner <christian.brauner@ubuntu.com>
+    Signed-off-by: Hridya Valsaraju <hridya@google.com>
+    Reviewed-by: Joel Fernandes (Google) <joel@joelfernandes.org>
+    Link: https://lore.kernel.org/r/20190808222727.132744-2-hridya@google.com
+    Link: https://lore.kernel.org/r/20190904110704.8606-2-christian.brauner@ubuntu.com
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/android/binder_internal.h b/drivers/android/binder_internal.h
+index 045b3e42d98b..fe8c745dc8e0 100644
+--- a/drivers/android/binder_internal.h
++++ b/drivers/android/binder_internal.h
+@@ -37,6 +37,8 @@ struct binder_device {
+ 
+ extern const struct file_operations binder_fops;
+ 
++extern char *binder_devices_param;
++
+ #ifdef CONFIG_ANDROID_BINDERFS
+ extern bool is_binderfs_device(const struct inode *inode);
+ #else
+
+commit 5b9633af298bfd1de650f6774d3fada546543101
+Author: Christian Brauner <christian@brauner.io>
+Date:   Thu Jan 31 01:25:02 2019 +0100
+
+    binderfs: remove separate device_initcall()
+    
+    binderfs should not have a separate device_initcall(). When a kernel is
+    compiled with CONFIG_ANDROID_BINDERFS register the filesystem alongside
+    CONFIG_ANDROID_IPC. This use-case is especially sensible when users specify
+    CONFIG_ANDROID_IPC=y, CONFIG_ANDROID_BINDERFS=y and
+    ANDROID_BINDER_DEVICES="".
+    When CONFIG_ANDROID_BINDERFS=n then this always succeeds so there's no
+    regression potential for legacy workloads.
+    
+    Signed-off-by: Christian Brauner <christian@brauner.io>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/android/binder_internal.h b/drivers/android/binder_internal.h
+index 7fb97f503ef2..045b3e42d98b 100644
+--- a/drivers/android/binder_internal.h
++++ b/drivers/android/binder_internal.h
+@@ -46,4 +46,13 @@ static inline bool is_binderfs_device(const struct inode *inode)
+ }
+ #endif
+ 
++#ifdef CONFIG_ANDROID_BINDERFS
++extern int __init init_binderfs(void);
++#else
++static inline int __init init_binderfs(void)
++{
++	return 0;
++}
++#endif
++
+ #endif /* _LINUX_BINDER_INTERNAL_H */
+
+commit 3ad20fe393b31025bebfc2d76964561f65df48aa
+Author: Christian Brauner <christian@brauner.io>
+Date:   Fri Dec 14 13:11:14 2018 +0100
+
+    binder: implement binderfs
+    
+    As discussed at Linux Plumbers Conference 2018 in Vancouver [1] this is the
+    implementation of binderfs.
+    
+    /* Abstract */
+    binderfs is a backwards-compatible filesystem for Android's binder ipc
+    mechanism. Each ipc namespace will mount a new binderfs instance. Mounting
+    binderfs multiple times at different locations in the same ipc namespace
+    will not cause a new super block to be allocated and hence it will be the
+    same filesystem instance.
+    Each new binderfs mount will have its own set of binder devices only
+    visible in the ipc namespace it has been mounted in. All devices in a new
+    binderfs mount will follow the scheme binder%d and numbering will always
+    start at 0.
+    
+    /* Backwards compatibility */
+    Devices requested in the Kconfig via CONFIG_ANDROID_BINDER_DEVICES for the
+    initial ipc namespace will work as before. They will be registered via
+    misc_register() and appear in the devtmpfs mount. Specifically, the
+    standard devices binder, hwbinder, and vndbinder will all appear in their
+    standard locations in /dev. Mounting or unmounting the binderfs mount in
+    the initial ipc namespace will have no effect on these devices, i.e. they
+    will neither show up in the binderfs mount nor will they disappear when the
+    binderfs mount is gone.
+    
+    /* binder-control */
+    Each new binderfs instance comes with a binder-control device. No other
+    devices will be present at first. The binder-control device can be used to
+    dynamically allocate binder devices. All requests operate on the binderfs
+    mount the binder-control device resides in.
+    Assuming a new instance of binderfs has been mounted at /dev/binderfs
+    via mount -t binderfs binderfs /dev/binderfs. Then a request to create a
+    new binder device can be made as illustrated in [2].
+    Binderfs devices can simply be removed via unlink().
+    
+    /* Implementation details */
+    - dynamic major number allocation:
+      When binderfs is registered as a new filesystem it will dynamically
+      allocate a new major number. The allocated major number will be returned
+      in struct binderfs_device when a new binder device is allocated.
+    - global minor number tracking:
+      Minor are tracked in a global idr struct that is capped at
+      BINDERFS_MAX_MINOR. The minor number tracker is protected by a global
+      mutex. This is the only point of contention between binderfs mounts.
+    - struct binderfs_info:
+      Each binderfs super block has its own struct binderfs_info that tracks
+      specific details about a binderfs instance:
+      - ipc namespace
+      - dentry of the binder-control device
+      - root uid and root gid of the user namespace the binderfs instance
+        was mounted in
+    - mountable by user namespace root:
+      binderfs can be mounted by user namespace root in a non-initial user
+      namespace. The devices will be owned by user namespace root.
+    - binderfs binder devices without misc infrastructure:
+      New binder devices associated with a binderfs mount do not use the
+      full misc_register() infrastructure.
+      The misc_register() infrastructure can only create new devices in the
+      host's devtmpfs mount. binderfs does however only make devices appear
+      under its own mountpoint and thus allocates new character device nodes
+      from the inode of the root dentry of the super block. This will have
+      the side-effect that binderfs specific device nodes do not appear in
+      sysfs. This behavior is similar to devpts allocated pts devices and
+      has no effect on the functionality of the ipc mechanism itself.
+    
+    [1]: https://goo.gl/JL2tfX
+    [2]: program to allocate a new binderfs binder device:
+    
+         #define _GNU_SOURCE
+         #include <errno.h>
+         #include <fcntl.h>
+         #include <stdio.h>
+         #include <stdlib.h>
+         #include <string.h>
+         #include <sys/ioctl.h>
+         #include <sys/stat.h>
+         #include <sys/types.h>
+         #include <unistd.h>
+         #include <linux/android/binder_ctl.h>
+    
+         int main(int argc, char *argv[])
+         {
+                 int fd, ret, saved_errno;
+                 size_t len;
+                 struct binderfs_device device = { 0 };
+    
+                 if (argc < 2)
+                         exit(EXIT_FAILURE);
+    
+                 len = strlen(argv[1]);
+                 if (len > BINDERFS_MAX_NAME)
+                         exit(EXIT_FAILURE);
+    
+                 memcpy(device.name, argv[1], len);
+    
+                 fd = open("/dev/binderfs/binder-control", O_RDONLY | O_CLOEXEC);
+                 if (fd < 0) {
+                         printf("%s - Failed to open binder-control device\n",
+                                strerror(errno));
+                         exit(EXIT_FAILURE);
+                 }
+    
+                 ret = ioctl(fd, BINDER_CTL_ADD, &device);
+                 saved_errno = errno;
+                 close(fd);
+                 errno = saved_errno;
+                 if (ret < 0) {
+                         printf("%s - Failed to allocate new binder device\n",
+                                strerror(errno));
+                         exit(EXIT_FAILURE);
+                 }
+    
+                 printf("Allocated new binder device with major %d, minor %d, and "
+                        "name %s\n", device.major, device.minor,
+                        device.name);
+    
+                 exit(EXIT_SUCCESS);
+         }
+    
+    Cc: Martijn Coenen <maco@android.com>
+    Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+    Signed-off-by: Christian Brauner <christian.brauner@ubuntu.com>
+    Acked-by: Todd Kjos <tkjos@google.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/android/binder_internal.h b/drivers/android/binder_internal.h
+new file mode 100644
+index 000000000000..7fb97f503ef2
+--- /dev/null
++++ b/drivers/android/binder_internal.h
+@@ -0,0 +1,49 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++
++#ifndef _LINUX_BINDER_INTERNAL_H
++#define _LINUX_BINDER_INTERNAL_H
++
++#include <linux/export.h>
++#include <linux/fs.h>
++#include <linux/list.h>
++#include <linux/miscdevice.h>
++#include <linux/mutex.h>
++#include <linux/stddef.h>
++#include <linux/types.h>
++#include <linux/uidgid.h>
++
++struct binder_context {
++	struct binder_node *binder_context_mgr_node;
++	struct mutex context_mgr_node_lock;
++	kuid_t binder_context_mgr_uid;
++	const char *name;
++};
++
++/**
++ * struct binder_device - information about a binder device node
++ * @hlist:          list of binder devices (only used for devices requested via
++ *                  CONFIG_ANDROID_BINDER_DEVICES)
++ * @miscdev:        information about a binder character device node
++ * @context:        binder context information
++ * @binderfs_inode: This is the inode of the root dentry of the super block
++ *                  belonging to a binderfs mount.
++ */
++struct binder_device {
++	struct hlist_node hlist;
++	struct miscdevice miscdev;
++	struct binder_context context;
++	struct inode *binderfs_inode;
++};
++
++extern const struct file_operations binder_fops;
++
++#ifdef CONFIG_ANDROID_BINDERFS
++extern bool is_binderfs_device(const struct inode *inode);
++#else
++static inline bool is_binderfs_device(const struct inode *inode)
++{
++	return false;
++}
++#endif
++
++#endif /* _LINUX_BINDER_INTERNAL_H */

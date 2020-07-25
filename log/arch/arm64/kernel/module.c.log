@@ -1,0 +1,2928 @@
+commit 3b23e4991fb66f6d152f9055ede271a726ef9f21
+Author: Torsten Duwe <duwe@lst.de>
+Date:   Fri Feb 8 16:10:19 2019 +0100
+
+    arm64: implement ftrace with regs
+    
+    This patch implements FTRACE_WITH_REGS for arm64, which allows a traced
+    function's arguments (and some other registers) to be captured into a
+    struct pt_regs, allowing these to be inspected and/or modified. This is
+    a building block for live-patching, where a function's arguments may be
+    forwarded to another function. This is also necessary to enable ftrace
+    and in-kernel pointer authentication at the same time, as it allows the
+    LR value to be captured and adjusted prior to signing.
+    
+    Using GCC's -fpatchable-function-entry=N option, we can have the
+    compiler insert a configurable number of NOPs between the function entry
+    point and the usual prologue. This also ensures functions are AAPCS
+    compliant (e.g. disabling inter-procedural register allocation).
+    
+    For example, with -fpatchable-function-entry=2, GCC 8.1.0 compiles the
+    following:
+    
+    | unsigned long bar(void);
+    |
+    | unsigned long foo(void)
+    | {
+    |         return bar() + 1;
+    | }
+    
+    ... to:
+    
+    | <foo>:
+    |         nop
+    |         nop
+    |         stp     x29, x30, [sp, #-16]!
+    |         mov     x29, sp
+    |         bl      0 <bar>
+    |         add     x0, x0, #0x1
+    |         ldp     x29, x30, [sp], #16
+    |         ret
+    
+    This patch builds the kernel with -fpatchable-function-entry=2,
+    prefixing each function with two NOPs. To trace a function, we replace
+    these NOPs with a sequence that saves the LR into a GPR, then calls an
+    ftrace entry assembly function which saves this and other relevant
+    registers:
+    
+    | mov   x9, x30
+    | bl    <ftrace-entry>
+    
+    Since patchable functions are AAPCS compliant (and the kernel does not
+    use x18 as a platform register), x9-x18 can be safely clobbered in the
+    patched sequence and the ftrace entry code.
+    
+    There are now two ftrace entry functions, ftrace_regs_entry (which saves
+    all GPRs), and ftrace_entry (which saves the bare minimum). A PLT is
+    allocated for each within modules.
+    
+    Signed-off-by: Torsten Duwe <duwe@suse.de>
+    [Mark: rework asm, comments, PLTs, initialization, commit message]
+    Signed-off-by: Mark Rutland <mark.rutland@arm.com>
+    Reviewed-by: Amit Daniel Kachhap <amit.kachhap@arm.com>
+    Reviewed-by: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+    Reviewed-by: Torsten Duwe <duwe@suse.de>
+    Tested-by: Amit Daniel Kachhap <amit.kachhap@arm.com>
+    Tested-by: Torsten Duwe <duwe@suse.de>
+    Cc: AKASHI Takahiro <takahiro.akashi@linaro.org>
+    Cc: Catalin Marinas <catalin.marinas@arm.com>
+    Cc: Josh Poimboeuf <jpoimboe@redhat.com>
+    Cc: Julien Thierry <jthierry@redhat.com>
+    Cc: Will Deacon <will@kernel.org>
+
+diff --git a/arch/arm64/kernel/module.c b/arch/arm64/kernel/module.c
+index d0692ecb99bb..1cd1a4d0ed30 100644
+--- a/arch/arm64/kernel/module.c
++++ b/arch/arm64/kernel/module.c
+@@ -486,21 +486,31 @@ static const Elf_Shdr *find_section(const Elf_Ehdr *hdr,
+ 	return NULL;
+ }
+ 
++static inline void __init_plt(struct plt_entry *plt, unsigned long addr)
++{
++	*plt = get_plt_entry(addr, plt);
++}
++
+ static int module_init_ftrace_plt(const Elf_Ehdr *hdr,
+ 				  const Elf_Shdr *sechdrs,
+ 				  struct module *mod)
+ {
+ #if defined(CONFIG_ARM64_MODULE_PLTS) && defined(CONFIG_DYNAMIC_FTRACE)
+ 	const Elf_Shdr *s;
+-	struct plt_entry *plt;
++	struct plt_entry *plts;
+ 
+ 	s = find_section(hdr, sechdrs, ".text.ftrace_trampoline");
+ 	if (!s)
+ 		return -ENOEXEC;
+ 
+-	plt = (void *)s->sh_addr;
+-	*plt = get_plt_entry(FTRACE_ADDR, plt);
+-	mod->arch.ftrace_trampoline = plt;
++	plts = (void *)s->sh_addr;
++
++	__init_plt(&plts[FTRACE_PLT_IDX], FTRACE_ADDR);
++
++	if (IS_ENABLED(CONFIG_DYNAMIC_FTRACE_WITH_REGS))
++		__init_plt(&plts[FTRACE_REGS_PLT_IDX], FTRACE_REGS_ADDR);
++
++	mod->arch.ftrace_trampolines = plts;
+ #endif
+ 	return 0;
+ }
+
+commit f1a54ae9af0da4d76239256ed640a93ab3aadac0
+Author: Mark Rutland <mark.rutland@arm.com>
+Date:   Thu Oct 17 15:26:38 2019 +0100
+
+    arm64: module/ftrace: intialize PLT at load time
+    
+    Currently we lazily-initialize a module's ftrace PLT at runtime when we
+    install the first ftrace call. To do so we have to apply a number of
+    sanity checks, transiently mark the module text as RW, and perform an
+    IPI as part of handling Neoverse-N1 erratum #1542419.
+    
+    We only expect the ftrace trampoline to point at ftrace_caller() (AKA
+    FTRACE_ADDR), so let's simplify all of this by intializing the PLT at
+    module load time, before the module loader marks the module RO and
+    performs the intial I-cache maintenance for the module.
+    
+    Thus we can rely on the module having been correctly intialized, and can
+    simplify the runtime work necessary to install an ftrace call in a
+    module. This will also allow for the removal of module_disable_ro().
+    
+    Tested by forcing ftrace_make_call() to use the module PLT, and then
+    loading up a module after setting up ftrace with:
+    
+    | echo ":mod:<module-name>" > set_ftrace_filter;
+    | echo function > current_tracer;
+    | modprobe <module-name>
+    
+    Since FTRACE_ADDR is only defined when CONFIG_DYNAMIC_FTRACE is
+    selected, we wrap its use along with most of module_init_ftrace_plt()
+    with ifdeffery rather than using IS_ENABLED().
+    
+    Signed-off-by: Mark Rutland <mark.rutland@arm.com>
+    Reviewed-by: Amit Daniel Kachhap <amit.kachhap@arm.com>
+    Reviewed-by: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+    Reviewed-by: Torsten Duwe <duwe@suse.de>
+    Tested-by: Amit Daniel Kachhap <amit.kachhap@arm.com>
+    Tested-by: Torsten Duwe <duwe@suse.de>
+    Cc: Catalin Marinas <catalin.marinas@arm.com>
+    Cc: James Morse <james.morse@arm.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Will Deacon <will@kernel.org>
+
+diff --git a/arch/arm64/kernel/module.c b/arch/arm64/kernel/module.c
+index 763a86d52fef..d0692ecb99bb 100644
+--- a/arch/arm64/kernel/module.c
++++ b/arch/arm64/kernel/module.c
+@@ -9,6 +9,7 @@
+ 
+ #include <linux/bitops.h>
+ #include <linux/elf.h>
++#include <linux/ftrace.h>
+ #include <linux/gfp.h>
+ #include <linux/kasan.h>
+ #include <linux/kernel.h>
+@@ -485,24 +486,33 @@ static const Elf_Shdr *find_section(const Elf_Ehdr *hdr,
+ 	return NULL;
+ }
+ 
++static int module_init_ftrace_plt(const Elf_Ehdr *hdr,
++				  const Elf_Shdr *sechdrs,
++				  struct module *mod)
++{
++#if defined(CONFIG_ARM64_MODULE_PLTS) && defined(CONFIG_DYNAMIC_FTRACE)
++	const Elf_Shdr *s;
++	struct plt_entry *plt;
++
++	s = find_section(hdr, sechdrs, ".text.ftrace_trampoline");
++	if (!s)
++		return -ENOEXEC;
++
++	plt = (void *)s->sh_addr;
++	*plt = get_plt_entry(FTRACE_ADDR, plt);
++	mod->arch.ftrace_trampoline = plt;
++#endif
++	return 0;
++}
++
+ int module_finalize(const Elf_Ehdr *hdr,
+ 		    const Elf_Shdr *sechdrs,
+ 		    struct module *me)
+ {
+ 	const Elf_Shdr *s;
+-
+ 	s = find_section(hdr, sechdrs, ".altinstructions");
+ 	if (s)
+ 		apply_alternatives_module((void *)s->sh_addr, s->sh_size);
+ 
+-#ifdef CONFIG_ARM64_MODULE_PLTS
+-	if (IS_ENABLED(CONFIG_DYNAMIC_FTRACE)) {
+-		s = find_section(hdr, sechdrs, ".text.ftrace_trampoline");
+-		if (!s)
+-			return -ENOEXEC;
+-		me->arch.ftrace_trampoline = (void *)s->sh_addr;
+-	}
+-#endif
+-
+-	return 0;
++	return module_init_ftrace_plt(hdr, sechdrs, me);
+ }
+
+commit bd8b21d3dd661658addc1cd4cc869bab11d28596
+Author: Mark Rutland <mark.rutland@arm.com>
+Date:   Thu Oct 17 14:03:26 2019 +0100
+
+    arm64: module: rework special section handling
+    
+    When we load a module, we have to perform some special work for a couple
+    of named sections. To do this, we iterate over all of the module's
+    sections, and perform work for each section we recognize.
+    
+    To make it easier to handle the unexpected absence of a section, and to
+    make the section-specific logic easer to read, let's factor the section
+    search into a helper. Similar is already done in the core module loader,
+    and other architectures (and ideally we'd unify these in future).
+    
+    If we expect a module to have an ftrace trampoline section, but it
+    doesn't have one, we'll now reject loading the module. When
+    ARM64_MODULE_PLTS is selected, any correctly built module should have
+    one (and this is assumed by arm64's ftrace PLT code) and the absence of
+    such a section implies something has gone wrong at build time.
+    
+    Subsequent patches will make use of the new helper.
+    
+    Signed-off-by: Mark Rutland <mark.rutland@arm.com>
+    Reviewed-by: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+    Reviewed-by: Torsten Duwe <duwe@suse.de>
+    Tested-by: Amit Daniel Kachhap <amit.kachhap@arm.com>
+    Tested-by: Torsten Duwe <duwe@suse.de>
+    Cc: Catalin Marinas <catalin.marinas@arm.com>
+    Cc: James Morse <james.morse@arm.com>
+    Cc: Will Deacon <will@kernel.org>
+
+diff --git a/arch/arm64/kernel/module.c b/arch/arm64/kernel/module.c
+index 03ff15bffbb6..763a86d52fef 100644
+--- a/arch/arm64/kernel/module.c
++++ b/arch/arm64/kernel/module.c
+@@ -470,22 +470,39 @@ int apply_relocate_add(Elf64_Shdr *sechdrs,
+ 	return -ENOEXEC;
+ }
+ 
+-int module_finalize(const Elf_Ehdr *hdr,
+-		    const Elf_Shdr *sechdrs,
+-		    struct module *me)
++static const Elf_Shdr *find_section(const Elf_Ehdr *hdr,
++				    const Elf_Shdr *sechdrs,
++				    const char *name)
+ {
+ 	const Elf_Shdr *s, *se;
+ 	const char *secstrs = (void *)hdr + sechdrs[hdr->e_shstrndx].sh_offset;
+ 
+ 	for (s = sechdrs, se = sechdrs + hdr->e_shnum; s < se; s++) {
+-		if (strcmp(".altinstructions", secstrs + s->sh_name) == 0)
+-			apply_alternatives_module((void *)s->sh_addr, s->sh_size);
++		if (strcmp(name, secstrs + s->sh_name) == 0)
++			return s;
++	}
++
++	return NULL;
++}
++
++int module_finalize(const Elf_Ehdr *hdr,
++		    const Elf_Shdr *sechdrs,
++		    struct module *me)
++{
++	const Elf_Shdr *s;
++
++	s = find_section(hdr, sechdrs, ".altinstructions");
++	if (s)
++		apply_alternatives_module((void *)s->sh_addr, s->sh_size);
++
+ #ifdef CONFIG_ARM64_MODULE_PLTS
+-		if (IS_ENABLED(CONFIG_DYNAMIC_FTRACE) &&
+-		    !strcmp(".text.ftrace_trampoline", secstrs + s->sh_name))
+-			me->arch.ftrace_trampoline = (void *)s->sh_addr;
+-#endif
++	if (IS_ENABLED(CONFIG_DYNAMIC_FTRACE)) {
++		s = find_section(hdr, sechdrs, ".text.ftrace_trampoline");
++		if (!s)
++			return -ENOEXEC;
++		me->arch.ftrace_trampoline = (void *)s->sh_addr;
+ 	}
++#endif
+ 
+ 	return 0;
+ }
+
+commit eca92a53a6ab9f27f1b61dcb3e16ebef75f0d5bb
+Author: Anders Roxell <anders.roxell@linaro.org>
+Date:   Fri Jul 26 13:27:21 2019 +0200
+
+    arm64: module: Mark expected switch fall-through
+    
+    When fall-through warnings was enabled by default the following warnings
+    was starting to show up:
+    
+    ../arch/arm64/kernel/module.c: In function ‘apply_relocate_add’:
+    ../arch/arm64/kernel/module.c:316:19: warning: this statement may fall
+     through [-Wimplicit-fallthrough=]
+        overflow_check = false;
+        ~~~~~~~~~~~~~~~^~~~~~~
+    ../arch/arm64/kernel/module.c:317:3: note: here
+       case R_AARCH64_MOVW_UABS_G0:
+       ^~~~
+    ../arch/arm64/kernel/module.c:322:19: warning: this statement may fall
+     through [-Wimplicit-fallthrough=]
+        overflow_check = false;
+        ~~~~~~~~~~~~~~~^~~~~~~
+    ../arch/arm64/kernel/module.c:323:3: note: here
+       case R_AARCH64_MOVW_UABS_G1:
+       ^~~~
+    
+    Rework so that the compiler doesn't warn about fall-through.
+    
+    Fixes: d93512ef0f0e ("Makefile: Globally enable fall-through warning")
+    Signed-off-by: Anders Roxell <anders.roxell@linaro.org>
+    Signed-off-by: Will Deacon <will@kernel.org>
+
+diff --git a/arch/arm64/kernel/module.c b/arch/arm64/kernel/module.c
+index 46e643e30708..03ff15bffbb6 100644
+--- a/arch/arm64/kernel/module.c
++++ b/arch/arm64/kernel/module.c
+@@ -314,18 +314,21 @@ int apply_relocate_add(Elf64_Shdr *sechdrs,
+ 		/* MOVW instruction relocations. */
+ 		case R_AARCH64_MOVW_UABS_G0_NC:
+ 			overflow_check = false;
++			/* Fall through */
+ 		case R_AARCH64_MOVW_UABS_G0:
+ 			ovf = reloc_insn_movw(RELOC_OP_ABS, loc, val, 0,
+ 					      AARCH64_INSN_IMM_MOVKZ);
+ 			break;
+ 		case R_AARCH64_MOVW_UABS_G1_NC:
+ 			overflow_check = false;
++			/* Fall through */
+ 		case R_AARCH64_MOVW_UABS_G1:
+ 			ovf = reloc_insn_movw(RELOC_OP_ABS, loc, val, 16,
+ 					      AARCH64_INSN_IMM_MOVKZ);
+ 			break;
+ 		case R_AARCH64_MOVW_UABS_G2_NC:
+ 			overflow_check = false;
++			/* Fall through */
+ 		case R_AARCH64_MOVW_UABS_G2:
+ 			ovf = reloc_insn_movw(RELOC_OP_ABS, loc, val, 32,
+ 					      AARCH64_INSN_IMM_MOVKZ);
+@@ -393,6 +396,7 @@ int apply_relocate_add(Elf64_Shdr *sechdrs,
+ 			break;
+ 		case R_AARCH64_ADR_PREL_PG_HI21_NC:
+ 			overflow_check = false;
++			/* Fall through */
+ 		case R_AARCH64_ADR_PREL_PG_HI21:
+ 			ovf = reloc_insn_adrp(me, sechdrs, loc, val);
+ 			if (ovf && ovf != -ERANGE)
+
+commit dfd437a257924484b144ee750e60affc95562c6d
+Merge: 0ecfebd2b524 0c61efd322b7
+Author: Linus Torvalds <torvalds@linux-foundation.org>
+Date:   Mon Jul 8 09:54:55 2019 -0700
+
+    Merge tag 'arm64-upstream' of git://git.kernel.org/pub/scm/linux/kernel/git/arm64/linux
+    
+    Pull arm64 updates from Catalin Marinas:
+    
+     - arm64 support for syscall emulation via PTRACE_SYSEMU{,_SINGLESTEP}
+    
+     - Wire up VM_FLUSH_RESET_PERMS for arm64, allowing the core code to
+       manage the permissions of executable vmalloc regions more strictly
+    
+     - Slight performance improvement by keeping softirqs enabled while
+       touching the FPSIMD/SVE state (kernel_neon_begin/end)
+    
+     - Expose a couple of ARMv8.5 features to user (HWCAP): CondM (new
+       XAFLAG and AXFLAG instructions for floating point comparison flags
+       manipulation) and FRINT (rounding floating point numbers to integers)
+    
+     - Re-instate ARM64_PSEUDO_NMI support which was previously marked as
+       BROKEN due to some bugs (now fixed)
+    
+     - Improve parking of stopped CPUs and implement an arm64-specific
+       panic_smp_self_stop() to avoid warning on not being able to stop
+       secondary CPUs during panic
+    
+     - perf: enable the ARM Statistical Profiling Extensions (SPE) on ACPI
+       platforms
+    
+     - perf: DDR performance monitor support for iMX8QXP
+    
+     - cache_line_size() can now be set from DT or ACPI/PPTT if provided to
+       cope with a system cache info not exposed via the CPUID registers
+    
+     - Avoid warning on hardware cache line size greater than
+       ARCH_DMA_MINALIGN if the system is fully coherent
+    
+     - arm64 do_page_fault() and hugetlb cleanups
+    
+     - Refactor set_pte_at() to avoid redundant READ_ONCE(*ptep)
+    
+     - Ignore ACPI 5.1 FADTs reported as 5.0 (infer from the
+       'arm_boot_flags' introduced in 5.1)
+    
+     - CONFIG_RANDOMIZE_BASE now enabled in defconfig
+    
+     - Allow the selection of ARM64_MODULE_PLTS, currently only done via
+       RANDOMIZE_BASE (and an erratum workaround), allowing modules to spill
+       over into the vmalloc area
+    
+     - Make ZONE_DMA32 configurable
+    
+    * tag 'arm64-upstream' of git://git.kernel.org/pub/scm/linux/kernel/git/arm64/linux: (54 commits)
+      perf: arm_spe: Enable ACPI/Platform automatic module loading
+      arm_pmu: acpi: spe: Add initial MADT/SPE probing
+      ACPI/PPTT: Add function to return ACPI 6.3 Identical tokens
+      ACPI/PPTT: Modify node flag detection to find last IDENTICAL
+      x86/entry: Simplify _TIF_SYSCALL_EMU handling
+      arm64: rename dump_instr as dump_kernel_instr
+      arm64/mm: Drop [PTE|PMD]_TYPE_FAULT
+      arm64: Implement panic_smp_self_stop()
+      arm64: Improve parking of stopped CPUs
+      arm64: Expose FRINT capabilities to userspace
+      arm64: Expose ARMv8.5 CondM capability to userspace
+      arm64: defconfig: enable CONFIG_RANDOMIZE_BASE
+      arm64: ARM64_MODULES_PLTS must depend on MODULES
+      arm64: bpf: do not allocate executable memory
+      arm64/kprobes: set VM_FLUSH_RESET_PERMS on kprobe instruction pages
+      arm64/mm: wire up CONFIG_ARCH_HAS_SET_DIRECT_MAP
+      arm64: module: create module allocations without exec permissions
+      arm64: Allow user selection of ARM64_MODULE_PLTS
+      acpi/arm64: ignore 5.1 FADTs that are reported as 5.0
+      arm64: Allow selecting Pseudo-NMI again
+      ...
+
+commit 4b1fe9b58e9d20f23f6b07d1c2e0dbd921da67bf
+Merge: 6fbc7275c7a9 aa69fb62bea1
+Author: Linus Torvalds <torvalds@linux-foundation.org>
+Date:   Wed Jul 3 15:57:30 2019 +0800
+
+    Merge tag 'arm64-fixes' of git://git.kernel.org/pub/scm/linux/kernel/git/arm64/linux
+    
+    Pull arm64 fixes from Will Deacon:
+     "Fix a build failure with the LLVM linker and a module allocation
+      failure when KASLR is active:
+    
+       - Fix module allocation when running with KASLR enabled
+    
+       - Fix broken build due to bug in LLVM linker (ld.lld)"
+    
+    * tag 'arm64-fixes' of git://git.kernel.org/pub/scm/linux/kernel/git/arm64/linux:
+      arm64/efi: Mark __efistub_stext_offset as an absolute symbol explicitly
+      arm64: kaslr: keep modules inside module region when KASAN is enabled
+
+commit 6f496a555d93db7a11d4860b9220d904822f586a
+Author: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+Date:   Tue Jun 25 19:08:54 2019 +0200
+
+    arm64: kaslr: keep modules inside module region when KASAN is enabled
+    
+    When KASLR and KASAN are both enabled, we keep the modules where they
+    are, and randomize the placement of the kernel so it is within 2 GB
+    of the module region. The reason for this is that putting modules in
+    the vmalloc region (like we normally do when KASLR is enabled) is not
+    possible in this case, given that the entire vmalloc region is already
+    backed by KASAN zero shadow pages, and so allocating dedicated KASAN
+    shadow space as required by loaded modules is not possible.
+    
+    The default module allocation window is set to [_etext - 128MB, _etext]
+    in kaslr.c, which is appropriate for KASLR kernels booted without a
+    seed or with 'nokaslr' on the command line. However, as it turns out,
+    it is not quite correct for the KASAN case, since it still intersects
+    the vmalloc region at the top, where attempts to allocate shadow pages
+    will collide with the KASAN zero shadow pages, causing a WARN() and all
+    kinds of other trouble. So cap the top end to MODULES_END explicitly
+    when running with KASAN.
+    
+    Cc: <stable@vger.kernel.org> # 4.9+
+    Acked-by: Catalin Marinas <catalin.marinas@arm.com>
+    Tested-by: Catalin Marinas <catalin.marinas@arm.com>
+    Signed-off-by: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+    Signed-off-by: Will Deacon <will@kernel.org>
+
+diff --git a/arch/arm64/kernel/module.c b/arch/arm64/kernel/module.c
+index dd080837e6a9..ed3706d6b3a0 100644
+--- a/arch/arm64/kernel/module.c
++++ b/arch/arm64/kernel/module.c
+@@ -32,6 +32,7 @@
+ 
+ void *module_alloc(unsigned long size)
+ {
++	u64 module_alloc_end = module_alloc_base + MODULES_VSIZE;
+ 	gfp_t gfp_mask = GFP_KERNEL;
+ 	void *p;
+ 
+@@ -39,9 +40,12 @@ void *module_alloc(unsigned long size)
+ 	if (IS_ENABLED(CONFIG_ARM64_MODULE_PLTS))
+ 		gfp_mask |= __GFP_NOWARN;
+ 
++	if (IS_ENABLED(CONFIG_KASAN))
++		/* don't exceed the static module region - see below */
++		module_alloc_end = MODULES_END;
++
+ 	p = __vmalloc_node_range(size, MODULE_ALIGN, module_alloc_base,
+-				module_alloc_base + MODULES_VSIZE,
+-				gfp_mask, PAGE_KERNEL_EXEC, 0,
++				module_alloc_end, gfp_mask, PAGE_KERNEL_EXEC, 0,
+ 				NUMA_NO_NODE, __builtin_return_address(0));
+ 
+ 	if (!p && IS_ENABLED(CONFIG_ARM64_MODULE_PLTS) &&
+
+commit 7dfac3c5f40eb92841147eccf1b96f428b10131f
+Author: Ard Biesheuvel <ard.biesheuvel@arm.com>
+Date:   Thu May 23 11:22:53 2019 +0100
+
+    arm64: module: create module allocations without exec permissions
+    
+    Now that the core code manages the executable permissions of code
+    regions of modules explicitly, it is no longer necessary to create
+    the module vmalloc regions with RWX permissions, and we can create
+    them with RW- permissions instead, which is preferred from a
+    security perspective.
+    
+    Acked-by: Will Deacon <will@kernel.org>
+    Signed-off-by: Ard Biesheuvel <ard.biesheuvel@arm.com>
+    Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+
+diff --git a/arch/arm64/kernel/module.c b/arch/arm64/kernel/module.c
+index dd080837e6a9..5b5936b7868c 100644
+--- a/arch/arm64/kernel/module.c
++++ b/arch/arm64/kernel/module.c
+@@ -41,7 +41,7 @@ void *module_alloc(unsigned long size)
+ 
+ 	p = __vmalloc_node_range(size, MODULE_ALIGN, module_alloc_base,
+ 				module_alloc_base + MODULES_VSIZE,
+-				gfp_mask, PAGE_KERNEL_EXEC, 0,
++				gfp_mask, PAGE_KERNEL, 0,
+ 				NUMA_NO_NODE, __builtin_return_address(0));
+ 
+ 	if (!p && IS_ENABLED(CONFIG_ARM64_MODULE_PLTS) &&
+@@ -57,7 +57,7 @@ void *module_alloc(unsigned long size)
+ 		 */
+ 		p = __vmalloc_node_range(size, MODULE_ALIGN, module_alloc_base,
+ 				module_alloc_base + SZ_2G, GFP_KERNEL,
+-				PAGE_KERNEL_EXEC, 0, NUMA_NO_NODE,
++				PAGE_KERNEL, 0, NUMA_NO_NODE,
+ 				__builtin_return_address(0));
+ 
+ 	if (p && (kasan_module_alloc(p, size) < 0)) {
+
+commit caab277b1de0a22b675c4c95fc7b285ec2eb5bf5
+Author: Thomas Gleixner <tglx@linutronix.de>
+Date:   Mon Jun 3 07:44:50 2019 +0200
+
+    treewide: Replace GPLv2 boilerplate/reference with SPDX - rule 234
+    
+    Based on 1 normalized pattern(s):
+    
+      this program is free software you can redistribute it and or modify
+      it under the terms of the gnu general public license version 2 as
+      published by the free software foundation this program is
+      distributed in the hope that it will be useful but without any
+      warranty without even the implied warranty of merchantability or
+      fitness for a particular purpose see the gnu general public license
+      for more details you should have received a copy of the gnu general
+      public license along with this program if not see http www gnu org
+      licenses
+    
+    extracted by the scancode license scanner the SPDX license identifier
+    
+      GPL-2.0-only
+    
+    has been chosen to replace the boilerplate/reference in 503 file(s).
+    
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Reviewed-by: Alexios Zavras <alexios.zavras@intel.com>
+    Reviewed-by: Allison Randal <allison@lohutok.net>
+    Reviewed-by: Enrico Weigelt <info@metux.net>
+    Cc: linux-spdx@vger.kernel.org
+    Link: https://lkml.kernel.org/r/20190602204653.811534538@linutronix.de
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/arch/arm64/kernel/module.c b/arch/arm64/kernel/module.c
+index dd080837e6a9..e23a68a5808f 100644
+--- a/arch/arm64/kernel/module.c
++++ b/arch/arm64/kernel/module.c
+@@ -1,20 +1,9 @@
++// SPDX-License-Identifier: GPL-2.0-only
+ /*
+  * AArch64 loadable module support.
+  *
+  * Copyright (C) 2012 ARM Limited
+  *
+- * This program is free software; you can redistribute it and/or modify
+- * it under the terms of the GNU General Public License version 2 as
+- * published by the Free Software Foundation.
+- *
+- * This program is distributed in the hope that it will be useful,
+- * but WITHOUT ANY WARRANTY; without even the implied warranty of
+- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+- * GNU General Public License for more details.
+- *
+- * You should have received a copy of the GNU General Public License
+- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+- *
+  * Author: Will Deacon <will.deacon@arm.com>
+  */
+ 
+
+commit 3fd00beb14a56c5ca10c3f67e5b8156f4f9223b5
+Author: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+Date:   Tue May 28 16:13:16 2019 +0200
+
+    arm64/module: revert to unsigned interpretation of ABS16/32 relocations
+    
+    Commit 1cf24a2cc3fd
+    
+      ("arm64/module: deal with ambiguity in PRELxx relocation ranges")
+    
+    updated the overflow checking logic in the relocation handling code to
+    ensure that PREL16/32 relocations don't overflow signed quantities.
+    
+    However, the same code path is used for absolute relocations, where the
+    interpretation is the opposite: the only current use case for absolute
+    relocations operating on non-native word size quantities is the CRC32
+    handling in the CONFIG_MODVERSIONS code, and these CRCs are unsigned
+    32-bit quantities, which are now being rejected by the module loader
+    if bit 31 happens to be set.
+    
+    So let's use different ranges for quanties subject to absolute vs.
+    relative relocations:
+    - ABS16/32 relocations should be in the range [0, Uxx_MAX)
+    - PREL16/32 relocations should be in the range [Sxx_MIN, Sxx_MAX)
+    - otherwise, print an error since no other 16 or 32 bit wide data
+      relocations are currently supported.
+    
+    Signed-off-by: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+    Signed-off-by: Will Deacon <will.deacon@arm.com>
+
+diff --git a/arch/arm64/kernel/module.c b/arch/arm64/kernel/module.c
+index f32359cffb01..dd080837e6a9 100644
+--- a/arch/arm64/kernel/module.c
++++ b/arch/arm64/kernel/module.c
+@@ -98,10 +98,10 @@ static int reloc_data(enum aarch64_reloc_op op, void *place, u64 val, int len)
+ 
+ 	/*
+ 	 * The ELF psABI for AArch64 documents the 16-bit and 32-bit place
+-	 * relative relocations as having a range of [-2^15, 2^16) or
+-	 * [-2^31, 2^32), respectively. However, in order to be able to detect
+-	 * overflows reliably, we have to choose whether we interpret such
+-	 * quantities as signed or as unsigned, and stick with it.
++	 * relative and absolute relocations as having a range of [-2^15, 2^16)
++	 * or [-2^31, 2^32), respectively. However, in order to be able to
++	 * detect overflows reliably, we have to choose whether we interpret
++	 * such quantities as signed or as unsigned, and stick with it.
+ 	 * The way we organize our address space requires a signed
+ 	 * interpretation of 32-bit relative references, so let's use that
+ 	 * for all R_AARCH64_PRELxx relocations. This means our upper
+@@ -111,13 +111,35 @@ static int reloc_data(enum aarch64_reloc_op op, void *place, u64 val, int len)
+ 	switch (len) {
+ 	case 16:
+ 		*(s16 *)place = sval;
+-		if (sval < S16_MIN || sval > S16_MAX)
+-			return -ERANGE;
++		switch (op) {
++		case RELOC_OP_ABS:
++			if (sval < 0 || sval > U16_MAX)
++				return -ERANGE;
++			break;
++		case RELOC_OP_PREL:
++			if (sval < S16_MIN || sval > S16_MAX)
++				return -ERANGE;
++			break;
++		default:
++			pr_err("Invalid 16-bit data relocation (%d)\n", op);
++			return 0;
++		}
+ 		break;
+ 	case 32:
+ 		*(s32 *)place = sval;
+-		if (sval < S32_MIN || sval > S32_MAX)
+-			return -ERANGE;
++		switch (op) {
++		case RELOC_OP_ABS:
++			if (sval < 0 || sval > U32_MAX)
++				return -ERANGE;
++			break;
++		case RELOC_OP_PREL:
++			if (sval < S32_MIN || sval > S32_MAX)
++				return -ERANGE;
++			break;
++		default:
++			pr_err("Invalid 32-bit data relocation (%d)\n", op);
++			return 0;
++		}
+ 		break;
+ 	case 64:
+ 		*(s64 *)place = sval;
+
+commit 1cf24a2cc3fd40942b0f9e6199aaec579e89a832
+Author: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+Date:   Thu May 23 11:38:54 2019 +0100
+
+    arm64/module: deal with ambiguity in PRELxx relocation ranges
+    
+    The R_AARCH64_PREL16 and R_AARCH64_PREL32 relocations are
+    documented as permitting a range of [-2^15 .. 2^16), resp.
+    [-2^31 .. 2^32). It is also documented that this means we
+    cannot detect overflow in some cases, which is bad.
+    
+    Since we always interpret the targets of these relocations as
+    signed quantities (e.g., in the ksymtab handling code), let's
+    tighten the overflow checks so that targets that are out of
+    range for our signed interpretation of the relocated quantity
+    get flagged.
+    
+    Signed-off-by: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+    Signed-off-by: Will Deacon <will.deacon@arm.com>
+
+diff --git a/arch/arm64/kernel/module.c b/arch/arm64/kernel/module.c
+index 1e418e69b58c..f32359cffb01 100644
+--- a/arch/arm64/kernel/module.c
++++ b/arch/arm64/kernel/module.c
+@@ -96,15 +96,27 @@ static int reloc_data(enum aarch64_reloc_op op, void *place, u64 val, int len)
+ {
+ 	s64 sval = do_reloc(op, place, val);
+ 
++	/*
++	 * The ELF psABI for AArch64 documents the 16-bit and 32-bit place
++	 * relative relocations as having a range of [-2^15, 2^16) or
++	 * [-2^31, 2^32), respectively. However, in order to be able to detect
++	 * overflows reliably, we have to choose whether we interpret such
++	 * quantities as signed or as unsigned, and stick with it.
++	 * The way we organize our address space requires a signed
++	 * interpretation of 32-bit relative references, so let's use that
++	 * for all R_AARCH64_PRELxx relocations. This means our upper
++	 * bound for overflow detection should be Sxx_MAX rather than Uxx_MAX.
++	 */
++
+ 	switch (len) {
+ 	case 16:
+ 		*(s16 *)place = sval;
+-		if (sval < S16_MIN || sval > U16_MAX)
++		if (sval < S16_MIN || sval > S16_MAX)
+ 			return -ERANGE;
+ 		break;
+ 	case 32:
+ 		*(s32 *)place = sval;
+-		if (sval < S32_MIN || sval > U32_MAX)
++		if (sval < S32_MIN || sval > S32_MAX)
+ 			return -ERANGE;
+ 		break;
+ 	case 64:
+
+commit b2eed9b58811283d00fa861944cb75797d4e52a7
+Author: Ard Biesheuvel <ard.biesheuvel@arm.com>
+Date:   Thu May 23 10:17:37 2019 +0100
+
+    arm64/kernel: kaslr: reduce module randomization range to 2 GB
+    
+    The following commit
+    
+      7290d5809571 ("module: use relative references for __ksymtab entries")
+    
+    updated the ksymtab handling of some KASLR capable architectures
+    so that ksymtab entries are emitted as pairs of 32-bit relative
+    references. This reduces the size of the entries, but more
+    importantly, it gets rid of statically assigned absolute
+    addresses, which require fixing up at boot time if the kernel
+    is self relocating (which takes a 24 byte RELA entry for each
+    member of the ksymtab struct).
+    
+    Since ksymtab entries are always part of the same module as the
+    symbol they export, it was assumed at the time that a 32-bit
+    relative reference is always sufficient to capture the offset
+    between a ksymtab entry and its target symbol.
+    
+    Unfortunately, this is not always true: in the case of per-CPU
+    variables, a per-CPU variable's base address (which usually differs
+    from the actual address of any of its per-CPU copies) is allocated
+    in the vicinity of the ..data.percpu section in the core kernel
+    (i.e., in the per-CPU reserved region which follows the section
+    containing the core kernel's statically allocated per-CPU variables).
+    
+    Since we randomize the module space over a 4 GB window covering
+    the core kernel (based on the -/+ 4 GB range of an ADRP/ADD pair),
+    we may end up putting the core kernel out of the -/+ 2 GB range of
+    32-bit relative references of module ksymtab entries that refer to
+    per-CPU variables.
+    
+    So reduce the module randomization range a bit further. We lose
+    1 bit of randomization this way, but this is something we can
+    tolerate.
+    
+    Cc: <stable@vger.kernel.org> # v4.19+
+    Signed-off-by: Ard Biesheuvel <ard.biesheuvel@arm.com>
+    Signed-off-by: Will Deacon <will.deacon@arm.com>
+
+diff --git a/arch/arm64/kernel/module.c b/arch/arm64/kernel/module.c
+index f713e2fc4d75..1e418e69b58c 100644
+--- a/arch/arm64/kernel/module.c
++++ b/arch/arm64/kernel/module.c
+@@ -56,7 +56,7 @@ void *module_alloc(unsigned long size)
+ 		 * can simply omit this fallback in that case.
+ 		 */
+ 		p = __vmalloc_node_range(size, MODULE_ALIGN, module_alloc_base,
+-				module_alloc_base + SZ_4G, GFP_KERNEL,
++				module_alloc_base + SZ_2G, GFP_KERNEL,
+ 				PAGE_KERNEL_EXEC, 0, NUMA_NO_NODE,
+ 				__builtin_return_address(0));
+ 
+
+commit bdb85cd1d20669dfae813555dddb745ad09323ba
+Author: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+Date:   Thu Nov 22 09:46:46 2018 +0100
+
+    arm64/module: switch to ADRP/ADD sequences for PLT entries
+    
+    Now that we have switched to the small code model entirely, and
+    reduced the extended KASLR range to 4 GB, we can be sure that the
+    targets of relative branches that are out of range are in range
+    for a ADRP/ADD pair, which is one instruction shorter than our
+    current MOVN/MOVK/MOVK sequence, and is more idiomatic and so it
+    is more likely to be implemented efficiently by micro-architectures.
+    
+    So switch over the ordinary PLT code and the special handling of
+    the Cortex-A53 ADRP errata, as well as the ftrace trampline
+    handling.
+    
+    Reviewed-by: Torsten Duwe <duwe@lst.de>
+    Signed-off-by: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+    [will: Added a couple of comments in the plt equality check]
+    Signed-off-by: Will Deacon <will.deacon@arm.com>
+
+diff --git a/arch/arm64/kernel/module.c b/arch/arm64/kernel/module.c
+index c2abe59c6f8f..f713e2fc4d75 100644
+--- a/arch/arm64/kernel/module.c
++++ b/arch/arm64/kernel/module.c
+@@ -203,9 +203,7 @@ static int reloc_insn_adrp(struct module *mod, Elf64_Shdr *sechdrs,
+ {
+ 	u32 insn;
+ 
+-	if (!IS_ENABLED(CONFIG_ARM64_ERRATUM_843419) ||
+-	    !cpus_have_const_cap(ARM64_WORKAROUND_843419) ||
+-	    ((u64)place & 0xfff) < 0xff8)
++	if (!is_forbidden_offset_for_adrp(place))
+ 		return reloc_insn_imm(RELOC_OP_PAGE, place, val, 12, 21,
+ 				      AARCH64_INSN_IMM_ADR);
+ 
+
+commit c8ebf64eab743130fe404dc6679c2ff0cbc01615
+Author: Jessica Yu <jeyu@kernel.org>
+Date:   Mon Nov 5 19:53:23 2018 +0100
+
+    arm64/module: use plt section indices for relocations
+    
+    Instead of saving a pointer to the .plt and .init.plt sections to apply
+    plt-based relocations, save and use their section indices instead.
+    
+    The mod->arch.{core,init}.plt pointers were problematic for livepatch
+    because they pointed within temporary section headers (provided by the
+    module loader via info->sechdrs) that would be freed after module load.
+    Since livepatch modules may need to apply relocations post-module-load
+    (for example, to patch a module that is loaded later), using section
+    indices to offset into the section headers (instead of accessing them
+    through a saved pointer) allows livepatch modules on arm64 to pass in
+    their own copy of the section headers to apply_relocate_add() to apply
+    delayed relocations.
+    
+    Reviewed-by: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+    Reviewed-by: Miroslav Benes <mbenes@suse.cz>
+    Signed-off-by: Jessica Yu <jeyu@kernel.org>
+    Signed-off-by: Will Deacon <will.deacon@arm.com>
+
+diff --git a/arch/arm64/kernel/module.c b/arch/arm64/kernel/module.c
+index f0f27aeefb73..c2abe59c6f8f 100644
+--- a/arch/arm64/kernel/module.c
++++ b/arch/arm64/kernel/module.c
+@@ -198,7 +198,8 @@ static int reloc_insn_imm(enum aarch64_reloc_op op, __le32 *place, u64 val,
+ 	return 0;
+ }
+ 
+-static int reloc_insn_adrp(struct module *mod, __le32 *place, u64 val)
++static int reloc_insn_adrp(struct module *mod, Elf64_Shdr *sechdrs,
++			   __le32 *place, u64 val)
+ {
+ 	u32 insn;
+ 
+@@ -215,7 +216,7 @@ static int reloc_insn_adrp(struct module *mod, __le32 *place, u64 val)
+ 		insn &= ~BIT(31);
+ 	} else {
+ 		/* out of range for ADR -> emit a veneer */
+-		val = module_emit_veneer_for_adrp(mod, place, val & ~0xfff);
++		val = module_emit_veneer_for_adrp(mod, sechdrs, place, val & ~0xfff);
+ 		if (!val)
+ 			return -ENOEXEC;
+ 		insn = aarch64_insn_gen_branch_imm((u64)place, val,
+@@ -368,7 +369,7 @@ int apply_relocate_add(Elf64_Shdr *sechdrs,
+ 		case R_AARCH64_ADR_PREL_PG_HI21_NC:
+ 			overflow_check = false;
+ 		case R_AARCH64_ADR_PREL_PG_HI21:
+-			ovf = reloc_insn_adrp(me, loc, val);
++			ovf = reloc_insn_adrp(me, sechdrs, loc, val);
+ 			if (ovf && ovf != -ERANGE)
+ 				return ovf;
+ 			break;
+@@ -413,7 +414,7 @@ int apply_relocate_add(Elf64_Shdr *sechdrs,
+ 
+ 			if (IS_ENABLED(CONFIG_ARM64_MODULE_PLTS) &&
+ 			    ovf == -ERANGE) {
+-				val = module_emit_plt_entry(me, loc, &rel[i], sym);
++				val = module_emit_plt_entry(me, sechdrs, loc, &rel[i], sym);
+ 				if (!val)
+ 					return -ENOEXEC;
+ 				ovf = reloc_insn_imm(RELOC_OP_PREL, loc, val, 2,
+
+commit 429388682dc266e7a693f9c27e3aabd341d55343
+Author: Will Deacon <will.deacon@arm.com>
+Date:   Fri Jun 22 09:31:15 2018 +0100
+
+    arm64: Avoid flush_icache_range() in alternatives patching code
+    
+    The implementation of flush_icache_range() includes instruction sequences
+    which are themselves patched at runtime, so it is not safe to call from
+    the patching framework.
+    
+    This patch reworks the alternatives cache-flushing code so that it rolls
+    its own internal D-cache maintenance using DC CIVAC before invalidating
+    the entire I-cache after all alternatives have been applied at boot.
+    Modules don't cause any issues, since flush_icache_range() is safe to
+    call by the time they are loaded.
+    
+    Acked-by: Mark Rutland <mark.rutland@arm.com>
+    Reported-by: Rohit Khanna <rokhanna@nvidia.com>
+    Cc: Alexander Van Brunt <avanbrunt@nvidia.com>
+    Signed-off-by: Will Deacon <will.deacon@arm.com>
+    Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+
+diff --git a/arch/arm64/kernel/module.c b/arch/arm64/kernel/module.c
+index 155fd91e78f4..f0f27aeefb73 100644
+--- a/arch/arm64/kernel/module.c
++++ b/arch/arm64/kernel/module.c
+@@ -448,9 +448,8 @@ int module_finalize(const Elf_Ehdr *hdr,
+ 	const char *secstrs = (void *)hdr + sechdrs[hdr->e_shstrndx].sh_offset;
+ 
+ 	for (s = sechdrs, se = sechdrs + hdr->e_shnum; s < se; s++) {
+-		if (strcmp(".altinstructions", secstrs + s->sh_name) == 0) {
+-			apply_alternatives((void *)s->sh_addr, s->sh_size);
+-		}
++		if (strcmp(".altinstructions", secstrs + s->sh_name) == 0)
++			apply_alternatives_module((void *)s->sh_addr, s->sh_size);
+ #ifdef CONFIG_ARM64_MODULE_PLTS
+ 		if (IS_ENABLED(CONFIG_DYNAMIC_FTRACE) &&
+ 		    !strcmp(".text.ftrace_trampoline", secstrs + s->sh_name))
+
+commit ed231ae384fdfcb546b63b2fe7add65029e3a94c
+Author: Kim Phillips <kim.phillips@arm.com>
+Date:   Tue Apr 24 10:39:43 2018 -0500
+
+    arm64/kernel: rename module_emit_adrp_veneer->module_emit_veneer_for_adrp
+    
+    Commit a257e02579e ("arm64/kernel: don't ban ADRP to work around
+    Cortex-A53 erratum #843419") introduced a function whose name ends with
+    "_veneer".
+    
+    This clashes with commit bd8b22d2888e ("Kbuild: kallsyms: ignore veneers
+    emitted by the ARM linker"), which removes symbols ending in "_veneer"
+    from kallsyms.
+    
+    The problem was manifested as 'perf test -vvvvv vmlinux' failed,
+    correctly claiming the symbol 'module_emit_adrp_veneer' was present in
+    vmlinux, but not in kallsyms.
+    
+    ...
+        ERR : 0xffff00000809aa58: module_emit_adrp_veneer not on kallsyms
+    ...
+        test child finished with -1
+        ---- end ----
+        vmlinux symtab matches kallsyms: FAILED!
+    
+    Fix the problem by renaming module_emit_adrp_veneer to
+    module_emit_veneer_for_adrp.  Now the test passes.
+    
+    Fixes: a257e02579e ("arm64/kernel: don't ban ADRP to work around Cortex-A53 erratum #843419")
+    Acked-by: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+    Cc: Will Deacon <will.deacon@arm.com>
+    Cc: Catalin Marinas <catalin.marinas@arm.com>
+    Cc: Michal Marek <mmarek@suse.cz>
+    Signed-off-by: Kim Phillips <kim.phillips@arm.com>
+    Signed-off-by: Will Deacon <will.deacon@arm.com>
+
+diff --git a/arch/arm64/kernel/module.c b/arch/arm64/kernel/module.c
+index 719fde8dcc19..155fd91e78f4 100644
+--- a/arch/arm64/kernel/module.c
++++ b/arch/arm64/kernel/module.c
+@@ -215,7 +215,7 @@ static int reloc_insn_adrp(struct module *mod, __le32 *place, u64 val)
+ 		insn &= ~BIT(31);
+ 	} else {
+ 		/* out of range for ADR -> emit a veneer */
+-		val = module_emit_adrp_veneer(mod, place, val & ~0xfff);
++		val = module_emit_veneer_for_adrp(mod, place, val & ~0xfff);
+ 		if (!val)
+ 			return -ENOEXEC;
+ 		insn = aarch64_insn_gen_branch_imm((u64)place, val,
+
+commit ca79acca273630935f2cfdfdf3fc7425ff51ce1c
+Author: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+Date:   Tue Mar 6 17:15:35 2018 +0000
+
+    arm64/kernel: enable A53 erratum #8434319 handling at runtime
+    
+    Omit patching of ADRP instruction at module load time if the current
+    CPUs are not susceptible to the erratum.
+    
+    Signed-off-by: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+    [will: Drop duplicate initialisation of .def_scope field]
+    Signed-off-by: Will Deacon <will.deacon@arm.com>
+
+diff --git a/arch/arm64/kernel/module.c b/arch/arm64/kernel/module.c
+index f9d824947c34..719fde8dcc19 100644
+--- a/arch/arm64/kernel/module.c
++++ b/arch/arm64/kernel/module.c
+@@ -203,6 +203,7 @@ static int reloc_insn_adrp(struct module *mod, __le32 *place, u64 val)
+ 	u32 insn;
+ 
+ 	if (!IS_ENABLED(CONFIG_ARM64_ERRATUM_843419) ||
++	    !cpus_have_const_cap(ARM64_WORKAROUND_843419) ||
+ 	    ((u64)place & 0xfff) < 0xff8)
+ 		return reloc_insn_imm(RELOC_OP_PAGE, place, val, 12, 21,
+ 				      AARCH64_INSN_IMM_ADR);
+
+commit a257e02579e42703de1b7825cbd56cd7191f97b0
+Author: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+Date:   Tue Mar 6 17:15:33 2018 +0000
+
+    arm64/kernel: don't ban ADRP to work around Cortex-A53 erratum #843419
+    
+    Working around Cortex-A53 erratum #843419 involves special handling of
+    ADRP instructions that end up in the last two instruction slots of a
+    4k page, or whose output register gets overwritten without having been
+    read. (Note that the latter instruction sequence is never emitted by
+    a properly functioning compiler, which is why it is disregarded by the
+    handling of the same erratum in the bfd.ld linker which we rely on for
+    the core kernel)
+    
+    Normally, this gets taken care of by the linker, which can spot such
+    sequences at final link time, and insert a veneer if the ADRP ends up
+    at a vulnerable offset. However, linux kernel modules are partially
+    linked ELF objects, and so there is no 'final link time' other than the
+    runtime loading of the module, at which time all the static relocations
+    are resolved.
+    
+    For this reason, we have implemented the #843419 workaround for modules
+    by avoiding ADRP instructions altogether, by using the large C model,
+    and by passing -mpc-relative-literal-loads to recent versions of GCC
+    that may emit adrp/ldr pairs to perform literal loads. However, this
+    workaround forces us to keep literal data mixed with the instructions
+    in the executable .text segment, and literal data may inadvertently
+    turn into an exploitable speculative gadget depending on the relative
+    offsets of arbitrary symbols.
+    
+    So let's reimplement this workaround in a way that allows us to switch
+    back to the small C model, and to drop the -mpc-relative-literal-loads
+    GCC switch, by patching affected ADRP instructions at runtime:
+    - ADRP instructions that do not appear at 4k relative offset 0xff8 or
+      0xffc are ignored
+    - ADRP instructions that are within 1 MB of their target symbol are
+      converted into ADR instructions
+    - remaining ADRP instructions are redirected via a veneer that performs
+      the load using an unaffected movn/movk sequence.
+    
+    Signed-off-by: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+    [will: tidied up ADRP -> ADR instruction patching.]
+    [will: use ULL suffix for 64-bit immediate]
+    Signed-off-by: Will Deacon <will.deacon@arm.com>
+
+diff --git a/arch/arm64/kernel/module.c b/arch/arm64/kernel/module.c
+index 70c3e5518e95..f9d824947c34 100644
+--- a/arch/arm64/kernel/module.c
++++ b/arch/arm64/kernel/module.c
+@@ -198,6 +198,33 @@ static int reloc_insn_imm(enum aarch64_reloc_op op, __le32 *place, u64 val,
+ 	return 0;
+ }
+ 
++static int reloc_insn_adrp(struct module *mod, __le32 *place, u64 val)
++{
++	u32 insn;
++
++	if (!IS_ENABLED(CONFIG_ARM64_ERRATUM_843419) ||
++	    ((u64)place & 0xfff) < 0xff8)
++		return reloc_insn_imm(RELOC_OP_PAGE, place, val, 12, 21,
++				      AARCH64_INSN_IMM_ADR);
++
++	/* patch ADRP to ADR if it is in range */
++	if (!reloc_insn_imm(RELOC_OP_PREL, place, val & ~0xfff, 0, 21,
++			    AARCH64_INSN_IMM_ADR)) {
++		insn = le32_to_cpu(*place);
++		insn &= ~BIT(31);
++	} else {
++		/* out of range for ADR -> emit a veneer */
++		val = module_emit_adrp_veneer(mod, place, val & ~0xfff);
++		if (!val)
++			return -ENOEXEC;
++		insn = aarch64_insn_gen_branch_imm((u64)place, val,
++						   AARCH64_INSN_BRANCH_NOLINK);
++	}
++
++	*place = cpu_to_le32(insn);
++	return 0;
++}
++
+ int apply_relocate_add(Elf64_Shdr *sechdrs,
+ 		       const char *strtab,
+ 		       unsigned int symindex,
+@@ -337,14 +364,13 @@ int apply_relocate_add(Elf64_Shdr *sechdrs,
+ 			ovf = reloc_insn_imm(RELOC_OP_PREL, loc, val, 0, 21,
+ 					     AARCH64_INSN_IMM_ADR);
+ 			break;
+-#ifndef CONFIG_ARM64_ERRATUM_843419
+ 		case R_AARCH64_ADR_PREL_PG_HI21_NC:
+ 			overflow_check = false;
+ 		case R_AARCH64_ADR_PREL_PG_HI21:
+-			ovf = reloc_insn_imm(RELOC_OP_PAGE, loc, val, 12, 21,
+-					     AARCH64_INSN_IMM_ADR);
++			ovf = reloc_insn_adrp(me, loc, val);
++			if (ovf && ovf != -ERANGE)
++				return ovf;
+ 			break;
+-#endif
+ 		case R_AARCH64_ADD_ABS_LO12_NC:
+ 		case R_AARCH64_LDST8_ABS_LO12_NC:
+ 			overflow_check = false;
+
+commit f2b9ba871beb92fd6884b957acb14621b15fbe2b
+Author: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+Date:   Tue Mar 6 17:15:32 2018 +0000
+
+    arm64/kernel: kaslr: reduce module randomization range to 4 GB
+    
+    We currently have to rely on the GCC large code model for KASLR for
+    two distinct but related reasons:
+    - if we enable full randomization, modules will be loaded very far away
+      from the core kernel, where they are out of range for ADRP instructions,
+    - even without full randomization, the fact that the 128 MB module region
+      is now no longer fully reserved for kernel modules means that there is
+      a very low likelihood that the normal bottom-up allocation of other
+      vmalloc regions may collide, and use up the range for other things.
+    
+    Large model code is suboptimal, given that each symbol reference involves
+    a literal load that goes through the D-cache, reducing cache utilization.
+    But more importantly, literals are not instructions but part of .text
+    nonetheless, and hence mapped with executable permissions.
+    
+    So let's get rid of our dependency on the large model for KASLR, by:
+    - reducing the full randomization range to 4 GB, thereby ensuring that
+      ADRP references between modules and the kernel are always in range,
+    - reduce the spillover range to 4 GB as well, so that we fallback to a
+      region that is still guaranteed to be in range
+    - move the randomization window of the core kernel to the middle of the
+      VMALLOC space
+    
+    Note that KASAN always uses the module region outside of the vmalloc space,
+    so keep the kernel close to that if KASAN is enabled.
+    
+    Signed-off-by: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+    Signed-off-by: Will Deacon <will.deacon@arm.com>
+
+diff --git a/arch/arm64/kernel/module.c b/arch/arm64/kernel/module.c
+index c8c6c2828b79..70c3e5518e95 100644
+--- a/arch/arm64/kernel/module.c
++++ b/arch/arm64/kernel/module.c
+@@ -55,9 +55,10 @@ void *module_alloc(unsigned long size)
+ 		 * less likely that the module region gets exhausted, so we
+ 		 * can simply omit this fallback in that case.
+ 		 */
+-		p = __vmalloc_node_range(size, MODULE_ALIGN, VMALLOC_START,
+-				VMALLOC_END, GFP_KERNEL, PAGE_KERNEL_EXEC, 0,
+-				NUMA_NO_NODE, __builtin_return_address(0));
++		p = __vmalloc_node_range(size, MODULE_ALIGN, module_alloc_base,
++				module_alloc_base + SZ_4G, GFP_KERNEL,
++				PAGE_KERNEL_EXEC, 0, NUMA_NO_NODE,
++				__builtin_return_address(0));
+ 
+ 	if (p && (kasan_module_alloc(p, size) < 0)) {
+ 		vfree(p);
+
+commit 5e8307b9c6f40526f290663e5a4de0f78bb0446a
+Author: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+Date:   Tue Mar 6 17:15:31 2018 +0000
+
+    arm64: module: don't BUG when exceeding preallocated PLT count
+    
+    When PLTs are emitted at relocation time, we really should not exceed
+    the number that we counted when parsing the relocation tables, and so
+    currently, we BUG() on this condition. However, even though this is a
+    clear bug in this particular piece of code, we can easily recover by
+    failing to load the module.
+    
+    So instead, return 0 from module_emit_plt_entry() if this condition
+    occurs, which is not a valid kernel address, and can hence serve as
+    a flag value that makes the relocation routine bail out.
+    
+    Signed-off-by: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+    Signed-off-by: Will Deacon <will.deacon@arm.com>
+
+diff --git a/arch/arm64/kernel/module.c b/arch/arm64/kernel/module.c
+index f469e0435903..c8c6c2828b79 100644
+--- a/arch/arm64/kernel/module.c
++++ b/arch/arm64/kernel/module.c
+@@ -386,6 +386,8 @@ int apply_relocate_add(Elf64_Shdr *sechdrs,
+ 			if (IS_ENABLED(CONFIG_ARM64_MODULE_PLTS) &&
+ 			    ovf == -ERANGE) {
+ 				val = module_emit_plt_entry(me, loc, &rel[i], sym);
++				if (!val)
++					return -ENOEXEC;
+ 				ovf = reloc_insn_imm(RELOC_OP_PREL, loc, val, 2,
+ 						     26, AARCH64_INSN_IMM_26);
+ 			}
+
+commit 02129ae5fea83294b45c8f16c4ff14ae94e6858d
+Author: Luc Van Oostenryck <luc.vanoostenryck@gmail.com>
+Date:   Wed Jun 28 16:56:00 2017 +0200
+
+    arm64: fix endianness annotation for reloc_insn_movw() & reloc_insn_imm()
+    
+    Here the functions reloc_insn_movw() & reloc_insn_imm() are used
+    to read, modify and write back ARM instructions, which are always
+    stored in memory in little-endian order. These values are thus
+    correctly converted to/from native order but the pointers used to
+    hold their addresses are declared as for native order values.
+    
+    Fix this by declaring the pointers as __le32* and remove the
+    casts that are now unneeded.
+    
+    Signed-off-by: Luc Van Oostenryck <luc.vanoostenryck@gmail.com>
+    Signed-off-by: Will Deacon <will.deacon@arm.com>
+
+diff --git a/arch/arm64/kernel/module.c b/arch/arm64/kernel/module.c
+index 8c3a7264fb0f..f469e0435903 100644
+--- a/arch/arm64/kernel/module.c
++++ b/arch/arm64/kernel/module.c
+@@ -74,7 +74,7 @@ enum aarch64_reloc_op {
+ 	RELOC_OP_PAGE,
+ };
+ 
+-static u64 do_reloc(enum aarch64_reloc_op reloc_op, void *place, u64 val)
++static u64 do_reloc(enum aarch64_reloc_op reloc_op, __le32 *place, u64 val)
+ {
+ 	switch (reloc_op) {
+ 	case RELOC_OP_ABS:
+@@ -121,12 +121,12 @@ enum aarch64_insn_movw_imm_type {
+ 	AARCH64_INSN_IMM_MOVKZ,
+ };
+ 
+-static int reloc_insn_movw(enum aarch64_reloc_op op, void *place, u64 val,
++static int reloc_insn_movw(enum aarch64_reloc_op op, __le32 *place, u64 val,
+ 			   int lsb, enum aarch64_insn_movw_imm_type imm_type)
+ {
+ 	u64 imm;
+ 	s64 sval;
+-	u32 insn = le32_to_cpu(*(u32 *)place);
++	u32 insn = le32_to_cpu(*place);
+ 
+ 	sval = do_reloc(op, place, val);
+ 	imm = sval >> lsb;
+@@ -154,7 +154,7 @@ static int reloc_insn_movw(enum aarch64_reloc_op op, void *place, u64 val,
+ 
+ 	/* Update the instruction with the new encoding. */
+ 	insn = aarch64_insn_encode_immediate(AARCH64_INSN_IMM_16, insn, imm);
+-	*(u32 *)place = cpu_to_le32(insn);
++	*place = cpu_to_le32(insn);
+ 
+ 	if (imm > U16_MAX)
+ 		return -ERANGE;
+@@ -162,12 +162,12 @@ static int reloc_insn_movw(enum aarch64_reloc_op op, void *place, u64 val,
+ 	return 0;
+ }
+ 
+-static int reloc_insn_imm(enum aarch64_reloc_op op, void *place, u64 val,
++static int reloc_insn_imm(enum aarch64_reloc_op op, __le32 *place, u64 val,
+ 			  int lsb, int len, enum aarch64_insn_imm_type imm_type)
+ {
+ 	u64 imm, imm_mask;
+ 	s64 sval;
+-	u32 insn = le32_to_cpu(*(u32 *)place);
++	u32 insn = le32_to_cpu(*place);
+ 
+ 	/* Calculate the relocation value. */
+ 	sval = do_reloc(op, place, val);
+@@ -179,7 +179,7 @@ static int reloc_insn_imm(enum aarch64_reloc_op op, void *place, u64 val,
+ 
+ 	/* Update the instruction's immediate field. */
+ 	insn = aarch64_insn_encode_immediate(imm_type, insn, imm);
+-	*(u32 *)place = cpu_to_le32(insn);
++	*place = cpu_to_le32(insn);
+ 
+ 	/*
+ 	 * Extract the upper value bits (including the sign bit) and
+
+commit e71a4e1bebaf7fd990efbdc04b38e5526914f0f1
+Author: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+Date:   Tue Jun 6 17:00:22 2017 +0000
+
+    arm64: ftrace: add support for far branches to dynamic ftrace
+    
+    Currently, dynamic ftrace support in the arm64 kernel assumes that all
+    core kernel code is within range of ordinary branch instructions that
+    occur in module code, which is usually the case, but is no longer
+    guaranteed now that we have support for module PLTs and address space
+    randomization.
+    
+    Since on arm64, all patching of branch instructions involves function
+    calls to the same entry point [ftrace_caller()], we can emit the modules
+    with a trampoline that has unlimited range, and patch both the trampoline
+    itself and the branch instruction to redirect the call via the trampoline.
+    
+    Signed-off-by: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+    [will: minor clarification to smp_wmb() comment]
+    Signed-off-by: Will Deacon <will.deacon@arm.com>
+
+diff --git a/arch/arm64/kernel/module.c b/arch/arm64/kernel/module.c
+index f035ff6fb223..8c3a7264fb0f 100644
+--- a/arch/arm64/kernel/module.c
++++ b/arch/arm64/kernel/module.c
+@@ -420,8 +420,12 @@ int module_finalize(const Elf_Ehdr *hdr,
+ 	for (s = sechdrs, se = sechdrs + hdr->e_shnum; s < se; s++) {
+ 		if (strcmp(".altinstructions", secstrs + s->sh_name) == 0) {
+ 			apply_alternatives((void *)s->sh_addr, s->sh_size);
+-			return 0;
+ 		}
++#ifdef CONFIG_ARM64_MODULE_PLTS
++		if (IS_ENABLED(CONFIG_DYNAMIC_FTRACE) &&
++		    !strcmp(".text.ftrace_trampoline", secstrs + s->sh_name))
++			me->arch.ftrace_trampoline = (void *)s->sh_addr;
++#endif
+ 	}
+ 
+ 	return 0;
+
+commit 0c2cf6d9487cb90be6ad7fac66044dfa8e8e5243
+Author: Florian Fainelli <f.fainelli@gmail.com>
+Date:   Thu Apr 27 11:19:02 2017 -0700
+
+    arm64: Silence first allocation with CONFIG_ARM64_MODULE_PLTS=y
+    
+    When CONFIG_ARM64_MODULE_PLTS is enabled, the first allocation using the
+    module space fails, because the module is too big, and then the module
+    allocation is attempted from vmalloc space. Silence the first allocation
+    failure in that case by setting __GFP_NOWARN.
+    
+    Reviewed-by: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+    Acked-by: Will Deacon <will.deacon@arm.com>
+    Signed-off-by: Florian Fainelli <f.fainelli@gmail.com>
+    Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+
+diff --git a/arch/arm64/kernel/module.c b/arch/arm64/kernel/module.c
+index c9a2ab446dc6..f035ff6fb223 100644
+--- a/arch/arm64/kernel/module.c
++++ b/arch/arm64/kernel/module.c
+@@ -32,11 +32,16 @@
+ 
+ void *module_alloc(unsigned long size)
+ {
++	gfp_t gfp_mask = GFP_KERNEL;
+ 	void *p;
+ 
++	/* Silence the initial allocation */
++	if (IS_ENABLED(CONFIG_ARM64_MODULE_PLTS))
++		gfp_mask |= __GFP_NOWARN;
++
+ 	p = __vmalloc_node_range(size, MODULE_ALIGN, module_alloc_base,
+ 				module_alloc_base + MODULES_VSIZE,
+-				GFP_KERNEL, PAGE_KERNEL_EXEC, 0,
++				gfp_mask, PAGE_KERNEL_EXEC, 0,
+ 				NUMA_NO_NODE, __builtin_return_address(0));
+ 
+ 	if (!p && IS_ENABLED(CONFIG_ARM64_MODULE_PLTS) &&
+
+commit 24af6c4e4e0f6e9803bec8dca0f7748afbb2bbf0
+Author: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+Date:   Tue Feb 21 22:12:57 2017 +0000
+
+    arm64: module: split core and init PLT sections
+    
+    The arm64 module PLT code allocates all PLT entries in a single core
+    section, since the overhead of having a separate init PLT section is
+    not justified by the small number of PLT entries usually required for
+    init code.
+    
+    However, the core and init module regions are allocated independently,
+    and there is a corner case where the core region may be allocated from
+    the VMALLOC region if the dedicated module region is exhausted, but the
+    init region, being much smaller, can still be allocated from the module
+    region. This leads to relocation failures if the distance between those
+    regions exceeds 128 MB. (In fact, this corner case is highly unlikely to
+    occur on arm64, but the issue has been observed on ARM, whose module
+    region is much smaller).
+    
+    So split the core and init PLT regions, and name the latter ".init.plt"
+    so it gets allocated along with (and sufficiently close to) the .init
+    sections that it serves. Also, given that init PLT entries may need to
+    be emitted for branches that target the core module, modify the logic
+    that disregards defined symbols to only disregard symbols that are
+    defined in the same section as the relocated branch instruction.
+    
+    Since there may now be two PLT entries associated with each entry in
+    the symbol table, we can no longer hijack the symbol::st_size fields
+    to record the addresses of PLT entries as we emit them for zero-addend
+    relocations. So instead, perform an explicit comparison to check for
+    duplicate entries.
+    
+    Signed-off-by: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+    Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+
+diff --git a/arch/arm64/kernel/module.c b/arch/arm64/kernel/module.c
+index 7f316982ce00..c9a2ab446dc6 100644
+--- a/arch/arm64/kernel/module.c
++++ b/arch/arm64/kernel/module.c
+@@ -380,7 +380,7 @@ int apply_relocate_add(Elf64_Shdr *sechdrs,
+ 
+ 			if (IS_ENABLED(CONFIG_ARM64_MODULE_PLTS) &&
+ 			    ovf == -ERANGE) {
+-				val = module_emit_plt_entry(me, &rel[i], sym);
++				val = module_emit_plt_entry(me, loc, &rel[i], sym);
+ 				ovf = reloc_insn_imm(RELOC_OP_PREL, loc, val, 2,
+ 						     26, AARCH64_INSN_IMM_26);
+ 			}
+
+commit f80fb3a3d50843a401dac4b566b3b131da8077a2
+Author: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+Date:   Tue Jan 26 14:12:01 2016 +0100
+
+    arm64: add support for kernel ASLR
+    
+    This adds support for KASLR is implemented, based on entropy provided by
+    the bootloader in the /chosen/kaslr-seed DT property. Depending on the size
+    of the address space (VA_BITS) and the page size, the entropy in the
+    virtual displacement is up to 13 bits (16k/2 levels) and up to 25 bits (all
+    4 levels), with the sidenote that displacements that result in the kernel
+    image straddling a 1GB/32MB/512MB alignment boundary (for 4KB/16KB/64KB
+    granule kernels, respectively) are not allowed, and will be rounded up to
+    an acceptable value.
+    
+    If CONFIG_RANDOMIZE_MODULE_REGION_FULL is enabled, the module region is
+    randomized independently from the core kernel. This makes it less likely
+    that the location of core kernel data structures can be determined by an
+    adversary, but causes all function calls from modules into the core kernel
+    to be resolved via entries in the module PLTs.
+    
+    If CONFIG_RANDOMIZE_MODULE_REGION_FULL is not enabled, the module region is
+    randomized by choosing a page aligned 128 MB region inside the interval
+    [_etext - 128 MB, _stext + 128 MB). This gives between 10 and 14 bits of
+    entropy (depending on page size), independently of the kernel randomization,
+    but still guarantees that modules are within the range of relative branch
+    and jump instructions (with the caveat that, since the module region is
+    shared with other uses of the vmalloc area, modules may need to be loaded
+    further away if the module region is exhausted)
+    
+    Signed-off-by: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+    Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+
+diff --git a/arch/arm64/kernel/module.c b/arch/arm64/kernel/module.c
+index a9dde97f5ca5..7f316982ce00 100644
+--- a/arch/arm64/kernel/module.c
++++ b/arch/arm64/kernel/module.c
+@@ -34,7 +34,8 @@ void *module_alloc(unsigned long size)
+ {
+ 	void *p;
+ 
+-	p = __vmalloc_node_range(size, MODULE_ALIGN, MODULES_VADDR, MODULES_END,
++	p = __vmalloc_node_range(size, MODULE_ALIGN, module_alloc_base,
++				module_alloc_base + MODULES_VSIZE,
+ 				GFP_KERNEL, PAGE_KERNEL_EXEC, 0,
+ 				NUMA_NO_NODE, __builtin_return_address(0));
+ 
+
+commit fd045f6cd98ec4953147b318418bd45e441e52a3
+Author: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+Date:   Tue Nov 24 12:37:35 2015 +0100
+
+    arm64: add support for module PLTs
+    
+    This adds support for emitting PLTs at module load time for relative
+    branches that are out of range. This is a prerequisite for KASLR, which
+    may place the kernel and the modules anywhere in the vmalloc area,
+    making it more likely that branch target offsets exceed the maximum
+    range of +/- 128 MB.
+    
+    In this version, I removed the distinction between relocations against
+    .init executable sections and ordinary executable sections. The reason
+    is that it is hardly worth the trouble, given that .init.text usually
+    does not contain that many far branches, and this version now only
+    reserves PLT entry space for jump and call relocations against undefined
+    symbols (since symbols defined in the same module can be assumed to be
+    within +/- 128 MB)
+    
+    For example, the mac80211.ko module (which is fairly sizable at ~400 KB)
+    built with -mcmodel=large gives the following relocation counts:
+    
+                        relocs    branches   unique     !local
+      .text              3925       3347       518        219
+      .init.text           11          8         7          1
+      .exit.text            4          4         4          1
+      .text.unlikely       81         67        36         17
+    
+    ('unique' means branches to unique type/symbol/addend combos, of which
+    !local is the subset referring to undefined symbols)
+    
+    IOW, we are only emitting a single PLT entry for the .init sections, and
+    we are better off just adding it to the core PLT section instead.
+    
+    Signed-off-by: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+    Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+
+diff --git a/arch/arm64/kernel/module.c b/arch/arm64/kernel/module.c
+index 93e970231ca9..a9dde97f5ca5 100644
+--- a/arch/arm64/kernel/module.c
++++ b/arch/arm64/kernel/module.c
+@@ -38,6 +38,21 @@ void *module_alloc(unsigned long size)
+ 				GFP_KERNEL, PAGE_KERNEL_EXEC, 0,
+ 				NUMA_NO_NODE, __builtin_return_address(0));
+ 
++	if (!p && IS_ENABLED(CONFIG_ARM64_MODULE_PLTS) &&
++	    !IS_ENABLED(CONFIG_KASAN))
++		/*
++		 * KASAN can only deal with module allocations being served
++		 * from the reserved module region, since the remainder of
++		 * the vmalloc region is already backed by zero shadow pages,
++		 * and punching holes into it is non-trivial. Since the module
++		 * region is not randomized when KASAN is enabled, it is even
++		 * less likely that the module region gets exhausted, so we
++		 * can simply omit this fallback in that case.
++		 */
++		p = __vmalloc_node_range(size, MODULE_ALIGN, VMALLOC_START,
++				VMALLOC_END, GFP_KERNEL, PAGE_KERNEL_EXEC, 0,
++				NUMA_NO_NODE, __builtin_return_address(0));
++
+ 	if (p && (kasan_module_alloc(p, size) < 0)) {
+ 		vfree(p);
+ 		return NULL;
+@@ -361,6 +376,13 @@ int apply_relocate_add(Elf64_Shdr *sechdrs,
+ 		case R_AARCH64_CALL26:
+ 			ovf = reloc_insn_imm(RELOC_OP_PREL, loc, val, 2, 26,
+ 					     AARCH64_INSN_IMM_26);
++
++			if (IS_ENABLED(CONFIG_ARM64_MODULE_PLTS) &&
++			    ovf == -ERANGE) {
++				val = module_emit_plt_entry(me, &rel[i], sym);
++				ovf = reloc_insn_imm(RELOC_OP_PREL, loc, val, 2,
++						     26, AARCH64_INSN_IMM_26);
++			}
+ 			break;
+ 
+ 		default:
+
+commit f930896967fa3f9ab16a6f87267b92798308d48f
+Author: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+Date:   Tue Jan 5 10:18:52 2016 +0100
+
+    arm64: module: avoid undefined shift behavior in reloc_data()
+    
+    Compilers may engage the improbability drive when encountering shifts
+    by a distance that is a multiple of the size of the operand type. Since
+    the required bounds check is very simple here, we can get rid of all the
+    fuzzy masking, shifting and comparing, and use the documented bounds
+    directly.
+    
+    Reported-by: David Binderman <dcb314@hotmail.com>
+    Signed-off-by: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+    Signed-off-by: Will Deacon <will.deacon@arm.com>
+
+diff --git a/arch/arm64/kernel/module.c b/arch/arm64/kernel/module.c
+index 03464ab0fff2..93e970231ca9 100644
+--- a/arch/arm64/kernel/module.c
++++ b/arch/arm64/kernel/module.c
+@@ -72,15 +72,18 @@ static u64 do_reloc(enum aarch64_reloc_op reloc_op, void *place, u64 val)
+ 
+ static int reloc_data(enum aarch64_reloc_op op, void *place, u64 val, int len)
+ {
+-	u64 imm_mask = (1 << len) - 1;
+ 	s64 sval = do_reloc(op, place, val);
+ 
+ 	switch (len) {
+ 	case 16:
+ 		*(s16 *)place = sval;
++		if (sval < S16_MIN || sval > U16_MAX)
++			return -ERANGE;
+ 		break;
+ 	case 32:
+ 		*(s32 *)place = sval;
++		if (sval < S32_MIN || sval > U32_MAX)
++			return -ERANGE;
+ 		break;
+ 	case 64:
+ 		*(s64 *)place = sval;
+@@ -89,21 +92,6 @@ static int reloc_data(enum aarch64_reloc_op op, void *place, u64 val, int len)
+ 		pr_err("Invalid length (%d) for data relocation\n", len);
+ 		return 0;
+ 	}
+-
+-	/*
+-	 * Extract the upper value bits (including the sign bit) and
+-	 * shift them to bit 0.
+-	 */
+-	sval = (s64)(sval & ~(imm_mask >> 1)) >> (len - 1);
+-
+-	/*
+-	 * Overflow has occurred if the value is not representable in
+-	 * len bits (i.e the bottom len bits are not sign-extended and
+-	 * the top bits are not all zero).
+-	 */
+-	if ((u64)(sval + 1) > 2)
+-		return -ERANGE;
+-
+ 	return 0;
+ }
+ 
+
+commit b24a557527f97ad88619d5bd4c8017c635056d69
+Author: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+Date:   Tue Jan 5 10:18:51 2016 +0100
+
+    arm64: module: fix relocation of movz instruction with negative immediate
+    
+    The test whether a movz instruction with a signed immediate should be
+    turned into a movn instruction (i.e., when the immediate is negative)
+    is flawed, since the value of imm is always positive. Also, the
+    subsequent bounds check is incorrect since the limit update never
+    executes, due to the fact that the imm_type comparison will always be
+    false for negative signed immediates.
+    
+    Let's fix this by performing the sign test on sval directly, and
+    replacing the bounds check with a simple comparison against U16_MAX.
+    
+    Signed-off-by: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+    [will: tidied up use of sval, renamed MOVK enum value to MOVKZ]
+    Signed-off-by: Will Deacon <will.deacon@arm.com>
+
+diff --git a/arch/arm64/kernel/module.c b/arch/arm64/kernel/module.c
+index f4bc779e62e8..03464ab0fff2 100644
+--- a/arch/arm64/kernel/module.c
++++ b/arch/arm64/kernel/module.c
+@@ -30,9 +30,6 @@
+ #include <asm/insn.h>
+ #include <asm/sections.h>
+ 
+-#define	AARCH64_INSN_IMM_MOVNZ		AARCH64_INSN_IMM_MAX
+-#define	AARCH64_INSN_IMM_MOVK		AARCH64_INSN_IMM_16
+-
+ void *module_alloc(unsigned long size)
+ {
+ 	void *p;
+@@ -110,16 +107,20 @@ static int reloc_data(enum aarch64_reloc_op op, void *place, u64 val, int len)
+ 	return 0;
+ }
+ 
++enum aarch64_insn_movw_imm_type {
++	AARCH64_INSN_IMM_MOVNZ,
++	AARCH64_INSN_IMM_MOVKZ,
++};
++
+ static int reloc_insn_movw(enum aarch64_reloc_op op, void *place, u64 val,
+-			   int lsb, enum aarch64_insn_imm_type imm_type)
++			   int lsb, enum aarch64_insn_movw_imm_type imm_type)
+ {
+-	u64 imm, limit = 0;
++	u64 imm;
+ 	s64 sval;
+ 	u32 insn = le32_to_cpu(*(u32 *)place);
+ 
+ 	sval = do_reloc(op, place, val);
+-	sval >>= lsb;
+-	imm = sval & 0xffff;
++	imm = sval >> lsb;
+ 
+ 	if (imm_type == AARCH64_INSN_IMM_MOVNZ) {
+ 		/*
+@@ -128,7 +129,7 @@ static int reloc_insn_movw(enum aarch64_reloc_op op, void *place, u64 val,
+ 		 * immediate is less than zero.
+ 		 */
+ 		insn &= ~(3 << 29);
+-		if ((s64)imm >= 0) {
++		if (sval >= 0) {
+ 			/* >=0: Set the instruction to MOVZ (opcode 10b). */
+ 			insn |= 2 << 29;
+ 		} else {
+@@ -140,29 +141,13 @@ static int reloc_insn_movw(enum aarch64_reloc_op op, void *place, u64 val,
+ 			 */
+ 			imm = ~imm;
+ 		}
+-		imm_type = AARCH64_INSN_IMM_MOVK;
+ 	}
+ 
+ 	/* Update the instruction with the new encoding. */
+-	insn = aarch64_insn_encode_immediate(imm_type, insn, imm);
++	insn = aarch64_insn_encode_immediate(AARCH64_INSN_IMM_16, insn, imm);
+ 	*(u32 *)place = cpu_to_le32(insn);
+ 
+-	/* Shift out the immediate field. */
+-	sval >>= 16;
+-
+-	/*
+-	 * For unsigned immediates, the overflow check is straightforward.
+-	 * For signed immediates, the sign bit is actually the bit past the
+-	 * most significant bit of the field.
+-	 * The AARCH64_INSN_IMM_16 immediate type is unsigned.
+-	 */
+-	if (imm_type != AARCH64_INSN_IMM_16) {
+-		sval++;
+-		limit++;
+-	}
+-
+-	/* Check the upper bits depending on the sign of the immediate. */
+-	if ((u64)sval > limit)
++	if (imm > U16_MAX)
+ 		return -ERANGE;
+ 
+ 	return 0;
+@@ -267,25 +252,25 @@ int apply_relocate_add(Elf64_Shdr *sechdrs,
+ 			overflow_check = false;
+ 		case R_AARCH64_MOVW_UABS_G0:
+ 			ovf = reloc_insn_movw(RELOC_OP_ABS, loc, val, 0,
+-					      AARCH64_INSN_IMM_16);
++					      AARCH64_INSN_IMM_MOVKZ);
+ 			break;
+ 		case R_AARCH64_MOVW_UABS_G1_NC:
+ 			overflow_check = false;
+ 		case R_AARCH64_MOVW_UABS_G1:
+ 			ovf = reloc_insn_movw(RELOC_OP_ABS, loc, val, 16,
+-					      AARCH64_INSN_IMM_16);
++					      AARCH64_INSN_IMM_MOVKZ);
+ 			break;
+ 		case R_AARCH64_MOVW_UABS_G2_NC:
+ 			overflow_check = false;
+ 		case R_AARCH64_MOVW_UABS_G2:
+ 			ovf = reloc_insn_movw(RELOC_OP_ABS, loc, val, 32,
+-					      AARCH64_INSN_IMM_16);
++					      AARCH64_INSN_IMM_MOVKZ);
+ 			break;
+ 		case R_AARCH64_MOVW_UABS_G3:
+ 			/* We're using the top bits so we can't overflow. */
+ 			overflow_check = false;
+ 			ovf = reloc_insn_movw(RELOC_OP_ABS, loc, val, 48,
+-					      AARCH64_INSN_IMM_16);
++					      AARCH64_INSN_IMM_MOVKZ);
+ 			break;
+ 		case R_AARCH64_MOVW_SABS_G0:
+ 			ovf = reloc_insn_movw(RELOC_OP_ABS, loc, val, 0,
+@@ -302,7 +287,7 @@ int apply_relocate_add(Elf64_Shdr *sechdrs,
+ 		case R_AARCH64_MOVW_PREL_G0_NC:
+ 			overflow_check = false;
+ 			ovf = reloc_insn_movw(RELOC_OP_PREL, loc, val, 0,
+-					      AARCH64_INSN_IMM_MOVK);
++					      AARCH64_INSN_IMM_MOVKZ);
+ 			break;
+ 		case R_AARCH64_MOVW_PREL_G0:
+ 			ovf = reloc_insn_movw(RELOC_OP_PREL, loc, val, 0,
+@@ -311,7 +296,7 @@ int apply_relocate_add(Elf64_Shdr *sechdrs,
+ 		case R_AARCH64_MOVW_PREL_G1_NC:
+ 			overflow_check = false;
+ 			ovf = reloc_insn_movw(RELOC_OP_PREL, loc, val, 16,
+-					      AARCH64_INSN_IMM_MOVK);
++					      AARCH64_INSN_IMM_MOVKZ);
+ 			break;
+ 		case R_AARCH64_MOVW_PREL_G1:
+ 			ovf = reloc_insn_movw(RELOC_OP_PREL, loc, val, 16,
+@@ -320,7 +305,7 @@ int apply_relocate_add(Elf64_Shdr *sechdrs,
+ 		case R_AARCH64_MOVW_PREL_G2_NC:
+ 			overflow_check = false;
+ 			ovf = reloc_insn_movw(RELOC_OP_PREL, loc, val, 32,
+-					      AARCH64_INSN_IMM_MOVK);
++					      AARCH64_INSN_IMM_MOVKZ);
+ 			break;
+ 		case R_AARCH64_MOVW_PREL_G2:
+ 			ovf = reloc_insn_movw(RELOC_OP_PREL, loc, val, 32,
+
+commit 39d114ddc68223022c12ae3a1573912bc4b585e5
+Author: Andrey Ryabinin <ryabinin.a.a@gmail.com>
+Date:   Mon Oct 12 18:52:58 2015 +0300
+
+    arm64: add KASAN support
+    
+    This patch adds arch specific code for kernel address sanitizer
+    (see Documentation/kasan.txt).
+    
+    1/8 of kernel addresses reserved for shadow memory. There was no
+    big enough hole for this, so virtual addresses for shadow were
+    stolen from vmalloc area.
+    
+    At early boot stage the whole shadow region populated with just
+    one physical page (kasan_zero_page). Later, this page reused
+    as readonly zero shadow for some memory that KASan currently
+    don't track (vmalloc).
+    After mapping the physical memory, pages for shadow memory are
+    allocated and mapped.
+    
+    Functions like memset/memmove/memcpy do a lot of memory accesses.
+    If bad pointer passed to one of these function it is important
+    to catch this. Compiler's instrumentation cannot do this since
+    these functions are written in assembly.
+    KASan replaces memory functions with manually instrumented variants.
+    Original functions declared as weak symbols so strong definitions
+    in mm/kasan/kasan.c could replace them. Original functions have aliases
+    with '__' prefix in name, so we could call non-instrumented variant
+    if needed.
+    Some files built without kasan instrumentation (e.g. mm/slub.c).
+    Original mem* function replaced (via #define) with prefixed variants
+    to disable memory access checks for such files.
+    
+    Signed-off-by: Andrey Ryabinin <ryabinin.a.a@gmail.com>
+    Tested-by: Linus Walleij <linus.walleij@linaro.org>
+    Reviewed-by: Catalin Marinas <catalin.marinas@arm.com>
+    Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+
+diff --git a/arch/arm64/kernel/module.c b/arch/arm64/kernel/module.c
+index 876eb8df50bf..f4bc779e62e8 100644
+--- a/arch/arm64/kernel/module.c
++++ b/arch/arm64/kernel/module.c
+@@ -21,6 +21,7 @@
+ #include <linux/bitops.h>
+ #include <linux/elf.h>
+ #include <linux/gfp.h>
++#include <linux/kasan.h>
+ #include <linux/kernel.h>
+ #include <linux/mm.h>
+ #include <linux/moduleloader.h>
+@@ -34,9 +35,18 @@
+ 
+ void *module_alloc(unsigned long size)
+ {
+-	return __vmalloc_node_range(size, 1, MODULES_VADDR, MODULES_END,
+-				    GFP_KERNEL, PAGE_KERNEL_EXEC, 0,
+-				    NUMA_NO_NODE, __builtin_return_address(0));
++	void *p;
++
++	p = __vmalloc_node_range(size, MODULE_ALIGN, MODULES_VADDR, MODULES_END,
++				GFP_KERNEL, PAGE_KERNEL_EXEC, 0,
++				NUMA_NO_NODE, __builtin_return_address(0));
++
++	if (p && (kasan_module_alloc(p, size) < 0)) {
++		vfree(p);
++		return NULL;
++	}
++
++	return p;
+ }
+ 
+ enum aarch64_reloc_op {
+
+commit df057cc7b4fa59e9b55f07ffdb6c62bf02e99a00
+Author: Will Deacon <will.deacon@arm.com>
+Date:   Tue Mar 17 12:15:02 2015 +0000
+
+    arm64: errata: add module build workaround for erratum #843419
+    
+    Cortex-A53 processors <= r0p4 are affected by erratum #843419 which can
+    lead to a memory access using an incorrect address in certain sequences
+    headed by an ADRP instruction.
+    
+    There is a linker fix to generate veneers for ADRP instructions, but
+    this doesn't work for kernel modules which are built as unlinked ELF
+    objects.
+    
+    This patch adds a new config option for the erratum which, when enabled,
+    builds kernel modules with the mcmodel=large flag. This uses absolute
+    addressing for all kernel symbols, thereby removing the use of ADRP as
+    a PC-relative form of addressing. The ADRP relocs are removed from the
+    module loader so that we fail to load any potentially affected modules.
+    
+    Cc: <stable@vger.kernel.org>
+    Acked-by: Catalin Marinas <catalin.marinas@arm.com>
+    Signed-off-by: Will Deacon <will.deacon@arm.com>
+
+diff --git a/arch/arm64/kernel/module.c b/arch/arm64/kernel/module.c
+index 67bf4107f6ef..876eb8df50bf 100644
+--- a/arch/arm64/kernel/module.c
++++ b/arch/arm64/kernel/module.c
+@@ -332,12 +332,14 @@ int apply_relocate_add(Elf64_Shdr *sechdrs,
+ 			ovf = reloc_insn_imm(RELOC_OP_PREL, loc, val, 0, 21,
+ 					     AARCH64_INSN_IMM_ADR);
+ 			break;
++#ifndef CONFIG_ARM64_ERRATUM_843419
+ 		case R_AARCH64_ADR_PREL_PG_HI21_NC:
+ 			overflow_check = false;
+ 		case R_AARCH64_ADR_PREL_PG_HI21:
+ 			ovf = reloc_insn_imm(RELOC_OP_PAGE, loc, val, 12, 21,
+ 					     AARCH64_INSN_IMM_ADR);
+ 			break;
++#endif
+ 		case R_AARCH64_ADD_ABS_LO12_NC:
+ 		case R_AARCH64_LDST8_ABS_LO12_NC:
+ 			overflow_check = false;
+
+commit cb9e3c292d0115499c660028ad35ac5501d722b5
+Author: Andrey Ryabinin <a.ryabinin@samsung.com>
+Date:   Fri Feb 13 14:40:07 2015 -0800
+
+    mm: vmalloc: pass additional vm_flags to __vmalloc_node_range()
+    
+    For instrumenting global variables KASan will shadow memory backing memory
+    for modules.  So on module loading we will need to allocate memory for
+    shadow and map it at address in shadow that corresponds to the address
+    allocated in module_alloc().
+    
+    __vmalloc_node_range() could be used for this purpose, except it puts a
+    guard hole after allocated area.  Guard hole in shadow memory should be a
+    problem because at some future point we might need to have a shadow memory
+    at address occupied by guard hole.  So we could fail to allocate shadow
+    for module_alloc().
+    
+    Now we have VM_NO_GUARD flag disabling guard page, so we need to pass into
+    __vmalloc_node_range().  Add new parameter 'vm_flags' to
+    __vmalloc_node_range() function.
+    
+    Signed-off-by: Andrey Ryabinin <a.ryabinin@samsung.com>
+    Cc: Dmitry Vyukov <dvyukov@google.com>
+    Cc: Konstantin Serebryany <kcc@google.com>
+    Cc: Dmitry Chernenkov <dmitryc@google.com>
+    Signed-off-by: Andrey Konovalov <adech.fo@gmail.com>
+    Cc: Yuri Gribov <tetra2005@gmail.com>
+    Cc: Konstantin Khlebnikov <koct9i@gmail.com>
+    Cc: Sasha Levin <sasha.levin@oracle.com>
+    Cc: Christoph Lameter <cl@linux.com>
+    Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+    Cc: Dave Hansen <dave.hansen@intel.com>
+    Cc: Andi Kleen <andi@firstfloor.org>
+    Cc: Ingo Molnar <mingo@elte.hu>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: "H. Peter Anvin" <hpa@zytor.com>
+    Cc: Christoph Lameter <cl@linux.com>
+    Cc: Pekka Enberg <penberg@kernel.org>
+    Cc: David Rientjes <rientjes@google.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/arch/arm64/kernel/module.c b/arch/arm64/kernel/module.c
+index 9b6f71db2709..67bf4107f6ef 100644
+--- a/arch/arm64/kernel/module.c
++++ b/arch/arm64/kernel/module.c
+@@ -35,8 +35,8 @@
+ void *module_alloc(unsigned long size)
+ {
+ 	return __vmalloc_node_range(size, 1, MODULES_VADDR, MODULES_END,
+-				    GFP_KERNEL, PAGE_KERNEL_EXEC, NUMA_NO_NODE,
+-				    __builtin_return_address(0));
++				    GFP_KERNEL, PAGE_KERNEL_EXEC, 0,
++				    NUMA_NO_NODE, __builtin_return_address(0));
+ }
+ 
+ enum aarch64_reloc_op {
+
+commit 2c2b282d001e9934adeac93c10eb037b81d532f5
+Author: Paul Walmsley <pwalmsley@nvidia.com>
+Date:   Mon Jan 5 17:38:41 2015 -0700
+
+    arm64: fix missing asm/alternative.h include in kernel/module.c
+    
+    On next-20150105, defconfig compilation breaks with:
+    
+    arch/arm64/kernel/module.c:408:4: error: implicit declaration of function ‘apply_alternatives’ [-Werror=implicit-function-declaration]
+    
+    Fix by including asm/alternative.h, where the apply_alternatives()
+    prototype is declared.
+    
+    This second version incorporates a comment from Mark Rutland
+    <mark.rutland@arm.com> to keep the includes in alphabetical order
+    by filename.
+    
+    Signed-off-by: Paul Walmsley <paul@pwsan.com>
+    Cc: Paul Walmsley <pwalmsley@nvidia.com>
+    Cc: Catalin Marinas <catalin.marinas@arm.com>
+    Cc: Will Deacon <will.deacon@arm.com>
+    Acked-by: Mark Rutland <mark.rutland@arm.com>
+    Signed-off-by: Will Deacon <will.deacon@arm.com>
+
+diff --git a/arch/arm64/kernel/module.c b/arch/arm64/kernel/module.c
+index fd027b101de5..9b6f71db2709 100644
+--- a/arch/arm64/kernel/module.c
++++ b/arch/arm64/kernel/module.c
+@@ -25,6 +25,7 @@
+ #include <linux/mm.h>
+ #include <linux/moduleloader.h>
+ #include <linux/vmalloc.h>
++#include <asm/alternative.h>
+ #include <asm/insn.h>
+ #include <asm/sections.h>
+ 
+
+commit 932ded4b0b9bf111fbf9d176ec12152a0d29b0fd
+Author: Andre Przywara <andre.przywara@arm.com>
+Date:   Fri Nov 28 13:40:45 2014 +0000
+
+    arm64: add module support for alternatives fixups
+    
+    Currently the kernel patches all necessary instructions once at boot
+    time, so modules are not covered by this.
+    Change the apply_alternatives() function to take a beginning and an
+    end pointer and introduce a new variant (apply_alternatives_all()) to
+    cover the existing use case for the static kernel image section.
+    Add a module_finalize() function to arm64 to check for an
+    alternatives section in a module and patch only the instructions from
+    that specific area.
+    Since that module code is not touched before the module
+    initialization has ended, we don't need to halt the machine before
+    doing the patching in the module's code.
+    
+    Signed-off-by: Andre Przywara <andre.przywara@arm.com>
+    Signed-off-by: Will Deacon <will.deacon@arm.com>
+
+diff --git a/arch/arm64/kernel/module.c b/arch/arm64/kernel/module.c
+index 1eb1cc955139..fd027b101de5 100644
+--- a/arch/arm64/kernel/module.c
++++ b/arch/arm64/kernel/module.c
+@@ -26,6 +26,7 @@
+ #include <linux/moduleloader.h>
+ #include <linux/vmalloc.h>
+ #include <asm/insn.h>
++#include <asm/sections.h>
+ 
+ #define	AARCH64_INSN_IMM_MOVNZ		AARCH64_INSN_IMM_MAX
+ #define	AARCH64_INSN_IMM_MOVK		AARCH64_INSN_IMM_16
+@@ -394,3 +395,20 @@ int apply_relocate_add(Elf64_Shdr *sechdrs,
+ 	       me->name, (int)ELF64_R_TYPE(rel[i].r_info), val);
+ 	return -ENOEXEC;
+ }
++
++int module_finalize(const Elf_Ehdr *hdr,
++		    const Elf_Shdr *sechdrs,
++		    struct module *me)
++{
++	const Elf_Shdr *s, *se;
++	const char *secstrs = (void *)hdr + sechdrs[hdr->e_shstrndx].sh_offset;
++
++	for (s = sechdrs, se = sechdrs + hdr->e_shnum; s < se; s++) {
++		if (strcmp(".altinstructions", secstrs + s->sh_name) == 0) {
++			apply_alternatives((void *)s->sh_addr, s->sh_size);
++			return 0;
++		}
++	}
++
++	return 0;
++}
+
+commit c84fced8d990dd86c523233d38b4685a52a4fc3f
+Author: Jiang Liu <liuj97@gmail.com>
+Date:   Tue Jan 7 22:17:10 2014 +0800
+
+    arm64: move encode_insn_immediate() from module.c to insn.c
+    
+    Function encode_insn_immediate() will be used by other instruction
+    manipulate related functions, so move it into insn.c and rename it
+    as aarch64_insn_encode_immediate().
+    
+    Reviewed-by: Will Deacon <will.deacon@arm.com>
+    Signed-off-by: Jiang Liu <liuj97@gmail.com>
+    Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+
+diff --git a/arch/arm64/kernel/module.c b/arch/arm64/kernel/module.c
+index e2ad0d87721f..1eb1cc955139 100644
+--- a/arch/arm64/kernel/module.c
++++ b/arch/arm64/kernel/module.c
+@@ -25,6 +25,10 @@
+ #include <linux/mm.h>
+ #include <linux/moduleloader.h>
+ #include <linux/vmalloc.h>
++#include <asm/insn.h>
++
++#define	AARCH64_INSN_IMM_MOVNZ		AARCH64_INSN_IMM_MAX
++#define	AARCH64_INSN_IMM_MOVK		AARCH64_INSN_IMM_16
+ 
+ void *module_alloc(unsigned long size)
+ {
+@@ -94,28 +98,18 @@ static int reloc_data(enum aarch64_reloc_op op, void *place, u64 val, int len)
+ 	return 0;
+ }
+ 
+-enum aarch64_imm_type {
+-	INSN_IMM_MOVNZ,
+-	INSN_IMM_MOVK,
+-	INSN_IMM_ADR,
+-	INSN_IMM_26,
+-	INSN_IMM_19,
+-	INSN_IMM_16,
+-	INSN_IMM_14,
+-	INSN_IMM_12,
+-	INSN_IMM_9,
+-};
+-
+-static u32 encode_insn_immediate(enum aarch64_imm_type type, u32 insn, u64 imm)
++static int reloc_insn_movw(enum aarch64_reloc_op op, void *place, u64 val,
++			   int lsb, enum aarch64_insn_imm_type imm_type)
+ {
+-	u32 immlo, immhi, lomask, himask, mask;
+-	int shift;
++	u64 imm, limit = 0;
++	s64 sval;
++	u32 insn = le32_to_cpu(*(u32 *)place);
+ 
+-	/* The instruction stream is always little endian. */
+-	insn = le32_to_cpu(insn);
++	sval = do_reloc(op, place, val);
++	sval >>= lsb;
++	imm = sval & 0xffff;
+ 
+-	switch (type) {
+-	case INSN_IMM_MOVNZ:
++	if (imm_type == AARCH64_INSN_IMM_MOVNZ) {
+ 		/*
+ 		 * For signed MOVW relocations, we have to manipulate the
+ 		 * instruction encoding depending on whether or not the
+@@ -134,70 +128,12 @@ static u32 encode_insn_immediate(enum aarch64_imm_type type, u32 insn, u64 imm)
+ 			 */
+ 			imm = ~imm;
+ 		}
+-	case INSN_IMM_MOVK:
+-		mask = BIT(16) - 1;
+-		shift = 5;
+-		break;
+-	case INSN_IMM_ADR:
+-		lomask = 0x3;
+-		himask = 0x7ffff;
+-		immlo = imm & lomask;
+-		imm >>= 2;
+-		immhi = imm & himask;
+-		imm = (immlo << 24) | (immhi);
+-		mask = (lomask << 24) | (himask);
+-		shift = 5;
+-		break;
+-	case INSN_IMM_26:
+-		mask = BIT(26) - 1;
+-		shift = 0;
+-		break;
+-	case INSN_IMM_19:
+-		mask = BIT(19) - 1;
+-		shift = 5;
+-		break;
+-	case INSN_IMM_16:
+-		mask = BIT(16) - 1;
+-		shift = 5;
+-		break;
+-	case INSN_IMM_14:
+-		mask = BIT(14) - 1;
+-		shift = 5;
+-		break;
+-	case INSN_IMM_12:
+-		mask = BIT(12) - 1;
+-		shift = 10;
+-		break;
+-	case INSN_IMM_9:
+-		mask = BIT(9) - 1;
+-		shift = 12;
+-		break;
+-	default:
+-		pr_err("encode_insn_immediate: unknown immediate encoding %d\n",
+-			type);
+-		return 0;
++		imm_type = AARCH64_INSN_IMM_MOVK;
+ 	}
+ 
+-	/* Update the immediate field. */
+-	insn &= ~(mask << shift);
+-	insn |= (imm & mask) << shift;
+-
+-	return cpu_to_le32(insn);
+-}
+-
+-static int reloc_insn_movw(enum aarch64_reloc_op op, void *place, u64 val,
+-			   int lsb, enum aarch64_imm_type imm_type)
+-{
+-	u64 imm, limit = 0;
+-	s64 sval;
+-	u32 insn = *(u32 *)place;
+-
+-	sval = do_reloc(op, place, val);
+-	sval >>= lsb;
+-	imm = sval & 0xffff;
+-
+ 	/* Update the instruction with the new encoding. */
+-	*(u32 *)place = encode_insn_immediate(imm_type, insn, imm);
++	insn = aarch64_insn_encode_immediate(imm_type, insn, imm);
++	*(u32 *)place = cpu_to_le32(insn);
+ 
+ 	/* Shift out the immediate field. */
+ 	sval >>= 16;
+@@ -206,9 +142,9 @@ static int reloc_insn_movw(enum aarch64_reloc_op op, void *place, u64 val,
+ 	 * For unsigned immediates, the overflow check is straightforward.
+ 	 * For signed immediates, the sign bit is actually the bit past the
+ 	 * most significant bit of the field.
+-	 * The INSN_IMM_16 immediate type is unsigned.
++	 * The AARCH64_INSN_IMM_16 immediate type is unsigned.
+ 	 */
+-	if (imm_type != INSN_IMM_16) {
++	if (imm_type != AARCH64_INSN_IMM_16) {
+ 		sval++;
+ 		limit++;
+ 	}
+@@ -221,11 +157,11 @@ static int reloc_insn_movw(enum aarch64_reloc_op op, void *place, u64 val,
+ }
+ 
+ static int reloc_insn_imm(enum aarch64_reloc_op op, void *place, u64 val,
+-			  int lsb, int len, enum aarch64_imm_type imm_type)
++			  int lsb, int len, enum aarch64_insn_imm_type imm_type)
+ {
+ 	u64 imm, imm_mask;
+ 	s64 sval;
+-	u32 insn = *(u32 *)place;
++	u32 insn = le32_to_cpu(*(u32 *)place);
+ 
+ 	/* Calculate the relocation value. */
+ 	sval = do_reloc(op, place, val);
+@@ -236,7 +172,8 @@ static int reloc_insn_imm(enum aarch64_reloc_op op, void *place, u64 val,
+ 	imm = sval & imm_mask;
+ 
+ 	/* Update the instruction's immediate field. */
+-	*(u32 *)place = encode_insn_immediate(imm_type, insn, imm);
++	insn = aarch64_insn_encode_immediate(imm_type, insn, imm);
++	*(u32 *)place = cpu_to_le32(insn);
+ 
+ 	/*
+ 	 * Extract the upper value bits (including the sign bit) and
+@@ -318,125 +255,125 @@ int apply_relocate_add(Elf64_Shdr *sechdrs,
+ 			overflow_check = false;
+ 		case R_AARCH64_MOVW_UABS_G0:
+ 			ovf = reloc_insn_movw(RELOC_OP_ABS, loc, val, 0,
+-					      INSN_IMM_16);
++					      AARCH64_INSN_IMM_16);
+ 			break;
+ 		case R_AARCH64_MOVW_UABS_G1_NC:
+ 			overflow_check = false;
+ 		case R_AARCH64_MOVW_UABS_G1:
+ 			ovf = reloc_insn_movw(RELOC_OP_ABS, loc, val, 16,
+-					      INSN_IMM_16);
++					      AARCH64_INSN_IMM_16);
+ 			break;
+ 		case R_AARCH64_MOVW_UABS_G2_NC:
+ 			overflow_check = false;
+ 		case R_AARCH64_MOVW_UABS_G2:
+ 			ovf = reloc_insn_movw(RELOC_OP_ABS, loc, val, 32,
+-					      INSN_IMM_16);
++					      AARCH64_INSN_IMM_16);
+ 			break;
+ 		case R_AARCH64_MOVW_UABS_G3:
+ 			/* We're using the top bits so we can't overflow. */
+ 			overflow_check = false;
+ 			ovf = reloc_insn_movw(RELOC_OP_ABS, loc, val, 48,
+-					      INSN_IMM_16);
++					      AARCH64_INSN_IMM_16);
+ 			break;
+ 		case R_AARCH64_MOVW_SABS_G0:
+ 			ovf = reloc_insn_movw(RELOC_OP_ABS, loc, val, 0,
+-					      INSN_IMM_MOVNZ);
++					      AARCH64_INSN_IMM_MOVNZ);
+ 			break;
+ 		case R_AARCH64_MOVW_SABS_G1:
+ 			ovf = reloc_insn_movw(RELOC_OP_ABS, loc, val, 16,
+-					      INSN_IMM_MOVNZ);
++					      AARCH64_INSN_IMM_MOVNZ);
+ 			break;
+ 		case R_AARCH64_MOVW_SABS_G2:
+ 			ovf = reloc_insn_movw(RELOC_OP_ABS, loc, val, 32,
+-					      INSN_IMM_MOVNZ);
++					      AARCH64_INSN_IMM_MOVNZ);
+ 			break;
+ 		case R_AARCH64_MOVW_PREL_G0_NC:
+ 			overflow_check = false;
+ 			ovf = reloc_insn_movw(RELOC_OP_PREL, loc, val, 0,
+-					      INSN_IMM_MOVK);
++					      AARCH64_INSN_IMM_MOVK);
+ 			break;
+ 		case R_AARCH64_MOVW_PREL_G0:
+ 			ovf = reloc_insn_movw(RELOC_OP_PREL, loc, val, 0,
+-					      INSN_IMM_MOVNZ);
++					      AARCH64_INSN_IMM_MOVNZ);
+ 			break;
+ 		case R_AARCH64_MOVW_PREL_G1_NC:
+ 			overflow_check = false;
+ 			ovf = reloc_insn_movw(RELOC_OP_PREL, loc, val, 16,
+-					      INSN_IMM_MOVK);
++					      AARCH64_INSN_IMM_MOVK);
+ 			break;
+ 		case R_AARCH64_MOVW_PREL_G1:
+ 			ovf = reloc_insn_movw(RELOC_OP_PREL, loc, val, 16,
+-					      INSN_IMM_MOVNZ);
++					      AARCH64_INSN_IMM_MOVNZ);
+ 			break;
+ 		case R_AARCH64_MOVW_PREL_G2_NC:
+ 			overflow_check = false;
+ 			ovf = reloc_insn_movw(RELOC_OP_PREL, loc, val, 32,
+-					      INSN_IMM_MOVK);
++					      AARCH64_INSN_IMM_MOVK);
+ 			break;
+ 		case R_AARCH64_MOVW_PREL_G2:
+ 			ovf = reloc_insn_movw(RELOC_OP_PREL, loc, val, 32,
+-					      INSN_IMM_MOVNZ);
++					      AARCH64_INSN_IMM_MOVNZ);
+ 			break;
+ 		case R_AARCH64_MOVW_PREL_G3:
+ 			/* We're using the top bits so we can't overflow. */
+ 			overflow_check = false;
+ 			ovf = reloc_insn_movw(RELOC_OP_PREL, loc, val, 48,
+-					      INSN_IMM_MOVNZ);
++					      AARCH64_INSN_IMM_MOVNZ);
+ 			break;
+ 
+ 		/* Immediate instruction relocations. */
+ 		case R_AARCH64_LD_PREL_LO19:
+ 			ovf = reloc_insn_imm(RELOC_OP_PREL, loc, val, 2, 19,
+-					     INSN_IMM_19);
++					     AARCH64_INSN_IMM_19);
+ 			break;
+ 		case R_AARCH64_ADR_PREL_LO21:
+ 			ovf = reloc_insn_imm(RELOC_OP_PREL, loc, val, 0, 21,
+-					     INSN_IMM_ADR);
++					     AARCH64_INSN_IMM_ADR);
+ 			break;
+ 		case R_AARCH64_ADR_PREL_PG_HI21_NC:
+ 			overflow_check = false;
+ 		case R_AARCH64_ADR_PREL_PG_HI21:
+ 			ovf = reloc_insn_imm(RELOC_OP_PAGE, loc, val, 12, 21,
+-					     INSN_IMM_ADR);
++					     AARCH64_INSN_IMM_ADR);
+ 			break;
+ 		case R_AARCH64_ADD_ABS_LO12_NC:
+ 		case R_AARCH64_LDST8_ABS_LO12_NC:
+ 			overflow_check = false;
+ 			ovf = reloc_insn_imm(RELOC_OP_ABS, loc, val, 0, 12,
+-					     INSN_IMM_12);
++					     AARCH64_INSN_IMM_12);
+ 			break;
+ 		case R_AARCH64_LDST16_ABS_LO12_NC:
+ 			overflow_check = false;
+ 			ovf = reloc_insn_imm(RELOC_OP_ABS, loc, val, 1, 11,
+-					     INSN_IMM_12);
++					     AARCH64_INSN_IMM_12);
+ 			break;
+ 		case R_AARCH64_LDST32_ABS_LO12_NC:
+ 			overflow_check = false;
+ 			ovf = reloc_insn_imm(RELOC_OP_ABS, loc, val, 2, 10,
+-					     INSN_IMM_12);
++					     AARCH64_INSN_IMM_12);
+ 			break;
+ 		case R_AARCH64_LDST64_ABS_LO12_NC:
+ 			overflow_check = false;
+ 			ovf = reloc_insn_imm(RELOC_OP_ABS, loc, val, 3, 9,
+-					     INSN_IMM_12);
++					     AARCH64_INSN_IMM_12);
+ 			break;
+ 		case R_AARCH64_LDST128_ABS_LO12_NC:
+ 			overflow_check = false;
+ 			ovf = reloc_insn_imm(RELOC_OP_ABS, loc, val, 4, 8,
+-					     INSN_IMM_12);
++					     AARCH64_INSN_IMM_12);
+ 			break;
+ 		case R_AARCH64_TSTBR14:
+ 			ovf = reloc_insn_imm(RELOC_OP_PREL, loc, val, 2, 14,
+-					     INSN_IMM_14);
++					     AARCH64_INSN_IMM_14);
+ 			break;
+ 		case R_AARCH64_CONDBR19:
+ 			ovf = reloc_insn_imm(RELOC_OP_PREL, loc, val, 2, 19,
+-					     INSN_IMM_19);
++					     AARCH64_INSN_IMM_19);
+ 			break;
+ 		case R_AARCH64_JUMP26:
+ 		case R_AARCH64_CALL26:
+ 			ovf = reloc_insn_imm(RELOC_OP_PREL, loc, val, 2, 26,
+-					     INSN_IMM_26);
++					     AARCH64_INSN_IMM_26);
+ 			break;
+ 
+ 		default:
+
+commit 40c3baa7c66f1352521378ee83509fb8f4c465de
+Author: Jianguo Wu <wujianguo@huawei.com>
+Date:   Tue Nov 12 15:07:27 2013 -0800
+
+    mm/arch: use NUMA_NO_NODE
+    
+    Use more appropriate NUMA_NO_NODE instead of -1 in all archs' module_alloc()
+    
+    Signed-off-by: Jianguo Wu <wujianguo@huawei.com>
+    Acked-by: David Rientjes <rientjes@google.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/arch/arm64/kernel/module.c b/arch/arm64/kernel/module.c
+index 2c28a6cf93e6..e2ad0d87721f 100644
+--- a/arch/arm64/kernel/module.c
++++ b/arch/arm64/kernel/module.c
+@@ -29,7 +29,7 @@
+ void *module_alloc(unsigned long size)
+ {
+ 	return __vmalloc_node_range(size, 1, MODULES_VADDR, MODULES_END,
+-				    GFP_KERNEL, PAGE_KERNEL_EXEC, -1,
++				    GFP_KERNEL, PAGE_KERNEL_EXEC, NUMA_NO_NODE,
+ 				    __builtin_return_address(0));
+ }
+ 
+
+commit 122e2fa0d310d262cb85cf0b003032e5d2bc2ae7
+Author: Will Deacon <will.deacon@arm.com>
+Date:   Tue Nov 5 10:16:52 2013 +0000
+
+    arm64: module: ensure instruction is little-endian before manipulation
+    
+    Relocations that require an instruction immediate to be re-encoded must
+    ensure that the instruction pattern is represented in a little-endian
+    format for the manipulation code to work correctly.
+    
+    This patch converts the loaded instruction into native-endianess prior
+    to encoding and then converts back to little-endian byteorder before
+    updating memory.
+    
+    Signed-off-by: Will Deacon <will.deacon@arm.com>
+    Tested-by: Matthew Leach <matthew.leach@arm.com>
+    Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+
+diff --git a/arch/arm64/kernel/module.c b/arch/arm64/kernel/module.c
+index ca0e3d55da99..2c28a6cf93e6 100644
+--- a/arch/arm64/kernel/module.c
++++ b/arch/arm64/kernel/module.c
+@@ -111,6 +111,9 @@ static u32 encode_insn_immediate(enum aarch64_imm_type type, u32 insn, u64 imm)
+ 	u32 immlo, immhi, lomask, himask, mask;
+ 	int shift;
+ 
++	/* The instruction stream is always little endian. */
++	insn = le32_to_cpu(insn);
++
+ 	switch (type) {
+ 	case INSN_IMM_MOVNZ:
+ 		/*
+@@ -179,7 +182,7 @@ static u32 encode_insn_immediate(enum aarch64_imm_type type, u32 insn, u64 imm)
+ 	insn &= ~(mask << shift);
+ 	insn |= (imm & mask) << shift;
+ 
+-	return insn;
++	return cpu_to_le32(insn);
+ }
+ 
+ static int reloc_insn_movw(enum aarch64_reloc_op op, void *place, u64 val,
+
+commit 257cb251925f854da435cbf79b140984413871ac
+Author: Will Deacon <will.deacon@arm.com>
+Date:   Mon Mar 5 11:49:33 2012 +0000
+
+    arm64: Loadable modules
+    
+    This patch adds support for loadable modules. Loadable modules are
+    loaded 64MB below the kernel image due to branch relocation restrictions
+    (see Documentation/arm64/memory.txt).
+    
+    Signed-off-by: Will Deacon <will.deacon@arm.com>
+    Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+    Acked-by: Tony Lindgren <tony@atomide.com>
+    Acked-by: Nicolas Pitre <nico@linaro.org>
+    Acked-by: Olof Johansson <olof@lixom.net>
+    Acked-by: Santosh Shilimkar <santosh.shilimkar@ti.com>
+    Acked-by: Arnd Bergmann <arnd@arndb.de>
+
+diff --git a/arch/arm64/kernel/module.c b/arch/arm64/kernel/module.c
+new file mode 100644
+index 000000000000..ca0e3d55da99
+--- /dev/null
++++ b/arch/arm64/kernel/module.c
+@@ -0,0 +1,456 @@
++/*
++ * AArch64 loadable module support.
++ *
++ * Copyright (C) 2012 ARM Limited
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
++ *
++ * Author: Will Deacon <will.deacon@arm.com>
++ */
++
++#include <linux/bitops.h>
++#include <linux/elf.h>
++#include <linux/gfp.h>
++#include <linux/kernel.h>
++#include <linux/mm.h>
++#include <linux/moduleloader.h>
++#include <linux/vmalloc.h>
++
++void *module_alloc(unsigned long size)
++{
++	return __vmalloc_node_range(size, 1, MODULES_VADDR, MODULES_END,
++				    GFP_KERNEL, PAGE_KERNEL_EXEC, -1,
++				    __builtin_return_address(0));
++}
++
++enum aarch64_reloc_op {
++	RELOC_OP_NONE,
++	RELOC_OP_ABS,
++	RELOC_OP_PREL,
++	RELOC_OP_PAGE,
++};
++
++static u64 do_reloc(enum aarch64_reloc_op reloc_op, void *place, u64 val)
++{
++	switch (reloc_op) {
++	case RELOC_OP_ABS:
++		return val;
++	case RELOC_OP_PREL:
++		return val - (u64)place;
++	case RELOC_OP_PAGE:
++		return (val & ~0xfff) - ((u64)place & ~0xfff);
++	case RELOC_OP_NONE:
++		return 0;
++	}
++
++	pr_err("do_reloc: unknown relocation operation %d\n", reloc_op);
++	return 0;
++}
++
++static int reloc_data(enum aarch64_reloc_op op, void *place, u64 val, int len)
++{
++	u64 imm_mask = (1 << len) - 1;
++	s64 sval = do_reloc(op, place, val);
++
++	switch (len) {
++	case 16:
++		*(s16 *)place = sval;
++		break;
++	case 32:
++		*(s32 *)place = sval;
++		break;
++	case 64:
++		*(s64 *)place = sval;
++		break;
++	default:
++		pr_err("Invalid length (%d) for data relocation\n", len);
++		return 0;
++	}
++
++	/*
++	 * Extract the upper value bits (including the sign bit) and
++	 * shift them to bit 0.
++	 */
++	sval = (s64)(sval & ~(imm_mask >> 1)) >> (len - 1);
++
++	/*
++	 * Overflow has occurred if the value is not representable in
++	 * len bits (i.e the bottom len bits are not sign-extended and
++	 * the top bits are not all zero).
++	 */
++	if ((u64)(sval + 1) > 2)
++		return -ERANGE;
++
++	return 0;
++}
++
++enum aarch64_imm_type {
++	INSN_IMM_MOVNZ,
++	INSN_IMM_MOVK,
++	INSN_IMM_ADR,
++	INSN_IMM_26,
++	INSN_IMM_19,
++	INSN_IMM_16,
++	INSN_IMM_14,
++	INSN_IMM_12,
++	INSN_IMM_9,
++};
++
++static u32 encode_insn_immediate(enum aarch64_imm_type type, u32 insn, u64 imm)
++{
++	u32 immlo, immhi, lomask, himask, mask;
++	int shift;
++
++	switch (type) {
++	case INSN_IMM_MOVNZ:
++		/*
++		 * For signed MOVW relocations, we have to manipulate the
++		 * instruction encoding depending on whether or not the
++		 * immediate is less than zero.
++		 */
++		insn &= ~(3 << 29);
++		if ((s64)imm >= 0) {
++			/* >=0: Set the instruction to MOVZ (opcode 10b). */
++			insn |= 2 << 29;
++		} else {
++			/*
++			 * <0: Set the instruction to MOVN (opcode 00b).
++			 *     Since we've masked the opcode already, we
++			 *     don't need to do anything other than
++			 *     inverting the new immediate field.
++			 */
++			imm = ~imm;
++		}
++	case INSN_IMM_MOVK:
++		mask = BIT(16) - 1;
++		shift = 5;
++		break;
++	case INSN_IMM_ADR:
++		lomask = 0x3;
++		himask = 0x7ffff;
++		immlo = imm & lomask;
++		imm >>= 2;
++		immhi = imm & himask;
++		imm = (immlo << 24) | (immhi);
++		mask = (lomask << 24) | (himask);
++		shift = 5;
++		break;
++	case INSN_IMM_26:
++		mask = BIT(26) - 1;
++		shift = 0;
++		break;
++	case INSN_IMM_19:
++		mask = BIT(19) - 1;
++		shift = 5;
++		break;
++	case INSN_IMM_16:
++		mask = BIT(16) - 1;
++		shift = 5;
++		break;
++	case INSN_IMM_14:
++		mask = BIT(14) - 1;
++		shift = 5;
++		break;
++	case INSN_IMM_12:
++		mask = BIT(12) - 1;
++		shift = 10;
++		break;
++	case INSN_IMM_9:
++		mask = BIT(9) - 1;
++		shift = 12;
++		break;
++	default:
++		pr_err("encode_insn_immediate: unknown immediate encoding %d\n",
++			type);
++		return 0;
++	}
++
++	/* Update the immediate field. */
++	insn &= ~(mask << shift);
++	insn |= (imm & mask) << shift;
++
++	return insn;
++}
++
++static int reloc_insn_movw(enum aarch64_reloc_op op, void *place, u64 val,
++			   int lsb, enum aarch64_imm_type imm_type)
++{
++	u64 imm, limit = 0;
++	s64 sval;
++	u32 insn = *(u32 *)place;
++
++	sval = do_reloc(op, place, val);
++	sval >>= lsb;
++	imm = sval & 0xffff;
++
++	/* Update the instruction with the new encoding. */
++	*(u32 *)place = encode_insn_immediate(imm_type, insn, imm);
++
++	/* Shift out the immediate field. */
++	sval >>= 16;
++
++	/*
++	 * For unsigned immediates, the overflow check is straightforward.
++	 * For signed immediates, the sign bit is actually the bit past the
++	 * most significant bit of the field.
++	 * The INSN_IMM_16 immediate type is unsigned.
++	 */
++	if (imm_type != INSN_IMM_16) {
++		sval++;
++		limit++;
++	}
++
++	/* Check the upper bits depending on the sign of the immediate. */
++	if ((u64)sval > limit)
++		return -ERANGE;
++
++	return 0;
++}
++
++static int reloc_insn_imm(enum aarch64_reloc_op op, void *place, u64 val,
++			  int lsb, int len, enum aarch64_imm_type imm_type)
++{
++	u64 imm, imm_mask;
++	s64 sval;
++	u32 insn = *(u32 *)place;
++
++	/* Calculate the relocation value. */
++	sval = do_reloc(op, place, val);
++	sval >>= lsb;
++
++	/* Extract the value bits and shift them to bit 0. */
++	imm_mask = (BIT(lsb + len) - 1) >> lsb;
++	imm = sval & imm_mask;
++
++	/* Update the instruction's immediate field. */
++	*(u32 *)place = encode_insn_immediate(imm_type, insn, imm);
++
++	/*
++	 * Extract the upper value bits (including the sign bit) and
++	 * shift them to bit 0.
++	 */
++	sval = (s64)(sval & ~(imm_mask >> 1)) >> (len - 1);
++
++	/*
++	 * Overflow has occurred if the upper bits are not all equal to
++	 * the sign bit of the value.
++	 */
++	if ((u64)(sval + 1) >= 2)
++		return -ERANGE;
++
++	return 0;
++}
++
++int apply_relocate_add(Elf64_Shdr *sechdrs,
++		       const char *strtab,
++		       unsigned int symindex,
++		       unsigned int relsec,
++		       struct module *me)
++{
++	unsigned int i;
++	int ovf;
++	bool overflow_check;
++	Elf64_Sym *sym;
++	void *loc;
++	u64 val;
++	Elf64_Rela *rel = (void *)sechdrs[relsec].sh_addr;
++
++	for (i = 0; i < sechdrs[relsec].sh_size / sizeof(*rel); i++) {
++		/* loc corresponds to P in the AArch64 ELF document. */
++		loc = (void *)sechdrs[sechdrs[relsec].sh_info].sh_addr
++			+ rel[i].r_offset;
++
++		/* sym is the ELF symbol we're referring to. */
++		sym = (Elf64_Sym *)sechdrs[symindex].sh_addr
++			+ ELF64_R_SYM(rel[i].r_info);
++
++		/* val corresponds to (S + A) in the AArch64 ELF document. */
++		val = sym->st_value + rel[i].r_addend;
++
++		/* Check for overflow by default. */
++		overflow_check = true;
++
++		/* Perform the static relocation. */
++		switch (ELF64_R_TYPE(rel[i].r_info)) {
++		/* Null relocations. */
++		case R_ARM_NONE:
++		case R_AARCH64_NONE:
++			ovf = 0;
++			break;
++
++		/* Data relocations. */
++		case R_AARCH64_ABS64:
++			overflow_check = false;
++			ovf = reloc_data(RELOC_OP_ABS, loc, val, 64);
++			break;
++		case R_AARCH64_ABS32:
++			ovf = reloc_data(RELOC_OP_ABS, loc, val, 32);
++			break;
++		case R_AARCH64_ABS16:
++			ovf = reloc_data(RELOC_OP_ABS, loc, val, 16);
++			break;
++		case R_AARCH64_PREL64:
++			overflow_check = false;
++			ovf = reloc_data(RELOC_OP_PREL, loc, val, 64);
++			break;
++		case R_AARCH64_PREL32:
++			ovf = reloc_data(RELOC_OP_PREL, loc, val, 32);
++			break;
++		case R_AARCH64_PREL16:
++			ovf = reloc_data(RELOC_OP_PREL, loc, val, 16);
++			break;
++
++		/* MOVW instruction relocations. */
++		case R_AARCH64_MOVW_UABS_G0_NC:
++			overflow_check = false;
++		case R_AARCH64_MOVW_UABS_G0:
++			ovf = reloc_insn_movw(RELOC_OP_ABS, loc, val, 0,
++					      INSN_IMM_16);
++			break;
++		case R_AARCH64_MOVW_UABS_G1_NC:
++			overflow_check = false;
++		case R_AARCH64_MOVW_UABS_G1:
++			ovf = reloc_insn_movw(RELOC_OP_ABS, loc, val, 16,
++					      INSN_IMM_16);
++			break;
++		case R_AARCH64_MOVW_UABS_G2_NC:
++			overflow_check = false;
++		case R_AARCH64_MOVW_UABS_G2:
++			ovf = reloc_insn_movw(RELOC_OP_ABS, loc, val, 32,
++					      INSN_IMM_16);
++			break;
++		case R_AARCH64_MOVW_UABS_G3:
++			/* We're using the top bits so we can't overflow. */
++			overflow_check = false;
++			ovf = reloc_insn_movw(RELOC_OP_ABS, loc, val, 48,
++					      INSN_IMM_16);
++			break;
++		case R_AARCH64_MOVW_SABS_G0:
++			ovf = reloc_insn_movw(RELOC_OP_ABS, loc, val, 0,
++					      INSN_IMM_MOVNZ);
++			break;
++		case R_AARCH64_MOVW_SABS_G1:
++			ovf = reloc_insn_movw(RELOC_OP_ABS, loc, val, 16,
++					      INSN_IMM_MOVNZ);
++			break;
++		case R_AARCH64_MOVW_SABS_G2:
++			ovf = reloc_insn_movw(RELOC_OP_ABS, loc, val, 32,
++					      INSN_IMM_MOVNZ);
++			break;
++		case R_AARCH64_MOVW_PREL_G0_NC:
++			overflow_check = false;
++			ovf = reloc_insn_movw(RELOC_OP_PREL, loc, val, 0,
++					      INSN_IMM_MOVK);
++			break;
++		case R_AARCH64_MOVW_PREL_G0:
++			ovf = reloc_insn_movw(RELOC_OP_PREL, loc, val, 0,
++					      INSN_IMM_MOVNZ);
++			break;
++		case R_AARCH64_MOVW_PREL_G1_NC:
++			overflow_check = false;
++			ovf = reloc_insn_movw(RELOC_OP_PREL, loc, val, 16,
++					      INSN_IMM_MOVK);
++			break;
++		case R_AARCH64_MOVW_PREL_G1:
++			ovf = reloc_insn_movw(RELOC_OP_PREL, loc, val, 16,
++					      INSN_IMM_MOVNZ);
++			break;
++		case R_AARCH64_MOVW_PREL_G2_NC:
++			overflow_check = false;
++			ovf = reloc_insn_movw(RELOC_OP_PREL, loc, val, 32,
++					      INSN_IMM_MOVK);
++			break;
++		case R_AARCH64_MOVW_PREL_G2:
++			ovf = reloc_insn_movw(RELOC_OP_PREL, loc, val, 32,
++					      INSN_IMM_MOVNZ);
++			break;
++		case R_AARCH64_MOVW_PREL_G3:
++			/* We're using the top bits so we can't overflow. */
++			overflow_check = false;
++			ovf = reloc_insn_movw(RELOC_OP_PREL, loc, val, 48,
++					      INSN_IMM_MOVNZ);
++			break;
++
++		/* Immediate instruction relocations. */
++		case R_AARCH64_LD_PREL_LO19:
++			ovf = reloc_insn_imm(RELOC_OP_PREL, loc, val, 2, 19,
++					     INSN_IMM_19);
++			break;
++		case R_AARCH64_ADR_PREL_LO21:
++			ovf = reloc_insn_imm(RELOC_OP_PREL, loc, val, 0, 21,
++					     INSN_IMM_ADR);
++			break;
++		case R_AARCH64_ADR_PREL_PG_HI21_NC:
++			overflow_check = false;
++		case R_AARCH64_ADR_PREL_PG_HI21:
++			ovf = reloc_insn_imm(RELOC_OP_PAGE, loc, val, 12, 21,
++					     INSN_IMM_ADR);
++			break;
++		case R_AARCH64_ADD_ABS_LO12_NC:
++		case R_AARCH64_LDST8_ABS_LO12_NC:
++			overflow_check = false;
++			ovf = reloc_insn_imm(RELOC_OP_ABS, loc, val, 0, 12,
++					     INSN_IMM_12);
++			break;
++		case R_AARCH64_LDST16_ABS_LO12_NC:
++			overflow_check = false;
++			ovf = reloc_insn_imm(RELOC_OP_ABS, loc, val, 1, 11,
++					     INSN_IMM_12);
++			break;
++		case R_AARCH64_LDST32_ABS_LO12_NC:
++			overflow_check = false;
++			ovf = reloc_insn_imm(RELOC_OP_ABS, loc, val, 2, 10,
++					     INSN_IMM_12);
++			break;
++		case R_AARCH64_LDST64_ABS_LO12_NC:
++			overflow_check = false;
++			ovf = reloc_insn_imm(RELOC_OP_ABS, loc, val, 3, 9,
++					     INSN_IMM_12);
++			break;
++		case R_AARCH64_LDST128_ABS_LO12_NC:
++			overflow_check = false;
++			ovf = reloc_insn_imm(RELOC_OP_ABS, loc, val, 4, 8,
++					     INSN_IMM_12);
++			break;
++		case R_AARCH64_TSTBR14:
++			ovf = reloc_insn_imm(RELOC_OP_PREL, loc, val, 2, 14,
++					     INSN_IMM_14);
++			break;
++		case R_AARCH64_CONDBR19:
++			ovf = reloc_insn_imm(RELOC_OP_PREL, loc, val, 2, 19,
++					     INSN_IMM_19);
++			break;
++		case R_AARCH64_JUMP26:
++		case R_AARCH64_CALL26:
++			ovf = reloc_insn_imm(RELOC_OP_PREL, loc, val, 2, 26,
++					     INSN_IMM_26);
++			break;
++
++		default:
++			pr_err("module %s: unsupported RELA relocation: %llu\n",
++			       me->name, ELF64_R_TYPE(rel[i].r_info));
++			return -ENOEXEC;
++		}
++
++		if (overflow_check && ovf == -ERANGE)
++			goto overflow;
++
++	}
++
++	return 0;
++
++overflow:
++	pr_err("module %s: overflow in relocation type %d val %Lx\n",
++	       me->name, (int)ELF64_R_TYPE(rel[i].r_info), val);
++	return -ENOEXEC;
++}

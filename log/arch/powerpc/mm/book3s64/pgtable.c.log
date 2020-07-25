@@ -1,0 +1,1479 @@
+commit 18594f9b8c45484bd527ebc6b08383b95f58ba73
+Author: Nicholas Piggin <npiggin@gmail.com>
+Date:   Mon May 4 22:29:07 2020 +1000
+
+    powerpc/64s/radix: Don't prefetch DAR in update_mmu_cache
+    
+    The idea behind this prefetch was to kick off a page table walk before
+    returning from the fault, getting some pipelining advantage.
+    
+    But this never showed up any noticable performance advantage, and in
+    fact with KUAP the prefetches are actually blocked and cause some
+    kind of micro-architectural fault. Removing this improves page fault
+    microbenchmark performance by about 9%.
+    
+    Signed-off-by: Nicholas Piggin <npiggin@gmail.com>
+    [mpe: Keep the early return in update_mmu_cache()]
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+    Link: https://lore.kernel.org/r/20200504122907.49304-1-npiggin@gmail.com
+
+diff --git a/arch/powerpc/mm/book3s64/pgtable.c b/arch/powerpc/mm/book3s64/pgtable.c
+index 54b6d6d103ea..c58ad1049909 100644
+--- a/arch/powerpc/mm/book3s64/pgtable.c
++++ b/arch/powerpc/mm/book3s64/pgtable.c
+@@ -156,19 +156,6 @@ pmd_t pmd_modify(pmd_t pmd, pgprot_t newprot)
+ 	pmdv &= _HPAGE_CHG_MASK;
+ 	return pmd_set_protbits(__pmd(pmdv), newprot);
+ }
+-
+-/*
+- * This is called at the end of handling a user page fault, when the
+- * fault has been handled by updating a HUGE PMD entry in the linux page tables.
+- * We use it to preload an HPTE into the hash table corresponding to
+- * the updated linux HUGE PMD entry.
+- */
+-void update_mmu_cache_pmd(struct vm_area_struct *vma, unsigned long addr,
+-			  pmd_t *pmd)
+-{
+-	if (radix_enabled())
+-		prefetch((void *)addr);
+-}
+ #endif /* CONFIG_TRANSPARENT_HUGEPAGE */
+ 
+ /* For use by kexec */
+
+commit 75358ea359e7c0dfceb3c7b3d854570b4260cb7f
+Author: Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+Date:   Tue May 5 12:47:29 2020 +0530
+
+    powerpc/mm/book3s64: Fix MADV_DONTNEED and parallel page fault race
+    
+    MADV_DONTNEED holds mmap_sem in read mode and that implies a
+    parallel page fault is possible and the kernel can end up with a level 1 PTE
+    entry (THP entry) converted to a level 0 PTE entry without flushing
+    the THP TLB entry.
+    
+    Most architectures including POWER have issues with kernel instantiating a level
+    0 PTE entry while holding level 1 TLB entries.
+    
+    The code sequence I am looking at is
+    
+    down_read(mmap_sem)                         down_read(mmap_sem)
+    
+    zap_pmd_range()
+     zap_huge_pmd()
+      pmd lock held
+      pmd_cleared
+      table details added to mmu_gather
+      pmd_unlock()
+                                             insert a level 0 PTE entry()
+    
+    tlb_finish_mmu().
+    
+    Fix this by forcing a tlb flush before releasing pmd lock if this is
+    not a fullmm invalidate. We can safely skip this invalidate for
+    task exit case (fullmm invalidate) because in that case we are sure
+    there can be no parallel fault handlers.
+    
+    This do change the Qemu guest RAM del/unplug time as below
+    
+    128 core, 496GB guest:
+    
+    Without patch:
+    munmap start: timer = 196449 ms, PID=6681
+    munmap finish: timer = 196488 ms, PID=6681 - delta = 39ms
+    
+    With patch:
+    munmap start: timer = 196345 ms, PID=6879
+    munmap finish: timer = 196714 ms, PID=6879 - delta = 369ms
+    
+    Signed-off-by: Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+    Link: https://lore.kernel.org/r/20200505071729.54912-23-aneesh.kumar@linux.ibm.com
+
+diff --git a/arch/powerpc/mm/book3s64/pgtable.c b/arch/powerpc/mm/book3s64/pgtable.c
+index 127325ead505..54b6d6d103ea 100644
+--- a/arch/powerpc/mm/book3s64/pgtable.c
++++ b/arch/powerpc/mm/book3s64/pgtable.c
+@@ -112,6 +112,24 @@ pmd_t pmdp_invalidate(struct vm_area_struct *vma, unsigned long address,
+ 	return __pmd(old_pmd);
+ }
+ 
++pmd_t pmdp_huge_get_and_clear_full(struct vm_area_struct *vma,
++				   unsigned long addr, pmd_t *pmdp, int full)
++{
++	pmd_t pmd;
++	VM_BUG_ON(addr & ~HPAGE_PMD_MASK);
++	VM_BUG_ON((pmd_present(*pmdp) && !pmd_trans_huge(*pmdp) &&
++		   !pmd_devmap(*pmdp)) || !pmd_present(*pmdp));
++	pmd = pmdp_huge_get_and_clear(vma->vm_mm, addr, pmdp);
++	/*
++	 * if it not a fullmm flush, then we can possibly end up converting
++	 * this PMD pte entry to a regular level 0 PTE by a parallel page fault.
++	 * Make sure we flush the tlb in this case.
++	 */
++	if (!full)
++		flush_pmd_tlb_range(vma, addr, addr + HPAGE_PMD_SIZE);
++	return pmd;
++}
++
+ static pmd_t pmd_set_protbits(pmd_t pmd, pgprot_t pgprot)
+ {
+ 	return __pmd(pmd_val(pmd) | pgprot_val(pgprot));
+
+commit e21dfbf01346ee4447d1533b1c57a003c773c6e3
+Author: Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+Date:   Tue May 5 12:47:27 2020 +0530
+
+    powerpc/mm/book3s64: Avoid sending IPI on clearing PMD
+    
+    Now that all the lockless page table walk is careful w.r.t the PTE
+    address returned, we can now revert
+    commit: 13bd817bb884 ("powerpc/thp: Serialize pmd clear against a linux page table walk.")
+    
+    We also drop the equivalent IPI from other pte updates routines. We still keep
+    IPI in hash pmdp collapse and that is to take care of parallel hash page table
+    insert. The radix pmdp collapse flush can possibly be removed once I am sure
+    generic code doesn't have the any expectations around parallel gup walk.
+    
+    This speeds up Qemu guest RAM del/unplug time as below
+    
+    128 core, 496GB guest:
+    
+    Without patch:
+    munmap start: timer = 13162 ms, PID=7684
+    munmap finish: timer = 95312 ms, PID=7684 - delta = 82150 ms
+    
+    With patch:
+    munmap start: timer = 196449 ms, PID=6681
+    munmap finish: timer = 196488 ms, PID=6681 - delta = 39ms
+    
+    Signed-off-by: Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+    Link: https://lore.kernel.org/r/20200505071729.54912-21-aneesh.kumar@linux.ibm.com
+
+diff --git a/arch/powerpc/mm/book3s64/pgtable.c b/arch/powerpc/mm/book3s64/pgtable.c
+index e0bb69c616e4..127325ead505 100644
+--- a/arch/powerpc/mm/book3s64/pgtable.c
++++ b/arch/powerpc/mm/book3s64/pgtable.c
+@@ -109,14 +109,6 @@ pmd_t pmdp_invalidate(struct vm_area_struct *vma, unsigned long address,
+ 
+ 	old_pmd = pmd_hugepage_update(vma->vm_mm, address, pmdp, _PAGE_PRESENT, _PAGE_INVALID);
+ 	flush_pmd_tlb_range(vma, address, address + HPAGE_PMD_SIZE);
+-	/*
+-	 * This ensures that generic code that rely on IRQ disabling
+-	 * to prevent a parallel THP split work as expected.
+-	 *
+-	 * Marking the entry with _PAGE_INVALID && ~_PAGE_PRESENT requires
+-	 * a special case check in pmd_access_permitted.
+-	 */
+-	serialize_against_pte_lookup(vma->vm_mm);
+ 	return __pmd(old_pmd);
+ }
+ 
+
+commit 4e00c5affdd4b04e6392001716333971932f3d0c
+Author: Logan Gunthorpe <logang@deltatee.com>
+Date:   Fri Apr 10 14:33:32 2020 -0700
+
+    powerpc/mm: thread pgprot_t through create_section_mapping()
+    
+    In prepartion to support a pgprot_t argument for arch_add_memory().
+    
+    Signed-off-by: Logan Gunthorpe <logang@deltatee.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Cc: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+    Cc: Paul Mackerras <paulus@samba.org>
+    Cc: Michael Ellerman <mpe@ellerman.id.au>
+    Cc: Andy Lutomirski <luto@kernel.org>
+    Cc: Borislav Petkov <bp@alien8.de>
+    Cc: Catalin Marinas <catalin.marinas@arm.com>
+    Cc: Christoph Hellwig <hch@lst.de>
+    Cc: Dan Williams <dan.j.williams@intel.com>
+    Cc: Dave Hansen <dave.hansen@linux.intel.com>
+    Cc: David Hildenbrand <david@redhat.com>
+    Cc: Eric Badger <ebadger@gigaio.com>
+    Cc: "H. Peter Anvin" <hpa@zytor.com>
+    Cc: Ingo Molnar <mingo@redhat.com>
+    Cc: Jason Gunthorpe <jgg@ziepe.ca>
+    Cc: Michal Hocko <mhocko@suse.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Will Deacon <will@kernel.org>
+    Link: http://lkml.kernel.org/r/20200306170846.9333-6-logang@deltatee.com
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/arch/powerpc/mm/book3s64/pgtable.c b/arch/powerpc/mm/book3s64/pgtable.c
+index 2bf7e1b4fd82..e0bb69c616e4 100644
+--- a/arch/powerpc/mm/book3s64/pgtable.c
++++ b/arch/powerpc/mm/book3s64/pgtable.c
+@@ -171,12 +171,13 @@ void mmu_cleanup_all(void)
+ }
+ 
+ #ifdef CONFIG_MEMORY_HOTPLUG
+-int __meminit create_section_mapping(unsigned long start, unsigned long end, int nid)
++int __meminit create_section_mapping(unsigned long start, unsigned long end,
++				     int nid, pgprot_t prot)
+ {
+ 	if (radix_enabled())
+-		return radix__create_section_mapping(start, end, nid);
++		return radix__create_section_mapping(start, end, nid, prot);
+ 
+-	return hash__create_section_mapping(start, end, nid);
++	return hash__create_section_mapping(start, end, nid, prot);
+ }
+ 
+ int __meminit remove_section_mapping(unsigned long start, unsigned long end)
+
+commit 12e4d53f3f04e81f9e83d6fc10edc7314ab9f6b9
+Author: Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+Date:   Mon Feb 3 17:36:46 2020 -0800
+
+    powerpc/mmu_gather: enable RCU_TABLE_FREE even for !SMP case
+    
+    Patch series "Fixup page directory freeing", v4.
+    
+    This is a repost of patch series from Peter with the arch specific changes
+    except ppc64 dropped.  ppc64 changes are added here because we are redoing
+    the patch series on top of ppc64 changes.  This makes it easy to backport
+    these changes.  Only the first 2 patches need to be backported to stable.
+    
+    The thing is, on anything SMP, freeing page directories should observe the
+    exact same order as normal page freeing:
+    
+     1) unhook page/directory
+     2) TLB invalidate
+     3) free page/directory
+    
+    Without this, any concurrent page-table walk could end up with a
+    Use-after-Free.  This is esp.  trivial for anything that has software
+    page-table walkers (HAVE_FAST_GUP / software TLB fill) or the hardware
+    caches partial page-walks (ie.  caches page directories).
+    
+    Even on UP this might give issues since mmu_gather is preemptible these
+    days.  An interrupt or preempted task accessing user pages might stumble
+    into the free page if the hardware caches page directories.
+    
+    This patch series fixes ppc64 and add generic MMU_GATHER changes to
+    support the conversion of other architectures.  I haven't added patches
+    w.r.t other architecture because they are yet to be acked.
+    
+    This patch (of 9):
+    
+    A followup patch is going to make sure we correctly invalidate page walk
+    cache before we free page table pages.  In order to keep things simple
+    enable RCU_TABLE_FREE even for !SMP so that we don't have to fixup the
+    !SMP case differently in the followup patch
+    
+    !SMP case is right now broken for radix translation w.r.t page walk
+    cache flush.  We can get interrupted in between page table free and
+    that would imply we have page walk cache entries pointing to tables
+    which got freed already.  Michael said "both our platforms that run on
+    Power9 force SMP on in Kconfig, so the !SMP case is unlikely to be a
+    problem for anyone in practice, unless they've hacked their kernel to
+    build it !SMP."
+    
+    Link: http://lkml.kernel.org/r/20200116064531.483522-2-aneesh.kumar@linux.ibm.com
+    Signed-off-by: Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+    Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+    Acked-by: Michael Ellerman <mpe@ellerman.id.au>
+    Cc: <stable@vger.kernel.org>
+    
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/arch/powerpc/mm/book3s64/pgtable.c b/arch/powerpc/mm/book3s64/pgtable.c
+index 75483b40fcb1..2bf7e1b4fd82 100644
+--- a/arch/powerpc/mm/book3s64/pgtable.c
++++ b/arch/powerpc/mm/book3s64/pgtable.c
+@@ -378,7 +378,6 @@ static inline void pgtable_free(void *table, int index)
+ 	}
+ }
+ 
+-#ifdef CONFIG_SMP
+ void pgtable_free_tlb(struct mmu_gather *tlb, void *table, int index)
+ {
+ 	unsigned long pgf = (unsigned long)table;
+@@ -395,12 +394,6 @@ void __tlb_remove_table(void *_table)
+ 
+ 	return pgtable_free(table, index);
+ }
+-#else
+-void pgtable_free_tlb(struct mmu_gather *tlb, void *table, int index)
+-{
+-	return pgtable_free(table, index);
+-}
+-#endif
+ 
+ #ifdef CONFIG_PROC_FS
+ atomic_long_t direct_pages_count[MMU_PAGE_COUNT];
+
+commit 2275d7b5754a573ffb2ca9e40bd0546eeb986696
+Author: Nicholas Piggin <npiggin@gmail.com>
+Date:   Tue Sep 3 01:29:31 2019 +1000
+
+    powerpc/64s/radix: introduce options to disable use of the tlbie instruction
+    
+    Introduce two options to control the use of the tlbie instruction. A
+    boot time option which completely disables the kernel using the
+    instruction, this is currently incompatible with HASH MMU, KVM, and
+    coherent accelerators.
+    
+    And a debugfs option can be switched at runtime and avoids using tlbie
+    for invalidating CPU TLBs for normal process and kernel address
+    mappings. Coherent accelerators are still managed with tlbie, as will
+    KVM partition scope translations.
+    
+    Cross-CPU TLB flushing is implemented with IPIs and tlbiel. This is a
+    basic implementation which does not attempt to make any optimisation
+    beyond the tlbie implementation.
+    
+    This is useful for performance testing among other things. For example
+    in certain situations on large systems, using IPIs may be faster than
+    tlbie as they can be directed rather than broadcast. Later we may also
+    take advantage of the IPIs to do more interesting things such as trim
+    the mm cpumask more aggressively.
+    
+    Signed-off-by: Nicholas Piggin <npiggin@gmail.com>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+    Link: https://lore.kernel.org/r/20190902152931.17840-7-npiggin@gmail.com
+
+diff --git a/arch/powerpc/mm/book3s64/pgtable.c b/arch/powerpc/mm/book3s64/pgtable.c
+index 351eb78eed55..75483b40fcb1 100644
+--- a/arch/powerpc/mm/book3s64/pgtable.c
++++ b/arch/powerpc/mm/book3s64/pgtable.c
+@@ -8,6 +8,7 @@
+ #include <linux/memblock.h>
+ #include <misc/cxl-base.h>
+ 
++#include <asm/debugfs.h>
+ #include <asm/pgalloc.h>
+ #include <asm/tlb.h>
+ #include <asm/trace.h>
+@@ -469,3 +470,49 @@ int pmd_move_must_withdraw(struct spinlock *new_pmd_ptl,
+ 
+ 	return true;
+ }
++
++/*
++ * Does the CPU support tlbie?
++ */
++bool tlbie_capable __read_mostly = true;
++EXPORT_SYMBOL(tlbie_capable);
++
++/*
++ * Should tlbie be used for management of CPU TLBs, for kernel and process
++ * address spaces? tlbie may still be used for nMMU accelerators, and for KVM
++ * guest address spaces.
++ */
++bool tlbie_enabled __read_mostly = true;
++
++static int __init setup_disable_tlbie(char *str)
++{
++	if (!radix_enabled()) {
++		pr_err("disable_tlbie: Unable to disable TLBIE with Hash MMU.\n");
++		return 1;
++	}
++
++	tlbie_capable = false;
++	tlbie_enabled = false;
++
++        return 1;
++}
++__setup("disable_tlbie", setup_disable_tlbie);
++
++static int __init pgtable_debugfs_setup(void)
++{
++	if (!tlbie_capable)
++		return 0;
++
++	/*
++	 * There is no locking vs tlb flushing when changing this value.
++	 * The tlb flushers will see one value or another, and use either
++	 * tlbie or tlbiel with IPIs. In both cases the TLBs will be
++	 * invalidated as expected.
++	 */
++	debugfs_create_bool("tlbie_enabled", 0600,
++			powerpc_debugfs_root,
++			&tlbie_enabled);
++
++	return 0;
++}
++arch_initcall(pgtable_debugfs_setup);
+
+commit 7d805accbec57a151bd0dd305a1109feebdfd4a4
+Author: Nicholas Piggin <npiggin@gmail.com>
+Date:   Tue Sep 3 01:29:30 2019 +1000
+
+    powerpc/64s: remove unnecessary translation cache flushes at boot
+    
+    The various translation structure invalidations performed in early boot
+    when the MMU is off are not required, because everything is invalidated
+    immediately before a CPU first enables its MMU (see early_init_mmu
+    and early_init_mmu_secondary).
+    
+    Signed-off-by: Nicholas Piggin <npiggin@gmail.com>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+    Link: https://lore.kernel.org/r/20190902152931.17840-6-npiggin@gmail.com
+
+diff --git a/arch/powerpc/mm/book3s64/pgtable.c b/arch/powerpc/mm/book3s64/pgtable.c
+index 6fab9c0bbbaf..351eb78eed55 100644
+--- a/arch/powerpc/mm/book3s64/pgtable.c
++++ b/arch/powerpc/mm/book3s64/pgtable.c
+@@ -252,6 +252,11 @@ void mmu_partition_table_set_entry(unsigned int lpid, unsigned long dw0,
+ 		pr_info("PATE registered by ultravisor: dw0 = 0x%lx, dw1 = 0x%lx\n",
+ 			dw0, dw1);
+ 	} else if (flush) {
++		/*
++		 * Boot does not need to flush, because MMU is off and each
++		 * CPU does a tlbiel_all() before switching them on, which
++		 * flushes everything.
++		 */
+ 		flush_partition(lpid, (old & PATB_HR));
+ 	}
+ }
+
+commit fd13daea5f72605a0a7386ebedbb5ff2b2a48da4
+Author: Nicholas Piggin <npiggin@gmail.com>
+Date:   Tue Sep 3 01:29:28 2019 +1000
+
+    powerpc/64s: make mmu_partition_table_set_entry TLB flush optional
+    
+    No functional change.
+    
+    Signed-off-by: Nicholas Piggin <npiggin@gmail.com>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+    Link: https://lore.kernel.org/r/20190902152931.17840-4-npiggin@gmail.com
+
+diff --git a/arch/powerpc/mm/book3s64/pgtable.c b/arch/powerpc/mm/book3s64/pgtable.c
+index c2b87c5ba50b..6fab9c0bbbaf 100644
+--- a/arch/powerpc/mm/book3s64/pgtable.c
++++ b/arch/powerpc/mm/book3s64/pgtable.c
+@@ -224,7 +224,7 @@ static void flush_partition(unsigned int lpid, bool radix)
+ }
+ 
+ void mmu_partition_table_set_entry(unsigned int lpid, unsigned long dw0,
+-				  unsigned long dw1)
++				  unsigned long dw1, bool flush)
+ {
+ 	unsigned long old = be64_to_cpu(partition_tb[lpid].patb0);
+ 
+@@ -251,7 +251,7 @@ void mmu_partition_table_set_entry(unsigned int lpid, unsigned long dw0,
+ 		uv_register_pate(lpid, dw0, dw1);
+ 		pr_info("PATE registered by ultravisor: dw0 = 0x%lx, dw1 = 0x%lx\n",
+ 			dw0, dw1);
+-	} else {
++	} else if (flush) {
+ 		flush_partition(lpid, (old & PATB_HR));
+ 	}
+ }
+
+commit 99161de3a283af59f2813da6cbdccc1d2784c7de
+Author: Nicholas Piggin <npiggin@gmail.com>
+Date:   Tue Sep 3 01:29:27 2019 +1000
+
+    powerpc/64s/radix: tidy up TLB flushing code
+    
+    There should be no functional changes.
+    
+    - Use calls to existing radix_tlb.c functions in flush_partition.
+    
+    - Rename radix__flush_tlb_lpid to radix__flush_all_lpid and similar,
+      because they flush everything, matching flush_all_mm rather than
+      flush_tlb_mm for the lpid.
+    
+    - Remove some unused radix_tlb.c flush primitives.
+    
+    Signed-off: Nicholas Piggin <npiggin@gmail.com>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+    Link: https://lore.kernel.org/r/20190902152931.17840-3-npiggin@gmail.com
+
+diff --git a/arch/powerpc/mm/book3s64/pgtable.c b/arch/powerpc/mm/book3s64/pgtable.c
+index 97f3be778c79..c2b87c5ba50b 100644
+--- a/arch/powerpc/mm/book3s64/pgtable.c
++++ b/arch/powerpc/mm/book3s64/pgtable.c
+@@ -210,20 +210,17 @@ void __init mmu_partition_table_init(void)
+ 
+ static void flush_partition(unsigned int lpid, bool radix)
+ {
+-	asm volatile("ptesync" : : : "memory");
+ 	if (radix) {
+-		asm volatile(PPC_TLBIE_5(%0,%1,2,0,1) : :
+-			     "r" (TLBIEL_INVAL_SET_LPID), "r" (lpid));
+-		asm volatile(PPC_TLBIE_5(%0,%1,2,1,1) : :
+-			     "r" (TLBIEL_INVAL_SET_LPID), "r" (lpid));
+-		trace_tlbie(lpid, 0, TLBIEL_INVAL_SET_LPID, lpid, 2, 0, 1);
++		radix__flush_all_lpid(lpid);
++		radix__flush_all_lpid_guest(lpid);
+ 	} else {
++		asm volatile("ptesync" : : : "memory");
+ 		asm volatile(PPC_TLBIE_5(%0,%1,2,0,0) : :
+ 			     "r" (TLBIEL_INVAL_SET_LPID), "r" (lpid));
++		/* do we need fixup here ?*/
++		asm volatile("eieio; tlbsync; ptesync" : : : "memory");
+ 		trace_tlbie(lpid, 0, TLBIEL_INVAL_SET_LPID, lpid, 2, 0, 0);
+ 	}
+-	/* do we need fixup here ?*/
+-	asm volatile("eieio; tlbsync; ptesync" : : : "memory");
+ }
+ 
+ void mmu_partition_table_set_entry(unsigned int lpid, unsigned long dw0,
+
+commit ed6546bdc61b7c4bd926cebd82ba52d056fcefa1
+Author: Nicholas Piggin <npiggin@gmail.com>
+Date:   Tue Sep 3 01:29:26 2019 +1000
+
+    powerpc/64s: remove register_process_table callback
+    
+    This callback is only required because the partition table init comes
+    before process table allocation on powernv (aka bare metal aka native).
+    
+    Change the order to allocate the process table first, and remove the
+    callback.
+    
+    Signed-off-by: Nicholas Piggin <npiggin@gmail.com>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+    Link: https://lore.kernel.org/r/20190902152931.17840-2-npiggin@gmail.com
+
+diff --git a/arch/powerpc/mm/book3s64/pgtable.c b/arch/powerpc/mm/book3s64/pgtable.c
+index 206b43ae4000..97f3be778c79 100644
+--- a/arch/powerpc/mm/book3s64/pgtable.c
++++ b/arch/powerpc/mm/book3s64/pgtable.c
+@@ -23,9 +23,6 @@ EXPORT_SYMBOL(__pmd_frag_nr);
+ unsigned long __pmd_frag_size_shift;
+ EXPORT_SYMBOL(__pmd_frag_size_shift);
+ 
+-int (*register_process_table)(unsigned long base, unsigned long page_size,
+-			      unsigned long tbl_size);
+-
+ #ifdef CONFIG_TRANSPARENT_HUGEPAGE
+ /*
+  * This is called when relaxing access to a hugepage. It's also called in the page
+
+commit 9044adca782c065de182d28876808446b3a8ccde
+Merge: 07aa1e786d4f 68e0aa8ec5ce
+Author: Michael Ellerman <mpe@ellerman.id.au>
+Date:   Fri Aug 30 09:52:57 2019 +1000
+
+    Merge branch 'topic/ppc-kvm' into next
+    
+    Merge our ppc-kvm topic branch to bring in the Ultravisor support
+    patches.
+
+commit 5223134029a87db925ecc9449f9501bad391a52e
+Author: Claudio Carvalho <cclaudio@linux.ibm.com>
+Date:   Thu Aug 22 00:48:36 2019 -0300
+
+    powerpc/mm: Write to PTCR only if ultravisor disabled
+    
+    In ultravisor enabled systems, PTCR becomes ultravisor privileged only
+    for writing and an attempt to write to it will cause a Hypervisor
+    Emulation Assitance interrupt.
+    
+    This patch uses the set_ptcr_when_no_uv() function to restrict PTCR
+    writing to only when ultravisor is disabled.
+    
+    Signed-off-by: Claudio Carvalho <cclaudio@linux.ibm.com>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+    Link: https://lore.kernel.org/r/20190822034838.27876-6-cclaudio@linux.ibm.com
+
+diff --git a/arch/powerpc/mm/book3s64/pgtable.c b/arch/powerpc/mm/book3s64/pgtable.c
+index 4173f6931009..01a7570c10e0 100644
+--- a/arch/powerpc/mm/book3s64/pgtable.c
++++ b/arch/powerpc/mm/book3s64/pgtable.c
+@@ -207,7 +207,7 @@ void __init mmu_partition_table_init(void)
+ 	 * 64 K size.
+ 	 */
+ 	ptcr = __pa(partition_tb) | (PATB_SIZE_SHIFT - 12);
+-	mtspr(SPRN_PTCR, ptcr);
++	set_ptcr_when_no_uv(ptcr);
+ 	powernv_set_nmmu_ptcr(ptcr);
+ }
+ 
+
+commit 139a1d2842ec181cf017502a46bb8d947682a960
+Author: Michael Anderson <andmike@linux.ibm.com>
+Date:   Thu Aug 22 00:48:35 2019 -0300
+
+    powerpc/mm: Use UV_WRITE_PATE ucall to register a PATE
+    
+    When Ultravisor (UV) is enabled, the partition table is stored in secure
+    memory and can only be accessed via the UV. The Hypervisor (HV) however
+    maintains a copy of the partition table in normal memory to allow Nest MMU
+    translations to occur (for normal VMs). The HV copy includes partition
+    table entries (PATE)s for secure VMs which would currently be unused
+    (Nest MMU translations cannot access secure memory) but they would be
+    needed as we add functionality.
+    
+    This patch adds the UV_WRITE_PATE ucall which is used to update the PATE
+    for a VM (both normal and secure) when Ultravisor is enabled.
+    
+    Signed-off-by: Michael Anderson <andmike@linux.ibm.com>
+    Signed-off-by: Madhavan Srinivasan <maddy@linux.vnet.ibm.com>
+    Signed-off-by: Ram Pai <linuxram@us.ibm.com>
+    [ cclaudio: Write the PATE in HV's table before doing that in UV's ]
+    Signed-off-by: Claudio Carvalho <cclaudio@linux.ibm.com>
+    Reviewed-by: Ryan Grimm <grimm@linux.vnet.ibm.com>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+    Link: https://lore.kernel.org/r/20190822034838.27876-5-cclaudio@linux.ibm.com
+
+diff --git a/arch/powerpc/mm/book3s64/pgtable.c b/arch/powerpc/mm/book3s64/pgtable.c
+index 7d0e0d0d22c4..4173f6931009 100644
+--- a/arch/powerpc/mm/book3s64/pgtable.c
++++ b/arch/powerpc/mm/book3s64/pgtable.c
+@@ -12,6 +12,8 @@
+ #include <asm/tlb.h>
+ #include <asm/trace.h>
+ #include <asm/powernv.h>
++#include <asm/firmware.h>
++#include <asm/ultravisor.h>
+ 
+ #include <mm/mmu_decl.h>
+ #include <trace/events/thp.h>
+@@ -209,21 +211,10 @@ void __init mmu_partition_table_init(void)
+ 	powernv_set_nmmu_ptcr(ptcr);
+ }
+ 
+-void mmu_partition_table_set_entry(unsigned int lpid, unsigned long dw0,
+-				   unsigned long dw1)
++static void flush_partition(unsigned int lpid, bool radix)
+ {
+-	unsigned long old = be64_to_cpu(partition_tb[lpid].patb0);
+-
+-	partition_tb[lpid].patb0 = cpu_to_be64(dw0);
+-	partition_tb[lpid].patb1 = cpu_to_be64(dw1);
+-
+-	/*
+-	 * Global flush of TLBs and partition table caches for this lpid.
+-	 * The type of flush (hash or radix) depends on what the previous
+-	 * use of this partition ID was, not the new use.
+-	 */
+ 	asm volatile("ptesync" : : : "memory");
+-	if (old & PATB_HR) {
++	if (radix) {
+ 		asm volatile(PPC_TLBIE_5(%0,%1,2,0,1) : :
+ 			     "r" (TLBIEL_INVAL_SET_LPID), "r" (lpid));
+ 		asm volatile(PPC_TLBIE_5(%0,%1,2,1,1) : :
+@@ -237,6 +228,39 @@ void mmu_partition_table_set_entry(unsigned int lpid, unsigned long dw0,
+ 	/* do we need fixup here ?*/
+ 	asm volatile("eieio; tlbsync; ptesync" : : : "memory");
+ }
++
++void mmu_partition_table_set_entry(unsigned int lpid, unsigned long dw0,
++				  unsigned long dw1)
++{
++	unsigned long old = be64_to_cpu(partition_tb[lpid].patb0);
++
++	/*
++	 * When ultravisor is enabled, the partition table is stored in secure
++	 * memory and can only be accessed doing an ultravisor call. However, we
++	 * maintain a copy of the partition table in normal memory to allow Nest
++	 * MMU translations to occur (for normal VMs).
++	 *
++	 * Therefore, here we always update partition_tb, regardless of whether
++	 * we are running under an ultravisor or not.
++	 */
++	partition_tb[lpid].patb0 = cpu_to_be64(dw0);
++	partition_tb[lpid].patb1 = cpu_to_be64(dw1);
++
++	/*
++	 * If ultravisor is enabled, we do an ultravisor call to register the
++	 * partition table entry (PATE), which also do a global flush of TLBs
++	 * and partition table caches for the lpid. Otherwise, just do the
++	 * flush. The type of flush (hash or radix) depends on what the previous
++	 * use of the partition ID was, not the new use.
++	 */
++	if (firmware_has_feature(FW_FEATURE_ULTRAVISOR)) {
++		uv_register_pate(lpid, dw0, dw1);
++		pr_info("PATE registered by ultravisor: dw0 = 0x%lx, dw1 = 0x%lx\n",
++			dw0, dw1);
++	} else {
++		flush_partition(lpid, (old & PATB_HR));
++	}
++}
+ EXPORT_SYMBOL_GPL(mmu_partition_table_set_entry);
+ 
+ static pmd_t *get_pmd_from_cache(struct mm_struct *mm)
+
+commit 191e42063a7241e5c3a1d1f36896a20b147517e9
+Author: Christophe Leroy <christophe.leroy@c-s.fr>
+Date:   Tue Aug 20 14:07:18 2019 +0000
+
+    powerpc/mm: refactor ioremap_range() and use ioremap_page_range()
+    
+    book3s64's ioremap_range() is almost same as fallback ioremap_range(),
+    except that it calls radix__ioremap_range() when radix is enabled.
+    
+    radix__ioremap_range() is also very similar to the other ones, expect
+    that it calls ioremap_page_range when slab is available.
+    
+    PPC32 __ioremap_caller() have a loop doing the same thing as
+    ioremap_range() so use it on PPC32 as well.
+    
+    Lets keep only one version of ioremap_range() which calls
+    ioremap_page_range() on all platforms when slab is available.
+    
+    At the same time, drop the nid parameter which is not used.
+    
+    Signed-off-by: Christophe Leroy <christophe.leroy@c-s.fr>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+    Link: https://lore.kernel.org/r/4b1dca7096b01823b101be7338983578641547f1.1566309263.git.christophe.leroy@c-s.fr
+
+diff --git a/arch/powerpc/mm/book3s64/pgtable.c b/arch/powerpc/mm/book3s64/pgtable.c
+index 7d0e0d0d22c4..4c8bed856533 100644
+--- a/arch/powerpc/mm/book3s64/pgtable.c
++++ b/arch/powerpc/mm/book3s64/pgtable.c
+@@ -446,24 +446,3 @@ int pmd_move_must_withdraw(struct spinlock *new_pmd_ptl,
+ 
+ 	return true;
+ }
+-
+-int ioremap_range(unsigned long ea, phys_addr_t pa, unsigned long size, pgprot_t prot, int nid)
+-{
+-	unsigned long i;
+-
+-	if (radix_enabled())
+-		return radix__ioremap_range(ea, pa, size, prot, nid);
+-
+-	for (i = 0; i < size; i += PAGE_SIZE) {
+-		int err = map_kernel_page(ea + i, pa + i, prot);
+-		if (err) {
+-			if (slab_is_available())
+-				unmap_kernel_range(ea, size);
+-			else
+-				WARN_ON_ONCE(1); /* Should clean up */
+-			return err;
+-		}
+-	}
+-
+-	return 0;
+-}
+
+commit 192f0f8e9db7efe4ac98d47f5fa4334e43c1204d
+Merge: ec9249752465 f5a9e488d623
+Author: Linus Torvalds <torvalds@linux-foundation.org>
+Date:   Sat Jul 13 16:08:36 2019 -0700
+
+    Merge tag 'powerpc-5.3-1' of git://git.kernel.org/pub/scm/linux/kernel/git/powerpc/linux
+    
+    Pull powerpc updates from Michael Ellerman:
+     "Notable changes:
+    
+       - Removal of the NPU DMA code, used by the out-of-tree Nvidia driver,
+         as well as some other functions only used by drivers that haven't
+         (yet?) made it upstream.
+    
+       - A fix for a bug in our handling of hardware watchpoints (eg. perf
+         record -e mem: ...) which could lead to register corruption and
+         kernel crashes.
+    
+       - Enable HAVE_ARCH_HUGE_VMAP, which allows us to use large pages for
+         vmalloc when using the Radix MMU.
+    
+       - A large but incremental rewrite of our exception handling code to
+         use gas macros rather than multiple levels of nested CPP macros.
+    
+      And the usual small fixes, cleanups and improvements.
+    
+      Thanks to: Alastair D'Silva, Alexey Kardashevskiy, Andreas Schwab,
+      Aneesh Kumar K.V, Anju T Sudhakar, Anton Blanchard, Arnd Bergmann,
+      Athira Rajeev, Cédric Le Goater, Christian Lamparter, Christophe
+      Leroy, Christophe Lombard, Christoph Hellwig, Daniel Axtens, Denis
+      Efremov, Enrico Weigelt, Frederic Barrat, Gautham R. Shenoy, Geert
+      Uytterhoeven, Geliang Tang, Gen Zhang, Greg Kroah-Hartman, Greg Kurz,
+      Gustavo Romero, Krzysztof Kozlowski, Madhavan Srinivasan, Masahiro
+      Yamada, Mathieu Malaterre, Michael Neuling, Nathan Lynch, Naveen N.
+      Rao, Nicholas Piggin, Nishad Kamdar, Oliver O'Halloran, Qian Cai, Ravi
+      Bangoria, Sachin Sant, Sam Bobroff, Satheesh Rajendran, Segher
+      Boessenkool, Shaokun Zhang, Shawn Anastasio, Stewart Smith, Suraj
+      Jitindar Singh, Thiago Jung Bauermann, YueHaibing"
+    
+    * tag 'powerpc-5.3-1' of git://git.kernel.org/pub/scm/linux/kernel/git/powerpc/linux: (163 commits)
+      powerpc/powernv/idle: Fix restore of SPRN_LDBAR for POWER9 stop state.
+      powerpc/eeh: Handle hugepages in ioremap space
+      ocxl: Update for AFU descriptor template version 1.1
+      powerpc/boot: pass CONFIG options in a simpler and more robust way
+      powerpc/boot: add {get, put}_unaligned_be32 to xz_config.h
+      powerpc/irq: Don't WARN continuously in arch_local_irq_restore()
+      powerpc/module64: Use symbolic instructions names.
+      powerpc/module32: Use symbolic instructions names.
+      powerpc: Move PPC_HA() PPC_HI() and PPC_LO() to ppc-opcode.h
+      powerpc/module64: Fix comment in R_PPC64_ENTRY handling
+      powerpc/boot: Add lzo support for uImage
+      powerpc/boot: Add lzma support for uImage
+      powerpc/boot: don't force gzipped uImage
+      powerpc/8xx: Add microcode patch to move SMC parameter RAM.
+      powerpc/8xx: Use IO accessors in microcode programming.
+      powerpc/8xx: replace #ifdefs by IS_ENABLED() in microcode.c
+      powerpc/8xx: refactor programming of microcode CPM params.
+      powerpc/8xx: refactor printing of microcode patch name.
+      powerpc/8xx: Refactor microcode write
+      powerpc/8xx: refactor writing of CPM microcode arrays
+      ...
+
+commit 1ecf2cdc74fc7f79b4b45dd34f89c4a8e6ada96f
+Author: Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+Date:   Tue May 14 11:33:01 2019 +0530
+
+    powerpc/mm: pmd_devmap implies pmd_large().
+    
+    large devmap usage is dependent on THP. Hence once check is sufficient.
+    
+    Signed-off-by: Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+
+diff --git a/arch/powerpc/mm/book3s64/pgtable.c b/arch/powerpc/mm/book3s64/pgtable.c
+index 953850a602f7..85bc81abd286 100644
+--- a/arch/powerpc/mm/book3s64/pgtable.c
++++ b/arch/powerpc/mm/book3s64/pgtable.c
+@@ -76,7 +76,7 @@ void set_pmd_at(struct mm_struct *mm, unsigned long addr,
+ 
+ 	WARN_ON(pte_hw_valid(pmd_pte(*pmdp)) && !pte_protnone(pmd_pte(*pmdp)));
+ 	assert_spin_locked(pmd_lockptr(mm, pmdp));
+-	WARN_ON(!(pmd_large(pmd) || pmd_devmap(pmd)));
++	WARN_ON(!(pmd_large(pmd)));
+ #endif
+ 	trace_hugepage_set_pmd(addr, pmd_val(pmd));
+ 	return set_pte_at(mm, addr, pmdp_ptep(pmdp), pmd_pte(pmd));
+
+commit 8b8dc695143642c6a8bee2242f2f7af4232298ab
+Merge: 3c25ab35fbc8 b7cbb5240130
+Author: Michael Ellerman <mpe@ellerman.id.au>
+Date:   Mon Jul 1 14:04:39 2019 +1000
+
+    Merge branch 'fixes' into next
+    
+    Merge our fixes branch into next, this brings in a number of commits
+    that fix bugs we don't want to hit in next, in particular the fix for
+    CVE-2019-12817.
+
+commit d38153f9ccc9b6b6a27a91559999292c27b72b8c
+Author: Nicholas Piggin <npiggin@gmail.com>
+Date:   Mon Jun 10 13:08:17 2019 +1000
+
+    powerpc/64s/radix: ioremap use ioremap_page_range
+    
+    Radix can use ioremap_page_range for ioremap, after slab is available.
+    This makes it possible to enable huge ioremap mapping support.
+    
+    Signed-off-by: Nicholas Piggin <npiggin@gmail.com>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+
+diff --git a/arch/powerpc/mm/book3s64/pgtable.c b/arch/powerpc/mm/book3s64/pgtable.c
+index 16bda049187a..ad3dd977c22d 100644
+--- a/arch/powerpc/mm/book3s64/pgtable.c
++++ b/arch/powerpc/mm/book3s64/pgtable.c
+@@ -447,3 +447,24 @@ int pmd_move_must_withdraw(struct spinlock *new_pmd_ptl,
+ 
+ 	return true;
+ }
++
++int ioremap_range(unsigned long ea, phys_addr_t pa, unsigned long size, pgprot_t prot, int nid)
++{
++	unsigned long i;
++
++	if (radix_enabled())
++		return radix__ioremap_range(ea, pa, size, prot, nid);
++
++	for (i = 0; i < size; i += PAGE_SIZE) {
++		int err = map_kernel_page(ea + i, pa + i, prot);
++		if (err) {
++			if (slab_is_available())
++				unmap_kernel_range(ea, size);
++			else
++				WARN_ON_ONCE(1); /* Should clean up */
++			return err;
++		}
++	}
++
++	return 0;
++}
+
+commit fa1827d7731ac24f44309ddc2ca806650912bf0e
+Merge: 6a71398c6aea c21f5a9ed85c
+Author: Linus Torvalds <torvalds@linux-foundation.org>
+Date:   Sat Jun 15 07:29:32 2019 -1000
+
+    Merge tag 'powerpc-5.2-4' of git://git.kernel.org/pub/scm/linux/kernel/git/powerpc/linux
+    
+    Pull powerpc fixes from Michael Ellerman:
+     "One fix for a regression introduced by our 32-bit KASAN support, which
+      broke booting on machines with "bootx" early debugging enabled.
+    
+      A fix for a bug which broke kexec on 32-bit, introduced by changes to
+      the 32-bit STRICT_KERNEL_RWX support in v5.1.
+    
+      Finally two fixes going to stable for our THP split/collapse handling,
+      discovered by Nick. The first fixes random crashes and/or corruption
+      in guests under sufficient load.
+    
+      Thanks to: Nicholas Piggin, Christophe Leroy, Aaro Koskinen, Mathieu
+      Malaterre"
+    
+    * tag 'powerpc-5.2-4' of git://git.kernel.org/pub/scm/linux/kernel/git/powerpc/linux:
+      powerpc/32s: fix booting with CONFIG_PPC_EARLY_DEBUG_BOOTX
+      powerpc/64s: __find_linux_pte() synchronization vs pmdp_invalidate()
+      powerpc/64s: Fix THP PMD collapse serialisation
+      powerpc: Fix kexec failure on book3s/32
+
+commit 33258a1db165cf43a9e6382587ad06e9b7f8187c
+Author: Nicholas Piggin <npiggin@gmail.com>
+Date:   Fri Jun 7 13:56:35 2019 +1000
+
+    powerpc/64s: Fix THP PMD collapse serialisation
+    
+    Commit 1b2443a547f9 ("powerpc/book3s64: Avoid multiple endian
+    conversion in pte helpers") changed the actual bitwise tests in
+    pte_access_permitted by using pte_write() and pte_present() helpers
+    rather than raw bitwise testing _PAGE_WRITE and _PAGE_PRESENT bits.
+    
+    The pte_present() change now returns true for PTEs which are
+    !_PAGE_PRESENT and _PAGE_INVALID, which is the combination used by
+    pmdp_invalidate() to synchronize access from lock-free lookups.
+    pte_access_permitted() is used by pmd_access_permitted(), so allowing
+    GUP lock free access to proceed with such PTEs breaks this
+    synchronisation.
+    
+    This bug has been observed on a host using the hash page table MMU,
+    with random crashes and corruption in guests, usually together with
+    bad PMD messages in the host.
+    
+    Fix this by adding an explicit check in pmd_access_permitted(), and
+    documenting the condition explicitly.
+    
+    The pte_write() change should be okay, and would prevent GUP from
+    falling back to the slow path when encountering savedwrite PTEs, which
+    matches what x86 (that does not implement savedwrite) does.
+    
+    Fixes: 1b2443a547f9 ("powerpc/book3s64: Avoid multiple endian conversion in pte helpers")
+    Cc: stable@vger.kernel.org # v4.20+
+    Signed-off-by: Nicholas Piggin <npiggin@gmail.com>
+    Reviewed-by: Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+
+diff --git a/arch/powerpc/mm/book3s64/pgtable.c b/arch/powerpc/mm/book3s64/pgtable.c
+index 16bda049187a..ff98b663c83e 100644
+--- a/arch/powerpc/mm/book3s64/pgtable.c
++++ b/arch/powerpc/mm/book3s64/pgtable.c
+@@ -116,6 +116,9 @@ pmd_t pmdp_invalidate(struct vm_area_struct *vma, unsigned long address,
+ 	/*
+ 	 * This ensures that generic code that rely on IRQ disabling
+ 	 * to prevent a parallel THP split work as expected.
++	 *
++	 * Marking the entry with _PAGE_INVALID && ~_PAGE_PRESENT requires
++	 * a special case check in pmd_access_permitted.
+ 	 */
+ 	serialize_against_pte_lookup(vma->vm_mm);
+ 	return __pmd(old_pmd);
+
+commit 2874c5fd284268364ece81a7bd936f3c8168e567
+Author: Thomas Gleixner <tglx@linutronix.de>
+Date:   Mon May 27 08:55:01 2019 +0200
+
+    treewide: Replace GPLv2 boilerplate/reference with SPDX - rule 152
+    
+    Based on 1 normalized pattern(s):
+    
+      this program is free software you can redistribute it and or modify
+      it under the terms of the gnu general public license as published by
+      the free software foundation either version 2 of the license or at
+      your option any later version
+    
+    extracted by the scancode license scanner the SPDX license identifier
+    
+      GPL-2.0-or-later
+    
+    has been chosen to replace the boilerplate/reference in 3029 file(s).
+    
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Reviewed-by: Allison Randal <allison@lohutok.net>
+    Cc: linux-spdx@vger.kernel.org
+    Link: https://lkml.kernel.org/r/20190527070032.746973796@linutronix.de
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/arch/powerpc/mm/book3s64/pgtable.c b/arch/powerpc/mm/book3s64/pgtable.c
+index 16bda049187a..a255707e4aee 100644
+--- a/arch/powerpc/mm/book3s64/pgtable.c
++++ b/arch/powerpc/mm/book3s64/pgtable.c
+@@ -1,10 +1,6 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
+ /*
+  * Copyright 2015-2016, Aneesh Kumar K.V, IBM Corporation.
+- *
+- * This program is free software; you can redistribute it and/or
+- * modify it under the terms of the GNU General Public License
+- * as published by the Free Software Foundation; either version
+- * 2 of the License, or (at your option) any later version.
+  */
+ 
+ #include <linux/sched.h>
+
+commit 47d99948eee48a84a4b242c17915a4ff59a29b5d
+Author: Christophe Leroy <christophe.leroy@c-s.fr>
+Date:   Fri Mar 29 10:00:00 2019 +0000
+
+    powerpc/mm: Move book3s64 specifics in subdirectory mm/book3s64
+    
+    Many files in arch/powerpc/mm are only for book3S64. This patch
+    creates a subdirectory for them.
+    
+    Signed-off-by: Christophe Leroy <christophe.leroy@c-s.fr>
+    [mpe: Update the selftest sym links, shorten new filenames, cleanup some
+          whitespace and formatting in the new files.]
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+
+diff --git a/arch/powerpc/mm/book3s64/pgtable.c b/arch/powerpc/mm/book3s64/pgtable.c
+new file mode 100644
+index 000000000000..16bda049187a
+--- /dev/null
++++ b/arch/powerpc/mm/book3s64/pgtable.c
+@@ -0,0 +1,449 @@
++/*
++ * Copyright 2015-2016, Aneesh Kumar K.V, IBM Corporation.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version
++ * 2 of the License, or (at your option) any later version.
++ */
++
++#include <linux/sched.h>
++#include <linux/mm_types.h>
++#include <linux/memblock.h>
++#include <misc/cxl-base.h>
++
++#include <asm/pgalloc.h>
++#include <asm/tlb.h>
++#include <asm/trace.h>
++#include <asm/powernv.h>
++
++#include <mm/mmu_decl.h>
++#include <trace/events/thp.h>
++
++unsigned long __pmd_frag_nr;
++EXPORT_SYMBOL(__pmd_frag_nr);
++unsigned long __pmd_frag_size_shift;
++EXPORT_SYMBOL(__pmd_frag_size_shift);
++
++int (*register_process_table)(unsigned long base, unsigned long page_size,
++			      unsigned long tbl_size);
++
++#ifdef CONFIG_TRANSPARENT_HUGEPAGE
++/*
++ * This is called when relaxing access to a hugepage. It's also called in the page
++ * fault path when we don't hit any of the major fault cases, ie, a minor
++ * update of _PAGE_ACCESSED, _PAGE_DIRTY, etc... The generic code will have
++ * handled those two for us, we additionally deal with missing execute
++ * permission here on some processors
++ */
++int pmdp_set_access_flags(struct vm_area_struct *vma, unsigned long address,
++			  pmd_t *pmdp, pmd_t entry, int dirty)
++{
++	int changed;
++#ifdef CONFIG_DEBUG_VM
++	WARN_ON(!pmd_trans_huge(*pmdp) && !pmd_devmap(*pmdp));
++	assert_spin_locked(pmd_lockptr(vma->vm_mm, pmdp));
++#endif
++	changed = !pmd_same(*(pmdp), entry);
++	if (changed) {
++		/*
++		 * We can use MMU_PAGE_2M here, because only radix
++		 * path look at the psize.
++		 */
++		__ptep_set_access_flags(vma, pmdp_ptep(pmdp),
++					pmd_pte(entry), address, MMU_PAGE_2M);
++	}
++	return changed;
++}
++
++int pmdp_test_and_clear_young(struct vm_area_struct *vma,
++			      unsigned long address, pmd_t *pmdp)
++{
++	return __pmdp_test_and_clear_young(vma->vm_mm, address, pmdp);
++}
++/*
++ * set a new huge pmd. We should not be called for updating
++ * an existing pmd entry. That should go via pmd_hugepage_update.
++ */
++void set_pmd_at(struct mm_struct *mm, unsigned long addr,
++		pmd_t *pmdp, pmd_t pmd)
++{
++#ifdef CONFIG_DEBUG_VM
++	/*
++	 * Make sure hardware valid bit is not set. We don't do
++	 * tlb flush for this update.
++	 */
++
++	WARN_ON(pte_hw_valid(pmd_pte(*pmdp)) && !pte_protnone(pmd_pte(*pmdp)));
++	assert_spin_locked(pmd_lockptr(mm, pmdp));
++	WARN_ON(!(pmd_large(pmd) || pmd_devmap(pmd)));
++#endif
++	trace_hugepage_set_pmd(addr, pmd_val(pmd));
++	return set_pte_at(mm, addr, pmdp_ptep(pmdp), pmd_pte(pmd));
++}
++
++static void do_nothing(void *unused)
++{
++
++}
++/*
++ * Serialize against find_current_mm_pte which does lock-less
++ * lookup in page tables with local interrupts disabled. For huge pages
++ * it casts pmd_t to pte_t. Since format of pte_t is different from
++ * pmd_t we want to prevent transit from pmd pointing to page table
++ * to pmd pointing to huge page (and back) while interrupts are disabled.
++ * We clear pmd to possibly replace it with page table pointer in
++ * different code paths. So make sure we wait for the parallel
++ * find_current_mm_pte to finish.
++ */
++void serialize_against_pte_lookup(struct mm_struct *mm)
++{
++	smp_mb();
++	smp_call_function_many(mm_cpumask(mm), do_nothing, NULL, 1);
++}
++
++/*
++ * We use this to invalidate a pmdp entry before switching from a
++ * hugepte to regular pmd entry.
++ */
++pmd_t pmdp_invalidate(struct vm_area_struct *vma, unsigned long address,
++		     pmd_t *pmdp)
++{
++	unsigned long old_pmd;
++
++	old_pmd = pmd_hugepage_update(vma->vm_mm, address, pmdp, _PAGE_PRESENT, _PAGE_INVALID);
++	flush_pmd_tlb_range(vma, address, address + HPAGE_PMD_SIZE);
++	/*
++	 * This ensures that generic code that rely on IRQ disabling
++	 * to prevent a parallel THP split work as expected.
++	 */
++	serialize_against_pte_lookup(vma->vm_mm);
++	return __pmd(old_pmd);
++}
++
++static pmd_t pmd_set_protbits(pmd_t pmd, pgprot_t pgprot)
++{
++	return __pmd(pmd_val(pmd) | pgprot_val(pgprot));
++}
++
++pmd_t pfn_pmd(unsigned long pfn, pgprot_t pgprot)
++{
++	unsigned long pmdv;
++
++	pmdv = (pfn << PAGE_SHIFT) & PTE_RPN_MASK;
++	return pmd_set_protbits(__pmd(pmdv), pgprot);
++}
++
++pmd_t mk_pmd(struct page *page, pgprot_t pgprot)
++{
++	return pfn_pmd(page_to_pfn(page), pgprot);
++}
++
++pmd_t pmd_modify(pmd_t pmd, pgprot_t newprot)
++{
++	unsigned long pmdv;
++
++	pmdv = pmd_val(pmd);
++	pmdv &= _HPAGE_CHG_MASK;
++	return pmd_set_protbits(__pmd(pmdv), newprot);
++}
++
++/*
++ * This is called at the end of handling a user page fault, when the
++ * fault has been handled by updating a HUGE PMD entry in the linux page tables.
++ * We use it to preload an HPTE into the hash table corresponding to
++ * the updated linux HUGE PMD entry.
++ */
++void update_mmu_cache_pmd(struct vm_area_struct *vma, unsigned long addr,
++			  pmd_t *pmd)
++{
++	if (radix_enabled())
++		prefetch((void *)addr);
++}
++#endif /* CONFIG_TRANSPARENT_HUGEPAGE */
++
++/* For use by kexec */
++void mmu_cleanup_all(void)
++{
++	if (radix_enabled())
++		radix__mmu_cleanup_all();
++	else if (mmu_hash_ops.hpte_clear_all)
++		mmu_hash_ops.hpte_clear_all();
++}
++
++#ifdef CONFIG_MEMORY_HOTPLUG
++int __meminit create_section_mapping(unsigned long start, unsigned long end, int nid)
++{
++	if (radix_enabled())
++		return radix__create_section_mapping(start, end, nid);
++
++	return hash__create_section_mapping(start, end, nid);
++}
++
++int __meminit remove_section_mapping(unsigned long start, unsigned long end)
++{
++	if (radix_enabled())
++		return radix__remove_section_mapping(start, end);
++
++	return hash__remove_section_mapping(start, end);
++}
++#endif /* CONFIG_MEMORY_HOTPLUG */
++
++void __init mmu_partition_table_init(void)
++{
++	unsigned long patb_size = 1UL << PATB_SIZE_SHIFT;
++	unsigned long ptcr;
++
++	BUILD_BUG_ON_MSG((PATB_SIZE_SHIFT > 36), "Partition table size too large.");
++	/* Initialize the Partition Table with no entries */
++	partition_tb = memblock_alloc(patb_size, patb_size);
++	if (!partition_tb)
++		panic("%s: Failed to allocate %lu bytes align=0x%lx\n",
++		      __func__, patb_size, patb_size);
++
++	/*
++	 * update partition table control register,
++	 * 64 K size.
++	 */
++	ptcr = __pa(partition_tb) | (PATB_SIZE_SHIFT - 12);
++	mtspr(SPRN_PTCR, ptcr);
++	powernv_set_nmmu_ptcr(ptcr);
++}
++
++void mmu_partition_table_set_entry(unsigned int lpid, unsigned long dw0,
++				   unsigned long dw1)
++{
++	unsigned long old = be64_to_cpu(partition_tb[lpid].patb0);
++
++	partition_tb[lpid].patb0 = cpu_to_be64(dw0);
++	partition_tb[lpid].patb1 = cpu_to_be64(dw1);
++
++	/*
++	 * Global flush of TLBs and partition table caches for this lpid.
++	 * The type of flush (hash or radix) depends on what the previous
++	 * use of this partition ID was, not the new use.
++	 */
++	asm volatile("ptesync" : : : "memory");
++	if (old & PATB_HR) {
++		asm volatile(PPC_TLBIE_5(%0,%1,2,0,1) : :
++			     "r" (TLBIEL_INVAL_SET_LPID), "r" (lpid));
++		asm volatile(PPC_TLBIE_5(%0,%1,2,1,1) : :
++			     "r" (TLBIEL_INVAL_SET_LPID), "r" (lpid));
++		trace_tlbie(lpid, 0, TLBIEL_INVAL_SET_LPID, lpid, 2, 0, 1);
++	} else {
++		asm volatile(PPC_TLBIE_5(%0,%1,2,0,0) : :
++			     "r" (TLBIEL_INVAL_SET_LPID), "r" (lpid));
++		trace_tlbie(lpid, 0, TLBIEL_INVAL_SET_LPID, lpid, 2, 0, 0);
++	}
++	/* do we need fixup here ?*/
++	asm volatile("eieio; tlbsync; ptesync" : : : "memory");
++}
++EXPORT_SYMBOL_GPL(mmu_partition_table_set_entry);
++
++static pmd_t *get_pmd_from_cache(struct mm_struct *mm)
++{
++	void *pmd_frag, *ret;
++
++	if (PMD_FRAG_NR == 1)
++		return NULL;
++
++	spin_lock(&mm->page_table_lock);
++	ret = mm->context.pmd_frag;
++	if (ret) {
++		pmd_frag = ret + PMD_FRAG_SIZE;
++		/*
++		 * If we have taken up all the fragments mark PTE page NULL
++		 */
++		if (((unsigned long)pmd_frag & ~PAGE_MASK) == 0)
++			pmd_frag = NULL;
++		mm->context.pmd_frag = pmd_frag;
++	}
++	spin_unlock(&mm->page_table_lock);
++	return (pmd_t *)ret;
++}
++
++static pmd_t *__alloc_for_pmdcache(struct mm_struct *mm)
++{
++	void *ret = NULL;
++	struct page *page;
++	gfp_t gfp = GFP_KERNEL_ACCOUNT | __GFP_ZERO;
++
++	if (mm == &init_mm)
++		gfp &= ~__GFP_ACCOUNT;
++	page = alloc_page(gfp);
++	if (!page)
++		return NULL;
++	if (!pgtable_pmd_page_ctor(page)) {
++		__free_pages(page, 0);
++		return NULL;
++	}
++
++	atomic_set(&page->pt_frag_refcount, 1);
++
++	ret = page_address(page);
++	/*
++	 * if we support only one fragment just return the
++	 * allocated page.
++	 */
++	if (PMD_FRAG_NR == 1)
++		return ret;
++
++	spin_lock(&mm->page_table_lock);
++	/*
++	 * If we find pgtable_page set, we return
++	 * the allocated page with single fragement
++	 * count.
++	 */
++	if (likely(!mm->context.pmd_frag)) {
++		atomic_set(&page->pt_frag_refcount, PMD_FRAG_NR);
++		mm->context.pmd_frag = ret + PMD_FRAG_SIZE;
++	}
++	spin_unlock(&mm->page_table_lock);
++
++	return (pmd_t *)ret;
++}
++
++pmd_t *pmd_fragment_alloc(struct mm_struct *mm, unsigned long vmaddr)
++{
++	pmd_t *pmd;
++
++	pmd = get_pmd_from_cache(mm);
++	if (pmd)
++		return pmd;
++
++	return __alloc_for_pmdcache(mm);
++}
++
++void pmd_fragment_free(unsigned long *pmd)
++{
++	struct page *page = virt_to_page(pmd);
++
++	BUG_ON(atomic_read(&page->pt_frag_refcount) <= 0);
++	if (atomic_dec_and_test(&page->pt_frag_refcount)) {
++		pgtable_pmd_page_dtor(page);
++		__free_page(page);
++	}
++}
++
++static inline void pgtable_free(void *table, int index)
++{
++	switch (index) {
++	case PTE_INDEX:
++		pte_fragment_free(table, 0);
++		break;
++	case PMD_INDEX:
++		pmd_fragment_free(table);
++		break;
++	case PUD_INDEX:
++		kmem_cache_free(PGT_CACHE(PUD_CACHE_INDEX), table);
++		break;
++#if defined(CONFIG_PPC_4K_PAGES) && defined(CONFIG_HUGETLB_PAGE)
++		/* 16M hugepd directory at pud level */
++	case HTLB_16M_INDEX:
++		BUILD_BUG_ON(H_16M_CACHE_INDEX <= 0);
++		kmem_cache_free(PGT_CACHE(H_16M_CACHE_INDEX), table);
++		break;
++		/* 16G hugepd directory at the pgd level */
++	case HTLB_16G_INDEX:
++		BUILD_BUG_ON(H_16G_CACHE_INDEX <= 0);
++		kmem_cache_free(PGT_CACHE(H_16G_CACHE_INDEX), table);
++		break;
++#endif
++		/* We don't free pgd table via RCU callback */
++	default:
++		BUG();
++	}
++}
++
++#ifdef CONFIG_SMP
++void pgtable_free_tlb(struct mmu_gather *tlb, void *table, int index)
++{
++	unsigned long pgf = (unsigned long)table;
++
++	BUG_ON(index > MAX_PGTABLE_INDEX_SIZE);
++	pgf |= index;
++	tlb_remove_table(tlb, (void *)pgf);
++}
++
++void __tlb_remove_table(void *_table)
++{
++	void *table = (void *)((unsigned long)_table & ~MAX_PGTABLE_INDEX_SIZE);
++	unsigned int index = (unsigned long)_table & MAX_PGTABLE_INDEX_SIZE;
++
++	return pgtable_free(table, index);
++}
++#else
++void pgtable_free_tlb(struct mmu_gather *tlb, void *table, int index)
++{
++	return pgtable_free(table, index);
++}
++#endif
++
++#ifdef CONFIG_PROC_FS
++atomic_long_t direct_pages_count[MMU_PAGE_COUNT];
++
++void arch_report_meminfo(struct seq_file *m)
++{
++	/*
++	 * Hash maps the memory with one size mmu_linear_psize.
++	 * So don't bother to print these on hash
++	 */
++	if (!radix_enabled())
++		return;
++	seq_printf(m, "DirectMap4k:    %8lu kB\n",
++		   atomic_long_read(&direct_pages_count[MMU_PAGE_4K]) << 2);
++	seq_printf(m, "DirectMap64k:    %8lu kB\n",
++		   atomic_long_read(&direct_pages_count[MMU_PAGE_64K]) << 6);
++	seq_printf(m, "DirectMap2M:    %8lu kB\n",
++		   atomic_long_read(&direct_pages_count[MMU_PAGE_2M]) << 11);
++	seq_printf(m, "DirectMap1G:    %8lu kB\n",
++		   atomic_long_read(&direct_pages_count[MMU_PAGE_1G]) << 20);
++}
++#endif /* CONFIG_PROC_FS */
++
++pte_t ptep_modify_prot_start(struct vm_area_struct *vma, unsigned long addr,
++			     pte_t *ptep)
++{
++	unsigned long pte_val;
++
++	/*
++	 * Clear the _PAGE_PRESENT so that no hardware parallel update is
++	 * possible. Also keep the pte_present true so that we don't take
++	 * wrong fault.
++	 */
++	pte_val = pte_update(vma->vm_mm, addr, ptep, _PAGE_PRESENT, _PAGE_INVALID, 0);
++
++	return __pte(pte_val);
++
++}
++
++void ptep_modify_prot_commit(struct vm_area_struct *vma, unsigned long addr,
++			     pte_t *ptep, pte_t old_pte, pte_t pte)
++{
++	if (radix_enabled())
++		return radix__ptep_modify_prot_commit(vma, addr,
++						      ptep, old_pte, pte);
++	set_pte_at(vma->vm_mm, addr, ptep, pte);
++}
++
++/*
++ * For hash translation mode, we use the deposited table to store hash slot
++ * information and they are stored at PTRS_PER_PMD offset from related pmd
++ * location. Hence a pmd move requires deposit and withdraw.
++ *
++ * For radix translation with split pmd ptl, we store the deposited table in the
++ * pmd page. Hence if we have different pmd page we need to withdraw during pmd
++ * move.
++ *
++ * With hash we use deposited table always irrespective of anon or not.
++ * With radix we use deposited table only for anonymous mapping.
++ */
++int pmd_move_must_withdraw(struct spinlock *new_pmd_ptl,
++			   struct spinlock *old_pmd_ptl,
++			   struct vm_area_struct *vma)
++{
++	if (radix_enabled())
++		return (new_pmd_ptl != old_pmd_ptl) && vma_is_anonymous(vma);
++
++	return true;
++}

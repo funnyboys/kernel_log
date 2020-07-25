@@ -1,0 +1,2887 @@
+commit b6f61c31464940513ef4eccb3a030a405b4256d6
+Author: David Howells <dhowells@redhat.com>
+Date:   Tue May 12 14:03:53 2020 +0100
+
+    keys: Implement update for the big_key type
+    
+    Implement the ->update op for the big_key type.
+    
+    Signed-off-by: David Howells <dhowells@redhat.com>
+    Acked-by: Jason A. Donenfeld <Jason@zx2c4.com>
+
+diff --git a/security/keys/big_key.c b/security/keys/big_key.c
+index d43f3daab2b8..dd708e8f13c0 100644
+--- a/security/keys/big_key.c
++++ b/security/keys/big_key.c
+@@ -47,7 +47,7 @@ struct key_type key_type_big_key = {
+ 	.destroy		= big_key_destroy,
+ 	.describe		= big_key_describe,
+ 	.read			= big_key_read,
+-	/* no ->update(); don't add it without changing chacha20poly1305's nonce */
++	.update			= big_key_update,
+ };
+ 
+ /*
+@@ -191,6 +191,23 @@ void big_key_destroy(struct key *key)
+ 	key->payload.data[big_key_data] = NULL;
+ }
+ 
++/*
++ * Update a big key
++ */
++int big_key_update(struct key *key, struct key_preparsed_payload *prep)
++{
++	int ret;
++
++	ret = key_payload_reserve(key, prep->datalen);
++	if (ret < 0)
++		return ret;
++
++	if (key_is_positive(key))
++		big_key_destroy(key);
++
++	return generic_key_instantiate(key, prep);
++}
++
+ /*
+  * describe the big_key key
+  */
+
+commit 521fd61c84a19b31dfbaa8dde3d2577e4e115d12
+Author: Jason A. Donenfeld <Jason@zx2c4.com>
+Date:   Mon May 11 15:51:01 2020 -0600
+
+    security/keys: rewrite big_key crypto to use library interface
+    
+    A while back, I noticed that the crypto and crypto API usage in big_keys
+    were entirely broken in multiple ways, so I rewrote it. Now, I'm
+    rewriting it again, but this time using the simpler ChaCha20Poly1305
+    library function. This makes the file considerably more simple; the
+    diffstat alone should justify this commit. It also should be faster,
+    since it no longer requires a mutex around the "aead api object" (nor
+    allocations), allowing us to encrypt multiple items in parallel. We also
+    benefit from being able to pass any type of pointer, so we can get rid
+    of the ridiculously complex custom page allocator that big_key really
+    doesn't need.
+    
+    [DH: Change the select CRYPTO_LIB_CHACHA20POLY1305 to a depends on as
+     select doesn't propagate and the build can end up with an =y dependending
+     on some =m pieces.
+    
+     The depends on CRYPTO also had to be removed otherwise the configurator
+     complains about a recursive dependency.]
+    
+    Cc: Andy Lutomirski <luto@kernel.org>
+    Cc: Greg KH <gregkh@linuxfoundation.org>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: kernel-hardening@lists.openwall.com
+    Reviewed-by: Eric Biggers <ebiggers@google.com>
+    Signed-off-by: Jason A. Donenfeld <Jason@zx2c4.com>
+    Signed-off-by: David Howells <dhowells@redhat.com>
+
+diff --git a/security/keys/big_key.c b/security/keys/big_key.c
+index 82008f900930..d43f3daab2b8 100644
+--- a/security/keys/big_key.c
++++ b/security/keys/big_key.c
+@@ -1,7 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ /* Large capacity key type
+  *
+- * Copyright (C) 2017 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.
++ * Copyright (C) 2017-2020 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.
+  * Copyright (C) 2013 Red Hat, Inc. All Rights Reserved.
+  * Written by David Howells (dhowells@redhat.com)
+  */
+@@ -12,20 +12,10 @@
+ #include <linux/file.h>
+ #include <linux/shmem_fs.h>
+ #include <linux/err.h>
+-#include <linux/scatterlist.h>
+ #include <linux/random.h>
+-#include <linux/vmalloc.h>
+ #include <keys/user-type.h>
+ #include <keys/big_key-type.h>
+-#include <crypto/aead.h>
+-#include <crypto/gcm.h>
+-
+-struct big_key_buf {
+-	unsigned int		nr_pages;
+-	void			*virt;
+-	struct scatterlist	*sg;
+-	struct page		*pages[];
+-};
++#include <crypto/chacha20poly1305.h>
+ 
+ /*
+  * Layout of key payload words.
+@@ -37,14 +27,6 @@ enum {
+ 	big_key_len,
+ };
+ 
+-/*
+- * Crypto operation with big_key data
+- */
+-enum big_key_op {
+-	BIG_KEY_ENC,
+-	BIG_KEY_DEC,
+-};
+-
+ /*
+  * If the data is under this limit, there's no point creating a shm file to
+  * hold it as the permanently resident metadata for the shmem fs will be at
+@@ -52,16 +34,6 @@ enum big_key_op {
+  */
+ #define BIG_KEY_FILE_THRESHOLD (sizeof(struct inode) + sizeof(struct dentry))
+ 
+-/*
+- * Key size for big_key data encryption
+- */
+-#define ENC_KEY_SIZE 32
+-
+-/*
+- * Authentication tag length
+- */
+-#define ENC_AUTHTAG_SIZE 16
+-
+ /*
+  * big_key defined keys take an arbitrary string as the description and an
+  * arbitrary blob of data as the payload
+@@ -75,136 +47,20 @@ struct key_type key_type_big_key = {
+ 	.destroy		= big_key_destroy,
+ 	.describe		= big_key_describe,
+ 	.read			= big_key_read,
+-	/* no ->update(); don't add it without changing big_key_crypt() nonce */
++	/* no ->update(); don't add it without changing chacha20poly1305's nonce */
+ };
+ 
+-/*
+- * Crypto names for big_key data authenticated encryption
+- */
+-static const char big_key_alg_name[] = "gcm(aes)";
+-#define BIG_KEY_IV_SIZE		GCM_AES_IV_SIZE
+-
+-/*
+- * Crypto algorithms for big_key data authenticated encryption
+- */
+-static struct crypto_aead *big_key_aead;
+-
+-/*
+- * Since changing the key affects the entire object, we need a mutex.
+- */
+-static DEFINE_MUTEX(big_key_aead_lock);
+-
+-/*
+- * Encrypt/decrypt big_key data
+- */
+-static int big_key_crypt(enum big_key_op op, struct big_key_buf *buf, size_t datalen, u8 *key)
+-{
+-	int ret;
+-	struct aead_request *aead_req;
+-	/* We always use a zero nonce. The reason we can get away with this is
+-	 * because we're using a different randomly generated key for every
+-	 * different encryption. Notably, too, key_type_big_key doesn't define
+-	 * an .update function, so there's no chance we'll wind up reusing the
+-	 * key to encrypt updated data. Simply put: one key, one encryption.
+-	 */
+-	u8 zero_nonce[BIG_KEY_IV_SIZE];
+-
+-	aead_req = aead_request_alloc(big_key_aead, GFP_KERNEL);
+-	if (!aead_req)
+-		return -ENOMEM;
+-
+-	memset(zero_nonce, 0, sizeof(zero_nonce));
+-	aead_request_set_crypt(aead_req, buf->sg, buf->sg, datalen, zero_nonce);
+-	aead_request_set_callback(aead_req, CRYPTO_TFM_REQ_MAY_SLEEP, NULL, NULL);
+-	aead_request_set_ad(aead_req, 0);
+-
+-	mutex_lock(&big_key_aead_lock);
+-	if (crypto_aead_setkey(big_key_aead, key, ENC_KEY_SIZE)) {
+-		ret = -EAGAIN;
+-		goto error;
+-	}
+-	if (op == BIG_KEY_ENC)
+-		ret = crypto_aead_encrypt(aead_req);
+-	else
+-		ret = crypto_aead_decrypt(aead_req);
+-error:
+-	mutex_unlock(&big_key_aead_lock);
+-	aead_request_free(aead_req);
+-	return ret;
+-}
+-
+-/*
+- * Free up the buffer.
+- */
+-static void big_key_free_buffer(struct big_key_buf *buf)
+-{
+-	unsigned int i;
+-
+-	if (buf->virt) {
+-		memset(buf->virt, 0, buf->nr_pages * PAGE_SIZE);
+-		vunmap(buf->virt);
+-	}
+-
+-	for (i = 0; i < buf->nr_pages; i++)
+-		if (buf->pages[i])
+-			__free_page(buf->pages[i]);
+-
+-	kfree(buf);
+-}
+-
+-/*
+- * Allocate a buffer consisting of a set of pages with a virtual mapping
+- * applied over them.
+- */
+-static void *big_key_alloc_buffer(size_t len)
+-{
+-	struct big_key_buf *buf;
+-	unsigned int npg = (len + PAGE_SIZE - 1) >> PAGE_SHIFT;
+-	unsigned int i, l;
+-
+-	buf = kzalloc(sizeof(struct big_key_buf) +
+-		      sizeof(struct page) * npg +
+-		      sizeof(struct scatterlist) * npg,
+-		      GFP_KERNEL);
+-	if (!buf)
+-		return NULL;
+-
+-	buf->nr_pages = npg;
+-	buf->sg = (void *)(buf->pages + npg);
+-	sg_init_table(buf->sg, npg);
+-
+-	for (i = 0; i < buf->nr_pages; i++) {
+-		buf->pages[i] = alloc_page(GFP_KERNEL);
+-		if (!buf->pages[i])
+-			goto nomem;
+-
+-		l = min_t(size_t, len, PAGE_SIZE);
+-		sg_set_page(&buf->sg[i], buf->pages[i], l, 0);
+-		len -= l;
+-	}
+-
+-	buf->virt = vmap(buf->pages, buf->nr_pages, VM_MAP, PAGE_KERNEL);
+-	if (!buf->virt)
+-		goto nomem;
+-
+-	return buf;
+-
+-nomem:
+-	big_key_free_buffer(buf);
+-	return NULL;
+-}
+-
+ /*
+  * Preparse a big key
+  */
+ int big_key_preparse(struct key_preparsed_payload *prep)
+ {
+-	struct big_key_buf *buf;
+ 	struct path *path = (struct path *)&prep->payload.data[big_key_path];
+ 	struct file *file;
+-	u8 *enckey;
++	u8 *buf, *enckey;
+ 	ssize_t written;
+-	size_t datalen = prep->datalen, enclen = datalen + ENC_AUTHTAG_SIZE;
++	size_t datalen = prep->datalen;
++	size_t enclen = datalen + CHACHA20POLY1305_AUTHTAG_SIZE;
+ 	int ret;
+ 
+ 	if (datalen <= 0 || datalen > 1024 * 1024 || !prep->data)
+@@ -220,28 +76,28 @@ int big_key_preparse(struct key_preparsed_payload *prep)
+ 		 * to be swapped out if needed.
+ 		 *
+ 		 * File content is stored encrypted with randomly generated key.
++		 * Since the key is random for each file, we can set the nonce
++		 * to zero, provided we never define a ->update() call.
+ 		 */
+ 		loff_t pos = 0;
+ 
+-		buf = big_key_alloc_buffer(enclen);
++		buf = kvmalloc(enclen, GFP_KERNEL);
+ 		if (!buf)
+ 			return -ENOMEM;
+-		memcpy(buf->virt, prep->data, datalen);
+ 
+ 		/* generate random key */
+-		enckey = kmalloc(ENC_KEY_SIZE, GFP_KERNEL);
++		enckey = kmalloc(CHACHA20POLY1305_KEY_SIZE, GFP_KERNEL);
+ 		if (!enckey) {
+ 			ret = -ENOMEM;
+ 			goto error;
+ 		}
+-		ret = get_random_bytes_wait(enckey, ENC_KEY_SIZE);
++		ret = get_random_bytes_wait(enckey, CHACHA20POLY1305_KEY_SIZE);
+ 		if (unlikely(ret))
+ 			goto err_enckey;
+ 
+-		/* encrypt aligned data */
+-		ret = big_key_crypt(BIG_KEY_ENC, buf, datalen, enckey);
+-		if (ret)
+-			goto err_enckey;
++		/* encrypt data */
++		chacha20poly1305_encrypt(buf, prep->data, datalen, NULL, 0,
++					 0, enckey);
+ 
+ 		/* save aligned data to file */
+ 		file = shmem_kernel_file_setup("", enclen, 0);
+@@ -250,11 +106,11 @@ int big_key_preparse(struct key_preparsed_payload *prep)
+ 			goto err_enckey;
+ 		}
+ 
+-		written = kernel_write(file, buf->virt, enclen, &pos);
++		written = kernel_write(file, buf, enclen, &pos);
+ 		if (written != enclen) {
+ 			ret = written;
+ 			if (written >= 0)
+-				ret = -ENOMEM;
++				ret = -EIO;
+ 			goto err_fput;
+ 		}
+ 
+@@ -265,7 +121,8 @@ int big_key_preparse(struct key_preparsed_payload *prep)
+ 		*path = file->f_path;
+ 		path_get(path);
+ 		fput(file);
+-		big_key_free_buffer(buf);
++		memzero_explicit(buf, enclen);
++		kvfree(buf);
+ 	} else {
+ 		/* Just store the data in a buffer */
+ 		void *data = kmalloc(datalen, GFP_KERNEL);
+@@ -283,7 +140,8 @@ int big_key_preparse(struct key_preparsed_payload *prep)
+ err_enckey:
+ 	kzfree(enckey);
+ error:
+-	big_key_free_buffer(buf);
++	memzero_explicit(buf, enclen);
++	kvfree(buf);
+ 	return ret;
+ }
+ 
+@@ -361,14 +219,13 @@ long big_key_read(const struct key *key, char *buffer, size_t buflen)
+ 		return datalen;
+ 
+ 	if (datalen > BIG_KEY_FILE_THRESHOLD) {
+-		struct big_key_buf *buf;
+ 		struct path *path = (struct path *)&key->payload.data[big_key_path];
+ 		struct file *file;
+-		u8 *enckey = (u8 *)key->payload.data[big_key_data];
+-		size_t enclen = datalen + ENC_AUTHTAG_SIZE;
++		u8 *buf, *enckey = (u8 *)key->payload.data[big_key_data];
++		size_t enclen = datalen + CHACHA20POLY1305_AUTHTAG_SIZE;
+ 		loff_t pos = 0;
+ 
+-		buf = big_key_alloc_buffer(enclen);
++		buf = kvmalloc(enclen, GFP_KERNEL);
+ 		if (!buf)
+ 			return -ENOMEM;
+ 
+@@ -379,25 +236,28 @@ long big_key_read(const struct key *key, char *buffer, size_t buflen)
+ 		}
+ 
+ 		/* read file to kernel and decrypt */
+-		ret = kernel_read(file, buf->virt, enclen, &pos);
+-		if (ret >= 0 && ret != enclen) {
+-			ret = -EIO;
++		ret = kernel_read(file, buf, enclen, &pos);
++		if (ret != enclen) {
++			if (ret >= 0)
++				ret = -EIO;
+ 			goto err_fput;
+ 		}
+ 
+-		ret = big_key_crypt(BIG_KEY_DEC, buf, enclen, enckey);
+-		if (ret)
++		ret = chacha20poly1305_decrypt(buf, buf, enclen, NULL, 0, 0,
++					       enckey) ? 0 : -EBADMSG;
++		if (unlikely(ret))
+ 			goto err_fput;
+ 
+ 		ret = datalen;
+ 
+ 		/* copy out decrypted data */
+-		memcpy(buffer, buf->virt, datalen);
++		memcpy(buffer, buf, datalen);
+ 
+ err_fput:
+ 		fput(file);
+ error:
+-		big_key_free_buffer(buf);
++		memzero_explicit(buf, enclen);
++		kvfree(buf);
+ 	} else {
+ 		ret = datalen;
+ 		memcpy(buffer, key->payload.data[big_key_data], datalen);
+@@ -411,39 +271,7 @@ long big_key_read(const struct key *key, char *buffer, size_t buflen)
+  */
+ static int __init big_key_init(void)
+ {
+-	int ret;
+-
+-	/* init block cipher */
+-	big_key_aead = crypto_alloc_aead(big_key_alg_name, 0, CRYPTO_ALG_ASYNC);
+-	if (IS_ERR(big_key_aead)) {
+-		ret = PTR_ERR(big_key_aead);
+-		pr_err("Can't alloc crypto: %d\n", ret);
+-		return ret;
+-	}
+-
+-	if (unlikely(crypto_aead_ivsize(big_key_aead) != BIG_KEY_IV_SIZE)) {
+-		WARN(1, "big key algorithm changed?");
+-		ret = -EINVAL;
+-		goto free_aead;
+-	}
+-
+-	ret = crypto_aead_setauthsize(big_key_aead, ENC_AUTHTAG_SIZE);
+-	if (ret < 0) {
+-		pr_err("Can't set crypto auth tag len: %d\n", ret);
+-		goto free_aead;
+-	}
+-
+-	ret = register_key_type(&key_type_big_key);
+-	if (ret < 0) {
+-		pr_err("Can't register type: %d\n", ret);
+-		goto free_aead;
+-	}
+-
+-	return 0;
+-
+-free_aead:
+-	crypto_free_aead(big_key_aead);
+-	return ret;
++	return register_key_type(&key_type_big_key);
+ }
+ 
+ late_initcall(big_key_init);
+
+commit d3ec10aa95819bff18a0d936b18884c7816d0914
+Author: Waiman Long <longman@redhat.com>
+Date:   Sat Mar 21 21:11:24 2020 -0400
+
+    KEYS: Don't write out to userspace while holding key semaphore
+    
+    A lockdep circular locking dependency report was seen when running a
+    keyutils test:
+    
+    [12537.027242] ======================================================
+    [12537.059309] WARNING: possible circular locking dependency detected
+    [12537.088148] 4.18.0-147.7.1.el8_1.x86_64+debug #1 Tainted: G OE    --------- -  -
+    [12537.125253] ------------------------------------------------------
+    [12537.153189] keyctl/25598 is trying to acquire lock:
+    [12537.175087] 000000007c39f96c (&mm->mmap_sem){++++}, at: __might_fault+0xc4/0x1b0
+    [12537.208365]
+    [12537.208365] but task is already holding lock:
+    [12537.234507] 000000003de5b58d (&type->lock_class){++++}, at: keyctl_read_key+0x15a/0x220
+    [12537.270476]
+    [12537.270476] which lock already depends on the new lock.
+    [12537.270476]
+    [12537.307209]
+    [12537.307209] the existing dependency chain (in reverse order) is:
+    [12537.340754]
+    [12537.340754] -> #3 (&type->lock_class){++++}:
+    [12537.367434]        down_write+0x4d/0x110
+    [12537.385202]        __key_link_begin+0x87/0x280
+    [12537.405232]        request_key_and_link+0x483/0xf70
+    [12537.427221]        request_key+0x3c/0x80
+    [12537.444839]        dns_query+0x1db/0x5a5 [dns_resolver]
+    [12537.468445]        dns_resolve_server_name_to_ip+0x1e1/0x4d0 [cifs]
+    [12537.496731]        cifs_reconnect+0xe04/0x2500 [cifs]
+    [12537.519418]        cifs_readv_from_socket+0x461/0x690 [cifs]
+    [12537.546263]        cifs_read_from_socket+0xa0/0xe0 [cifs]
+    [12537.573551]        cifs_demultiplex_thread+0x311/0x2db0 [cifs]
+    [12537.601045]        kthread+0x30c/0x3d0
+    [12537.617906]        ret_from_fork+0x3a/0x50
+    [12537.636225]
+    [12537.636225] -> #2 (root_key_user.cons_lock){+.+.}:
+    [12537.664525]        __mutex_lock+0x105/0x11f0
+    [12537.683734]        request_key_and_link+0x35a/0xf70
+    [12537.705640]        request_key+0x3c/0x80
+    [12537.723304]        dns_query+0x1db/0x5a5 [dns_resolver]
+    [12537.746773]        dns_resolve_server_name_to_ip+0x1e1/0x4d0 [cifs]
+    [12537.775607]        cifs_reconnect+0xe04/0x2500 [cifs]
+    [12537.798322]        cifs_readv_from_socket+0x461/0x690 [cifs]
+    [12537.823369]        cifs_read_from_socket+0xa0/0xe0 [cifs]
+    [12537.847262]        cifs_demultiplex_thread+0x311/0x2db0 [cifs]
+    [12537.873477]        kthread+0x30c/0x3d0
+    [12537.890281]        ret_from_fork+0x3a/0x50
+    [12537.908649]
+    [12537.908649] -> #1 (&tcp_ses->srv_mutex){+.+.}:
+    [12537.935225]        __mutex_lock+0x105/0x11f0
+    [12537.954450]        cifs_call_async+0x102/0x7f0 [cifs]
+    [12537.977250]        smb2_async_readv+0x6c3/0xc90 [cifs]
+    [12538.000659]        cifs_readpages+0x120a/0x1e50 [cifs]
+    [12538.023920]        read_pages+0xf5/0x560
+    [12538.041583]        __do_page_cache_readahead+0x41d/0x4b0
+    [12538.067047]        ondemand_readahead+0x44c/0xc10
+    [12538.092069]        filemap_fault+0xec1/0x1830
+    [12538.111637]        __do_fault+0x82/0x260
+    [12538.129216]        do_fault+0x419/0xfb0
+    [12538.146390]        __handle_mm_fault+0x862/0xdf0
+    [12538.167408]        handle_mm_fault+0x154/0x550
+    [12538.187401]        __do_page_fault+0x42f/0xa60
+    [12538.207395]        do_page_fault+0x38/0x5e0
+    [12538.225777]        page_fault+0x1e/0x30
+    [12538.243010]
+    [12538.243010] -> #0 (&mm->mmap_sem){++++}:
+    [12538.267875]        lock_acquire+0x14c/0x420
+    [12538.286848]        __might_fault+0x119/0x1b0
+    [12538.306006]        keyring_read_iterator+0x7e/0x170
+    [12538.327936]        assoc_array_subtree_iterate+0x97/0x280
+    [12538.352154]        keyring_read+0xe9/0x110
+    [12538.370558]        keyctl_read_key+0x1b9/0x220
+    [12538.391470]        do_syscall_64+0xa5/0x4b0
+    [12538.410511]        entry_SYSCALL_64_after_hwframe+0x6a/0xdf
+    [12538.435535]
+    [12538.435535] other info that might help us debug this:
+    [12538.435535]
+    [12538.472829] Chain exists of:
+    [12538.472829]   &mm->mmap_sem --> root_key_user.cons_lock --> &type->lock_class
+    [12538.472829]
+    [12538.524820]  Possible unsafe locking scenario:
+    [12538.524820]
+    [12538.551431]        CPU0                    CPU1
+    [12538.572654]        ----                    ----
+    [12538.595865]   lock(&type->lock_class);
+    [12538.613737]                                lock(root_key_user.cons_lock);
+    [12538.644234]                                lock(&type->lock_class);
+    [12538.672410]   lock(&mm->mmap_sem);
+    [12538.687758]
+    [12538.687758]  *** DEADLOCK ***
+    [12538.687758]
+    [12538.714455] 1 lock held by keyctl/25598:
+    [12538.732097]  #0: 000000003de5b58d (&type->lock_class){++++}, at: keyctl_read_key+0x15a/0x220
+    [12538.770573]
+    [12538.770573] stack backtrace:
+    [12538.790136] CPU: 2 PID: 25598 Comm: keyctl Kdump: loaded Tainted: G
+    [12538.844855] Hardware name: HP ProLiant DL360 Gen9/ProLiant DL360 Gen9, BIOS P89 12/27/2015
+    [12538.881963] Call Trace:
+    [12538.892897]  dump_stack+0x9a/0xf0
+    [12538.907908]  print_circular_bug.isra.25.cold.50+0x1bc/0x279
+    [12538.932891]  ? save_trace+0xd6/0x250
+    [12538.948979]  check_prev_add.constprop.32+0xc36/0x14f0
+    [12538.971643]  ? keyring_compare_object+0x104/0x190
+    [12538.992738]  ? check_usage+0x550/0x550
+    [12539.009845]  ? sched_clock+0x5/0x10
+    [12539.025484]  ? sched_clock_cpu+0x18/0x1e0
+    [12539.043555]  __lock_acquire+0x1f12/0x38d0
+    [12539.061551]  ? trace_hardirqs_on+0x10/0x10
+    [12539.080554]  lock_acquire+0x14c/0x420
+    [12539.100330]  ? __might_fault+0xc4/0x1b0
+    [12539.119079]  __might_fault+0x119/0x1b0
+    [12539.135869]  ? __might_fault+0xc4/0x1b0
+    [12539.153234]  keyring_read_iterator+0x7e/0x170
+    [12539.172787]  ? keyring_read+0x110/0x110
+    [12539.190059]  assoc_array_subtree_iterate+0x97/0x280
+    [12539.211526]  keyring_read+0xe9/0x110
+    [12539.227561]  ? keyring_gc_check_iterator+0xc0/0xc0
+    [12539.249076]  keyctl_read_key+0x1b9/0x220
+    [12539.266660]  do_syscall_64+0xa5/0x4b0
+    [12539.283091]  entry_SYSCALL_64_after_hwframe+0x6a/0xdf
+    
+    One way to prevent this deadlock scenario from happening is to not
+    allow writing to userspace while holding the key semaphore. Instead,
+    an internal buffer is allocated for getting the keys out from the
+    read method first before copying them out to userspace without holding
+    the lock.
+    
+    That requires taking out the __user modifier from all the relevant
+    read methods as well as additional changes to not use any userspace
+    write helpers. That is,
+    
+      1) The put_user() call is replaced by a direct copy.
+      2) The copy_to_user() call is replaced by memcpy().
+      3) All the fault handling code is removed.
+    
+    Compiling on a x86-64 system, the size of the rxrpc_read() function is
+    reduced from 3795 bytes to 2384 bytes with this patch.
+    
+    Fixes: ^1da177e4c3f4 ("Linux-2.6.12-rc2")
+    Reviewed-by: Jarkko Sakkinen <jarkko.sakkinen@linux.intel.com>
+    Signed-off-by: Waiman Long <longman@redhat.com>
+    Signed-off-by: David Howells <dhowells@redhat.com>
+
+diff --git a/security/keys/big_key.c b/security/keys/big_key.c
+index 001abe530a0d..82008f900930 100644
+--- a/security/keys/big_key.c
++++ b/security/keys/big_key.c
+@@ -352,7 +352,7 @@ void big_key_describe(const struct key *key, struct seq_file *m)
+  * read the key data
+  * - the key's semaphore is read-locked
+  */
+-long big_key_read(const struct key *key, char __user *buffer, size_t buflen)
++long big_key_read(const struct key *key, char *buffer, size_t buflen)
+ {
+ 	size_t datalen = (size_t)key->payload.data[big_key_len];
+ 	long ret;
+@@ -391,9 +391,8 @@ long big_key_read(const struct key *key, char __user *buffer, size_t buflen)
+ 
+ 		ret = datalen;
+ 
+-		/* copy decrypted data to user */
+-		if (copy_to_user(buffer, buf->virt, datalen) != 0)
+-			ret = -EFAULT;
++		/* copy out decrypted data */
++		memcpy(buffer, buf->virt, datalen);
+ 
+ err_fput:
+ 		fput(file);
+@@ -401,9 +400,7 @@ long big_key_read(const struct key *key, char __user *buffer, size_t buflen)
+ 		big_key_free_buffer(buf);
+ 	} else {
+ 		ret = datalen;
+-		if (copy_to_user(buffer, key->payload.data[big_key_data],
+-				 datalen) != 0)
+-			ret = -EFAULT;
++		memcpy(buffer, key->payload.data[big_key_data], datalen);
+ 	}
+ 
+ 	return ret;
+
+commit b4d0d230ccfb5d1a9ea85da64aa584df7c148ee9
+Author: Thomas Gleixner <tglx@linutronix.de>
+Date:   Mon May 20 19:08:01 2019 +0200
+
+    treewide: Replace GPLv2 boilerplate/reference with SPDX - rule 36
+    
+    Based on 1 normalized pattern(s):
+    
+      this program is free software you can redistribute it and or modify
+      it under the terms of the gnu general public licence as published by
+      the free software foundation either version 2 of the licence or at
+      your option any later version
+    
+    extracted by the scancode license scanner the SPDX license identifier
+    
+      GPL-2.0-or-later
+    
+    has been chosen to replace the boilerplate/reference in 114 file(s).
+    
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Reviewed-by: Allison Randal <allison@lohutok.net>
+    Reviewed-by: Kate Stewart <kstewart@linuxfoundation.org>
+    Cc: linux-spdx@vger.kernel.org
+    Link: https://lkml.kernel.org/r/20190520170857.552531963@linutronix.de
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/security/keys/big_key.c b/security/keys/big_key.c
+index 2806e70d7f8f..001abe530a0d 100644
+--- a/security/keys/big_key.c
++++ b/security/keys/big_key.c
+@@ -1,13 +1,9 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
+ /* Large capacity key type
+  *
+  * Copyright (C) 2017 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.
+  * Copyright (C) 2013 Red Hat, Inc. All Rights Reserved.
+  * Written by David Howells (dhowells@redhat.com)
+- *
+- * This program is free software; you can redistribute it and/or
+- * modify it under the terms of the GNU General Public Licence
+- * as published by the Free Software Foundation; either version
+- * 2 of the Licence, or (at your option) any later version.
+  */
+ 
+ #define pr_fmt(fmt) "big_key: "fmt
+
+commit a964f395614af195cf5c5caa84a9c487b86d5ba5
+Author: Tycho Andersen <tycho@tycho.ws>
+Date:   Tue Apr 24 14:26:37 2018 -0600
+
+    big key: get rid of stack array allocation
+    
+    We're interested in getting rid of all of the stack allocated arrays in the
+    kernel [1]. This patch simply hardcodes the iv length to match that of the
+    hardcoded cipher.
+    
+    [1]: https://lkml.org/lkml/2018/3/7/621
+    
+    v2: hardcode the length of the nonce to be the GCM AES IV length, and do a
+        sanity check in init(), Eric Biggers
+    v3: * remember to free big_key_aead when sanity check fails
+        * define a constant for big key IV size so it can be changed along side
+          the algorithm in the code
+    
+    Signed-off-by: Tycho Andersen <tycho@tycho.ws>
+    Reviewed-by: Kees Cook <keescook@chromium.org>
+    CC: David Howells <dhowells@redhat.com>
+    CC: James Morris <jmorris@namei.org>
+    CC: "Serge E. Hallyn" <serge@hallyn.com>
+    CC: Jason A. Donenfeld <Jason@zx2c4.com>
+    CC: Eric Biggers <ebiggers3@gmail.com>
+    Signed-off-by: James Morris <james.morris@microsoft.com>
+
+diff --git a/security/keys/big_key.c b/security/keys/big_key.c
+index 933623784ccd..2806e70d7f8f 100644
+--- a/security/keys/big_key.c
++++ b/security/keys/big_key.c
+@@ -22,6 +22,7 @@
+ #include <keys/user-type.h>
+ #include <keys/big_key-type.h>
+ #include <crypto/aead.h>
++#include <crypto/gcm.h>
+ 
+ struct big_key_buf {
+ 	unsigned int		nr_pages;
+@@ -85,6 +86,7 @@ struct key_type key_type_big_key = {
+  * Crypto names for big_key data authenticated encryption
+  */
+ static const char big_key_alg_name[] = "gcm(aes)";
++#define BIG_KEY_IV_SIZE		GCM_AES_IV_SIZE
+ 
+ /*
+  * Crypto algorithms for big_key data authenticated encryption
+@@ -109,7 +111,7 @@ static int big_key_crypt(enum big_key_op op, struct big_key_buf *buf, size_t dat
+ 	 * an .update function, so there's no chance we'll wind up reusing the
+ 	 * key to encrypt updated data. Simply put: one key, one encryption.
+ 	 */
+-	u8 zero_nonce[crypto_aead_ivsize(big_key_aead)];
++	u8 zero_nonce[BIG_KEY_IV_SIZE];
+ 
+ 	aead_req = aead_request_alloc(big_key_aead, GFP_KERNEL);
+ 	if (!aead_req)
+@@ -425,6 +427,13 @@ static int __init big_key_init(void)
+ 		pr_err("Can't alloc crypto: %d\n", ret);
+ 		return ret;
+ 	}
++
++	if (unlikely(crypto_aead_ivsize(big_key_aead) != BIG_KEY_IV_SIZE)) {
++		WARN(1, "big key algorithm changed?");
++		ret = -EINVAL;
++		goto free_aead;
++	}
++
+ 	ret = crypto_aead_setauthsize(big_key_aead, ENC_AUTHTAG_SIZE);
+ 	if (ret < 0) {
+ 		pr_err("Can't set crypto auth tag len: %d\n", ret);
+
+commit 514c60324960137e74457fdc233a339b985fa8a8
+Author: Randy Dunlap <rdunlap@infradead.org>
+Date:   Thu Apr 5 16:25:34 2018 -0700
+
+    headers: untangle kmemleak.h from mm.h
+    
+    Currently <linux/slab.h> #includes <linux/kmemleak.h> for no obvious
+    reason.  It looks like it's only a convenience, so remove kmemleak.h
+    from slab.h and add <linux/kmemleak.h> to any users of kmemleak_* that
+    don't already #include it.  Also remove <linux/kmemleak.h> from source
+    files that do not use it.
+    
+    This is tested on i386 allmodconfig and x86_64 allmodconfig.  It would
+    be good to run it through the 0day bot for other $ARCHes.  I have
+    neither the horsepower nor the storage space for the other $ARCHes.
+    
+    Update: This patch has been extensively build-tested by both the 0day
+    bot & kisskb/ozlabs build farms.  Both of them reported 2 build failures
+    for which patches are included here (in v2).
+    
+    [ slab.h is the second most used header file after module.h; kernel.h is
+      right there with slab.h. There could be some minor error in the
+      counting due to some #includes having comments after them and I didn't
+      combine all of those. ]
+    
+    [akpm@linux-foundation.org: security/keys/big_key.c needs vmalloc.h, per sfr]
+    Link: http://lkml.kernel.org/r/e4309f98-3749-93e1-4bb7-d9501a39d015@infradead.org
+    Link: http://kisskb.ellerman.id.au/kisskb/head/13396/
+    Signed-off-by: Randy Dunlap <rdunlap@infradead.org>
+    Reviewed-by: Ingo Molnar <mingo@kernel.org>
+    Reported-by: Michael Ellerman <mpe@ellerman.id.au>      [2 build failures]
+    Reported-by: Fengguang Wu <fengguang.wu@intel.com>      [2 build failures]
+    Reviewed-by: Andrew Morton <akpm@linux-foundation.org>
+    Cc: Wei Yongjun <weiyongjun1@huawei.com>
+    Cc: Luis R. Rodriguez <mcgrof@kernel.org>
+    Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+    Cc: Mimi Zohar <zohar@linux.vnet.ibm.com>
+    Cc: John Johansen <john.johansen@canonical.com>
+    Cc: Stephen Rothwell <sfr@canb.auug.org.au>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/security/keys/big_key.c b/security/keys/big_key.c
+index fa728f662a6f..933623784ccd 100644
+--- a/security/keys/big_key.c
++++ b/security/keys/big_key.c
+@@ -18,6 +18,7 @@
+ #include <linux/err.h>
+ #include <linux/scatterlist.h>
+ #include <linux/random.h>
++#include <linux/vmalloc.h>
+ #include <keys/user-type.h>
+ #include <keys/big_key-type.h>
+ #include <crypto/aead.h>
+
+commit d9f4bb1a0f4db493efe6d7c58ffe696a57de7eb3
+Author: David Howells <dhowells@redhat.com>
+Date:   Thu Feb 22 14:38:34 2018 +0000
+
+    KEYS: Use individual pages in big_key for crypto buffers
+    
+    kmalloc() can't always allocate large enough buffers for big_key to use for
+    crypto (1MB + some metadata) so we cannot use that to allocate the buffer.
+    Further, vmalloc'd pages can't be passed to sg_init_one() and the aead
+    crypto accessors cannot be called progressively and must be passed all the
+    data in one go (which means we can't pass the data in one block at a time).
+    
+    Fix this by allocating the buffer pages individually and passing them
+    through a multientry scatterlist to the crypto layer.  This has the bonus
+    advantage that we don't have to allocate a contiguous series of pages.
+    
+    We then vmap() the page list and pass that through to the VFS read/write
+    routines.
+    
+    This can trigger a warning:
+    
+            WARNING: CPU: 0 PID: 60912 at mm/page_alloc.c:3883 __alloc_pages_nodemask+0xb7c/0x15f8
+            ([<00000000002acbb6>] __alloc_pages_nodemask+0x1ee/0x15f8)
+             [<00000000002dd356>] kmalloc_order+0x46/0x90
+             [<00000000002dd3e0>] kmalloc_order_trace+0x40/0x1f8
+             [<0000000000326a10>] __kmalloc+0x430/0x4c0
+             [<00000000004343e4>] big_key_preparse+0x7c/0x210
+             [<000000000042c040>] key_create_or_update+0x128/0x420
+             [<000000000042e52c>] SyS_add_key+0x124/0x220
+             [<00000000007bba2c>] system_call+0xc4/0x2b0
+    
+    from the keyctl/padd/useradd test of the keyutils testsuite on s390x.
+    
+    Note that it might be better to shovel data through in page-sized lumps
+    instead as there's no particular need to use a monolithic buffer unless the
+    kernel itself wants to access the data.
+    
+    Fixes: 13100a72f40f ("Security: Keys: Big keys stored encrypted")
+    Reported-by: Paul Bunyan <pbunyan@redhat.com>
+    Signed-off-by: David Howells <dhowells@redhat.com>
+    cc: Kirill Marinushkin <k.marinushkin@gmail.com>
+
+diff --git a/security/keys/big_key.c b/security/keys/big_key.c
+index 929e14978c42..fa728f662a6f 100644
+--- a/security/keys/big_key.c
++++ b/security/keys/big_key.c
+@@ -22,6 +22,13 @@
+ #include <keys/big_key-type.h>
+ #include <crypto/aead.h>
+ 
++struct big_key_buf {
++	unsigned int		nr_pages;
++	void			*virt;
++	struct scatterlist	*sg;
++	struct page		*pages[];
++};
++
+ /*
+  * Layout of key payload words.
+  */
+@@ -91,10 +98,9 @@ static DEFINE_MUTEX(big_key_aead_lock);
+ /*
+  * Encrypt/decrypt big_key data
+  */
+-static int big_key_crypt(enum big_key_op op, u8 *data, size_t datalen, u8 *key)
++static int big_key_crypt(enum big_key_op op, struct big_key_buf *buf, size_t datalen, u8 *key)
+ {
+ 	int ret;
+-	struct scatterlist sgio;
+ 	struct aead_request *aead_req;
+ 	/* We always use a zero nonce. The reason we can get away with this is
+ 	 * because we're using a different randomly generated key for every
+@@ -109,8 +115,7 @@ static int big_key_crypt(enum big_key_op op, u8 *data, size_t datalen, u8 *key)
+ 		return -ENOMEM;
+ 
+ 	memset(zero_nonce, 0, sizeof(zero_nonce));
+-	sg_init_one(&sgio, data, datalen + (op == BIG_KEY_ENC ? ENC_AUTHTAG_SIZE : 0));
+-	aead_request_set_crypt(aead_req, &sgio, &sgio, datalen, zero_nonce);
++	aead_request_set_crypt(aead_req, buf->sg, buf->sg, datalen, zero_nonce);
+ 	aead_request_set_callback(aead_req, CRYPTO_TFM_REQ_MAY_SLEEP, NULL, NULL);
+ 	aead_request_set_ad(aead_req, 0);
+ 
+@@ -129,22 +134,82 @@ static int big_key_crypt(enum big_key_op op, u8 *data, size_t datalen, u8 *key)
+ 	return ret;
+ }
+ 
++/*
++ * Free up the buffer.
++ */
++static void big_key_free_buffer(struct big_key_buf *buf)
++{
++	unsigned int i;
++
++	if (buf->virt) {
++		memset(buf->virt, 0, buf->nr_pages * PAGE_SIZE);
++		vunmap(buf->virt);
++	}
++
++	for (i = 0; i < buf->nr_pages; i++)
++		if (buf->pages[i])
++			__free_page(buf->pages[i]);
++
++	kfree(buf);
++}
++
++/*
++ * Allocate a buffer consisting of a set of pages with a virtual mapping
++ * applied over them.
++ */
++static void *big_key_alloc_buffer(size_t len)
++{
++	struct big_key_buf *buf;
++	unsigned int npg = (len + PAGE_SIZE - 1) >> PAGE_SHIFT;
++	unsigned int i, l;
++
++	buf = kzalloc(sizeof(struct big_key_buf) +
++		      sizeof(struct page) * npg +
++		      sizeof(struct scatterlist) * npg,
++		      GFP_KERNEL);
++	if (!buf)
++		return NULL;
++
++	buf->nr_pages = npg;
++	buf->sg = (void *)(buf->pages + npg);
++	sg_init_table(buf->sg, npg);
++
++	for (i = 0; i < buf->nr_pages; i++) {
++		buf->pages[i] = alloc_page(GFP_KERNEL);
++		if (!buf->pages[i])
++			goto nomem;
++
++		l = min_t(size_t, len, PAGE_SIZE);
++		sg_set_page(&buf->sg[i], buf->pages[i], l, 0);
++		len -= l;
++	}
++
++	buf->virt = vmap(buf->pages, buf->nr_pages, VM_MAP, PAGE_KERNEL);
++	if (!buf->virt)
++		goto nomem;
++
++	return buf;
++
++nomem:
++	big_key_free_buffer(buf);
++	return NULL;
++}
++
+ /*
+  * Preparse a big key
+  */
+ int big_key_preparse(struct key_preparsed_payload *prep)
+ {
++	struct big_key_buf *buf;
+ 	struct path *path = (struct path *)&prep->payload.data[big_key_path];
+ 	struct file *file;
+ 	u8 *enckey;
+-	u8 *data = NULL;
+ 	ssize_t written;
+-	size_t datalen = prep->datalen;
++	size_t datalen = prep->datalen, enclen = datalen + ENC_AUTHTAG_SIZE;
+ 	int ret;
+ 
+-	ret = -EINVAL;
+ 	if (datalen <= 0 || datalen > 1024 * 1024 || !prep->data)
+-		goto error;
++		return -EINVAL;
+ 
+ 	/* Set an arbitrary quota */
+ 	prep->quotalen = 16;
+@@ -157,13 +222,12 @@ int big_key_preparse(struct key_preparsed_payload *prep)
+ 		 *
+ 		 * File content is stored encrypted with randomly generated key.
+ 		 */
+-		size_t enclen = datalen + ENC_AUTHTAG_SIZE;
+ 		loff_t pos = 0;
+ 
+-		data = kmalloc(enclen, GFP_KERNEL);
+-		if (!data)
++		buf = big_key_alloc_buffer(enclen);
++		if (!buf)
+ 			return -ENOMEM;
+-		memcpy(data, prep->data, datalen);
++		memcpy(buf->virt, prep->data, datalen);
+ 
+ 		/* generate random key */
+ 		enckey = kmalloc(ENC_KEY_SIZE, GFP_KERNEL);
+@@ -176,7 +240,7 @@ int big_key_preparse(struct key_preparsed_payload *prep)
+ 			goto err_enckey;
+ 
+ 		/* encrypt aligned data */
+-		ret = big_key_crypt(BIG_KEY_ENC, data, datalen, enckey);
++		ret = big_key_crypt(BIG_KEY_ENC, buf, datalen, enckey);
+ 		if (ret)
+ 			goto err_enckey;
+ 
+@@ -187,7 +251,7 @@ int big_key_preparse(struct key_preparsed_payload *prep)
+ 			goto err_enckey;
+ 		}
+ 
+-		written = kernel_write(file, data, enclen, &pos);
++		written = kernel_write(file, buf->virt, enclen, &pos);
+ 		if (written != enclen) {
+ 			ret = written;
+ 			if (written >= 0)
+@@ -202,7 +266,7 @@ int big_key_preparse(struct key_preparsed_payload *prep)
+ 		*path = file->f_path;
+ 		path_get(path);
+ 		fput(file);
+-		kzfree(data);
++		big_key_free_buffer(buf);
+ 	} else {
+ 		/* Just store the data in a buffer */
+ 		void *data = kmalloc(datalen, GFP_KERNEL);
+@@ -220,7 +284,7 @@ int big_key_preparse(struct key_preparsed_payload *prep)
+ err_enckey:
+ 	kzfree(enckey);
+ error:
+-	kzfree(data);
++	big_key_free_buffer(buf);
+ 	return ret;
+ }
+ 
+@@ -298,15 +362,15 @@ long big_key_read(const struct key *key, char __user *buffer, size_t buflen)
+ 		return datalen;
+ 
+ 	if (datalen > BIG_KEY_FILE_THRESHOLD) {
++		struct big_key_buf *buf;
+ 		struct path *path = (struct path *)&key->payload.data[big_key_path];
+ 		struct file *file;
+-		u8 *data;
+ 		u8 *enckey = (u8 *)key->payload.data[big_key_data];
+ 		size_t enclen = datalen + ENC_AUTHTAG_SIZE;
+ 		loff_t pos = 0;
+ 
+-		data = kmalloc(enclen, GFP_KERNEL);
+-		if (!data)
++		buf = big_key_alloc_buffer(enclen);
++		if (!buf)
+ 			return -ENOMEM;
+ 
+ 		file = dentry_open(path, O_RDONLY, current_cred());
+@@ -316,26 +380,26 @@ long big_key_read(const struct key *key, char __user *buffer, size_t buflen)
+ 		}
+ 
+ 		/* read file to kernel and decrypt */
+-		ret = kernel_read(file, data, enclen, &pos);
++		ret = kernel_read(file, buf->virt, enclen, &pos);
+ 		if (ret >= 0 && ret != enclen) {
+ 			ret = -EIO;
+ 			goto err_fput;
+ 		}
+ 
+-		ret = big_key_crypt(BIG_KEY_DEC, data, enclen, enckey);
++		ret = big_key_crypt(BIG_KEY_DEC, buf, enclen, enckey);
+ 		if (ret)
+ 			goto err_fput;
+ 
+ 		ret = datalen;
+ 
+ 		/* copy decrypted data to user */
+-		if (copy_to_user(buffer, data, datalen) != 0)
++		if (copy_to_user(buffer, buf->virt, datalen) != 0)
+ 			ret = -EFAULT;
+ 
+ err_fput:
+ 		fput(file);
+ error:
+-		kzfree(data);
++		big_key_free_buffer(buf);
+ 	} else {
+ 		ret = datalen;
+ 		if (copy_to_user(buffer, key->payload.data[big_key_data],
+
+commit 363b02dab09b3226f3bd1420dad9c72b79a42a76
+Author: David Howells <dhowells@redhat.com>
+Date:   Wed Oct 4 16:43:25 2017 +0100
+
+    KEYS: Fix race between updating and finding a negative key
+    
+    Consolidate KEY_FLAG_INSTANTIATED, KEY_FLAG_NEGATIVE and the rejection
+    error into one field such that:
+    
+     (1) The instantiation state can be modified/read atomically.
+    
+     (2) The error can be accessed atomically with the state.
+    
+     (3) The error isn't stored unioned with the payload pointers.
+    
+    This deals with the problem that the state is spread over three different
+    objects (two bits and a separate variable) and reading or updating them
+    atomically isn't practical, given that not only can uninstantiated keys
+    change into instantiated or rejected keys, but rejected keys can also turn
+    into instantiated keys - and someone accessing the key might not be using
+    any locking.
+    
+    The main side effect of this problem is that what was held in the payload
+    may change, depending on the state.  For instance, you might observe the
+    key to be in the rejected state.  You then read the cached error, but if
+    the key semaphore wasn't locked, the key might've become instantiated
+    between the two reads - and you might now have something in hand that isn't
+    actually an error code.
+    
+    The state is now KEY_IS_UNINSTANTIATED, KEY_IS_POSITIVE or a negative error
+    code if the key is negatively instantiated.  The key_is_instantiated()
+    function is replaced with key_is_positive() to avoid confusion as negative
+    keys are also 'instantiated'.
+    
+    Additionally, barriering is included:
+    
+     (1) Order payload-set before state-set during instantiation.
+    
+     (2) Order state-read before payload-read when using the key.
+    
+    Further separate barriering is necessary if RCU is being used to access the
+    payload content after reading the payload pointers.
+    
+    Fixes: 146aa8b1453b ("KEYS: Merge the type-specific data with the payload data")
+    Cc: stable@vger.kernel.org # v4.4+
+    Reported-by: Eric Biggers <ebiggers@google.com>
+    Signed-off-by: David Howells <dhowells@redhat.com>
+    Reviewed-by: Eric Biggers <ebiggers@google.com>
+
+diff --git a/security/keys/big_key.c b/security/keys/big_key.c
+index e607830b6154..929e14978c42 100644
+--- a/security/keys/big_key.c
++++ b/security/keys/big_key.c
+@@ -247,7 +247,7 @@ void big_key_revoke(struct key *key)
+ 
+ 	/* clear the quota */
+ 	key_payload_reserve(key, 0);
+-	if (key_is_instantiated(key) &&
++	if (key_is_positive(key) &&
+ 	    (size_t)key->payload.data[big_key_len] > BIG_KEY_FILE_THRESHOLD)
+ 		vfs_truncate(path, 0);
+ }
+@@ -279,7 +279,7 @@ void big_key_describe(const struct key *key, struct seq_file *m)
+ 
+ 	seq_puts(m, key->description);
+ 
+-	if (key_is_instantiated(key))
++	if (key_is_positive(key))
+ 		seq_printf(m, ": %zu [%s]",
+ 			   datalen,
+ 			   datalen > BIG_KEY_FILE_THRESHOLD ? "file" : "buff");
+
+commit 428490e38b2e352812e0b765d8bceafab0ec441d
+Author: Jason A. Donenfeld <Jason@zx2c4.com>
+Date:   Wed Sep 20 16:58:39 2017 +0200
+
+    security/keys: rewrite all of big_key crypto
+    
+    This started out as just replacing the use of crypto/rng with
+    get_random_bytes_wait, so that we wouldn't use bad randomness at boot
+    time. But, upon looking further, it appears that there were even deeper
+    underlying cryptographic problems, and that this seems to have been
+    committed with very little crypto review. So, I rewrote the whole thing,
+    trying to keep to the conventions introduced by the previous author, to
+    fix these cryptographic flaws.
+    
+    It makes no sense to seed crypto/rng at boot time and then keep
+    using it like this, when in fact there's already get_random_bytes_wait,
+    which can ensure there's enough entropy and be a much more standard way
+    of generating keys. Since this sensitive material is being stored
+    untrusted, using ECB and no authentication is simply not okay at all. I
+    find it surprising and a bit horrifying that this code even made it past
+    basic crypto review, which perhaps points to some larger issues. This
+    patch moves from using AES-ECB to using AES-GCM. Since keys are uniquely
+    generated each time, we can set the nonce to zero. There was also a race
+    condition in which the same key would be reused at the same time in
+    different threads. A mutex fixes this issue now.
+    
+    So, to summarize, this commit fixes the following vulnerabilities:
+    
+      * Low entropy key generation, allowing an attacker to potentially
+        guess or predict keys.
+      * Unauthenticated encryption, allowing an attacker to modify the
+        cipher text in particular ways in order to manipulate the plaintext,
+        which is is even more frightening considering the next point.
+      * Use of ECB mode, allowing an attacker to trivially swap blocks or
+        compare identical plaintext blocks.
+      * Key re-use.
+      * Faulty memory zeroing.
+    
+    Signed-off-by: Jason A. Donenfeld <Jason@zx2c4.com>
+    Reviewed-by: Eric Biggers <ebiggers3@gmail.com>
+    Signed-off-by: David Howells <dhowells@redhat.com>
+    Cc: Herbert Xu <herbert@gondor.apana.org.au>
+    Cc: Kirill Marinushkin <k.marinushkin@gmail.com>
+    Cc: security@kernel.org
+    Cc: stable@vger.kernel.org
+
+diff --git a/security/keys/big_key.c b/security/keys/big_key.c
+index 507d6fb86a4f..e607830b6154 100644
+--- a/security/keys/big_key.c
++++ b/security/keys/big_key.c
+@@ -1,5 +1,6 @@
+ /* Large capacity key type
+  *
++ * Copyright (C) 2017 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.
+  * Copyright (C) 2013 Red Hat, Inc. All Rights Reserved.
+  * Written by David Howells (dhowells@redhat.com)
+  *
+@@ -16,10 +17,10 @@
+ #include <linux/shmem_fs.h>
+ #include <linux/err.h>
+ #include <linux/scatterlist.h>
++#include <linux/random.h>
+ #include <keys/user-type.h>
+ #include <keys/big_key-type.h>
+-#include <crypto/rng.h>
+-#include <crypto/skcipher.h>
++#include <crypto/aead.h>
+ 
+ /*
+  * Layout of key payload words.
+@@ -49,7 +50,12 @@ enum big_key_op {
+ /*
+  * Key size for big_key data encryption
+  */
+-#define ENC_KEY_SIZE	16
++#define ENC_KEY_SIZE 32
++
++/*
++ * Authentication tag length
++ */
++#define ENC_AUTHTAG_SIZE 16
+ 
+ /*
+  * big_key defined keys take an arbitrary string as the description and an
+@@ -64,57 +70,62 @@ struct key_type key_type_big_key = {
+ 	.destroy		= big_key_destroy,
+ 	.describe		= big_key_describe,
+ 	.read			= big_key_read,
++	/* no ->update(); don't add it without changing big_key_crypt() nonce */
+ };
+ 
+ /*
+- * Crypto names for big_key data encryption
++ * Crypto names for big_key data authenticated encryption
+  */
+-static const char big_key_rng_name[] = "stdrng";
+-static const char big_key_alg_name[] = "ecb(aes)";
++static const char big_key_alg_name[] = "gcm(aes)";
+ 
+ /*
+- * Crypto algorithms for big_key data encryption
++ * Crypto algorithms for big_key data authenticated encryption
+  */
+-static struct crypto_rng *big_key_rng;
+-static struct crypto_skcipher *big_key_skcipher;
++static struct crypto_aead *big_key_aead;
+ 
+ /*
+- * Generate random key to encrypt big_key data
++ * Since changing the key affects the entire object, we need a mutex.
+  */
+-static inline int big_key_gen_enckey(u8 *key)
+-{
+-	return crypto_rng_get_bytes(big_key_rng, key, ENC_KEY_SIZE);
+-}
++static DEFINE_MUTEX(big_key_aead_lock);
+ 
+ /*
+  * Encrypt/decrypt big_key data
+  */
+ static int big_key_crypt(enum big_key_op op, u8 *data, size_t datalen, u8 *key)
+ {
+-	int ret = -EINVAL;
++	int ret;
+ 	struct scatterlist sgio;
+-	SKCIPHER_REQUEST_ON_STACK(req, big_key_skcipher);
+-
+-	if (crypto_skcipher_setkey(big_key_skcipher, key, ENC_KEY_SIZE)) {
++	struct aead_request *aead_req;
++	/* We always use a zero nonce. The reason we can get away with this is
++	 * because we're using a different randomly generated key for every
++	 * different encryption. Notably, too, key_type_big_key doesn't define
++	 * an .update function, so there's no chance we'll wind up reusing the
++	 * key to encrypt updated data. Simply put: one key, one encryption.
++	 */
++	u8 zero_nonce[crypto_aead_ivsize(big_key_aead)];
++
++	aead_req = aead_request_alloc(big_key_aead, GFP_KERNEL);
++	if (!aead_req)
++		return -ENOMEM;
++
++	memset(zero_nonce, 0, sizeof(zero_nonce));
++	sg_init_one(&sgio, data, datalen + (op == BIG_KEY_ENC ? ENC_AUTHTAG_SIZE : 0));
++	aead_request_set_crypt(aead_req, &sgio, &sgio, datalen, zero_nonce);
++	aead_request_set_callback(aead_req, CRYPTO_TFM_REQ_MAY_SLEEP, NULL, NULL);
++	aead_request_set_ad(aead_req, 0);
++
++	mutex_lock(&big_key_aead_lock);
++	if (crypto_aead_setkey(big_key_aead, key, ENC_KEY_SIZE)) {
+ 		ret = -EAGAIN;
+ 		goto error;
+ 	}
+-
+-	skcipher_request_set_tfm(req, big_key_skcipher);
+-	skcipher_request_set_callback(req, CRYPTO_TFM_REQ_MAY_SLEEP,
+-				      NULL, NULL);
+-
+-	sg_init_one(&sgio, data, datalen);
+-	skcipher_request_set_crypt(req, &sgio, &sgio, datalen, NULL);
+-
+ 	if (op == BIG_KEY_ENC)
+-		ret = crypto_skcipher_encrypt(req);
++		ret = crypto_aead_encrypt(aead_req);
+ 	else
+-		ret = crypto_skcipher_decrypt(req);
+-
+-	skcipher_request_zero(req);
+-
++		ret = crypto_aead_decrypt(aead_req);
+ error:
++	mutex_unlock(&big_key_aead_lock);
++	aead_request_free(aead_req);
+ 	return ret;
+ }
+ 
+@@ -146,16 +157,13 @@ int big_key_preparse(struct key_preparsed_payload *prep)
+ 		 *
+ 		 * File content is stored encrypted with randomly generated key.
+ 		 */
+-		size_t enclen = ALIGN(datalen, crypto_skcipher_blocksize(big_key_skcipher));
++		size_t enclen = datalen + ENC_AUTHTAG_SIZE;
+ 		loff_t pos = 0;
+ 
+-		/* prepare aligned data to encrypt */
+ 		data = kmalloc(enclen, GFP_KERNEL);
+ 		if (!data)
+ 			return -ENOMEM;
+-
+ 		memcpy(data, prep->data, datalen);
+-		memset(data + datalen, 0x00, enclen - datalen);
+ 
+ 		/* generate random key */
+ 		enckey = kmalloc(ENC_KEY_SIZE, GFP_KERNEL);
+@@ -163,13 +171,12 @@ int big_key_preparse(struct key_preparsed_payload *prep)
+ 			ret = -ENOMEM;
+ 			goto error;
+ 		}
+-
+-		ret = big_key_gen_enckey(enckey);
+-		if (ret)
++		ret = get_random_bytes_wait(enckey, ENC_KEY_SIZE);
++		if (unlikely(ret))
+ 			goto err_enckey;
+ 
+ 		/* encrypt aligned data */
+-		ret = big_key_crypt(BIG_KEY_ENC, data, enclen, enckey);
++		ret = big_key_crypt(BIG_KEY_ENC, data, datalen, enckey);
+ 		if (ret)
+ 			goto err_enckey;
+ 
+@@ -295,7 +302,7 @@ long big_key_read(const struct key *key, char __user *buffer, size_t buflen)
+ 		struct file *file;
+ 		u8 *data;
+ 		u8 *enckey = (u8 *)key->payload.data[big_key_data];
+-		size_t enclen = ALIGN(datalen, crypto_skcipher_blocksize(big_key_skcipher));
++		size_t enclen = datalen + ENC_AUTHTAG_SIZE;
+ 		loff_t pos = 0;
+ 
+ 		data = kmalloc(enclen, GFP_KERNEL);
+@@ -344,47 +351,31 @@ long big_key_read(const struct key *key, char __user *buffer, size_t buflen)
+  */
+ static int __init big_key_init(void)
+ {
+-	struct crypto_skcipher *cipher;
+-	struct crypto_rng *rng;
+ 	int ret;
+ 
+-	rng = crypto_alloc_rng(big_key_rng_name, 0, 0);
+-	if (IS_ERR(rng)) {
+-		pr_err("Can't alloc rng: %ld\n", PTR_ERR(rng));
+-		return PTR_ERR(rng);
+-	}
+-
+-	big_key_rng = rng;
+-
+-	/* seed RNG */
+-	ret = crypto_rng_reset(rng, NULL, crypto_rng_seedsize(rng));
+-	if (ret) {
+-		pr_err("Can't reset rng: %d\n", ret);
+-		goto error_rng;
+-	}
+-
+ 	/* init block cipher */
+-	cipher = crypto_alloc_skcipher(big_key_alg_name, 0, CRYPTO_ALG_ASYNC);
+-	if (IS_ERR(cipher)) {
+-		ret = PTR_ERR(cipher);
++	big_key_aead = crypto_alloc_aead(big_key_alg_name, 0, CRYPTO_ALG_ASYNC);
++	if (IS_ERR(big_key_aead)) {
++		ret = PTR_ERR(big_key_aead);
+ 		pr_err("Can't alloc crypto: %d\n", ret);
+-		goto error_rng;
++		return ret;
++	}
++	ret = crypto_aead_setauthsize(big_key_aead, ENC_AUTHTAG_SIZE);
++	if (ret < 0) {
++		pr_err("Can't set crypto auth tag len: %d\n", ret);
++		goto free_aead;
+ 	}
+-
+-	big_key_skcipher = cipher;
+ 
+ 	ret = register_key_type(&key_type_big_key);
+ 	if (ret < 0) {
+ 		pr_err("Can't register type: %d\n", ret);
+-		goto error_cipher;
++		goto free_aead;
+ 	}
+ 
+ 	return 0;
+ 
+-error_cipher:
+-	crypto_free_skcipher(big_key_skcipher);
+-error_rng:
+-	crypto_free_rng(big_key_rng);
++free_aead:
++	crypto_free_aead(big_key_aead);
+ 	return ret;
+ }
+ 
+
+commit 910801809b2e40a4baedd080ef5d80b4a180e70e
+Author: Jason A. Donenfeld <Jason@zx2c4.com>
+Date:   Wed Sep 20 16:58:38 2017 +0200
+
+    security/keys: properly zero out sensitive key material in big_key
+    
+    Error paths forgot to zero out sensitive material, so this patch changes
+    some kfrees into a kzfrees.
+    
+    Signed-off-by: Jason A. Donenfeld <Jason@zx2c4.com>
+    Signed-off-by: David Howells <dhowells@redhat.com>
+    Reviewed-by: Eric Biggers <ebiggers3@gmail.com>
+    Cc: Herbert Xu <herbert@gondor.apana.org.au>
+    Cc: Kirill Marinushkin <k.marinushkin@gmail.com>
+    Cc: security@kernel.org
+    Cc: stable@vger.kernel.org
+
+diff --git a/security/keys/big_key.c b/security/keys/big_key.c
+index 6acb00f6f22c..507d6fb86a4f 100644
+--- a/security/keys/big_key.c
++++ b/security/keys/big_key.c
+@@ -195,7 +195,7 @@ int big_key_preparse(struct key_preparsed_payload *prep)
+ 		*path = file->f_path;
+ 		path_get(path);
+ 		fput(file);
+-		kfree(data);
++		kzfree(data);
+ 	} else {
+ 		/* Just store the data in a buffer */
+ 		void *data = kmalloc(datalen, GFP_KERNEL);
+@@ -211,9 +211,9 @@ int big_key_preparse(struct key_preparsed_payload *prep)
+ err_fput:
+ 	fput(file);
+ err_enckey:
+-	kfree(enckey);
++	kzfree(enckey);
+ error:
+-	kfree(data);
++	kzfree(data);
+ 	return ret;
+ }
+ 
+@@ -227,7 +227,7 @@ void big_key_free_preparse(struct key_preparsed_payload *prep)
+ 
+ 		path_put(path);
+ 	}
+-	kfree(prep->payload.data[big_key_data]);
++	kzfree(prep->payload.data[big_key_data]);
+ }
+ 
+ /*
+@@ -259,7 +259,7 @@ void big_key_destroy(struct key *key)
+ 		path->mnt = NULL;
+ 		path->dentry = NULL;
+ 	}
+-	kfree(key->payload.data[big_key_data]);
++	kzfree(key->payload.data[big_key_data]);
+ 	key->payload.data[big_key_data] = NULL;
+ }
+ 
+@@ -328,7 +328,7 @@ long big_key_read(const struct key *key, char __user *buffer, size_t buflen)
+ err_fput:
+ 		fput(file);
+ error:
+-		kfree(data);
++		kzfree(data);
+ 	} else {
+ 		ret = datalen;
+ 		if (copy_to_user(buffer, key->payload.data[big_key_data],
+
+commit e13ec939e96b13e664bb6cee361cc976a0ee621a
+Author: Christoph Hellwig <hch@lst.de>
+Date:   Fri Sep 1 17:39:14 2017 +0200
+
+    fs: fix kernel_write prototype
+    
+    Make the position an in/out argument like all the other read/write
+    helpers and and make the buf argument a void pointer.
+    
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/security/keys/big_key.c b/security/keys/big_key.c
+index 9f4c86cade8e..6acb00f6f22c 100644
+--- a/security/keys/big_key.c
++++ b/security/keys/big_key.c
+@@ -147,6 +147,7 @@ int big_key_preparse(struct key_preparsed_payload *prep)
+ 		 * File content is stored encrypted with randomly generated key.
+ 		 */
+ 		size_t enclen = ALIGN(datalen, crypto_skcipher_blocksize(big_key_skcipher));
++		loff_t pos = 0;
+ 
+ 		/* prepare aligned data to encrypt */
+ 		data = kmalloc(enclen, GFP_KERNEL);
+@@ -179,7 +180,7 @@ int big_key_preparse(struct key_preparsed_payload *prep)
+ 			goto err_enckey;
+ 		}
+ 
+-		written = kernel_write(file, data, enclen, 0);
++		written = kernel_write(file, data, enclen, &pos);
+ 		if (written != enclen) {
+ 			ret = written;
+ 			if (written >= 0)
+
+commit bdd1d2d3d251c65b74ac4493e08db18971c09240
+Author: Christoph Hellwig <hch@lst.de>
+Date:   Fri Sep 1 17:39:13 2017 +0200
+
+    fs: fix kernel_read prototype
+    
+    Use proper ssize_t and size_t types for the return value and count
+    argument, move the offset last and make it an in/out argument like
+    all other read/write helpers, and make the buf argument a void pointer
+    to get rid of lots of casts in the callers.
+    
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/security/keys/big_key.c b/security/keys/big_key.c
+index 835c1ab30d01..9f4c86cade8e 100644
+--- a/security/keys/big_key.c
++++ b/security/keys/big_key.c
+@@ -295,6 +295,7 @@ long big_key_read(const struct key *key, char __user *buffer, size_t buflen)
+ 		u8 *data;
+ 		u8 *enckey = (u8 *)key->payload.data[big_key_data];
+ 		size_t enclen = ALIGN(datalen, crypto_skcipher_blocksize(big_key_skcipher));
++		loff_t pos = 0;
+ 
+ 		data = kmalloc(enclen, GFP_KERNEL);
+ 		if (!data)
+@@ -307,7 +308,7 @@ long big_key_read(const struct key *key, char __user *buffer, size_t buflen)
+ 		}
+ 
+ 		/* read file to kernel and decrypt */
+-		ret = kernel_read(file, 0, data, enclen);
++		ret = kernel_read(file, data, enclen, &pos);
+ 		if (ret >= 0 && ret != enclen) {
+ 			ret = -EIO;
+ 			goto err_fput;
+
+commit 7df3e59c3d1df4f87fe874c7956ef7a3d2f4d5fb
+Author: David Howells <dhowells@redhat.com>
+Date:   Wed Oct 26 15:02:01 2016 +0100
+
+    KEYS: Sort out big_key initialisation
+    
+    big_key has two separate initialisation functions, one that registers the
+    key type and one that registers the crypto.  If the key type fails to
+    register, there's no problem if the crypto registers successfully because
+    there's no way to reach the crypto except through the key type.
+    
+    However, if the key type registers successfully but the crypto does not,
+    big_key_rng and big_key_blkcipher may end up set to NULL - but the code
+    neither checks for this nor unregisters the big key key type.
+    
+    Furthermore, since the key type is registered before the crypto, it is
+    theoretically possible for the kernel to try adding a big_key before the
+    crypto is set up, leading to the same effect.
+    
+    Fix this by merging big_key_crypto_init() and big_key_init() and calling
+    the resulting function late.  If they're going to be encrypted, we
+    shouldn't be creating big_keys before we have the facilities to do the
+    encryption available.  The key type registration is also moved after the
+    crypto initialisation.
+    
+    The fix also includes message printing on failure.
+    
+    If the big_key type isn't correctly set up, simply doing:
+    
+            dd if=/dev/zero bs=4096 count=1 | keyctl padd big_key a @s
+    
+    ought to cause an oops.
+    
+    Fixes: 13100a72f40f5748a04017e0ab3df4cf27c809ef ('Security: Keys: Big keys stored encrypted')
+    Signed-off-by: David Howells <dhowells@redhat.com>
+    cc: Peter Hlavaty <zer0mem@yahoo.com>
+    cc: Kirill Marinushkin <k.marinushkin@gmail.com>
+    cc: Artem Savkov <asavkov@redhat.com>
+    cc: stable@vger.kernel.org
+    Signed-off-by: James Morris <james.l.morris@oracle.com>
+
+diff --git a/security/keys/big_key.c b/security/keys/big_key.c
+index c0b3030b5634..835c1ab30d01 100644
+--- a/security/keys/big_key.c
++++ b/security/keys/big_key.c
+@@ -9,6 +9,7 @@
+  * 2 of the Licence, or (at your option) any later version.
+  */
+ 
++#define pr_fmt(fmt) "big_key: "fmt
+ #include <linux/init.h>
+ #include <linux/seq_file.h>
+ #include <linux/file.h>
+@@ -341,44 +342,48 @@ long big_key_read(const struct key *key, char __user *buffer, size_t buflen)
+  */
+ static int __init big_key_init(void)
+ {
+-	return register_key_type(&key_type_big_key);
+-}
+-
+-/*
+- * Initialize big_key crypto and RNG algorithms
+- */
+-static int __init big_key_crypto_init(void)
+-{
+-	int ret = -EINVAL;
++	struct crypto_skcipher *cipher;
++	struct crypto_rng *rng;
++	int ret;
+ 
+-	/* init RNG */
+-	big_key_rng = crypto_alloc_rng(big_key_rng_name, 0, 0);
+-	if (IS_ERR(big_key_rng)) {
+-		big_key_rng = NULL;
+-		return -EFAULT;
++	rng = crypto_alloc_rng(big_key_rng_name, 0, 0);
++	if (IS_ERR(rng)) {
++		pr_err("Can't alloc rng: %ld\n", PTR_ERR(rng));
++		return PTR_ERR(rng);
+ 	}
+ 
++	big_key_rng = rng;
++
+ 	/* seed RNG */
+-	ret = crypto_rng_reset(big_key_rng, NULL, crypto_rng_seedsize(big_key_rng));
+-	if (ret)
+-		goto error;
++	ret = crypto_rng_reset(rng, NULL, crypto_rng_seedsize(rng));
++	if (ret) {
++		pr_err("Can't reset rng: %d\n", ret);
++		goto error_rng;
++	}
+ 
+ 	/* init block cipher */
+-	big_key_skcipher = crypto_alloc_skcipher(big_key_alg_name,
+-						 0, CRYPTO_ALG_ASYNC);
+-	if (IS_ERR(big_key_skcipher)) {
+-		big_key_skcipher = NULL;
+-		ret = -EFAULT;
+-		goto error;
++	cipher = crypto_alloc_skcipher(big_key_alg_name, 0, CRYPTO_ALG_ASYNC);
++	if (IS_ERR(cipher)) {
++		ret = PTR_ERR(cipher);
++		pr_err("Can't alloc crypto: %d\n", ret);
++		goto error_rng;
++	}
++
++	big_key_skcipher = cipher;
++
++	ret = register_key_type(&key_type_big_key);
++	if (ret < 0) {
++		pr_err("Can't register type: %d\n", ret);
++		goto error_cipher;
+ 	}
+ 
+ 	return 0;
+ 
+-error:
++error_cipher:
++	crypto_free_skcipher(big_key_skcipher);
++error_rng:
+ 	crypto_free_rng(big_key_rng);
+-	big_key_rng = NULL;
+ 	return ret;
+ }
+ 
+-device_initcall(big_key_init);
+-late_initcall(big_key_crypto_init);
++late_initcall(big_key_init);
+
+commit d56d72c6a0612be14ccb455c92886d2cb102c2ab
+Author: Herbert Xu <herbert@gondor.apana.org.au>
+Date:   Wed Jun 22 22:13:53 2016 +0800
+
+    KEYS: Use skcipher for big keys
+    
+    This patch replaces use of the obsolete blkcipher with skcipher.
+    
+    Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+    Acked-by: David Howells <dhowells@redhat.com>
+
+diff --git a/security/keys/big_key.c b/security/keys/big_key.c
+index 9e443fccad4c..c0b3030b5634 100644
+--- a/security/keys/big_key.c
++++ b/security/keys/big_key.c
+@@ -18,6 +18,7 @@
+ #include <keys/user-type.h>
+ #include <keys/big_key-type.h>
+ #include <crypto/rng.h>
++#include <crypto/skcipher.h>
+ 
+ /*
+  * Layout of key payload words.
+@@ -74,7 +75,7 @@ static const char big_key_alg_name[] = "ecb(aes)";
+  * Crypto algorithms for big_key data encryption
+  */
+ static struct crypto_rng *big_key_rng;
+-static struct crypto_blkcipher *big_key_blkcipher;
++static struct crypto_skcipher *big_key_skcipher;
+ 
+ /*
+  * Generate random key to encrypt big_key data
+@@ -91,22 +92,26 @@ static int big_key_crypt(enum big_key_op op, u8 *data, size_t datalen, u8 *key)
+ {
+ 	int ret = -EINVAL;
+ 	struct scatterlist sgio;
+-	struct blkcipher_desc desc;
++	SKCIPHER_REQUEST_ON_STACK(req, big_key_skcipher);
+ 
+-	if (crypto_blkcipher_setkey(big_key_blkcipher, key, ENC_KEY_SIZE)) {
++	if (crypto_skcipher_setkey(big_key_skcipher, key, ENC_KEY_SIZE)) {
+ 		ret = -EAGAIN;
+ 		goto error;
+ 	}
+ 
+-	desc.flags = 0;
+-	desc.tfm = big_key_blkcipher;
++	skcipher_request_set_tfm(req, big_key_skcipher);
++	skcipher_request_set_callback(req, CRYPTO_TFM_REQ_MAY_SLEEP,
++				      NULL, NULL);
+ 
+ 	sg_init_one(&sgio, data, datalen);
++	skcipher_request_set_crypt(req, &sgio, &sgio, datalen, NULL);
+ 
+ 	if (op == BIG_KEY_ENC)
+-		ret = crypto_blkcipher_encrypt(&desc, &sgio, &sgio, datalen);
++		ret = crypto_skcipher_encrypt(req);
+ 	else
+-		ret = crypto_blkcipher_decrypt(&desc, &sgio, &sgio, datalen);
++		ret = crypto_skcipher_decrypt(req);
++
++	skcipher_request_zero(req);
+ 
+ error:
+ 	return ret;
+@@ -140,7 +145,7 @@ int big_key_preparse(struct key_preparsed_payload *prep)
+ 		 *
+ 		 * File content is stored encrypted with randomly generated key.
+ 		 */
+-		size_t enclen = ALIGN(datalen, crypto_blkcipher_blocksize(big_key_blkcipher));
++		size_t enclen = ALIGN(datalen, crypto_skcipher_blocksize(big_key_skcipher));
+ 
+ 		/* prepare aligned data to encrypt */
+ 		data = kmalloc(enclen, GFP_KERNEL);
+@@ -288,7 +293,7 @@ long big_key_read(const struct key *key, char __user *buffer, size_t buflen)
+ 		struct file *file;
+ 		u8 *data;
+ 		u8 *enckey = (u8 *)key->payload.data[big_key_data];
+-		size_t enclen = ALIGN(datalen, crypto_blkcipher_blocksize(big_key_blkcipher));
++		size_t enclen = ALIGN(datalen, crypto_skcipher_blocksize(big_key_skcipher));
+ 
+ 		data = kmalloc(enclen, GFP_KERNEL);
+ 		if (!data)
+@@ -359,9 +364,10 @@ static int __init big_key_crypto_init(void)
+ 		goto error;
+ 
+ 	/* init block cipher */
+-	big_key_blkcipher = crypto_alloc_blkcipher(big_key_alg_name, 0, 0);
+-	if (IS_ERR(big_key_blkcipher)) {
+-		big_key_blkcipher = NULL;
++	big_key_skcipher = crypto_alloc_skcipher(big_key_alg_name,
++						 0, CRYPTO_ALG_ASYNC);
++	if (IS_ERR(big_key_skcipher)) {
++		big_key_skcipher = NULL;
+ 		ret = -EFAULT;
+ 		goto error;
+ 	}
+
+commit 13100a72f40f5748a04017e0ab3df4cf27c809ef
+Author: Kirill Marinushkin <k.marinushkin@gmail.com>
+Date:   Tue Apr 12 19:54:58 2016 +0100
+
+    Security: Keys: Big keys stored encrypted
+    
+    Solved TODO task: big keys saved to shmem file are now stored encrypted.
+    The encryption key is randomly generated and saved to payload[big_key_data].
+    
+    Signed-off-by: Kirill Marinushkin <k.marinushkin@gmail.com>
+    Signed-off-by: David Howells <dhowells@redhat.com>
+
+diff --git a/security/keys/big_key.c b/security/keys/big_key.c
+index c721e398893a..9e443fccad4c 100644
+--- a/security/keys/big_key.c
++++ b/security/keys/big_key.c
+@@ -14,8 +14,10 @@
+ #include <linux/file.h>
+ #include <linux/shmem_fs.h>
+ #include <linux/err.h>
++#include <linux/scatterlist.h>
+ #include <keys/user-type.h>
+ #include <keys/big_key-type.h>
++#include <crypto/rng.h>
+ 
+ /*
+  * Layout of key payload words.
+@@ -27,6 +29,14 @@ enum {
+ 	big_key_len,
+ };
+ 
++/*
++ * Crypto operation with big_key data
++ */
++enum big_key_op {
++	BIG_KEY_ENC,
++	BIG_KEY_DEC,
++};
++
+ /*
+  * If the data is under this limit, there's no point creating a shm file to
+  * hold it as the permanently resident metadata for the shmem fs will be at
+@@ -34,6 +44,11 @@ enum {
+  */
+ #define BIG_KEY_FILE_THRESHOLD (sizeof(struct inode) + sizeof(struct dentry))
+ 
++/*
++ * Key size for big_key data encryption
++ */
++#define ENC_KEY_SIZE	16
++
+ /*
+  * big_key defined keys take an arbitrary string as the description and an
+  * arbitrary blob of data as the payload
+@@ -49,6 +64,54 @@ struct key_type key_type_big_key = {
+ 	.read			= big_key_read,
+ };
+ 
++/*
++ * Crypto names for big_key data encryption
++ */
++static const char big_key_rng_name[] = "stdrng";
++static const char big_key_alg_name[] = "ecb(aes)";
++
++/*
++ * Crypto algorithms for big_key data encryption
++ */
++static struct crypto_rng *big_key_rng;
++static struct crypto_blkcipher *big_key_blkcipher;
++
++/*
++ * Generate random key to encrypt big_key data
++ */
++static inline int big_key_gen_enckey(u8 *key)
++{
++	return crypto_rng_get_bytes(big_key_rng, key, ENC_KEY_SIZE);
++}
++
++/*
++ * Encrypt/decrypt big_key data
++ */
++static int big_key_crypt(enum big_key_op op, u8 *data, size_t datalen, u8 *key)
++{
++	int ret = -EINVAL;
++	struct scatterlist sgio;
++	struct blkcipher_desc desc;
++
++	if (crypto_blkcipher_setkey(big_key_blkcipher, key, ENC_KEY_SIZE)) {
++		ret = -EAGAIN;
++		goto error;
++	}
++
++	desc.flags = 0;
++	desc.tfm = big_key_blkcipher;
++
++	sg_init_one(&sgio, data, datalen);
++
++	if (op == BIG_KEY_ENC)
++		ret = crypto_blkcipher_encrypt(&desc, &sgio, &sgio, datalen);
++	else
++		ret = crypto_blkcipher_decrypt(&desc, &sgio, &sgio, datalen);
++
++error:
++	return ret;
++}
++
+ /*
+  * Preparse a big key
+  */
+@@ -56,6 +119,8 @@ int big_key_preparse(struct key_preparsed_payload *prep)
+ {
+ 	struct path *path = (struct path *)&prep->payload.data[big_key_path];
+ 	struct file *file;
++	u8 *enckey;
++	u8 *data = NULL;
+ 	ssize_t written;
+ 	size_t datalen = prep->datalen;
+ 	int ret;
+@@ -73,16 +138,43 @@ int big_key_preparse(struct key_preparsed_payload *prep)
+ 		/* Create a shmem file to store the data in.  This will permit the data
+ 		 * to be swapped out if needed.
+ 		 *
+-		 * TODO: Encrypt the stored data with a temporary key.
++		 * File content is stored encrypted with randomly generated key.
+ 		 */
+-		file = shmem_kernel_file_setup("", datalen, 0);
++		size_t enclen = ALIGN(datalen, crypto_blkcipher_blocksize(big_key_blkcipher));
++
++		/* prepare aligned data to encrypt */
++		data = kmalloc(enclen, GFP_KERNEL);
++		if (!data)
++			return -ENOMEM;
++
++		memcpy(data, prep->data, datalen);
++		memset(data + datalen, 0x00, enclen - datalen);
++
++		/* generate random key */
++		enckey = kmalloc(ENC_KEY_SIZE, GFP_KERNEL);
++		if (!enckey) {
++			ret = -ENOMEM;
++			goto error;
++		}
++
++		ret = big_key_gen_enckey(enckey);
++		if (ret)
++			goto err_enckey;
++
++		/* encrypt aligned data */
++		ret = big_key_crypt(BIG_KEY_ENC, data, enclen, enckey);
++		if (ret)
++			goto err_enckey;
++
++		/* save aligned data to file */
++		file = shmem_kernel_file_setup("", enclen, 0);
+ 		if (IS_ERR(file)) {
+ 			ret = PTR_ERR(file);
+-			goto error;
++			goto err_enckey;
+ 		}
+ 
+-		written = kernel_write(file, prep->data, prep->datalen, 0);
+-		if (written != datalen) {
++		written = kernel_write(file, data, enclen, 0);
++		if (written != enclen) {
+ 			ret = written;
+ 			if (written >= 0)
+ 				ret = -ENOMEM;
+@@ -92,12 +184,15 @@ int big_key_preparse(struct key_preparsed_payload *prep)
+ 		/* Pin the mount and dentry to the key so that we can open it again
+ 		 * later
+ 		 */
++		prep->payload.data[big_key_data] = enckey;
+ 		*path = file->f_path;
+ 		path_get(path);
+ 		fput(file);
++		kfree(data);
+ 	} else {
+ 		/* Just store the data in a buffer */
+ 		void *data = kmalloc(datalen, GFP_KERNEL);
++
+ 		if (!data)
+ 			return -ENOMEM;
+ 
+@@ -108,7 +203,10 @@ int big_key_preparse(struct key_preparsed_payload *prep)
+ 
+ err_fput:
+ 	fput(file);
++err_enckey:
++	kfree(enckey);
+ error:
++	kfree(data);
+ 	return ret;
+ }
+ 
+@@ -119,10 +217,10 @@ void big_key_free_preparse(struct key_preparsed_payload *prep)
+ {
+ 	if (prep->datalen > BIG_KEY_FILE_THRESHOLD) {
+ 		struct path *path = (struct path *)&prep->payload.data[big_key_path];
++
+ 		path_put(path);
+-	} else {
+-		kfree(prep->payload.data[big_key_data]);
+ 	}
++	kfree(prep->payload.data[big_key_data]);
+ }
+ 
+ /*
+@@ -147,15 +245,15 @@ void big_key_destroy(struct key *key)
+ {
+ 	size_t datalen = (size_t)key->payload.data[big_key_len];
+ 
+-	if (datalen) {
++	if (datalen > BIG_KEY_FILE_THRESHOLD) {
+ 		struct path *path = (struct path *)&key->payload.data[big_key_path];
++
+ 		path_put(path);
+ 		path->mnt = NULL;
+ 		path->dentry = NULL;
+-	} else {
+-		kfree(key->payload.data[big_key_data]);
+-		key->payload.data[big_key_data] = NULL;
+ 	}
++	kfree(key->payload.data[big_key_data]);
++	key->payload.data[big_key_data] = NULL;
+ }
+ 
+ /*
+@@ -188,17 +286,41 @@ long big_key_read(const struct key *key, char __user *buffer, size_t buflen)
+ 	if (datalen > BIG_KEY_FILE_THRESHOLD) {
+ 		struct path *path = (struct path *)&key->payload.data[big_key_path];
+ 		struct file *file;
+-		loff_t pos;
++		u8 *data;
++		u8 *enckey = (u8 *)key->payload.data[big_key_data];
++		size_t enclen = ALIGN(datalen, crypto_blkcipher_blocksize(big_key_blkcipher));
++
++		data = kmalloc(enclen, GFP_KERNEL);
++		if (!data)
++			return -ENOMEM;
+ 
+ 		file = dentry_open(path, O_RDONLY, current_cred());
+-		if (IS_ERR(file))
+-			return PTR_ERR(file);
++		if (IS_ERR(file)) {
++			ret = PTR_ERR(file);
++			goto error;
++		}
+ 
+-		pos = 0;
+-		ret = vfs_read(file, buffer, datalen, &pos);
+-		fput(file);
+-		if (ret >= 0 && ret != datalen)
++		/* read file to kernel and decrypt */
++		ret = kernel_read(file, 0, data, enclen);
++		if (ret >= 0 && ret != enclen) {
+ 			ret = -EIO;
++			goto err_fput;
++		}
++
++		ret = big_key_crypt(BIG_KEY_DEC, data, enclen, enckey);
++		if (ret)
++			goto err_fput;
++
++		ret = datalen;
++
++		/* copy decrypted data to user */
++		if (copy_to_user(buffer, data, datalen) != 0)
++			ret = -EFAULT;
++
++err_fput:
++		fput(file);
++error:
++		kfree(data);
+ 	} else {
+ 		ret = datalen;
+ 		if (copy_to_user(buffer, key->payload.data[big_key_data],
+@@ -209,8 +331,48 @@ long big_key_read(const struct key *key, char __user *buffer, size_t buflen)
+ 	return ret;
+ }
+ 
++/*
++ * Register key type
++ */
+ static int __init big_key_init(void)
+ {
+ 	return register_key_type(&key_type_big_key);
+ }
++
++/*
++ * Initialize big_key crypto and RNG algorithms
++ */
++static int __init big_key_crypto_init(void)
++{
++	int ret = -EINVAL;
++
++	/* init RNG */
++	big_key_rng = crypto_alloc_rng(big_key_rng_name, 0, 0);
++	if (IS_ERR(big_key_rng)) {
++		big_key_rng = NULL;
++		return -EFAULT;
++	}
++
++	/* seed RNG */
++	ret = crypto_rng_reset(big_key_rng, NULL, crypto_rng_seedsize(big_key_rng));
++	if (ret)
++		goto error;
++
++	/* init block cipher */
++	big_key_blkcipher = crypto_alloc_blkcipher(big_key_alg_name, 0, 0);
++	if (IS_ERR(big_key_blkcipher)) {
++		big_key_blkcipher = NULL;
++		ret = -EFAULT;
++		goto error;
++	}
++
++	return 0;
++
++error:
++	crypto_free_rng(big_key_rng);
++	big_key_rng = NULL;
++	return ret;
++}
++
+ device_initcall(big_key_init);
++late_initcall(big_key_crypto_init);
+
+commit a1f2bdf338f15dbad10ee6362891ebf79244858b
+Author: Paul Gortmaker <paul.gortmaker@windriver.com>
+Date:   Wed Dec 9 17:37:15 2015 -0500
+
+    security/keys: make big_key.c explicitly non-modular
+    
+    The Kconfig currently controlling compilation of this code is:
+    
+    config BIG_KEYS
+            bool "Large payload keys"
+    
+    ...meaning that it currently is not being built as a module by anyone.
+    
+    Lets remove the modular code that is essentially orphaned, so that
+    when reading the driver there is no doubt it is builtin-only.
+    
+    Since module_init translates to device_initcall in the non-modular
+    case, the init ordering remains unchanged with this commit.
+    
+    We also delete the MODULE_LICENSE tag since all that information
+    is already contained at the top of the file in the comments.
+    
+    Cc: James Morris <james.l.morris@oracle.com>
+    Cc: "Serge E. Hallyn" <serge@hallyn.com>
+    Cc: keyrings@vger.kernel.org
+    Cc: linux-security-module@vger.kernel.org
+    Signed-off-by: Paul Gortmaker <paul.gortmaker@windriver.com>
+    Signed-off-by: David Howells <dhowells@redhat.com>
+
+diff --git a/security/keys/big_key.c b/security/keys/big_key.c
+index 907c1522ee46..c721e398893a 100644
+--- a/security/keys/big_key.c
++++ b/security/keys/big_key.c
+@@ -9,7 +9,6 @@
+  * 2 of the Licence, or (at your option) any later version.
+  */
+ 
+-#include <linux/module.h>
+ #include <linux/init.h>
+ #include <linux/seq_file.h>
+ #include <linux/file.h>
+@@ -18,8 +17,6 @@
+ #include <keys/user-type.h>
+ #include <keys/big_key-type.h>
+ 
+-MODULE_LICENSE("GPL");
+-
+ /*
+  * Layout of key payload words.
+  */
+@@ -212,18 +209,8 @@ long big_key_read(const struct key *key, char __user *buffer, size_t buflen)
+ 	return ret;
+ }
+ 
+-/*
+- * Module stuff
+- */
+ static int __init big_key_init(void)
+ {
+ 	return register_key_type(&key_type_big_key);
+ }
+-
+-static void __exit big_key_cleanup(void)
+-{
+-	unregister_key_type(&key_type_big_key);
+-}
+-
+-module_init(big_key_init);
+-module_exit(big_key_cleanup);
++device_initcall(big_key_init);
+
+commit 146aa8b1453bd8f1ff2304ffb71b4ee0eb9acdcc
+Author: David Howells <dhowells@redhat.com>
+Date:   Wed Oct 21 14:04:48 2015 +0100
+
+    KEYS: Merge the type-specific data with the payload data
+    
+    Merge the type-specific data with the payload data into one four-word chunk
+    as it seems pointless to keep them separate.
+    
+    Use user_key_payload() for accessing the payloads of overloaded
+    user-defined keys.
+    
+    Signed-off-by: David Howells <dhowells@redhat.com>
+    cc: linux-cifs@vger.kernel.org
+    cc: ecryptfs@vger.kernel.org
+    cc: linux-ext4@vger.kernel.org
+    cc: linux-f2fs-devel@lists.sourceforge.net
+    cc: linux-nfs@vger.kernel.org
+    cc: ceph-devel@vger.kernel.org
+    cc: linux-ima-devel@lists.sourceforge.net
+
+diff --git a/security/keys/big_key.c b/security/keys/big_key.c
+index b6adb94f6d52..907c1522ee46 100644
+--- a/security/keys/big_key.c
++++ b/security/keys/big_key.c
+@@ -20,6 +20,16 @@
+ 
+ MODULE_LICENSE("GPL");
+ 
++/*
++ * Layout of key payload words.
++ */
++enum {
++	big_key_data,
++	big_key_path,
++	big_key_path_2nd_part,
++	big_key_len,
++};
++
+ /*
+  * If the data is under this limit, there's no point creating a shm file to
+  * hold it as the permanently resident metadata for the shmem fs will be at
+@@ -47,7 +57,7 @@ struct key_type key_type_big_key = {
+  */
+ int big_key_preparse(struct key_preparsed_payload *prep)
+ {
+-	struct path *path = (struct path *)&prep->payload;
++	struct path *path = (struct path *)&prep->payload.data[big_key_path];
+ 	struct file *file;
+ 	ssize_t written;
+ 	size_t datalen = prep->datalen;
+@@ -60,7 +70,7 @@ int big_key_preparse(struct key_preparsed_payload *prep)
+ 	/* Set an arbitrary quota */
+ 	prep->quotalen = 16;
+ 
+-	prep->type_data[1] = (void *)(unsigned long)datalen;
++	prep->payload.data[big_key_len] = (void *)(unsigned long)datalen;
+ 
+ 	if (datalen > BIG_KEY_FILE_THRESHOLD) {
+ 		/* Create a shmem file to store the data in.  This will permit the data
+@@ -94,7 +104,8 @@ int big_key_preparse(struct key_preparsed_payload *prep)
+ 		if (!data)
+ 			return -ENOMEM;
+ 
+-		prep->payload[0] = memcpy(data, prep->data, prep->datalen);
++		prep->payload.data[big_key_data] = data;
++		memcpy(data, prep->data, prep->datalen);
+ 	}
+ 	return 0;
+ 
+@@ -110,10 +121,10 @@ int big_key_preparse(struct key_preparsed_payload *prep)
+ void big_key_free_preparse(struct key_preparsed_payload *prep)
+ {
+ 	if (prep->datalen > BIG_KEY_FILE_THRESHOLD) {
+-		struct path *path = (struct path *)&prep->payload;
++		struct path *path = (struct path *)&prep->payload.data[big_key_path];
+ 		path_put(path);
+ 	} else {
+-		kfree(prep->payload[0]);
++		kfree(prep->payload.data[big_key_data]);
+ 	}
+ }
+ 
+@@ -123,11 +134,12 @@ void big_key_free_preparse(struct key_preparsed_payload *prep)
+  */
+ void big_key_revoke(struct key *key)
+ {
+-	struct path *path = (struct path *)&key->payload.data2;
++	struct path *path = (struct path *)&key->payload.data[big_key_path];
+ 
+ 	/* clear the quota */
+ 	key_payload_reserve(key, 0);
+-	if (key_is_instantiated(key) && key->type_data.x[1] > BIG_KEY_FILE_THRESHOLD)
++	if (key_is_instantiated(key) &&
++	    (size_t)key->payload.data[big_key_len] > BIG_KEY_FILE_THRESHOLD)
+ 		vfs_truncate(path, 0);
+ }
+ 
+@@ -136,14 +148,16 @@ void big_key_revoke(struct key *key)
+  */
+ void big_key_destroy(struct key *key)
+ {
+-	if (key->type_data.x[1] > BIG_KEY_FILE_THRESHOLD) {
+-		struct path *path = (struct path *)&key->payload.data2;
++	size_t datalen = (size_t)key->payload.data[big_key_len];
++
++	if (datalen) {
++		struct path *path = (struct path *)&key->payload.data[big_key_path];
+ 		path_put(path);
+ 		path->mnt = NULL;
+ 		path->dentry = NULL;
+ 	} else {
+-		kfree(key->payload.data);
+-		key->payload.data = NULL;
++		kfree(key->payload.data[big_key_data]);
++		key->payload.data[big_key_data] = NULL;
+ 	}
+ }
+ 
+@@ -152,12 +166,12 @@ void big_key_destroy(struct key *key)
+  */
+ void big_key_describe(const struct key *key, struct seq_file *m)
+ {
+-	unsigned long datalen = key->type_data.x[1];
++	size_t datalen = (size_t)key->payload.data[big_key_len];
+ 
+ 	seq_puts(m, key->description);
+ 
+ 	if (key_is_instantiated(key))
+-		seq_printf(m, ": %lu [%s]",
++		seq_printf(m, ": %zu [%s]",
+ 			   datalen,
+ 			   datalen > BIG_KEY_FILE_THRESHOLD ? "file" : "buff");
+ }
+@@ -168,14 +182,14 @@ void big_key_describe(const struct key *key, struct seq_file *m)
+  */
+ long big_key_read(const struct key *key, char __user *buffer, size_t buflen)
+ {
+-	unsigned long datalen = key->type_data.x[1];
++	size_t datalen = (size_t)key->payload.data[big_key_len];
+ 	long ret;
+ 
+ 	if (!buffer || buflen < datalen)
+ 		return datalen;
+ 
+ 	if (datalen > BIG_KEY_FILE_THRESHOLD) {
+-		struct path *path = (struct path *)&key->payload.data2;
++		struct path *path = (struct path *)&key->payload.data[big_key_path];
+ 		struct file *file;
+ 		loff_t pos;
+ 
+@@ -190,7 +204,8 @@ long big_key_read(const struct key *key, char __user *buffer, size_t buflen)
+ 			ret = -EIO;
+ 	} else {
+ 		ret = datalen;
+-		if (copy_to_user(buffer, key->payload.data, datalen) != 0)
++		if (copy_to_user(buffer, key->payload.data[big_key_data],
++				 datalen) != 0)
+ 			ret = -EFAULT;
+ 	}
+ 
+
+commit c06cfb08b88dfbe13be44a69ae2fdc3a7c902d81
+Author: David Howells <dhowells@redhat.com>
+Date:   Tue Sep 16 17:36:06 2014 +0100
+
+    KEYS: Remove key_type::match in favour of overriding default by match_preparse
+    
+    A previous patch added a ->match_preparse() method to the key type.  This is
+    allowed to override the function called by the iteration algorithm.
+    Therefore, we can just set a default that simply checks for an exact match of
+    the key description with the original criterion data and allow match_preparse
+    to override it as needed.
+    
+    The key_type::match op is then redundant and can be removed, as can the
+    user_match() function.
+    
+    Signed-off-by: David Howells <dhowells@redhat.com>
+    Acked-by: Vivek Goyal <vgoyal@redhat.com>
+
+diff --git a/security/keys/big_key.c b/security/keys/big_key.c
+index 4045c13a761a..b6adb94f6d52 100644
+--- a/security/keys/big_key.c
++++ b/security/keys/big_key.c
+@@ -36,7 +36,6 @@ struct key_type key_type_big_key = {
+ 	.preparse		= big_key_preparse,
+ 	.free_preparse		= big_key_free_preparse,
+ 	.instantiate		= generic_key_instantiate,
+-	.match			= user_match,
+ 	.revoke			= big_key_revoke,
+ 	.destroy		= big_key_destroy,
+ 	.describe		= big_key_describe,
+
+commit 614d8c39014c185aa0f7254f0a470cc33fc1b284
+Author: David Howells <dhowells@redhat.com>
+Date:   Tue Sep 16 17:36:04 2014 +0100
+
+    KEYS: Remove key_type::def_lookup_type
+    
+    Remove key_type::def_lookup_type as it's no longer used.  The information now
+    defaults to KEYRING_SEARCH_LOOKUP_DIRECT but may be overridden by
+    type->match_preparse().
+    
+    Signed-off-by: David Howells <dhowells@redhat.com>
+    Acked-by: Vivek Goyal <vgoyal@redhat.com>
+
+diff --git a/security/keys/big_key.c b/security/keys/big_key.c
+index c2f91a0cf889..4045c13a761a 100644
+--- a/security/keys/big_key.c
++++ b/security/keys/big_key.c
+@@ -33,7 +33,6 @@ MODULE_LICENSE("GPL");
+  */
+ struct key_type key_type_big_key = {
+ 	.name			= "big_key",
+-	.def_lookup_type	= KEYRING_SEARCH_LOOKUP_DIRECT,
+ 	.preparse		= big_key_preparse,
+ 	.free_preparse		= big_key_free_preparse,
+ 	.instantiate		= generic_key_instantiate,
+
+commit 002edaf76f09af658241029817f5ef66f6bef5e4
+Author: David Howells <dhowells@redhat.com>
+Date:   Fri Jul 18 18:56:36 2014 +0100
+
+    KEYS: big_key: Use key preparsing
+    
+    Make use of key preparsing in the big key type so that quota size determination
+    can take place prior to keyring locking when a key is being added.
+    
+    Signed-off-by: David Howells <dhowells@redhat.com>
+    Acked-by: Steve Dickson <steved@redhat.com>
+
+diff --git a/security/keys/big_key.c b/security/keys/big_key.c
+index 8137b27d641d..c2f91a0cf889 100644
+--- a/security/keys/big_key.c
++++ b/security/keys/big_key.c
+@@ -34,7 +34,9 @@ MODULE_LICENSE("GPL");
+ struct key_type key_type_big_key = {
+ 	.name			= "big_key",
+ 	.def_lookup_type	= KEYRING_SEARCH_LOOKUP_DIRECT,
+-	.instantiate		= big_key_instantiate,
++	.preparse		= big_key_preparse,
++	.free_preparse		= big_key_free_preparse,
++	.instantiate		= generic_key_instantiate,
+ 	.match			= user_match,
+ 	.revoke			= big_key_revoke,
+ 	.destroy		= big_key_destroy,
+@@ -43,11 +45,11 @@ struct key_type key_type_big_key = {
+ };
+ 
+ /*
+- * Instantiate a big key
++ * Preparse a big key
+  */
+-int big_key_instantiate(struct key *key, struct key_preparsed_payload *prep)
++int big_key_preparse(struct key_preparsed_payload *prep)
+ {
+-	struct path *path = (struct path *)&key->payload.data2;
++	struct path *path = (struct path *)&prep->payload;
+ 	struct file *file;
+ 	ssize_t written;
+ 	size_t datalen = prep->datalen;
+@@ -58,11 +60,9 @@ int big_key_instantiate(struct key *key, struct key_preparsed_payload *prep)
+ 		goto error;
+ 
+ 	/* Set an arbitrary quota */
+-	ret = key_payload_reserve(key, 16);
+-	if (ret < 0)
+-		goto error;
++	prep->quotalen = 16;
+ 
+-	key->type_data.x[1] = datalen;
++	prep->type_data[1] = (void *)(unsigned long)datalen;
+ 
+ 	if (datalen > BIG_KEY_FILE_THRESHOLD) {
+ 		/* Create a shmem file to store the data in.  This will permit the data
+@@ -73,7 +73,7 @@ int big_key_instantiate(struct key *key, struct key_preparsed_payload *prep)
+ 		file = shmem_kernel_file_setup("", datalen, 0);
+ 		if (IS_ERR(file)) {
+ 			ret = PTR_ERR(file);
+-			goto err_quota;
++			goto error;
+ 		}
+ 
+ 		written = kernel_write(file, prep->data, prep->datalen, 0);
+@@ -93,23 +93,32 @@ int big_key_instantiate(struct key *key, struct key_preparsed_payload *prep)
+ 	} else {
+ 		/* Just store the data in a buffer */
+ 		void *data = kmalloc(datalen, GFP_KERNEL);
+-		if (!data) {
+-			ret = -ENOMEM;
+-			goto err_quota;
+-		}
++		if (!data)
++			return -ENOMEM;
+ 
+-		key->payload.data = memcpy(data, prep->data, prep->datalen);
++		prep->payload[0] = memcpy(data, prep->data, prep->datalen);
+ 	}
+ 	return 0;
+ 
+ err_fput:
+ 	fput(file);
+-err_quota:
+-	key_payload_reserve(key, 0);
+ error:
+ 	return ret;
+ }
+ 
++/*
++ * Clear preparsement.
++ */
++void big_key_free_preparse(struct key_preparsed_payload *prep)
++{
++	if (prep->datalen > BIG_KEY_FILE_THRESHOLD) {
++		struct path *path = (struct path *)&prep->payload;
++		path_put(path);
++	} else {
++		kfree(prep->payload[0]);
++	}
++}
++
+ /*
+  * dispose of the links from a revoked keyring
+  * - called with the key sem write-locked
+
+commit c7277090927a5e71871e799a355ed2940f6c8fc6
+Author: Eric Paris <eparis@redhat.com>
+Date:   Mon Dec 2 11:24:19 2013 +0000
+
+    security: shmem: implement kernel private shmem inodes
+    
+    We have a problem where the big_key key storage implementation uses a
+    shmem backed inode to hold the key contents.  Because of this detail of
+    implementation LSM checks are being done between processes trying to
+    read the keys and the tmpfs backed inode.  The LSM checks are already
+    being handled on the key interface level and should not be enforced at
+    the inode level (since the inode is an implementation detail, not a
+    part of the security model)
+    
+    This patch implements a new function shmem_kernel_file_setup() which
+    returns the equivalent to shmem_file_setup() only the underlying inode
+    has S_PRIVATE set.  This means that all LSM checks for the inode in
+    question are skipped.  It should only be used for kernel internal
+    operations where the inode is not exposed to userspace without proper
+    LSM checking.  It is possible that some other users of
+    shmem_file_setup() should use the new interface, but this has not been
+    explored.
+    
+    Reproducing this bug is a little bit difficult.  The steps I used on
+    Fedora are:
+    
+     (1) Turn off selinux enforcing:
+    
+            setenforce 0
+    
+     (2) Create a huge key
+    
+            k=`dd if=/dev/zero bs=8192 count=1 | keyctl padd big_key test-key @s`
+    
+     (3) Access the key in another context:
+    
+            runcon system_u:system_r:httpd_t:s0-s0:c0.c1023 keyctl print $k >/dev/null
+    
+     (4) Examine the audit logs:
+    
+            ausearch -m AVC -i --subject httpd_t | audit2allow
+    
+    If the last command's output includes a line that looks like:
+    
+            allow httpd_t user_tmpfs_t:file { open read };
+    
+    There was an inode check between httpd and the tmpfs filesystem.  With
+    this patch no such denial will be seen.  (NOTE! you should clear your
+    audit log if you have tested for this previously)
+    
+    (Please return you box to enforcing)
+    
+    Signed-off-by: Eric Paris <eparis@redhat.com>
+    Signed-off-by: David Howells <dhowells@redhat.com>
+    cc: Hugh Dickins <hughd@google.com>
+    cc: linux-mm@kvack.org
+
+diff --git a/security/keys/big_key.c b/security/keys/big_key.c
+index 7f44c3207a9b..8137b27d641d 100644
+--- a/security/keys/big_key.c
++++ b/security/keys/big_key.c
+@@ -70,7 +70,7 @@ int big_key_instantiate(struct key *key, struct key_preparsed_payload *prep)
+ 		 *
+ 		 * TODO: Encrypt the stored data with a temporary key.
+ 		 */
+-		file = shmem_file_setup("", datalen, 0);
++		file = shmem_kernel_file_setup("", datalen, 0);
+ 		if (IS_ERR(file)) {
+ 			ret = PTR_ERR(file);
+ 			goto err_quota;
+
+commit 97826c821ec6724fc359d9b7840dc10af914c641
+Author: David Howells <dhowells@redhat.com>
+Date:   Wed Nov 13 16:51:06 2013 +0000
+
+    KEYS: Fix error handling in big_key instantiation
+    
+    In the big_key_instantiate() function we return 0 if kernel_write() returns us
+    an error rather than returning an error.  This can potentially lead to
+    dentry_open() giving a BUG when called from big_key_read() with an unset
+    tmpfile path.
+    
+            ------------[ cut here ]------------
+            kernel BUG at fs/open.c:798!
+            ...
+            RIP: 0010:[<ffffffff8119bbd1>] dentry_open+0xd1/0xe0
+            ...
+            Call Trace:
+             [<ffffffff812350c5>] big_key_read+0x55/0x100
+             [<ffffffff81231084>] keyctl_read_key+0xb4/0xe0
+             [<ffffffff81231e58>] SyS_keyctl+0xf8/0x1d0
+             [<ffffffff815bb799>] system_call_fastpath+0x16/0x1b
+    
+    
+    Signed-off-by: David Howells <dhowells@redhat.com>
+    Reviewed-by: Stephen Gallagher <sgallagh@redhat.com>
+
+diff --git a/security/keys/big_key.c b/security/keys/big_key.c
+index 2cf5e62d67af..7f44c3207a9b 100644
+--- a/security/keys/big_key.c
++++ b/security/keys/big_key.c
+@@ -78,6 +78,7 @@ int big_key_instantiate(struct key *key, struct key_preparsed_payload *prep)
+ 
+ 		written = kernel_write(file, prep->data, prep->datalen, 0);
+ 		if (written != datalen) {
++			ret = written;
+ 			if (written >= 0)
+ 				ret = -ENOMEM;
+ 			goto err_fput;
+
+commit d2b86970245b64652c4d7799e707dd8bd1533b64
+Author: Wei Yongjun <yongjun_wei@trendmicro.com.cn>
+Date:   Wed Oct 30 11:23:02 2013 +0800
+
+    KEYS: fix error return code in big_key_instantiate()
+    
+    Fix to return a negative error code from the error handling
+    case instead of 0, as done elsewhere in this function.
+    
+    Signed-off-by: Wei Yongjun <yongjun_wei@trendmicro.com.cn>
+    Signed-off-by: David Howells <dhowells@redhat.com>
+
+diff --git a/security/keys/big_key.c b/security/keys/big_key.c
+index 5f9defc4a807..2cf5e62d67af 100644
+--- a/security/keys/big_key.c
++++ b/security/keys/big_key.c
+@@ -71,8 +71,10 @@ int big_key_instantiate(struct key *key, struct key_preparsed_payload *prep)
+ 		 * TODO: Encrypt the stored data with a temporary key.
+ 		 */
+ 		file = shmem_file_setup("", datalen, 0);
+-		if (IS_ERR(file))
++		if (IS_ERR(file)) {
++			ret = PTR_ERR(file);
+ 			goto err_quota;
++		}
+ 
+ 		written = kernel_write(file, prep->data, prep->datalen, 0);
+ 		if (written != datalen) {
+
+commit ab3c3587f8cda9083209a61dbe3a4407d3cada10
+Author: David Howells <dhowells@redhat.com>
+Date:   Tue Sep 24 10:35:18 2013 +0100
+
+    KEYS: Implement a big key type that can save to tmpfs
+    
+    Implement a big key type that can save its contents to tmpfs and thus
+    swapspace when memory is tight.  This is useful for Kerberos ticket caches.
+    
+    Signed-off-by: David Howells <dhowells@redhat.com>
+    Tested-by: Simo Sorce <simo@redhat.com>
+
+diff --git a/security/keys/big_key.c b/security/keys/big_key.c
+new file mode 100644
+index 000000000000..5f9defc4a807
+--- /dev/null
++++ b/security/keys/big_key.c
+@@ -0,0 +1,204 @@
++/* Large capacity key type
++ *
++ * Copyright (C) 2013 Red Hat, Inc. All Rights Reserved.
++ * Written by David Howells (dhowells@redhat.com)
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public Licence
++ * as published by the Free Software Foundation; either version
++ * 2 of the Licence, or (at your option) any later version.
++ */
++
++#include <linux/module.h>
++#include <linux/init.h>
++#include <linux/seq_file.h>
++#include <linux/file.h>
++#include <linux/shmem_fs.h>
++#include <linux/err.h>
++#include <keys/user-type.h>
++#include <keys/big_key-type.h>
++
++MODULE_LICENSE("GPL");
++
++/*
++ * If the data is under this limit, there's no point creating a shm file to
++ * hold it as the permanently resident metadata for the shmem fs will be at
++ * least as large as the data.
++ */
++#define BIG_KEY_FILE_THRESHOLD (sizeof(struct inode) + sizeof(struct dentry))
++
++/*
++ * big_key defined keys take an arbitrary string as the description and an
++ * arbitrary blob of data as the payload
++ */
++struct key_type key_type_big_key = {
++	.name			= "big_key",
++	.def_lookup_type	= KEYRING_SEARCH_LOOKUP_DIRECT,
++	.instantiate		= big_key_instantiate,
++	.match			= user_match,
++	.revoke			= big_key_revoke,
++	.destroy		= big_key_destroy,
++	.describe		= big_key_describe,
++	.read			= big_key_read,
++};
++
++/*
++ * Instantiate a big key
++ */
++int big_key_instantiate(struct key *key, struct key_preparsed_payload *prep)
++{
++	struct path *path = (struct path *)&key->payload.data2;
++	struct file *file;
++	ssize_t written;
++	size_t datalen = prep->datalen;
++	int ret;
++
++	ret = -EINVAL;
++	if (datalen <= 0 || datalen > 1024 * 1024 || !prep->data)
++		goto error;
++
++	/* Set an arbitrary quota */
++	ret = key_payload_reserve(key, 16);
++	if (ret < 0)
++		goto error;
++
++	key->type_data.x[1] = datalen;
++
++	if (datalen > BIG_KEY_FILE_THRESHOLD) {
++		/* Create a shmem file to store the data in.  This will permit the data
++		 * to be swapped out if needed.
++		 *
++		 * TODO: Encrypt the stored data with a temporary key.
++		 */
++		file = shmem_file_setup("", datalen, 0);
++		if (IS_ERR(file))
++			goto err_quota;
++
++		written = kernel_write(file, prep->data, prep->datalen, 0);
++		if (written != datalen) {
++			if (written >= 0)
++				ret = -ENOMEM;
++			goto err_fput;
++		}
++
++		/* Pin the mount and dentry to the key so that we can open it again
++		 * later
++		 */
++		*path = file->f_path;
++		path_get(path);
++		fput(file);
++	} else {
++		/* Just store the data in a buffer */
++		void *data = kmalloc(datalen, GFP_KERNEL);
++		if (!data) {
++			ret = -ENOMEM;
++			goto err_quota;
++		}
++
++		key->payload.data = memcpy(data, prep->data, prep->datalen);
++	}
++	return 0;
++
++err_fput:
++	fput(file);
++err_quota:
++	key_payload_reserve(key, 0);
++error:
++	return ret;
++}
++
++/*
++ * dispose of the links from a revoked keyring
++ * - called with the key sem write-locked
++ */
++void big_key_revoke(struct key *key)
++{
++	struct path *path = (struct path *)&key->payload.data2;
++
++	/* clear the quota */
++	key_payload_reserve(key, 0);
++	if (key_is_instantiated(key) && key->type_data.x[1] > BIG_KEY_FILE_THRESHOLD)
++		vfs_truncate(path, 0);
++}
++
++/*
++ * dispose of the data dangling from the corpse of a big_key key
++ */
++void big_key_destroy(struct key *key)
++{
++	if (key->type_data.x[1] > BIG_KEY_FILE_THRESHOLD) {
++		struct path *path = (struct path *)&key->payload.data2;
++		path_put(path);
++		path->mnt = NULL;
++		path->dentry = NULL;
++	} else {
++		kfree(key->payload.data);
++		key->payload.data = NULL;
++	}
++}
++
++/*
++ * describe the big_key key
++ */
++void big_key_describe(const struct key *key, struct seq_file *m)
++{
++	unsigned long datalen = key->type_data.x[1];
++
++	seq_puts(m, key->description);
++
++	if (key_is_instantiated(key))
++		seq_printf(m, ": %lu [%s]",
++			   datalen,
++			   datalen > BIG_KEY_FILE_THRESHOLD ? "file" : "buff");
++}
++
++/*
++ * read the key data
++ * - the key's semaphore is read-locked
++ */
++long big_key_read(const struct key *key, char __user *buffer, size_t buflen)
++{
++	unsigned long datalen = key->type_data.x[1];
++	long ret;
++
++	if (!buffer || buflen < datalen)
++		return datalen;
++
++	if (datalen > BIG_KEY_FILE_THRESHOLD) {
++		struct path *path = (struct path *)&key->payload.data2;
++		struct file *file;
++		loff_t pos;
++
++		file = dentry_open(path, O_RDONLY, current_cred());
++		if (IS_ERR(file))
++			return PTR_ERR(file);
++
++		pos = 0;
++		ret = vfs_read(file, buffer, datalen, &pos);
++		fput(file);
++		if (ret >= 0 && ret != datalen)
++			ret = -EIO;
++	} else {
++		ret = datalen;
++		if (copy_to_user(buffer, key->payload.data, datalen) != 0)
++			ret = -EFAULT;
++	}
++
++	return ret;
++}
++
++/*
++ * Module stuff
++ */
++static int __init big_key_init(void)
++{
++	return register_key_type(&key_type_big_key);
++}
++
++static void __exit big_key_cleanup(void)
++{
++	unregister_key_type(&key_type_big_key);
++}
++
++module_init(big_key_init);
++module_exit(big_key_cleanup);

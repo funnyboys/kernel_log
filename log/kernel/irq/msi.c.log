@@ -1,0 +1,2504 @@
+commit 6f1a4891a5928a5969c87fa5a584844c983ec823
+Author: Thomas Gleixner <tglx@linutronix.de>
+Date:   Fri Jan 31 15:26:52 2020 +0100
+
+    x86/apic/msi: Plug non-maskable MSI affinity race
+    
+    Evan tracked down a subtle race between the update of the MSI message and
+    the device raising an interrupt internally on PCI devices which do not
+    support MSI masking. The update of the MSI message is non-atomic and
+    consists of either 2 or 3 sequential 32bit wide writes to the PCI config
+    space.
+    
+       - Write address low 32bits
+       - Write address high 32bits (If supported by device)
+       - Write data
+    
+    When an interrupt is migrated then both address and data might change, so
+    the kernel attempts to mask the MSI interrupt first. But for MSI masking is
+    optional, so there exist devices which do not provide it. That means that
+    if the device raises an interrupt internally between the writes then a MSI
+    message is sent built from half updated state.
+    
+    On x86 this can lead to spurious interrupts on the wrong interrupt
+    vector when the affinity setting changes both address and data. As a
+    consequence the device interrupt can be lost causing the device to
+    become stuck or malfunctioning.
+    
+    Evan tried to handle that by disabling MSI accross an MSI message
+    update. That's not feasible because disabling MSI has issues on its own:
+    
+     If MSI is disabled the PCI device is routing an interrupt to the legacy
+     INTx mechanism. The INTx delivery can be disabled, but the disablement is
+     not working on all devices.
+    
+     Some devices lose interrupts when both MSI and INTx delivery are disabled.
+    
+    Another way to solve this would be to enforce the allocation of the same
+    vector on all CPUs in the system for this kind of screwed devices. That
+    could be done, but it would bring back the vector space exhaustion problems
+    which got solved a few years ago.
+    
+    Fortunately the high address (if supported by the device) is only relevant
+    when X2APIC is enabled which implies interrupt remapping. In the interrupt
+    remapping case the affinity setting is happening at the interrupt remapping
+    unit and the PCI MSI message is programmed only once when the PCI device is
+    initialized.
+    
+    That makes it possible to solve it with a two step update:
+    
+      1) Target the MSI msg to the new vector on the current target CPU
+    
+      2) Target the MSI msg to the new vector on the new target CPU
+    
+    In both cases writing the MSI message is only changing a single 32bit word
+    which prevents the issue of inconsistency.
+    
+    After writing the final destination it is necessary to check whether the
+    device issued an interrupt while the intermediate state #1 (new vector,
+    current CPU) was in effect.
+    
+    This is possible because the affinity change is always happening on the
+    current target CPU. The code runs with interrupts disabled, so the
+    interrupt can be detected by checking the IRR of the local APIC. If the
+    vector is pending in the IRR then the interrupt is retriggered on the new
+    target CPU by sending an IPI for the associated vector on the target CPU.
+    
+    This can cause spurious interrupts on both the local and the new target
+    CPU.
+    
+     1) If the new vector is not in use on the local CPU and the device
+        affected by the affinity change raised an interrupt during the
+        transitional state (step #1 above) then interrupt entry code will
+        ignore that spurious interrupt. The vector is marked so that the
+        'No irq handler for vector' warning is supressed once.
+    
+     2) If the new vector is in use already on the local CPU then the IRR check
+        might see an pending interrupt from the device which is using this
+        vector. The IPI to the new target CPU will then invoke the handler of
+        the device, which got the affinity change, even if that device did not
+        issue an interrupt
+    
+     3) If the new vector is in use already on the local CPU and the device
+        affected by the affinity change raised an interrupt during the
+        transitional state (step #1 above) then the handler of the device which
+        uses that vector on the local CPU will be invoked.
+    
+    expose issues in device driver interrupt handlers which are not prepared to
+    handle a spurious interrupt correctly. This not a regression, it's just
+    exposing something which was already broken as spurious interrupts can
+    happen for a lot of reasons and all driver handlers need to be able to deal
+    with them.
+    
+    Reported-by: Evan Green <evgreen@chromium.org>
+    Debugged-by: Evan Green <evgreen@chromium.org>
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Tested-by: Evan Green <evgreen@chromium.org>
+    Cc: stable@vger.kernel.org
+    Link: https://lore.kernel.org/r/87imkr4s7n.fsf@nanos.tec.linutronix.de
+
+diff --git a/kernel/irq/msi.c b/kernel/irq/msi.c
+index ad26fbcfbfc8..eb95f6106a1e 100644
+--- a/kernel/irq/msi.c
++++ b/kernel/irq/msi.c
+@@ -453,8 +453,11 @@ int msi_domain_alloc_irqs(struct irq_domain *domain, struct device *dev,
+ 			continue;
+ 
+ 		irq_data = irq_domain_get_irq_data(domain, desc->irq);
+-		if (!can_reserve)
++		if (!can_reserve) {
+ 			irqd_clr_can_reserve(irq_data);
++			if (domain->flags & IRQ_DOMAIN_MSI_NOMASK_QUIRK)
++				irqd_set_msi_nomask_quirk(irq_data);
++		}
+ 		ret = irq_domain_activate_irq(irq_data, can_reserve);
+ 		if (ret)
+ 			goto cleanup;
+
+commit bec04037e4e484f41ee4d9409e40616874169d20
+Author: Dou Liyang <douliyangs@gmail.com>
+Date:   Tue Dec 4 23:51:20 2018 +0800
+
+    genirq/core: Introduce struct irq_affinity_desc
+    
+    The interrupt affinity management uses straight cpumask pointers to convey
+    the automatically assigned affinity masks for managed interrupts. The core
+    interrupt descriptor allocation also decides based on the pointer being non
+    NULL whether an interrupt is managed or not.
+    
+    Devices which use managed interrupts usually have two classes of
+    interrupts:
+    
+      - Interrupts for multiple device queues
+      - Interrupts for general device management
+    
+    Currently both classes are treated the same way, i.e. as managed
+    interrupts. The general interrupts get the default affinity mask assigned
+    while the device queue interrupts are spread out over the possible CPUs.
+    
+    Treating the general interrupts as managed is both a limitation and under
+    certain circumstances a bug. Assume the following situation:
+    
+     default_irq_affinity = 4..7
+    
+    So if CPUs 4-7 are offlined, then the core code will shut down the device
+    management interrupts because the last CPU in their affinity mask went
+    offline.
+    
+    It's also a limitation because it's desired to allow manual placement of
+    the general device interrupts for various reasons. If they are marked
+    managed then the interrupt affinity setting from both user and kernel space
+    is disabled.
+    
+    To remedy that situation it's required to convey more information than the
+    cpumasks through various interfaces related to interrupt descriptor
+    allocation.
+    
+    Instead of adding yet another argument, create a new data structure
+    'irq_affinity_desc' which for now just contains the cpumask. This struct
+    can be expanded to convey auxilliary information in the next step.
+    
+    No functional change, just preparatory work.
+    
+    [ tglx: Simplified logic and clarified changelog ]
+    
+    Suggested-by: Thomas Gleixner <tglx@linutronix.de>
+    Suggested-by: Bjorn Helgaas <bhelgaas@google.com>
+    Signed-off-by: Dou Liyang <douliyangs@gmail.com>
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Cc: linux-pci@vger.kernel.org
+    Cc: kashyap.desai@broadcom.com
+    Cc: shivasharan.srikanteshwara@broadcom.com
+    Cc: sumit.saxena@broadcom.com
+    Cc: ming.lei@redhat.com
+    Cc: hch@lst.de
+    Cc: douliyang1@huawei.com
+    Link: https://lkml.kernel.org/r/20181204155122.6327-2-douliyangs@gmail.com
+
+diff --git a/kernel/irq/msi.c b/kernel/irq/msi.c
+index 4ca2fd46645d..ad26fbcfbfc8 100644
+--- a/kernel/irq/msi.c
++++ b/kernel/irq/msi.c
+@@ -23,11 +23,11 @@
+  * @nvec:	The number of vectors used in this entry
+  * @affinity:	Optional pointer to an affinity mask array size of @nvec
+  *
+- * If @affinity is not NULL then a an affinity array[@nvec] is allocated
+- * and the affinity masks from @affinity are copied.
++ * If @affinity is not NULL then an affinity array[@nvec] is allocated
++ * and the affinity masks and flags from @affinity are copied.
+  */
+-struct msi_desc *
+-alloc_msi_entry(struct device *dev, int nvec, const struct cpumask *affinity)
++struct msi_desc *alloc_msi_entry(struct device *dev, int nvec,
++				 const struct irq_affinity_desc *affinity)
+ {
+ 	struct msi_desc *desc;
+ 
+
+commit 0be8153cbc2af9a96e9ab8631fc3ba23bb52dbe3
+Author: Marc Zyngier <marc.zyngier@arm.com>
+Date:   Tue May 8 13:14:30 2018 +0100
+
+    genirq/msi: Allow level-triggered MSIs to be exposed by MSI providers
+    
+    So far, MSIs have been used to signal edge-triggered interrupts, as
+    a write is a good model for an edge (you can't "unwrite" something).
+    On the other hand, routing zillions of wires in an SoC because you
+    need level interrupts is a bit extreme.
+    
+    People have come up with a variety of schemes to support this, which
+    involves sending two messages: one to signal the interrupt, and one
+    to clear it. Since the kernel cannot represent this, we've ended up
+    with side-band mechanisms that are pretty awful.
+    
+    Instead, let's acknoledge the requirement, and ensure that, under the
+    right circumstances, the irq_compose_msg and irq_write_msg can take
+    as a parameter an array of two messages instead of a pointer to a
+    single one. We also add some checking that the compose method only
+    clobbers the second message if the MSI domain has been created with
+    the MSI_FLAG_LEVEL_CAPABLE flags.
+    
+    Signed-off-by: Marc Zyngier <marc.zyngier@arm.com>
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Rob Herring <robh@kernel.org>
+    Cc: Jason Cooper <jason@lakedaemon.net>
+    Cc: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+    Cc: Srinivas Kandagatla <srinivas.kandagatla@linaro.org>
+    Cc: Thomas Petazzoni <thomas.petazzoni@bootlin.com>
+    Cc: Miquel Raynal <miquel.raynal@bootlin.com>
+    Link: https://lkml.kernel.org/r/20180508121438.11301-2-marc.zyngier@arm.com
+
+diff --git a/kernel/irq/msi.c b/kernel/irq/msi.c
+index 2a8571f72b17..4ca2fd46645d 100644
+--- a/kernel/irq/msi.c
++++ b/kernel/irq/msi.c
+@@ -76,6 +76,19 @@ static inline void irq_chip_write_msi_msg(struct irq_data *data,
+ 	data->chip->irq_write_msi_msg(data, msg);
+ }
+ 
++static void msi_check_level(struct irq_domain *domain, struct msi_msg *msg)
++{
++	struct msi_domain_info *info = domain->host_data;
++
++	/*
++	 * If the MSI provider has messed with the second message and
++	 * not advertized that it is level-capable, signal the breakage.
++	 */
++	WARN_ON(!((info->flags & MSI_FLAG_LEVEL_CAPABLE) &&
++		  (info->chip->flags & IRQCHIP_SUPPORTS_LEVEL_MSI)) &&
++		(msg[1].address_lo || msg[1].address_hi || msg[1].data));
++}
++
+ /**
+  * msi_domain_set_affinity - Generic affinity setter function for MSI domains
+  * @irq_data:	The irq data associated to the interrupt
+@@ -89,13 +102,14 @@ int msi_domain_set_affinity(struct irq_data *irq_data,
+ 			    const struct cpumask *mask, bool force)
+ {
+ 	struct irq_data *parent = irq_data->parent_data;
+-	struct msi_msg msg;
++	struct msi_msg msg[2] = { [1] = { }, };
+ 	int ret;
+ 
+ 	ret = parent->chip->irq_set_affinity(parent, mask, force);
+ 	if (ret >= 0 && ret != IRQ_SET_MASK_OK_DONE) {
+-		BUG_ON(irq_chip_compose_msi_msg(irq_data, &msg));
+-		irq_chip_write_msi_msg(irq_data, &msg);
++		BUG_ON(irq_chip_compose_msi_msg(irq_data, msg));
++		msi_check_level(irq_data->domain, msg);
++		irq_chip_write_msi_msg(irq_data, msg);
+ 	}
+ 
+ 	return ret;
+@@ -104,20 +118,21 @@ int msi_domain_set_affinity(struct irq_data *irq_data,
+ static int msi_domain_activate(struct irq_domain *domain,
+ 			       struct irq_data *irq_data, bool early)
+ {
+-	struct msi_msg msg;
++	struct msi_msg msg[2] = { [1] = { }, };
+ 
+-	BUG_ON(irq_chip_compose_msi_msg(irq_data, &msg));
+-	irq_chip_write_msi_msg(irq_data, &msg);
++	BUG_ON(irq_chip_compose_msi_msg(irq_data, msg));
++	msi_check_level(irq_data->domain, msg);
++	irq_chip_write_msi_msg(irq_data, msg);
+ 	return 0;
+ }
+ 
+ static void msi_domain_deactivate(struct irq_domain *domain,
+ 				  struct irq_data *irq_data)
+ {
+-	struct msi_msg msg;
++	struct msi_msg msg[2];
+ 
+-	memset(&msg, 0, sizeof(msg));
+-	irq_chip_write_msi_msg(irq_data, &msg);
++	memset(msg, 0, sizeof(msg));
++	irq_chip_write_msi_msg(irq_data, msg);
+ }
+ 
+ static int msi_domain_alloc(struct irq_domain *domain, unsigned int virq,
+
+commit 52a65ff5603e685e9b19c2e108b3f0826dc7a86b
+Author: Thomas Gleixner <tglx@linutronix.de>
+Date:   Wed Mar 14 22:15:19 2018 +0100
+
+    genirq: Add missing SPDX identifiers
+    
+    Add SPDX identifiers to files
+    
+     - which contain an explicit license boiler plate or reference
+    
+     - which do not contain a license reference and were not updated in the
+       initial SPDX conversion because the license was deduced by the scanners
+       via EXPORT_SYMBOL_GPL as GPL2.0 only.
+    
+    [ tglx: Moved adding identifiers from the patch which removes the
+            references/boilerplate ]
+    
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Kate Stewart <kstewart@linuxfoundation.org>
+    Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+    Cc: Philippe Ombredanne <pombredanne@nexb.com>
+    Link: https://lkml.kernel.org/r/20180314212030.668321222@linutronix.de
+
+diff --git a/kernel/irq/msi.c b/kernel/irq/msi.c
+index 8429c88427ff..2a8571f72b17 100644
+--- a/kernel/irq/msi.c
++++ b/kernel/irq/msi.c
+@@ -1,3 +1,4 @@
++// SPDX-License-Identifier: GPL-2.0
+ /*
+  * Copyright (C) 2014 Intel Corp.
+  * Author: Jiang Liu <jiang.liu@linux.intel.com>
+
+commit 99bfce5db9c071800bdc7e9658a68e6d11aeecf6
+Author: Thomas Gleixner <tglx@linutronix.de>
+Date:   Wed Mar 14 22:15:16 2018 +0100
+
+    genirq: Cleanup top of file comments
+    
+    Remove pointless references to the file name itself and condense the
+    information so it wastes less space.
+    
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Acked-by: Marc Zyngier <marc.zyngier@arm.com>
+    Cc: Kate Stewart <kstewart@linuxfoundation.org>
+    Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+    Cc: Philippe Ombredanne <pombredanne@nexb.com>
+    Link: https://lkml.kernel.org/r/20180314212030.412095827@linutronix.de
+
+diff --git a/kernel/irq/msi.c b/kernel/irq/msi.c
+index 2f3c4f5382cc..8429c88427ff 100644
+--- a/kernel/irq/msi.c
++++ b/kernel/irq/msi.c
+@@ -1,6 +1,4 @@
+ /*
+- * linux/kernel/irq/msi.c
+- *
+  * Copyright (C) 2014 Intel Corp.
+  * Author: Jiang Liu <jiang.liu@linux.intel.com>
+  *
+
+commit bc976233a872c0f20f018fb1e89264a541584e25
+Author: Thomas Gleixner <tglx@linutronix.de>
+Date:   Fri Dec 29 10:47:22 2017 +0100
+
+    genirq/msi, x86/vector: Prevent reservation mode for non maskable MSI
+    
+    The new reservation mode for interrupts assigns a dummy vector when the
+    interrupt is allocated and assigns a real vector when the interrupt is
+    requested. The reservation mode prevents vector pressure when devices with
+    a large amount of queues/interrupts are initialized, but only a minimal
+    subset of those queues/interrupts is actually used.
+    
+    This mode has an issue with MSI interrupts which cannot be masked. If the
+    driver is not careful or the hardware emits an interrupt before the device
+    irq is requestd by the driver then the interrupt ends up on the dummy
+    vector as a spurious interrupt which can cause malfunction of the device or
+    in the worst case a lockup of the machine.
+    
+    Change the logic for the reservation mode so that the early activation of
+    MSI interrupts checks whether:
+    
+     - the device is a PCI/MSI device
+     - the reservation mode of the underlying irqdomain is activated
+     - PCI/MSI masking is globally enabled
+     - the PCI/MSI device uses either MSI-X, which supports masking, or
+       MSI with the maskbit supported.
+    
+    If one of those conditions is false, then clear the reservation mode flag
+    in the irq data of the interrupt and invoke irq_domain_activate_irq() with
+    the reserve argument cleared. In the x86 vector code, clear the can_reserve
+    flag in the vector allocation data so a subsequent free_irq() won't create
+    the same situation again. The interrupt stays assigned to a real vector
+    until pci_disable_msi() is invoked and all allocations are undone.
+    
+    Fixes: 4900be83602b ("x86/vector/msi: Switch to global reservation mode")
+    Reported-by: Alexandru Chirvasitu <achirvasub@gmail.com>
+    Reported-by: Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Tested-by: Alexandru Chirvasitu <achirvasub@gmail.com>
+    Tested-by: Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+    Cc: Dou Liyang <douly.fnst@cn.fujitsu.com>
+    Cc: Pavel Machek <pavel@ucw.cz>
+    Cc: Maciej W. Rozycki <macro@linux-mips.org>
+    Cc: Mikael Pettersson <mikpelinux@gmail.com>
+    Cc: Josh Poulson <jopoulso@microsoft.com>
+    Cc: Mihai Costache <v-micos@microsoft.com>
+    Cc: Stephen Hemminger <sthemmin@microsoft.com>
+    Cc: Marc Zyngier <marc.zyngier@arm.com>
+    Cc: linux-pci@vger.kernel.org
+    Cc: Haiyang Zhang <haiyangz@microsoft.com>
+    Cc: Dexuan Cui <decui@microsoft.com>
+    Cc: Simon Xiao <sixiao@microsoft.com>
+    Cc: Saeed Mahameed <saeedm@mellanox.com>
+    Cc: Jork Loeser <Jork.Loeser@microsoft.com>
+    Cc: Bjorn Helgaas <bhelgaas@google.com>
+    Cc: devel@linuxdriverproject.org
+    Cc: KY Srinivasan <kys@microsoft.com>
+    Cc: Alan Cox <alan@linux.intel.com>
+    Cc: Sakari Ailus <sakari.ailus@intel.com>,
+    Cc: linux-media@vger.kernel.org
+    Link: https://lkml.kernel.org/r/alpine.DEB.2.20.1712291406420.1899@nanos
+    Link: https://lkml.kernel.org/r/alpine.DEB.2.20.1712291409460.1899@nanos
+
+diff --git a/kernel/irq/msi.c b/kernel/irq/msi.c
+index 9ba954331171..2f3c4f5382cc 100644
+--- a/kernel/irq/msi.c
++++ b/kernel/irq/msi.c
+@@ -339,11 +339,38 @@ int msi_domain_populate_irqs(struct irq_domain *domain, struct device *dev,
+ 	return ret;
+ }
+ 
+-static bool msi_check_reservation_mode(struct msi_domain_info *info)
++/*
++ * Carefully check whether the device can use reservation mode. If
++ * reservation mode is enabled then the early activation will assign a
++ * dummy vector to the device. If the PCI/MSI device does not support
++ * masking of the entry then this can result in spurious interrupts when
++ * the device driver is not absolutely careful. But even then a malfunction
++ * of the hardware could result in a spurious interrupt on the dummy vector
++ * and render the device unusable. If the entry can be masked then the core
++ * logic will prevent the spurious interrupt and reservation mode can be
++ * used. For now reservation mode is restricted to PCI/MSI.
++ */
++static bool msi_check_reservation_mode(struct irq_domain *domain,
++				       struct msi_domain_info *info,
++				       struct device *dev)
+ {
++	struct msi_desc *desc;
++
++	if (domain->bus_token != DOMAIN_BUS_PCI_MSI)
++		return false;
++
+ 	if (!(info->flags & MSI_FLAG_MUST_REACTIVATE))
+ 		return false;
+-	return true;
++
++	if (IS_ENABLED(CONFIG_PCI_MSI) && pci_msi_ignore_mask)
++		return false;
++
++	/*
++	 * Checking the first MSI descriptor is sufficient. MSIX supports
++	 * masking and MSI does so when the maskbit is set.
++	 */
++	desc = first_msi_entry(dev);
++	return desc->msi_attrib.is_msix || desc->msi_attrib.maskbit;
+ }
+ 
+ /**
+@@ -394,7 +421,7 @@ int msi_domain_alloc_irqs(struct irq_domain *domain, struct device *dev,
+ 	if (ops->msi_finish)
+ 		ops->msi_finish(&arg, 0);
+ 
+-	can_reserve = msi_check_reservation_mode(info);
++	can_reserve = msi_check_reservation_mode(domain, info, dev);
+ 
+ 	for_each_msi_entry(desc, dev) {
+ 		virq = desc->irq;
+@@ -412,7 +439,9 @@ int msi_domain_alloc_irqs(struct irq_domain *domain, struct device *dev,
+ 			continue;
+ 
+ 		irq_data = irq_domain_get_irq_data(domain, desc->irq);
+-		ret = irq_domain_activate_irq(irq_data, true);
++		if (!can_reserve)
++			irqd_clr_can_reserve(irq_data);
++		ret = irq_domain_activate_irq(irq_data, can_reserve);
+ 		if (ret)
+ 			goto cleanup;
+ 	}
+
+commit da5dd9e854d2edd6b02ebfe28583052f922104da
+Author: Thomas Gleixner <tglx@linutronix.de>
+Date:   Fri Dec 29 10:42:10 2017 +0100
+
+    genirq/msi: Handle reactivation only on success
+    
+    When analyzing the fallout of the x86 vector allocation rework it turned
+    out that the error handling in msi_domain_alloc_irqs() is broken.
+    
+    If MSI_FLAG_MUST_REACTIVATE is set for a MSI domain then it clears the
+    activation flag for a successfully initialized msi descriptor. If a
+    subsequent initialization fails then the error handling code path does not
+    deactivate the interrupt because the activation flag got cleared.
+    
+    Move the clearing of the activation flag outside of the initialization loop
+    so that an eventual failure can be cleaned up correctly.
+    
+    Fixes: 22d0b12f3560 ("genirq/irqdomain: Add force reactivation flag to irq domains")
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Tested-by: Alexandru Chirvasitu <achirvasub@gmail.com>
+    Tested-by: Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+    Cc: Dou Liyang <douly.fnst@cn.fujitsu.com>
+    Cc: Pavel Machek <pavel@ucw.cz>
+    Cc: Maciej W. Rozycki <macro@linux-mips.org>
+    Cc: Mikael Pettersson <mikpelinux@gmail.com>
+    Cc: Josh Poulson <jopoulso@microsoft.com>
+    Cc: Mihai Costache <v-micos@microsoft.com>
+    Cc: Stephen Hemminger <sthemmin@microsoft.com>
+    Cc: Marc Zyngier <marc.zyngier@arm.com>
+    Cc: linux-pci@vger.kernel.org
+    Cc: Haiyang Zhang <haiyangz@microsoft.com>
+    Cc: Dexuan Cui <decui@microsoft.com>
+    Cc: Simon Xiao <sixiao@microsoft.com>
+    Cc: Saeed Mahameed <saeedm@mellanox.com>
+    Cc: Jork Loeser <Jork.Loeser@microsoft.com>
+    Cc: Bjorn Helgaas <bhelgaas@google.com>
+    Cc: devel@linuxdriverproject.org
+    Cc: KY Srinivasan <kys@microsoft.com>
+    Cc: Alan Cox <alan@linux.intel.com>
+    Cc: Sakari Ailus <sakari.ailus@intel.com>,
+    Cc: linux-media@vger.kernel.org
+
+diff --git a/kernel/irq/msi.c b/kernel/irq/msi.c
+index edb987b2c58d..9ba954331171 100644
+--- a/kernel/irq/msi.c
++++ b/kernel/irq/msi.c
+@@ -339,6 +339,13 @@ int msi_domain_populate_irqs(struct irq_domain *domain, struct device *dev,
+ 	return ret;
+ }
+ 
++static bool msi_check_reservation_mode(struct msi_domain_info *info)
++{
++	if (!(info->flags & MSI_FLAG_MUST_REACTIVATE))
++		return false;
++	return true;
++}
++
+ /**
+  * msi_domain_alloc_irqs - Allocate interrupts from a MSI interrupt domain
+  * @domain:	The domain to allocate from
+@@ -353,9 +360,11 @@ int msi_domain_alloc_irqs(struct irq_domain *domain, struct device *dev,
+ {
+ 	struct msi_domain_info *info = domain->host_data;
+ 	struct msi_domain_ops *ops = info->ops;
+-	msi_alloc_info_t arg;
++	struct irq_data *irq_data;
+ 	struct msi_desc *desc;
++	msi_alloc_info_t arg;
+ 	int i, ret, virq;
++	bool can_reserve;
+ 
+ 	ret = msi_domain_prepare_irqs(domain, dev, nvec, &arg);
+ 	if (ret)
+@@ -385,6 +394,8 @@ int msi_domain_alloc_irqs(struct irq_domain *domain, struct device *dev,
+ 	if (ops->msi_finish)
+ 		ops->msi_finish(&arg, 0);
+ 
++	can_reserve = msi_check_reservation_mode(info);
++
+ 	for_each_msi_entry(desc, dev) {
+ 		virq = desc->irq;
+ 		if (desc->nvec_used == 1)
+@@ -397,15 +408,23 @@ int msi_domain_alloc_irqs(struct irq_domain *domain, struct device *dev,
+ 		 * the MSI entries before the PCI layer enables MSI in the
+ 		 * card. Otherwise the card latches a random msi message.
+ 		 */
+-		if (info->flags & MSI_FLAG_ACTIVATE_EARLY) {
+-			struct irq_data *irq_data;
++		if (!(info->flags & MSI_FLAG_ACTIVATE_EARLY))
++			continue;
+ 
++		irq_data = irq_domain_get_irq_data(domain, desc->irq);
++		ret = irq_domain_activate_irq(irq_data, true);
++		if (ret)
++			goto cleanup;
++	}
++
++	/*
++	 * If these interrupts use reservation mode, clear the activated bit
++	 * so request_irq() will assign the final vector.
++	 */
++	if (can_reserve) {
++		for_each_msi_entry(desc, dev) {
+ 			irq_data = irq_domain_get_irq_data(domain, desc->irq);
+-			ret = irq_domain_activate_irq(irq_data, true);
+-			if (ret)
+-				goto cleanup;
+-			if (info->flags & MSI_FLAG_MUST_REACTIVATE)
+-				irqd_clr_activated(irq_data);
++			irqd_clr_activated(irq_data);
+ 		}
+ 	}
+ 	return 0;
+
+commit 22d0b12f3560d3b3264ee79faa1c05a5060fb916
+Author: Thomas Gleixner <tglx@linutronix.de>
+Date:   Wed Sep 13 23:29:13 2017 +0200
+
+    genirq/irqdomain: Add force reactivation flag to irq domains
+    
+    Allow irqdomains to tell the core code, that after early activation the
+    interrupt needs to be reactivated at request_irq() time.
+    
+    This allows reservation of vectors at early activation time and actual
+    vector assignment at request_irq() time.
+    
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Tested-by: Juergen Gross <jgross@suse.com>
+    Tested-by: Yu Chen <yu.c.chen@intel.com>
+    Acked-by: Juergen Gross <jgross@suse.com>
+    Cc: Boris Ostrovsky <boris.ostrovsky@oracle.com>
+    Cc: Tony Luck <tony.luck@intel.com>
+    Cc: Marc Zyngier <marc.zyngier@arm.com>
+    Cc: Alok Kataria <akataria@vmware.com>
+    Cc: Joerg Roedel <joro@8bytes.org>
+    Cc: "Rafael J. Wysocki" <rjw@rjwysocki.net>
+    Cc: Steven Rostedt <rostedt@goodmis.org>
+    Cc: Christoph Hellwig <hch@lst.de>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Borislav Petkov <bp@alien8.de>
+    Cc: Paolo Bonzini <pbonzini@redhat.com>
+    Cc: Rui Zhang <rui.zhang@intel.com>
+    Cc: "K. Y. Srinivasan" <kys@microsoft.com>
+    Cc: Arjan van de Ven <arjan@linux.intel.com>
+    Cc: Dan Williams <dan.j.williams@intel.com>
+    Cc: Len Brown <lenb@kernel.org>
+    Link: https://lkml.kernel.org/r/20170913213153.106242536@linutronix.de
+
+diff --git a/kernel/irq/msi.c b/kernel/irq/msi.c
+index d7553d015175..edb987b2c58d 100644
+--- a/kernel/irq/msi.c
++++ b/kernel/irq/msi.c
+@@ -404,6 +404,8 @@ int msi_domain_alloc_irqs(struct irq_domain *domain, struct device *dev,
+ 			ret = irq_domain_activate_irq(irq_data, true);
+ 			if (ret)
+ 				goto cleanup;
++			if (info->flags & MSI_FLAG_MUST_REACTIVATE)
++				irqd_clr_activated(irq_data);
+ 		}
+ 	}
+ 	return 0;
+
+commit 42e1cc2dc5b698181ab1ffb7972bd880230c506e
+Author: Thomas Gleixner <tglx@linutronix.de>
+Date:   Wed Sep 13 23:29:12 2017 +0200
+
+    genirq/irqdomain: Propagate early activation
+    
+    Propagate the early activation mode to the irqdomain activate()
+    callbacks. This is required for the upcoming reservation, late vector
+    assignment scheme, so that the early activation call can act accordingly.
+    
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Tested-by: Juergen Gross <jgross@suse.com>
+    Tested-by: Yu Chen <yu.c.chen@intel.com>
+    Acked-by: Juergen Gross <jgross@suse.com>
+    Cc: Boris Ostrovsky <boris.ostrovsky@oracle.com>
+    Cc: Tony Luck <tony.luck@intel.com>
+    Cc: Marc Zyngier <marc.zyngier@arm.com>
+    Cc: Alok Kataria <akataria@vmware.com>
+    Cc: Joerg Roedel <joro@8bytes.org>
+    Cc: "Rafael J. Wysocki" <rjw@rjwysocki.net>
+    Cc: Steven Rostedt <rostedt@goodmis.org>
+    Cc: Christoph Hellwig <hch@lst.de>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Borislav Petkov <bp@alien8.de>
+    Cc: Paolo Bonzini <pbonzini@redhat.com>
+    Cc: Rui Zhang <rui.zhang@intel.com>
+    Cc: "K. Y. Srinivasan" <kys@microsoft.com>
+    Cc: Arjan van de Ven <arjan@linux.intel.com>
+    Cc: Dan Williams <dan.j.williams@intel.com>
+    Cc: Len Brown <lenb@kernel.org>
+    Link: https://lkml.kernel.org/r/20170913213153.028353660@linutronix.de
+
+diff --git a/kernel/irq/msi.c b/kernel/irq/msi.c
+index 5ece369950ec..d7553d015175 100644
+--- a/kernel/irq/msi.c
++++ b/kernel/irq/msi.c
+@@ -401,7 +401,7 @@ int msi_domain_alloc_irqs(struct irq_domain *domain, struct device *dev,
+ 			struct irq_data *irq_data;
+ 
+ 			irq_data = irq_domain_get_irq_data(domain, desc->irq);
+-			ret = irq_domain_activate_irq(irq_data);
++			ret = irq_domain_activate_irq(irq_data, true);
+ 			if (ret)
+ 				goto cleanup;
+ 		}
+
+commit bb9b428a5c832d7abb494fbabac37c515c01c6c4
+Author: Thomas Gleixner <tglx@linutronix.de>
+Date:   Wed Sep 13 23:29:11 2017 +0200
+
+    genirq/irqdomain: Allow irq_domain_activate_irq() to fail
+    
+    Allow irq_domain_activate_irq() to fail. This is required to support a
+    reservation and late vector assignment scheme.
+    
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Tested-by: Juergen Gross <jgross@suse.com>
+    Tested-by: Yu Chen <yu.c.chen@intel.com>
+    Acked-by: Juergen Gross <jgross@suse.com>
+    Cc: Boris Ostrovsky <boris.ostrovsky@oracle.com>
+    Cc: Tony Luck <tony.luck@intel.com>
+    Cc: Marc Zyngier <marc.zyngier@arm.com>
+    Cc: Alok Kataria <akataria@vmware.com>
+    Cc: Joerg Roedel <joro@8bytes.org>
+    Cc: "Rafael J. Wysocki" <rjw@rjwysocki.net>
+    Cc: Steven Rostedt <rostedt@goodmis.org>
+    Cc: Christoph Hellwig <hch@lst.de>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Borislav Petkov <bp@alien8.de>
+    Cc: Paolo Bonzini <pbonzini@redhat.com>
+    Cc: Rui Zhang <rui.zhang@intel.com>
+    Cc: "K. Y. Srinivasan" <kys@microsoft.com>
+    Cc: Arjan van de Ven <arjan@linux.intel.com>
+    Cc: Dan Williams <dan.j.williams@intel.com>
+    Cc: Len Brown <lenb@kernel.org>
+    Link: https://lkml.kernel.org/r/20170913213152.933882227@linutronix.de
+
+diff --git a/kernel/irq/msi.c b/kernel/irq/msi.c
+index 6155fff9f647..5ece369950ec 100644
+--- a/kernel/irq/msi.c
++++ b/kernel/irq/msi.c
+@@ -401,11 +401,26 @@ int msi_domain_alloc_irqs(struct irq_domain *domain, struct device *dev,
+ 			struct irq_data *irq_data;
+ 
+ 			irq_data = irq_domain_get_irq_data(domain, desc->irq);
+-			irq_domain_activate_irq(irq_data);
++			ret = irq_domain_activate_irq(irq_data);
++			if (ret)
++				goto cleanup;
+ 		}
+ 	}
+-
+ 	return 0;
++
++cleanup:
++	for_each_msi_entry(desc, dev) {
++		struct irq_data *irqd;
++
++		if (desc->irq == virq)
++			break;
++
++		irqd = irq_domain_get_irq_data(domain, desc->irq);
++		if (irqd_is_activated(irqd))
++			irq_domain_deactivate_irq(irqd);
++	}
++	msi_domain_free_irqs(domain, dev);
++	return ret;
+ }
+ 
+ /**
+
+commit 72491643469aab736536ae71dcd199b19dabd891
+Author: Thomas Gleixner <tglx@linutronix.de>
+Date:   Wed Sep 13 23:29:10 2017 +0200
+
+    genirq/irqdomain: Update irq_domain_ops.activate() signature
+    
+    The irq_domain_ops.activate() callback has no return value and no way to
+    tell the function that the activation is early.
+    
+    The upcoming changes to support a reservation scheme which allows to assign
+    interrupt vectors on x86 only when the interrupt is actually requested
+    requires:
+    
+      - A return value, so activation can fail at request_irq() time
+    
+      - Information that the activate invocation is early, i.e. before
+        request_irq().
+    
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Tested-by: Juergen Gross <jgross@suse.com>
+    Tested-by: Yu Chen <yu.c.chen@intel.com>
+    Acked-by: Juergen Gross <jgross@suse.com>
+    Cc: Boris Ostrovsky <boris.ostrovsky@oracle.com>
+    Cc: Tony Luck <tony.luck@intel.com>
+    Cc: Marc Zyngier <marc.zyngier@arm.com>
+    Cc: Alok Kataria <akataria@vmware.com>
+    Cc: Joerg Roedel <joro@8bytes.org>
+    Cc: "Rafael J. Wysocki" <rjw@rjwysocki.net>
+    Cc: Steven Rostedt <rostedt@goodmis.org>
+    Cc: Christoph Hellwig <hch@lst.de>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Borislav Petkov <bp@alien8.de>
+    Cc: Paolo Bonzini <pbonzini@redhat.com>
+    Cc: Rui Zhang <rui.zhang@intel.com>
+    Cc: "K. Y. Srinivasan" <kys@microsoft.com>
+    Cc: Arjan van de Ven <arjan@linux.intel.com>
+    Cc: Dan Williams <dan.j.williams@intel.com>
+    Cc: Len Brown <lenb@kernel.org>
+    Link: https://lkml.kernel.org/r/20170913213152.848490816@linutronix.de
+
+diff --git a/kernel/irq/msi.c b/kernel/irq/msi.c
+index 94ecc0293844..6155fff9f647 100644
+--- a/kernel/irq/msi.c
++++ b/kernel/irq/msi.c
+@@ -102,13 +102,14 @@ int msi_domain_set_affinity(struct irq_data *irq_data,
+ 	return ret;
+ }
+ 
+-static void msi_domain_activate(struct irq_domain *domain,
+-				struct irq_data *irq_data)
++static int msi_domain_activate(struct irq_domain *domain,
++			       struct irq_data *irq_data, bool early)
+ {
+ 	struct msi_msg msg;
+ 
+ 	BUG_ON(irq_chip_compose_msi_msg(irq_data, &msg));
+ 	irq_chip_write_msi_msg(irq_data, &msg);
++	return 0;
+ }
+ 
+ static void msi_domain_deactivate(struct irq_domain *domain,
+
+commit 07557ccb8c83f315e409ddee181e9ffbf87c6ad1
+Author: Thomas Gleixner <tglx@linutronix.de>
+Date:   Wed Sep 13 23:29:05 2017 +0200
+
+    genirq/msi: Capture device name for debugfs
+    
+    For debugging the allocation of unused or potentially leaked interrupt
+    descriptor it's helpful to have some information about the site which
+    allocated them. In case of MSI this is simple because the caller hands the
+    device struct pointer into the domain allocation function.
+    
+    Duplicate the device name and show it in the debugfs entry of the interrupt
+    descriptor.
+    
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Tested-by: Juergen Gross <jgross@suse.com>
+    Tested-by: Yu Chen <yu.c.chen@intel.com>
+    Acked-by: Juergen Gross <jgross@suse.com>
+    Cc: Boris Ostrovsky <boris.ostrovsky@oracle.com>
+    Cc: Tony Luck <tony.luck@intel.com>
+    Cc: Marc Zyngier <marc.zyngier@arm.com>
+    Cc: Alok Kataria <akataria@vmware.com>
+    Cc: Joerg Roedel <joro@8bytes.org>
+    Cc: "Rafael J. Wysocki" <rjw@rjwysocki.net>
+    Cc: Steven Rostedt <rostedt@goodmis.org>
+    Cc: Christoph Hellwig <hch@lst.de>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Borislav Petkov <bp@alien8.de>
+    Cc: Paolo Bonzini <pbonzini@redhat.com>
+    Cc: Rui Zhang <rui.zhang@intel.com>
+    Cc: "K. Y. Srinivasan" <kys@microsoft.com>
+    Cc: Arjan van de Ven <arjan@linux.intel.com>
+    Cc: Dan Williams <dan.j.williams@intel.com>
+    Cc: Len Brown <lenb@kernel.org>
+    Link: https://lkml.kernel.org/r/20170913213152.433038426@linutronix.de
+
+diff --git a/kernel/irq/msi.c b/kernel/irq/msi.c
+index 3fa4bd59f569..94ecc0293844 100644
+--- a/kernel/irq/msi.c
++++ b/kernel/irq/msi.c
+@@ -16,6 +16,8 @@
+ #include <linux/msi.h>
+ #include <linux/slab.h>
+ 
++#include "internals.h"
++
+ /**
+  * alloc_msi_entry - Allocate an initialize msi_entry
+  * @dev:	Pointer to the device for which this is allocated
+@@ -373,8 +375,10 @@ int msi_domain_alloc_irqs(struct irq_domain *domain, struct device *dev,
+ 			return ret;
+ 		}
+ 
+-		for (i = 0; i < desc->nvec_used; i++)
++		for (i = 0; i < desc->nvec_used; i++) {
+ 			irq_set_msi_desc_off(virq, i, desc);
++			irq_debugfs_copy_devname(virq + i, dev);
++		}
+ 	}
+ 
+ 	if (ops->msi_finish)
+
+commit 596a7a1d0989c621c3ae49be73a1d1f9de22eb5a
+Author: John Keeping <john@metanate.com>
+Date:   Wed Sep 6 10:35:40 2017 +0100
+
+    genirq/msi: Fix populating multiple interrupts
+    
+    On allocating the interrupts routed via a wire-to-MSI bridge, the allocator
+    iterates over the MSI descriptors to build the hierarchy, but fails to use
+    the descriptor interrupt number, and instead uses the base number,
+    generating the wrong IRQ domain mappings.
+    
+    The fix is to use the MSI descriptor interrupt number when setting up
+    the interrupt instead of the base interrupt for the allocation range.
+    
+    The only saving grace is that although the MSI descriptors are allocated
+    in bulk, the wired interrupts are only allocated one by one (so
+    desc->irq == virq) and the bug went unnoticed so far.
+    
+    Fixes: 2145ac9310b60 ("genirq/msi: Add msi_domain_populate_irqs")
+    Signed-off-by: John Keeping <john@metanate.com>
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Reviewed-by: Marc Zyngier <marc.zyngier@arm.com>
+    Cc: stable@vger.kernel.org
+    Link: http://lkml.kernel.org/r/20170906103540.373864a2.john@metanate.com
+
+diff --git a/kernel/irq/msi.c b/kernel/irq/msi.c
+index 48eadf416c24..3fa4bd59f569 100644
+--- a/kernel/irq/msi.c
++++ b/kernel/irq/msi.c
+@@ -315,11 +315,12 @@ int msi_domain_populate_irqs(struct irq_domain *domain, struct device *dev,
+ 
+ 		ops->set_desc(arg, desc);
+ 		/* Assumes the domain mutex is held! */
+-		ret = irq_domain_alloc_irqs_hierarchy(domain, virq, 1, arg);
++		ret = irq_domain_alloc_irqs_hierarchy(domain, desc->irq, 1,
++						      arg);
+ 		if (ret)
+ 			break;
+ 
+-		irq_set_msi_desc_off(virq, 0, desc);
++		irq_set_msi_desc_off(desc->irq, 0, desc);
+ 	}
+ 
+ 	if (ret) {
+
+commit 6a6544e520abecd484ab8b67fb50d1fc003f3275
+Author: Marc Zyngier <marc.zyngier@arm.com>
+Date:   Tue Jun 20 22:17:44 2017 +0100
+
+    genirq/irqdomain: Remove auto-recursive hierarchy support
+    
+    It did seem like a good idea at the time, but it never really
+    caught on, and auto-recursive domains remain unused 3 years after
+    having been introduced.
+    
+    Oh well, time for a late spring cleanup.
+    
+    Signed-off-by: Marc Zyngier <marc.zyngier@arm.com>
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+
+diff --git a/kernel/irq/msi.c b/kernel/irq/msi.c
+index 9e3f1857c6bd..48eadf416c24 100644
+--- a/kernel/irq/msi.c
++++ b/kernel/irq/msi.c
+@@ -315,7 +315,7 @@ int msi_domain_populate_irqs(struct irq_domain *domain, struct device *dev,
+ 
+ 		ops->set_desc(arg, desc);
+ 		/* Assumes the domain mutex is held! */
+-		ret = irq_domain_alloc_irqs_recursive(domain, virq, 1, arg);
++		ret = irq_domain_alloc_irqs_hierarchy(domain, virq, 1, arg);
+ 		if (ret)
+ 			break;
+ 
+
+commit 0165308a2f994939d2e1b36624f5a8f57746bc88
+Author: Thomas Gleixner <tglx@linutronix.de>
+Date:   Tue Jun 20 01:37:04 2017 +0200
+
+    genirq/msi: Prevent overwriting domain name
+    
+    Prevent overwriting an already assigned domain name. Remove the extra check
+    for chip->name, because if domain->name is NULL overwriting it with NULL is
+    not a problem.
+    
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Acked-by: Marc Zyngier <marc.zyngier@arm.com>
+    Cc: Jens Axboe <axboe@kernel.dk>
+    Cc: Michael Ellerman <mpe@ellerman.id.au>
+    Cc: Keith Busch <keith.busch@intel.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Christoph Hellwig <hch@lst.de>
+    Link: http://lkml.kernel.org/r/20170619235443.510684976@linutronix.de
+
+diff --git a/kernel/irq/msi.c b/kernel/irq/msi.c
+index fe4d48ec5bc4..9e3f1857c6bd 100644
+--- a/kernel/irq/msi.c
++++ b/kernel/irq/msi.c
+@@ -274,7 +274,8 @@ struct irq_domain *msi_create_irq_domain(struct fwnode_handle *fwnode,
+ 
+ 	domain = irq_domain_create_hierarchy(parent, IRQ_DOMAIN_FLAG_MSI, 0,
+ 					     fwnode, &msi_domain_ops, info);
+-	if (domain && info->chip && info->chip->name)
++
++	if (domain && !domain->name && info->chip)
+ 		domain->name = info->chip->name;
+ 
+ 	return domain;
+
+commit a97b852b4d4c2f8c50cab13c71566639f9a1a990
+Author: Marc Zyngier <marc.zyngier@arm.com>
+Date:   Fri May 12 12:55:37 2017 +0100
+
+    genirq/msi: Populate the domain name if provided by the irqchip
+    
+    In order to ease debug, let's populate the domain name upfront, before any
+    MSI gets requested. This allows the domain to appear in the
+    irq_domain_mapping, and the user to easily find the expected data.
+    
+    Signed-off-by: Marc Zyngier <marc.zyngier@arm.com>
+    Link: http://lkml.kernel.org/r/20170512115538.10767-4-marc.zyngier@arm.com
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+
+diff --git a/kernel/irq/msi.c b/kernel/irq/msi.c
+index ddc2f5427f75..fe4d48ec5bc4 100644
+--- a/kernel/irq/msi.c
++++ b/kernel/irq/msi.c
+@@ -265,13 +265,19 @@ struct irq_domain *msi_create_irq_domain(struct fwnode_handle *fwnode,
+ 					 struct msi_domain_info *info,
+ 					 struct irq_domain *parent)
+ {
++	struct irq_domain *domain;
++
+ 	if (info->flags & MSI_FLAG_USE_DEF_DOM_OPS)
+ 		msi_domain_update_dom_ops(info);
+ 	if (info->flags & MSI_FLAG_USE_DEF_CHIP_OPS)
+ 		msi_domain_update_chip_ops(info);
+ 
+-	return irq_domain_create_hierarchy(parent, IRQ_DOMAIN_FLAG_MSI, 0,
+-					   fwnode, &msi_domain_ops, info);
++	domain = irq_domain_create_hierarchy(parent, IRQ_DOMAIN_FLAG_MSI, 0,
++					     fwnode, &msi_domain_ops, info);
++	if (domain && info->chip && info->chip->name)
++		domain->name = info->chip->name;
++
++	return domain;
+ }
+ 
+ int msi_domain_prepare_irqs(struct irq_domain *domain, struct device *dev,
+
+commit 88156f00904183d99e19269fbdb5cb56dc1522c3
+Author: Eric Auger <eric.auger@redhat.com>
+Date:   Thu Jan 19 20:57:58 2017 +0000
+
+    genirq/msi: Set IRQ_DOMAIN_FLAG_MSI on MSI domain creation
+    
+    Now we have a flag value indicating an IRQ domain implements MSI,
+    let's set it on msi_create_irq_domain().
+    
+    Signed-off-by: Eric Auger <eric.auger@redhat.com>
+    Reviewed-by: Marc Zyngier <marc.zyngier@arm.com>
+    Tested-by: Tomasz Nowicki <tomasz.nowicki@caviumnetworks.com>
+    Tested-by: Bharat Bhushan <bharat.bhushan@nxp.com>
+    Signed-off-by: Will Deacon <will.deacon@arm.com>
+
+diff --git a/kernel/irq/msi.c b/kernel/irq/msi.c
+index ee230063f033..ddc2f5427f75 100644
+--- a/kernel/irq/msi.c
++++ b/kernel/irq/msi.c
+@@ -270,8 +270,8 @@ struct irq_domain *msi_create_irq_domain(struct fwnode_handle *fwnode,
+ 	if (info->flags & MSI_FLAG_USE_DEF_CHIP_OPS)
+ 		msi_domain_update_chip_ops(info);
+ 
+-	return irq_domain_create_hierarchy(parent, 0, 0, fwnode,
+-					   &msi_domain_ops, info);
++	return irq_domain_create_hierarchy(parent, IRQ_DOMAIN_FLAG_MSI, 0,
++					   fwnode, &msi_domain_ops, info);
+ }
+ 
+ int msi_domain_prepare_irqs(struct irq_domain *domain, struct device *dev,
+
+commit 4e201566402c878a225d4425df8a4a664c6f251e
+Author: Marc Zyngier <marc.zyngier@arm.com>
+Date:   Tue Nov 22 09:21:16 2016 +0000
+
+    genirq/msi: Drop artificial PCI dependency
+    
+    The generic MSI layer doesn't have any PCI ties anymore, and the
+    build hack should have been removed some time ago.
+    
+    Fixes: d9109698be6e ("genirq: Introduce msi_domain_alloc/free_irqs()")
+    Signed-off-by: Marc Zyngier <marc.zyngier@arm.com>
+    Link: http://lkml.kernel.org/r/1479806476-20801-1-git-send-email-marc.zyngier@arm.com
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+
+diff --git a/kernel/irq/msi.c b/kernel/irq/msi.c
+index 8a3e872798f3..ee230063f033 100644
+--- a/kernel/irq/msi.c
++++ b/kernel/irq/msi.c
+@@ -14,9 +14,7 @@
+ #include <linux/irq.h>
+ #include <linux/irqdomain.h>
+ #include <linux/msi.h>
+-
+-/* Temparory solution for building, will be removed later */
+-#include <linux/pci.h>
++#include <linux/slab.h>
+ 
+ /**
+  * alloc_msi_entry - Allocate an initialize msi_entry
+
+commit 28f4b04143c56135b1ca742fc64b664ed04de6a4
+Author: Thomas Gleixner <tglx@linutronix.de>
+Date:   Wed Sep 14 16:18:47 2016 +0200
+
+    genirq/msi: Add cpumask allocation to alloc_msi_entry
+    
+    For irq spreading want to store affinity masks in the msi_entry. Add the
+    infrastructure for it.
+    
+    We allocate an array of cpumasks with an array size of the number of used
+    vectors in the entry, so we can hand in the information per linux interrupt
+    later.
+    
+    As we hand in the number of used vectors, we assign them right
+    away. Convert all the call sites.
+    
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Cc: axboe@fb.com
+    Cc: keith.busch@intel.com
+    Cc: agordeev@redhat.com
+    Cc: linux-block@vger.kernel.org
+    Cc: Christoph Hellwig <hch@lst.de>
+    Link: http://lkml.kernel.org/r/1473862739-15032-2-git-send-email-hch@lst.de
+
+diff --git a/kernel/irq/msi.c b/kernel/irq/msi.c
+index 19e9dfbe97fa..8a3e872798f3 100644
+--- a/kernel/irq/msi.c
++++ b/kernel/irq/msi.c
+@@ -18,20 +18,42 @@
+ /* Temparory solution for building, will be removed later */
+ #include <linux/pci.h>
+ 
+-struct msi_desc *alloc_msi_entry(struct device *dev)
++/**
++ * alloc_msi_entry - Allocate an initialize msi_entry
++ * @dev:	Pointer to the device for which this is allocated
++ * @nvec:	The number of vectors used in this entry
++ * @affinity:	Optional pointer to an affinity mask array size of @nvec
++ *
++ * If @affinity is not NULL then a an affinity array[@nvec] is allocated
++ * and the affinity masks from @affinity are copied.
++ */
++struct msi_desc *
++alloc_msi_entry(struct device *dev, int nvec, const struct cpumask *affinity)
+ {
+-	struct msi_desc *desc = kzalloc(sizeof(*desc), GFP_KERNEL);
++	struct msi_desc *desc;
++
++	desc = kzalloc(sizeof(*desc), GFP_KERNEL);
+ 	if (!desc)
+ 		return NULL;
+ 
+ 	INIT_LIST_HEAD(&desc->list);
+ 	desc->dev = dev;
++	desc->nvec_used = nvec;
++	if (affinity) {
++		desc->affinity = kmemdup(affinity,
++			nvec * sizeof(*desc->affinity), GFP_KERNEL);
++		if (!desc->affinity) {
++			kfree(desc);
++			return NULL;
++		}
++	}
+ 
+ 	return desc;
+ }
+ 
+ void free_msi_entry(struct msi_desc *entry)
+ {
++	kfree(entry->affinity);
+ 	kfree(entry);
+ }
+ 
+
+commit f3b0946d629c8bfbd3e5f038e30cb9c711a35f10
+Author: Marc Zyngier <marc.zyngier@arm.com>
+Date:   Wed Jul 13 17:18:33 2016 +0100
+
+    genirq/msi: Make sure PCI MSIs are activated early
+    
+    Bharat Kumar Gogada reported issues with the generic MSI code, where the
+    end-point ended up with garbage in its MSI configuration (both for the vector
+    and the message).
+    
+    It turns out that the two MSI paths in the kernel are doing slightly different
+    things:
+    
+    generic MSI: disable MSI -> allocate MSI -> enable MSI -> setup EP
+    PCI MSI: disable MSI -> allocate MSI -> setup EP -> enable MSI
+    
+    And it turns out that end-points are allowed to latch the content of the MSI
+    configuration registers as soon as MSIs are enabled.  In Bharat's case, the
+    end-point ends up using whatever was there already, which is not what you
+    want.
+    
+    In order to make things converge, we introduce a new MSI domain flag
+    (MSI_FLAG_ACTIVATE_EARLY) that is unconditionally set for PCI/MSI. When set,
+    this flag forces the programming of the end-point as soon as the MSIs are
+    allocated.
+    
+    A consequence of this is that we have an extra activate in irq_startup, but
+    that should be without much consequence.
+    
+    tglx:
+    
+     - Several people reported a VMWare regression with PCI/MSI-X passthrough. It
+       turns out that the patch also cures that issue.
+    
+     - We need to have a look at the MSI disable interrupt path, where we write
+       the msg to all zeros without disabling MSI in the PCI device. Is that
+       correct?
+    
+    Fixes: 52f518a3a7c2 "x86/MSI: Use hierarchical irqdomains to manage MSI interrupts"
+    Reported-and-tested-by: Bharat Kumar Gogada <bharat.kumar.gogada@xilinx.com>
+    Reported-and-tested-by: Foster Snowhill <forst@forstwoof.ru>
+    Reported-by: Matthias Prager <linux@matthiasprager.de>
+    Reported-by: Jason Taylor <jason.taylor@simplivity.com>
+    Signed-off-by: Marc Zyngier <marc.zyngier@arm.com>
+    Acked-by: Bjorn Helgaas <bhelgaas@google.com>
+    Cc: linux-pci@vger.kernel.org
+    Cc: stable@vger.kernel.org
+    Link: http://lkml.kernel.org/r/1468426713-31431-1-git-send-email-marc.zyngier@arm.com
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+
+diff --git a/kernel/irq/msi.c b/kernel/irq/msi.c
+index 54999350162c..19e9dfbe97fa 100644
+--- a/kernel/irq/msi.c
++++ b/kernel/irq/msi.c
+@@ -359,6 +359,17 @@ int msi_domain_alloc_irqs(struct irq_domain *domain, struct device *dev,
+ 		else
+ 			dev_dbg(dev, "irq [%d-%d] for MSI\n",
+ 				virq, virq + desc->nvec_used - 1);
++		/*
++		 * This flag is set by the PCI layer as we need to activate
++		 * the MSI entries before the PCI layer enables MSI in the
++		 * card. Otherwise the card latches a random msi message.
++		 */
++		if (info->flags & MSI_FLAG_ACTIVATE_EARLY) {
++			struct irq_data *irq_data;
++
++			irq_data = irq_domain_get_irq_data(domain, desc->irq);
++			irq_domain_activate_irq(irq_data);
++		}
+ 	}
+ 
+ 	return 0;
+
+commit 4364e1a29be16b2783c0bcbc263f61236af64281
+Author: Thomas Gleixner <tglx@linutronix.de>
+Date:   Mon Jul 4 15:32:25 2016 +0200
+
+    genirq/msi: Fix broken debug output
+    
+    virq is not required to be the same for all msi descs. Use the base irq number
+    from the desc in the debug printk.
+    
+    Reported-by: Ingo Molnar <mingo@kernel.org>
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+
+diff --git a/kernel/irq/msi.c b/kernel/irq/msi.c
+index 0e2a736b14a7..54999350162c 100644
+--- a/kernel/irq/msi.c
++++ b/kernel/irq/msi.c
+@@ -353,6 +353,7 @@ int msi_domain_alloc_irqs(struct irq_domain *domain, struct device *dev,
+ 		ops->msi_finish(&arg, 0);
+ 
+ 	for_each_msi_entry(desc, dev) {
++		virq = desc->irq;
+ 		if (desc->nvec_used == 1)
+ 			dev_dbg(dev, "irq %d for MSI\n", virq);
+ 		else
+
+commit 0972fa57f53525ffa6ced12d703750fc2791e3ce
+Author: Thomas Gleixner <tglx@linutronix.de>
+Date:   Mon Jul 4 17:39:26 2016 +0900
+
+    genirq/msi: Make use of affinity aware allocations
+    
+    Allow the MSI code to provide affinity hints per MSI descriptor.
+    
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Christoph Hellwig <hch@lst.de>
+    Cc: linux-block@vger.kernel.org
+    Cc: linux-pci@vger.kernel.org
+    Cc: linux-nvme@lists.infradead.org
+    Cc: axboe@fb.com
+    Cc: agordeev@redhat.com
+    Link: http://lkml.kernel.org/r/1467621574-8277-6-git-send-email-hch@lst.de
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+
+diff --git a/kernel/irq/msi.c b/kernel/irq/msi.c
+index 58dbbacc6fbb..0e2a736b14a7 100644
+--- a/kernel/irq/msi.c
++++ b/kernel/irq/msi.c
+@@ -335,7 +335,7 @@ int msi_domain_alloc_irqs(struct irq_domain *domain, struct device *dev,
+ 
+ 		virq = __irq_domain_alloc_irqs(domain, -1, desc->nvec_used,
+ 					       dev_to_node(dev), &arg, false,
+-					       NULL);
++					       desc->affinity);
+ 		if (virq < 0) {
+ 			ret = -ENOSPC;
+ 			if (ops->handle_error)
+
+commit 06ee6d571f0e350253a8fc3492316b2be007fae2
+Author: Thomas Gleixner <tglx@linutronix.de>
+Date:   Mon Jul 4 17:39:24 2016 +0900
+
+    genirq: Add affinity hint to irq allocation
+    
+    Add an extra argument to the irq(domain) allocation functions, so we can hand
+    down affinity hints to the allocator. Thats necessary to implement proper
+    support for multiqueue devices.
+    
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Christoph Hellwig <hch@lst.de>
+    Cc: linux-block@vger.kernel.org
+    Cc: linux-pci@vger.kernel.org
+    Cc: linux-nvme@lists.infradead.org
+    Cc: axboe@fb.com
+    Cc: agordeev@redhat.com
+    Link: http://lkml.kernel.org/r/1467621574-8277-4-git-send-email-hch@lst.de
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+
+diff --git a/kernel/irq/msi.c b/kernel/irq/msi.c
+index eb5bf2b50b07..58dbbacc6fbb 100644
+--- a/kernel/irq/msi.c
++++ b/kernel/irq/msi.c
+@@ -334,7 +334,8 @@ int msi_domain_alloc_irqs(struct irq_domain *domain, struct device *dev,
+ 		ops->set_desc(&arg, desc);
+ 
+ 		virq = __irq_domain_alloc_irqs(domain, -1, desc->nvec_used,
+-					       dev_to_node(dev), &arg, false);
++					       dev_to_node(dev), &arg, false,
++					       NULL);
+ 		if (virq < 0) {
+ 			ret = -ENOSPC;
+ 			if (ops->handle_error)
+
+commit b6140914fd079e43ea75a53429b47128584f033a
+Author: Thomas Gleixner <tglx@linutronix.de>
+Date:   Mon Jul 4 17:39:22 2016 +0900
+
+    genirq/msi: Remove unused MSI_FLAG_IDENTITY_MAP
+    
+    No user and we definitely don't want to grow one.
+    
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Reviewed-by: Bart Van Assche <bart.vanassche@sandisk.com>
+    Cc: Christoph Hellwig <hch@lst.de>
+    Cc: linux-block@vger.kernel.org
+    Cc: linux-pci@vger.kernel.org
+    Cc: linux-nvme@lists.infradead.org
+    Cc: axboe@fb.com
+    Cc: agordeev@redhat.com
+    Link: http://lkml.kernel.org/r/1467621574-8277-2-git-send-email-hch@lst.de
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+
+diff --git a/kernel/irq/msi.c b/kernel/irq/msi.c
+index 38e89ce7b071..eb5bf2b50b07 100644
+--- a/kernel/irq/msi.c
++++ b/kernel/irq/msi.c
+@@ -324,7 +324,7 @@ int msi_domain_alloc_irqs(struct irq_domain *domain, struct device *dev,
+ 	struct msi_domain_ops *ops = info->ops;
+ 	msi_alloc_info_t arg;
+ 	struct msi_desc *desc;
+-	int i, ret, virq = -1;
++	int i, ret, virq;
+ 
+ 	ret = msi_domain_prepare_irqs(domain, dev, nvec, &arg);
+ 	if (ret)
+@@ -332,12 +332,8 @@ int msi_domain_alloc_irqs(struct irq_domain *domain, struct device *dev,
+ 
+ 	for_each_msi_entry(desc, dev) {
+ 		ops->set_desc(&arg, desc);
+-		if (info->flags & MSI_FLAG_IDENTITY_MAP)
+-			virq = (int)ops->get_hwirq(info, &arg);
+-		else
+-			virq = -1;
+ 
+-		virq = __irq_domain_alloc_irqs(domain, virq, desc->nvec_used,
++		virq = __irq_domain_alloc_irqs(domain, -1, desc->nvec_used,
+ 					       dev_to_node(dev), &arg, false);
+ 		if (virq < 0) {
+ 			ret = -ENOSPC;
+
+commit d43421565bf0510d35e6a39ebf96586ad486f3aa
+Merge: 859e76254490 9662e32c810a
+Author: Linus Torvalds <torvalds@linux-foundation.org>
+Date:   Thu Jan 21 11:52:16 2016 -0800
+
+    Merge tag 'pci-v4.5-changes' of git://git.kernel.org/pub/scm/linux/kernel/git/helgaas/pci
+    
+    Pull PCI updates from Bjorn Helgaas:
+     "PCI changes for the v4.5 merge window:
+    
+      Enumeration:
+       - Simplify config space size computation (Bjorn Helgaas)
+       - Avoid iterating through ROM outside the resource window (Edward O'Callaghan)
+       - Support PCIe devices with short cfg_size (Jason S. McMullan)
+       - Add Netronome vendor and device IDs (Jason S. McMullan)
+       - Limit config space size for Netronome NFP6000 family (Jason S. McMullan)
+       - Add Netronome NFP4000 PF device ID (Simon Horman)
+       - Limit config space size for Netronome NFP4000 (Simon Horman)
+       - Print warnings for all invalid expansion ROM headers (Vladis Dronov)
+    
+      Resource management:
+       - Fix minimum allocation address overwrite (Christoph Biedl)
+    
+      PCI device hotplug:
+       - acpiphp_ibm: Fix null dereferences on null ibm_slot (Colin Ian King)
+       - pciehp: Always protect pciehp_disable_slot() with hotplug mutex (Guenter Roeck)
+       - shpchp: Constify hpc_ops structure (Julia Lawall)
+       - ibmphp: Remove unneeded NULL test (Julia Lawall)
+    
+      Power management:
+       - Make ASPM sysfs link_state_store() consistent with link_state_show() (Andy Lutomirski)
+    
+      Virtualization
+       - Add function 1 DMA alias quirk for Lite-On/Plextor M6e/Marvell 88SS9183 (Tim Sander)
+    
+      MSI:
+       - Remove empty pci_msi_init_pci_dev() (Bjorn Helgaas)
+       - Mark PCIe/PCI (MSI) IRQ cascade handlers as IRQF_NO_THREAD (Grygorii Strashko)
+       - Initialize MSI capability for all architectures (Guilherme G. Piccoli)
+       - Relax msi_domain_alloc() to support parentless MSI irqdomains (Liu Jiang)
+    
+      ARM Versatile host bridge driver:
+       - Remove unused pci_sys_data structures (Lorenzo Pieralisi)
+    
+      Broadcom iProc host bridge driver:
+       - Hide CONFIG_PCIE_IPROC (Arnd Bergmann)
+       - Do not use 0x in front of %pap (Dmitry V. Krivenok)
+       - Update iProc PCIe device tree binding (Ray Jui)
+       - Add PAXC interface support (Ray Jui)
+       - Add iProc PCIe MSI device tree binding (Ray Jui)
+       - Add iProc PCIe MSI support (Ray Jui)
+    
+      Freescale i.MX6 host bridge driver:
+       - Use gpio_set_value_cansleep() (Fabio Estevam)
+       - Add support for active-low reset GPIO (Petr Štetiar)
+    
+      HiSilicon host bridge driver:
+       - Add support for HiSilicon Hip06 PCIe host controllers (Gabriele Paoloni)
+    
+      Intel VMD host bridge driver:
+       - Export irq_domain_set_info() for module use (Keith Busch)
+       - x86/PCI: Allow DMA ops specific to a PCI domain (Keith Busch)
+       - Use 32 bit PCI domain numbers (Keith Busch)
+       - Add driver for Intel Volume Management Device (VMD) (Keith Busch)
+    
+      Qualcomm host bridge driver:
+       - Document PCIe devicetree bindings (Stanimir Varbanov)
+       - Add Qualcomm PCIe controller driver (Stanimir Varbanov)
+       - dts: apq8064: add PCIe devicetree node (Stanimir Varbanov)
+       - dts: ifc6410: enable PCIe DT node for this board (Stanimir Varbanov)
+    
+      Renesas R-Car host bridge driver:
+       - Add support for R-Car H3 to pcie-rcar (Harunobu Kurokawa)
+       - Allow DT to override default window settings (Phil Edworthy)
+       - Convert to DT resource parsing API (Phil Edworthy)
+       - Revert "PCI: rcar: Build pcie-rcar.c only on ARM" (Phil Edworthy)
+       - Remove unused pci_sys_data struct from pcie-rcar (Phil Edworthy)
+       - Add runtime PM support to pcie-rcar (Phil Edworthy)
+       - Add Gen2 PHY setup to pcie-rcar (Phil Edworthy)
+       - Add gen2 fallback compatibility string for pci-rcar-gen2 (Simon Horman)
+       - Add gen2 fallback compatibility string for pcie-rcar (Simon Horman)
+    
+      Synopsys DesignWare host bridge driver:
+       - Simplify control flow (Bjorn Helgaas)
+       - Make config accessor override checking symmetric (Bjorn Helgaas)
+       - Ensure ATU is enabled before IO/conf space accesses (Stanimir Varbanov)
+    
+      Miscellaneous:
+       - Add of_pci_get_host_bridge_resources() stub (Arnd Bergmann)
+       - Check for PCI_HEADER_TYPE_BRIDGE equality, not bitmask (Bjorn Helgaas)
+       - Fix all whitespace issues (Bogicevic Sasa)
+       - x86/PCI: Simplify pci_bios_{read,write} (Geliang Tang)
+       - Use to_pci_dev() instead of open-coding it (Geliang Tang)
+       - Use kobj_to_dev() instead of open-coding it (Geliang Tang)
+       - Use list_for_each_entry() to simplify code (Geliang Tang)
+       - Fix typos in <linux/msi.h> (Thomas Petazzoni)
+       - x86/PCI: Clarify AMD Fam10h config access restrictions comment (Tomasz Nowicki)"
+    
+    * tag 'pci-v4.5-changes' of git://git.kernel.org/pub/scm/linux/kernel/git/helgaas/pci: (58 commits)
+      PCI: Add function 1 DMA alias quirk for Lite-On/Plextor M6e/Marvell 88SS9183
+      PCI: Limit config space size for Netronome NFP4000
+      PCI: Add Netronome NFP4000 PF device ID
+      x86/PCI: Add driver for Intel Volume Management Device (VMD)
+      PCI/AER: Use 32 bit PCI domain numbers
+      x86/PCI: Allow DMA ops specific to a PCI domain
+      irqdomain: Export irq_domain_set_info() for module use
+      PCI: host: Add of_pci_get_host_bridge_resources() stub
+      genirq/MSI: Relax msi_domain_alloc() to support parentless MSI irqdomains
+      PCI: rcar: Add Gen2 PHY setup to pcie-rcar
+      PCI: rcar: Add runtime PM support to pcie-rcar
+      PCI: designware: Make config accessor override checking symmetric
+      PCI: ibmphp: Remove unneeded NULL test
+      ARM: dts: ifc6410: enable PCIe DT node for this board
+      ARM: dts: apq8064: add PCIe devicetree node
+      PCI: hotplug: Use list_for_each_entry() to simplify code
+      PCI: rcar: Remove unused pci_sys_data struct from pcie-rcar
+      PCI: hisi: Add support for HiSilicon Hip06 PCIe host controllers
+      PCI: Avoid iterating through memory outside the resource window
+      PCI: acpiphp_ibm: Fix null dereferences on null ibm_slot
+      ...
+
+commit bf6f869f8c111ba265cd199c64b25c646987500a
+Author: Liu Jiang <jiang.liu@linux.intel.com>
+Date:   Tue Jan 12 13:18:06 2016 -0700
+
+    genirq/MSI: Relax msi_domain_alloc() to support parentless MSI irqdomains
+    
+    Previously msi_domain_alloc() assumed MSI irqdomains always had parent
+    irqdomains, but that's not true for the new Intel VMD devices.  Relax
+    msi_domain_alloc() to support parentless MSI irqdomains.
+    
+    Signed-off-by: Jiang Liu <jiang.liu@linux.intel.com>
+    Signed-off-by: Keith Busch <keith.busch@intel.com>
+    Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+    Acked-by: Thomas Gleixner <tglx@linutronix.de>
+
+diff --git a/kernel/irq/msi.c b/kernel/irq/msi.c
+index 6b0c0b74a2a1..5e15cb4b2f00 100644
+--- a/kernel/irq/msi.c
++++ b/kernel/irq/msi.c
+@@ -109,9 +109,11 @@ static int msi_domain_alloc(struct irq_domain *domain, unsigned int virq,
+ 	if (irq_find_mapping(domain, hwirq) > 0)
+ 		return -EEXIST;
+ 
+-	ret = irq_domain_alloc_irqs_parent(domain, virq, nr_irqs, arg);
+-	if (ret < 0)
+-		return ret;
++	if (domain->parent) {
++		ret = irq_domain_alloc_irqs_parent(domain, virq, nr_irqs, arg);
++		if (ret < 0)
++			return ret;
++	}
+ 
+ 	for (i = 0; i < nr_irqs; i++) {
+ 		ret = ops->msi_init(domain, info, virq + i, hwirq + i, arg);
+
+commit 2145ac9310b60c1c11294b7bea10fe154009be1d
+Author: Marc Zyngier <marc.zyngier@arm.com>
+Date:   Mon Nov 23 08:26:06 2015 +0000
+
+    genirq/msi: Add msi_domain_populate_irqs
+    
+    To be able to allocate interrupts from the MSI layer down,
+    add a new msi_domain_populate_irqs entry point.
+    
+    Signed-off-by: Marc Zyngier <marc.zyngier@arm.com>
+
+diff --git a/kernel/irq/msi.c b/kernel/irq/msi.c
+index 9a85613d4227..15b249e7c673 100644
+--- a/kernel/irq/msi.c
++++ b/kernel/irq/msi.c
+@@ -266,6 +266,46 @@ int msi_domain_prepare_irqs(struct irq_domain *domain, struct device *dev,
+ 	return ret;
+ }
+ 
++int msi_domain_populate_irqs(struct irq_domain *domain, struct device *dev,
++			     int virq, int nvec, msi_alloc_info_t *arg)
++{
++	struct msi_domain_info *info = domain->host_data;
++	struct msi_domain_ops *ops = info->ops;
++	struct msi_desc *desc;
++	int ret = 0;
++
++	for_each_msi_entry(desc, dev) {
++		/* Don't even try the multi-MSI brain damage. */
++		if (WARN_ON(!desc->irq || desc->nvec_used != 1)) {
++			ret = -EINVAL;
++			break;
++		}
++
++		if (!(desc->irq >= virq && desc->irq < (virq + nvec)))
++			continue;
++
++		ops->set_desc(arg, desc);
++		/* Assumes the domain mutex is held! */
++		ret = irq_domain_alloc_irqs_recursive(domain, virq, 1, arg);
++		if (ret)
++			break;
++
++		irq_set_msi_desc_off(virq, 0, desc);
++	}
++
++	if (ret) {
++		/* Mop up the damage */
++		for_each_msi_entry(desc, dev) {
++			if (!(desc->irq >= virq && desc->irq < (virq + nvec)))
++				continue;
++
++			irq_domain_free_irqs_common(domain, desc->irq, 1);
++		}
++	}
++
++	return ret;
++}
++
+ /**
+  * msi_domain_alloc_irqs - Allocate interrupts from a MSI interrupt domain
+  * @domain:	The domain to allocate from
+
+commit b2eba39bcab9d60a6c3b80c7fc2f3dacb77eeaae
+Author: Marc Zyngier <marc.zyngier@arm.com>
+Date:   Mon Nov 23 08:26:05 2015 +0000
+
+    genirq/msi: Make the .prepare callback reusable
+    
+    The .prepare callbacks are so far only called from msi_domain_alloc_irqs.
+    In order to reuse that code, split that code and create a
+    msi_domain_prepare_irqs function that the existing code can call into.
+    
+    Signed-off-by: Marc Zyngier <marc.zyngier@arm.com>
+
+diff --git a/kernel/irq/msi.c b/kernel/irq/msi.c
+index 6b0c0b74a2a1..9a85613d4227 100644
+--- a/kernel/irq/msi.c
++++ b/kernel/irq/msi.c
+@@ -252,6 +252,20 @@ struct irq_domain *msi_create_irq_domain(struct fwnode_handle *fwnode,
+ 					   &msi_domain_ops, info);
+ }
+ 
++int msi_domain_prepare_irqs(struct irq_domain *domain, struct device *dev,
++			    int nvec, msi_alloc_info_t *arg)
++{
++	struct msi_domain_info *info = domain->host_data;
++	struct msi_domain_ops *ops = info->ops;
++	int ret;
++
++	ret = ops->msi_check(domain, info, dev);
++	if (ret == 0)
++		ret = ops->msi_prepare(domain, dev, nvec, arg);
++
++	return ret;
++}
++
+ /**
+  * msi_domain_alloc_irqs - Allocate interrupts from a MSI interrupt domain
+  * @domain:	The domain to allocate from
+@@ -270,9 +284,7 @@ int msi_domain_alloc_irqs(struct irq_domain *domain, struct device *dev,
+ 	struct msi_desc *desc;
+ 	int i, ret, virq = -1;
+ 
+-	ret = ops->msi_check(domain, info, dev);
+-	if (ret == 0)
+-		ret = ops->msi_prepare(domain, dev, nvec, &arg);
++	ret = msi_domain_prepare_irqs(domain, dev, nvec, &arg);
+ 	if (ret)
+ 		return ret;
+ 
+
+commit 6aa2fdb87cf01d7746955c600cbac352dc04d451
+Merge: 7b2a4306f9e7 d9e4ad5badf4
+Author: Linus Torvalds <torvalds@linux-foundation.org>
+Date:   Tue Nov 3 14:40:01 2015 -0800
+
+    Merge branch 'irq-core-for-linus' of git://git.kernel.org/pub/scm/linux/kernel/git/tip/tip
+    
+    Pull irq updates from Thomas Gleixner:
+     "The irq departement delivers:
+    
+       - Rework the irqdomain core infrastructure to accomodate ACPI based
+         systems.  This is required to support ARM64 without creating
+         artificial device tree nodes.
+    
+       - Sanitize the ACPI based ARM GIC initialization by making use of the
+         new firmware independent irqdomain core
+    
+       - Further improvements to the generic MSI management
+    
+       - Generalize the irq migration on CPU hotplug
+    
+       - Improvements to the threaded interrupt infrastructure
+    
+       - Allow the migration of "chained" low level interrupt handlers
+    
+       - Allow optional force masking of interrupts in disable_irq[_nosysnc]
+    
+       - Support for two new interrupt chips - Sigh!
+    
+       - A larger set of errata fixes for ARM gicv3
+    
+       - The usual pile of fixes, updates, improvements and cleanups all
+         over the place"
+    
+    * 'irq-core-for-linus' of git://git.kernel.org/pub/scm/linux/kernel/git/tip/tip: (71 commits)
+      Document that IRQ_NONE should be returned when IRQ not actually handled
+      PCI/MSI: Allow the MSI domain to be device-specific
+      PCI: Add per-device MSI domain hook
+      of/irq: Use the msi-map property to provide device-specific MSI domain
+      of/irq: Split of_msi_map_rid to reuse msi-map lookup
+      irqchip/gic-v3-its: Parse new version of msi-parent property
+      PCI/MSI: Use of_msi_get_domain instead of open-coded "msi-parent" parsing
+      of/irq: Use of_msi_get_domain instead of open-coded "msi-parent" parsing
+      of/irq: Add support code for multi-parent version of "msi-parent"
+      irqchip/gic-v3-its: Add handling of PCI requester id.
+      PCI/MSI: Add helper function pci_msi_domain_get_msi_rid().
+      of/irq: Add new function of_msi_map_rid()
+      Docs: dt: Add PCI MSI map bindings
+      irqchip/gic-v2m: Add support for multiple MSI frames
+      irqchip/gic-v3: Fix translation of LPIs after conversion to irq_fwspec
+      irqchip/mxs: Add Alphascale ASM9260 support
+      irqchip/mxs: Prepare driver for hardware with different offsets
+      irqchip/mxs: Panic if ioremap or domain creation fails
+      irqdomain: Documentation updates
+      irqdomain/msi: Use fwnode instead of of_node
+      ...
+
+commit 0701c53e460ea64daf0ee789d0b08fef57800016
+Author: Marc Zyngier <marc.zyngier@arm.com>
+Date:   Tue Oct 13 19:14:45 2015 +0100
+
+    genirq/msi: Do not use pci_msi_[un]mask_irq as default methods
+    
+    When we create a generic MSI domain, that MSI_FLAG_USE_DEF_CHIP_OPS
+    is set, and that any of .mask or .unmask are NULL in the irq_chip
+    structure, we set them to pci_msi_[un]mask_irq.
+    
+    This is a bad idea for at least two reasons:
+    - PCI_MSI might not be selected, kernel fails to build (yes, this is
+      legitimate, at least on arm64!)
+    - This may not be a PCI/MSI domain at all (platform MSI, for example)
+    
+    Either way, this looks wrong. Move the overriding of mask/unmask to
+    the PCI counterpart, and panic is any of these two methods is not
+    set in the core code (they really should be present).
+    
+    Signed-off-by: Marc Zyngier <marc.zyngier@arm.com>
+    Cc: Jiang Liu <jiang.liu@linux.intel.com>
+    Cc: Bjorn Helgaas <bhelgaas@google.com>
+    Link: http://lkml.kernel.org/r/1444760085-27857-1-git-send-email-marc.zyngier@arm.com
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+
+diff --git a/kernel/irq/msi.c b/kernel/irq/msi.c
+index 7e6512b9dc1f..be9149f62eb8 100644
+--- a/kernel/irq/msi.c
++++ b/kernel/irq/msi.c
+@@ -228,11 +228,7 @@ static void msi_domain_update_chip_ops(struct msi_domain_info *info)
+ {
+ 	struct irq_chip *chip = info->chip;
+ 
+-	BUG_ON(!chip);
+-	if (!chip->irq_mask)
+-		chip->irq_mask = pci_msi_mask_irq;
+-	if (!chip->irq_unmask)
+-		chip->irq_unmask = pci_msi_unmask_irq;
++	BUG_ON(!chip || !chip->irq_mask || !chip->irq_unmask);
+ 	if (!chip->irq_set_affinity)
+ 		chip->irq_set_affinity = msi_domain_set_affinity;
+ }
+
+commit be5436c83ac8921f33fe07323fab03c6644ce52e
+Author: Marc Zyngier <marc.zyngier@arm.com>
+Date:   Tue Oct 13 12:51:44 2015 +0100
+
+    irqdomain/msi: Use fwnode instead of of_node
+    
+    As we continue to push of_node towards the outskirts of irq domains,
+    let's start tackling the case of msi_create_irq_domain and its little
+    friends.
+    
+    This has limited impact in both PCI/MSI, platform MSI, and a few
+    drivers.
+    
+    Signed-off-by: Marc Zyngier <marc.zyngier@arm.com>
+    Tested-by: Hanjun Guo <hanjun.guo@linaro.org>
+    Tested-by: Lorenzo Pieralisi <lorenzo.pieralisi@arm.com>
+    Cc: <linux-arm-kernel@lists.infradead.org>
+    Cc: Tomasz Nowicki <tomasz.nowicki@linaro.org>
+    Cc: Suravee Suthikulpanit <Suravee.Suthikulpanit@amd.com>
+    Cc: Graeme Gregory <graeme@xora.org.uk>
+    Cc: Jake Oshins <jakeo@microsoft.com>
+    Cc: Jiang Liu <jiang.liu@linux.intel.com>
+    Cc: Jason Cooper <jason@lakedaemon.net>
+    Cc: Rafael J. Wysocki <rjw@rjwysocki.net>
+    Link: http://lkml.kernel.org/r/1444737105-31573-17-git-send-email-marc.zyngier@arm.com
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+
+diff --git a/kernel/irq/msi.c b/kernel/irq/msi.c
+index 7e6512b9dc1f..95354bb07a14 100644
+--- a/kernel/irq/msi.c
++++ b/kernel/irq/msi.c
+@@ -239,11 +239,11 @@ static void msi_domain_update_chip_ops(struct msi_domain_info *info)
+ 
+ /**
+  * msi_create_irq_domain - Create a MSI interrupt domain
+- * @of_node:	Optional device-tree node of the interrupt controller
++ * @fwnode:	Optional fwnode of the interrupt controller
+  * @info:	MSI domain info
+  * @parent:	Parent irq domain
+  */
+-struct irq_domain *msi_create_irq_domain(struct device_node *node,
++struct irq_domain *msi_create_irq_domain(struct fwnode_handle *fwnode,
+ 					 struct msi_domain_info *info,
+ 					 struct irq_domain *parent)
+ {
+@@ -252,8 +252,8 @@ struct irq_domain *msi_create_irq_domain(struct device_node *node,
+ 	if (info->flags & MSI_FLAG_USE_DEF_CHIP_OPS)
+ 		msi_domain_update_chip_ops(info);
+ 
+-	return irq_domain_add_hierarchy(parent, 0, 0, node, &msi_domain_ops,
+-					info);
++	return irq_domain_create_hierarchy(parent, 0, 0, fwnode,
++					   &msi_domain_ops, info);
+ }
+ 
+ /**
+
+commit aa48b6f708868ab9c22ca737f27a0da832bf7f08
+Author: Jiang Liu <jiang.liu@linux.intel.com>
+Date:   Thu Jul 9 16:00:47 2015 +0800
+
+    genirq/MSI: Move alloc_msi_entry() from PCI into generic MSI code
+    
+    Move alloc_msi_entry() from PCI MSI code into generic MSI code, so it
+    can be reused by other generic MSI drivers.  Also introduce
+    free_msi_entry() for completeness.
+    
+    Suggested-by: Stuart Yoder <stuart.yoder@freescale.com>.
+    Signed-off-by: Jiang Liu <jiang.liu@linux.intel.com>
+    Reviewed-by: Marc Zyngier <marc.zyngier@arm.com>
+    Reviewed-by: Yijing Wang <wangyijing@huawei.com>
+    Acked-by: Bjorn Helgaas <bhelgaas@google.com>
+    Cc: Tony Luck <tony.luck@intel.com>
+    Cc: linux-arm-kernel@lists.infradead.org
+    Cc: Grant Likely <grant.likely@linaro.org>
+    Cc: Borislav Petkov <bp@alien8.de>
+    Cc: Alexander Gordeev <agordeev@redhat.com>
+    Link: http://lkml.kernel.org/r/1436428847-8886-13-git-send-email-jiang.liu@linux.intel.com
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+
+diff --git a/kernel/irq/msi.c b/kernel/irq/msi.c
+index 7bf1f1bbb7fa..7e6512b9dc1f 100644
+--- a/kernel/irq/msi.c
++++ b/kernel/irq/msi.c
+@@ -18,6 +18,23 @@
+ /* Temparory solution for building, will be removed later */
+ #include <linux/pci.h>
+ 
++struct msi_desc *alloc_msi_entry(struct device *dev)
++{
++	struct msi_desc *desc = kzalloc(sizeof(*desc), GFP_KERNEL);
++	if (!desc)
++		return NULL;
++
++	INIT_LIST_HEAD(&desc->list);
++	desc->dev = dev;
++
++	return desc;
++}
++
++void free_msi_entry(struct msi_desc *entry)
++{
++	kfree(entry);
++}
++
+ void __get_cached_msi_msg(struct msi_desc *entry, struct msi_msg *msg)
+ {
+ 	*msg = entry->msg;
+
+commit 01364028bdbb095dc6524986261fe1777ad04347
+Author: Krzysztof Kozlowski <k.kozlowski.k@gmail.com>
+Date:   Mon Apr 27 21:54:23 2015 +0900
+
+    genirq: MSI: Constify irq_domain_ops
+    
+    The irq_domain_ops are not modified. The irqdomain core code accepts
+    pointer to a const data.
+    
+    Signed-off-by: Krzysztof Kozlowski <k.kozlowski.k@gmail.com>
+    Cc: Jason Cooper <jason@lakedaemon.net>
+    Cc: Kukjin Kim <kgene@kernel.org>
+    Cc: Stephen Warren <swarren@wwwdotorg.org>
+    Cc: Lee Jones <lee@kernel.org>
+    Cc: Matthias Brugger <matthias.bgg@gmail.com>
+    Cc: Maxime Ripard <maxime.ripard@free-electrons.com>
+    Cc: linux-arm-kernel@lists.infradead.org
+    Cc: linux-rpi-kernel@lists.infradead.org
+    Cc: linux-mediatek@lists.infradead.org
+    Link: http://lkml.kernel.org/r/1430139264-4362-1-git-send-email-k.kozlowski.k@gmail.com
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+
+diff --git a/kernel/irq/msi.c b/kernel/irq/msi.c
+index 474de5cb394d..7bf1f1bbb7fa 100644
+--- a/kernel/irq/msi.c
++++ b/kernel/irq/msi.c
+@@ -124,7 +124,7 @@ static void msi_domain_free(struct irq_domain *domain, unsigned int virq,
+ 	irq_domain_free_irqs_top(domain, virq, nr_irqs);
+ }
+ 
+-static struct irq_domain_ops msi_domain_ops = {
++static const struct irq_domain_ops msi_domain_ops = {
+ 	.alloc		= msi_domain_alloc,
+ 	.free		= msi_domain_free,
+ 	.activate	= msi_domain_activate,
+
+commit fe0c52fc003bc046380e52fe6799c96d770770cc
+Author: Marc Zyngier <marc.zyngier@arm.com>
+Date:   Mon Jan 26 19:10:19 2015 +0000
+
+    genirq: MSI: Fix freeing of unallocated MSI
+    
+    While debugging an unrelated issue with the GICv3 ITS driver, the
+    following trace triggered:
+    
+    WARNING: CPU: 1 PID: 1 at kernel/irq/irqdomain.c:1121 irq_domain_free_irqs+0x160/0x17c()
+    NULL pointer, cannot free irq
+    Modules linked in:
+    CPU: 1 PID: 1 Comm: swapper/0 Tainted: G        W      3.19.0-rc6+ #3690
+    Hardware name: FVP Base (DT)
+    Call trace:
+    [<ffffffc000089398>] dump_backtrace+0x0/0x13c
+    [<ffffffc0000894e4>] show_stack+0x10/0x1c
+    [<ffffffc00066d134>] dump_stack+0x74/0x94
+    [<ffffffc0000a92f8>] warn_slowpath_common+0x9c/0xd4
+    [<ffffffc0000a938c>] warn_slowpath_fmt+0x5c/0x80
+    [<ffffffc0000ee04c>] irq_domain_free_irqs+0x15c/0x17c
+    [<ffffffc0000ef918>] msi_domain_free_irqs+0x58/0x74
+    [<ffffffc000386f58>] free_msi_irqs+0xb4/0x1c0
+    
+        // The msi_prepare callback fails here
+    
+    [<ffffffc0003872c0>] pci_enable_msix+0x25c/0x3d4
+    [<ffffffc00038746c>] pci_enable_msix_range+0x34/0x80
+    [<ffffffc0003924ac>] vp_try_to_find_vqs+0xec/0x528
+    [<ffffffc000392954>] vp_find_vqs+0x6c/0xa8
+    [<ffffffc0003ee2a8>] init_vq+0x120/0x248
+    [<ffffffc0003eefb0>] virtblk_probe+0xb0/0x6bc
+    [<ffffffc00038fc34>] virtio_dev_probe+0x17c/0x214
+    [<ffffffc0003d4a04>] driver_probe_device+0x7c/0x23c
+    [<ffffffc0003d4cb0>] __driver_attach+0x98/0xa0
+    [<ffffffc0003d2c60>] bus_for_each_dev+0x60/0xb4
+    [<ffffffc0003d455c>] driver_attach+0x1c/0x28
+    [<ffffffc0003d41b0>] bus_add_driver+0x150/0x208
+    [<ffffffc0003d54c0>] driver_register+0x64/0x130
+    [<ffffffc00038f9e8>] register_virtio_driver+0x24/0x68
+    [<ffffffc00091320c>] init+0x70/0xac
+    [<ffffffc0000828f0>] do_one_initcall+0x94/0x1d0
+    [<ffffffc0008e9b00>] kernel_init_freeable+0x144/0x1e4
+    [<ffffffc00066a434>] kernel_init+0xc/0xd8
+    ---[ end trace f9ee562a77cc7bae ]---
+    
+    The ITS msi_prepare callback having failed, we end-up trying to
+    free MSIs that have never been allocated. Oddly enough, the kernel
+    is pretty upset about it.
+    
+    It turns out that this behaviour was expected before the MSI domain
+    was introduced (and dealt with in arch_teardown_msi_irqs).
+    
+    The obvious fix is to detect this early enough and bail out.
+    
+    Signed-off-by: Marc Zyngier <marc.zyngier@arm.com>
+    Reviewed-by: Jiang Liu <jiang.liu@linux.intel.com>
+    Link: http://lkml.kernel.org/r/1422299419-6051-1-git-send-email-marc.zyngier@arm.com
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+
+diff --git a/kernel/irq/msi.c b/kernel/irq/msi.c
+index 3e18163f336f..474de5cb394d 100644
+--- a/kernel/irq/msi.c
++++ b/kernel/irq/msi.c
+@@ -310,8 +310,15 @@ void msi_domain_free_irqs(struct irq_domain *domain, struct device *dev)
+ 	struct msi_desc *desc;
+ 
+ 	for_each_msi_entry(desc, dev) {
+-		irq_domain_free_irqs(desc->irq, desc->nvec_used);
+-		desc->irq = 0;
++		/*
++		 * We might have failed to allocate an MSI early
++		 * enough that there is no IRQ associated to this
++		 * entry. If that's the case, don't do anything.
++		 */
++		if (desc->irq) {
++			irq_domain_free_irqs(desc->irq, desc->nvec_used);
++			desc->irq = 0;
++		}
+ 	}
+ }
+ 
+
+commit 74faaf7aa64c76b60db0f5c994fd43a46be772ce
+Author: Thomas Gleixner <tglx@linutronix.de>
+Date:   Sat Dec 6 21:20:20 2014 +0100
+
+    genirq: Move irq_chip_write_msi_msg() helper to core
+    
+    No point to expose this to the world. The only legitimate user is the
+    core code.
+    
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Jiang Liu <jiang.liu@linux.intel.com>
+    Cc: Marc Zyngier <marc.zyngier@arm.com>
+
+diff --git a/kernel/irq/msi.c b/kernel/irq/msi.c
+index f477a2f8ce56..3e18163f336f 100644
+--- a/kernel/irq/msi.c
++++ b/kernel/irq/msi.c
+@@ -32,6 +32,12 @@ void get_cached_msi_msg(unsigned int irq, struct msi_msg *msg)
+ EXPORT_SYMBOL_GPL(get_cached_msi_msg);
+ 
+ #ifdef CONFIG_GENERIC_MSI_IRQ_DOMAIN
++static inline void irq_chip_write_msi_msg(struct irq_data *data,
++					  struct msi_msg *msg)
++{
++	data->chip->irq_write_msi_msg(data, msg);
++}
++
+ /**
+  * msi_domain_set_affinity - Generic affinity setter function for MSI domains
+  * @irq_data:	The irq data associated to the interrupt
+
+commit 38b6a1cf3e4df0a3267c01fab699ab65d58690f4
+Author: Jiang Liu <jiang.liu@linux.intel.com>
+Date:   Wed Nov 12 12:11:25 2014 +0100
+
+    PCI/MSI: Move cached entry functions to irq core
+    
+    Required to support non PCI based MSI.
+    
+    [ tglx: Extracted from Jiangs patch series ]
+    
+    Signed-off-by: Jiang Liu <jiang.liu@linux.intel.com>
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+
+diff --git a/kernel/irq/msi.c b/kernel/irq/msi.c
+index d0fe84d881f6..f477a2f8ce56 100644
+--- a/kernel/irq/msi.c
++++ b/kernel/irq/msi.c
+@@ -18,6 +18,19 @@
+ /* Temparory solution for building, will be removed later */
+ #include <linux/pci.h>
+ 
++void __get_cached_msi_msg(struct msi_desc *entry, struct msi_msg *msg)
++{
++	*msg = entry->msg;
++}
++
++void get_cached_msi_msg(unsigned int irq, struct msi_msg *msg)
++{
++	struct msi_desc *entry = irq_get_msi_desc(irq);
++
++	__get_cached_msi_msg(entry, msg);
++}
++EXPORT_SYMBOL_GPL(get_cached_msi_msg);
++
+ #ifdef CONFIG_GENERIC_MSI_IRQ_DOMAIN
+ /**
+  * msi_domain_set_affinity - Generic affinity setter function for MSI domains
+
+commit aeeb59657c35da64068336c20068da237f41ab76
+Author: Jiang Liu <jiang.liu@linux.intel.com>
+Date:   Sat Nov 15 22:24:05 2014 +0800
+
+    genirq: Provide default callbacks for msi_domain_ops
+    
+    Extend struct msi_domain_info and provide default callbacks for
+    msi_domain_ops.
+    
+    Signed-off-by: Jiang Liu <jiang.liu@linux.intel.com>
+    Cc: Tony Luck <tony.luck@intel.com>
+    Cc: linux-arm-kernel@lists.infradead.org
+    Cc: Bjorn Helgaas <bhelgaas@google.com>
+    Cc: Grant Likely <grant.likely@linaro.org>
+    Cc: Marc Zyngier <marc.zyngier@arm.com>
+    Cc: Yijing Wang <wangyijing@huawei.com>
+    Cc: Yingjoe Chen <yingjoe.chen@mediatek.com>
+    Cc: Borislav Petkov <bp@alien8.de>
+    Cc: Matthias Brugger <matthias.bgg@gmail.com>
+    Cc: Alexander Gordeev <agordeev@redhat.com>
+    Link: http://lkml.kernel.org/r/1416061447-9472-8-git-send-email-jiang.liu@linux.intel.com
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+
+diff --git a/kernel/irq/msi.c b/kernel/irq/msi.c
+index 23111aaa06b2..d0fe84d881f6 100644
+--- a/kernel/irq/msi.c
++++ b/kernel/irq/msi.c
+@@ -9,6 +9,8 @@
+  * This file contains common code to support Message Signalled Interrupt for
+  * PCI compatible and non PCI compatible devices.
+  */
++#include <linux/types.h>
++#include <linux/device.h>
+ #include <linux/irq.h>
+ #include <linux/irqdomain.h>
+ #include <linux/msi.h>
+@@ -110,23 +112,112 @@ static struct irq_domain_ops msi_domain_ops = {
+ 	.deactivate	= msi_domain_deactivate,
+ };
+ 
++#ifdef GENERIC_MSI_DOMAIN_OPS
++static irq_hw_number_t msi_domain_ops_get_hwirq(struct msi_domain_info *info,
++						msi_alloc_info_t *arg)
++{
++	return arg->hwirq;
++}
++
++static int msi_domain_ops_prepare(struct irq_domain *domain, struct device *dev,
++				  int nvec, msi_alloc_info_t *arg)
++{
++	memset(arg, 0, sizeof(*arg));
++	return 0;
++}
++
++static void msi_domain_ops_set_desc(msi_alloc_info_t *arg,
++				    struct msi_desc *desc)
++{
++	arg->desc = desc;
++}
++#else
++#define msi_domain_ops_get_hwirq	NULL
++#define msi_domain_ops_prepare		NULL
++#define msi_domain_ops_set_desc		NULL
++#endif /* !GENERIC_MSI_DOMAIN_OPS */
++
++static int msi_domain_ops_init(struct irq_domain *domain,
++			       struct msi_domain_info *info,
++			       unsigned int virq, irq_hw_number_t hwirq,
++			       msi_alloc_info_t *arg)
++{
++	irq_domain_set_hwirq_and_chip(domain, virq, hwirq, info->chip,
++				      info->chip_data);
++	if (info->handler && info->handler_name) {
++		__irq_set_handler(virq, info->handler, 0, info->handler_name);
++		if (info->handler_data)
++			irq_set_handler_data(virq, info->handler_data);
++	}
++	return 0;
++}
++
++static int msi_domain_ops_check(struct irq_domain *domain,
++				struct msi_domain_info *info,
++				struct device *dev)
++{
++	return 0;
++}
++
++static struct msi_domain_ops msi_domain_ops_default = {
++	.get_hwirq	= msi_domain_ops_get_hwirq,
++	.msi_init	= msi_domain_ops_init,
++	.msi_check	= msi_domain_ops_check,
++	.msi_prepare	= msi_domain_ops_prepare,
++	.set_desc	= msi_domain_ops_set_desc,
++};
++
++static void msi_domain_update_dom_ops(struct msi_domain_info *info)
++{
++	struct msi_domain_ops *ops = info->ops;
++
++	if (ops == NULL) {
++		info->ops = &msi_domain_ops_default;
++		return;
++	}
++
++	if (ops->get_hwirq == NULL)
++		ops->get_hwirq = msi_domain_ops_default.get_hwirq;
++	if (ops->msi_init == NULL)
++		ops->msi_init = msi_domain_ops_default.msi_init;
++	if (ops->msi_check == NULL)
++		ops->msi_check = msi_domain_ops_default.msi_check;
++	if (ops->msi_prepare == NULL)
++		ops->msi_prepare = msi_domain_ops_default.msi_prepare;
++	if (ops->set_desc == NULL)
++		ops->set_desc = msi_domain_ops_default.set_desc;
++}
++
++static void msi_domain_update_chip_ops(struct msi_domain_info *info)
++{
++	struct irq_chip *chip = info->chip;
++
++	BUG_ON(!chip);
++	if (!chip->irq_mask)
++		chip->irq_mask = pci_msi_mask_irq;
++	if (!chip->irq_unmask)
++		chip->irq_unmask = pci_msi_unmask_irq;
++	if (!chip->irq_set_affinity)
++		chip->irq_set_affinity = msi_domain_set_affinity;
++}
++
+ /**
+  * msi_create_irq_domain - Create a MSI interrupt domain
+  * @of_node:	Optional device-tree node of the interrupt controller
+  * @info:	MSI domain info
+  * @parent:	Parent irq domain
+  */
+-struct irq_domain *msi_create_irq_domain(struct device_node *of_node,
++struct irq_domain *msi_create_irq_domain(struct device_node *node,
+ 					 struct msi_domain_info *info,
+ 					 struct irq_domain *parent)
+ {
+-	struct irq_domain *domain;
++	if (info->flags & MSI_FLAG_USE_DEF_DOM_OPS)
++		msi_domain_update_dom_ops(info);
++	if (info->flags & MSI_FLAG_USE_DEF_CHIP_OPS)
++		msi_domain_update_chip_ops(info);
+ 
+-	domain = irq_domain_add_tree(of_node, &msi_domain_ops, info);
+-	if (domain)
+-		domain->parent = parent;
+-
+-	return domain;
++	return irq_domain_add_hierarchy(parent, 0, 0, node, &msi_domain_ops,
++					info);
+ }
+ 
+ /**
+@@ -155,8 +246,12 @@ int msi_domain_alloc_irqs(struct irq_domain *domain, struct device *dev,
+ 
+ 	for_each_msi_entry(desc, dev) {
+ 		ops->set_desc(&arg, desc);
++		if (info->flags & MSI_FLAG_IDENTITY_MAP)
++			virq = (int)ops->get_hwirq(info, &arg);
++		else
++			virq = -1;
+ 
+-		virq = __irq_domain_alloc_irqs(domain, -1, desc->nvec_used,
++		virq = __irq_domain_alloc_irqs(domain, virq, desc->nvec_used,
+ 					       dev_to_node(dev), &arg, false);
+ 		if (virq < 0) {
+ 			ret = -ENOSPC;
+
+commit d9109698be6e7439e6082aa00d79d4556114739b
+Author: Jiang Liu <jiang.liu@linux.intel.com>
+Date:   Sat Nov 15 22:24:04 2014 +0800
+
+    genirq: Introduce msi_domain_alloc/free_irqs()
+    
+    Introduce msi_domain_{alloc|free}_irqs() to alloc/free interrupts
+    from generic MSI irqdomain.
+    
+    Signed-off-by: Jiang Liu <jiang.liu@linux.intel.com>
+    Cc: Tony Luck <tony.luck@intel.com>
+    Cc: linux-arm-kernel@lists.infradead.org
+    Cc: Bjorn Helgaas <bhelgaas@google.com>
+    Cc: Grant Likely <grant.likely@linaro.org>
+    Cc: Marc Zyngier <marc.zyngier@arm.com>
+    Cc: Yijing Wang <wangyijing@huawei.com>
+    Cc: Yingjoe Chen <yingjoe.chen@mediatek.com>
+    Cc: Borislav Petkov <bp@alien8.de>
+    Cc: Matthias Brugger <matthias.bgg@gmail.com>
+    Cc: Alexander Gordeev <agordeev@redhat.com>
+    Link: http://lkml.kernel.org/r/1416061447-9472-7-git-send-email-jiang.liu@linux.intel.com
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+
+diff --git a/kernel/irq/msi.c b/kernel/irq/msi.c
+index 5e0cef4741d9..23111aaa06b2 100644
+--- a/kernel/irq/msi.c
++++ b/kernel/irq/msi.c
+@@ -13,6 +13,9 @@
+ #include <linux/irqdomain.h>
+ #include <linux/msi.h>
+ 
++/* Temparory solution for building, will be removed later */
++#include <linux/pci.h>
++
+ #ifdef CONFIG_GENERIC_MSI_IRQ_DOMAIN
+ /**
+  * msi_domain_set_affinity - Generic affinity setter function for MSI domains
+@@ -126,6 +129,78 @@ struct irq_domain *msi_create_irq_domain(struct device_node *of_node,
+ 	return domain;
+ }
+ 
++/**
++ * msi_domain_alloc_irqs - Allocate interrupts from a MSI interrupt domain
++ * @domain:	The domain to allocate from
++ * @dev:	Pointer to device struct of the device for which the interrupts
++ *		are allocated
++ * @nvec:	The number of interrupts to allocate
++ *
++ * Returns 0 on success or an error code.
++ */
++int msi_domain_alloc_irqs(struct irq_domain *domain, struct device *dev,
++			  int nvec)
++{
++	struct msi_domain_info *info = domain->host_data;
++	struct msi_domain_ops *ops = info->ops;
++	msi_alloc_info_t arg;
++	struct msi_desc *desc;
++	int i, ret, virq = -1;
++
++	ret = ops->msi_check(domain, info, dev);
++	if (ret == 0)
++		ret = ops->msi_prepare(domain, dev, nvec, &arg);
++	if (ret)
++		return ret;
++
++	for_each_msi_entry(desc, dev) {
++		ops->set_desc(&arg, desc);
++
++		virq = __irq_domain_alloc_irqs(domain, -1, desc->nvec_used,
++					       dev_to_node(dev), &arg, false);
++		if (virq < 0) {
++			ret = -ENOSPC;
++			if (ops->handle_error)
++				ret = ops->handle_error(domain, desc, ret);
++			if (ops->msi_finish)
++				ops->msi_finish(&arg, ret);
++			return ret;
++		}
++
++		for (i = 0; i < desc->nvec_used; i++)
++			irq_set_msi_desc_off(virq, i, desc);
++	}
++
++	if (ops->msi_finish)
++		ops->msi_finish(&arg, 0);
++
++	for_each_msi_entry(desc, dev) {
++		if (desc->nvec_used == 1)
++			dev_dbg(dev, "irq %d for MSI\n", virq);
++		else
++			dev_dbg(dev, "irq [%d-%d] for MSI\n",
++				virq, virq + desc->nvec_used - 1);
++	}
++
++	return 0;
++}
++
++/**
++ * msi_domain_free_irqs - Free interrupts from a MSI interrupt @domain associated tp @dev
++ * @domain:	The domain to managing the interrupts
++ * @dev:	Pointer to device struct of the device for which the interrupts
++ *		are free
++ */
++void msi_domain_free_irqs(struct irq_domain *domain, struct device *dev)
++{
++	struct msi_desc *desc;
++
++	for_each_msi_entry(desc, dev) {
++		irq_domain_free_irqs(desc->irq, desc->nvec_used);
++		desc->irq = 0;
++	}
++}
++
+ /**
+  * msi_get_domain_info - Get the MSI interrupt domain info for @domain
+  * @domain:	The interrupt domain to retrieve data from
+
+commit f3cf8bb0d6c3c11ddedf01f02f856f2ae8c33aa4
+Author: Jiang Liu <jiang.liu@linux.intel.com>
+Date:   Wed Nov 12 11:39:03 2014 +0100
+
+    genirq: Add generic msi irq domain support
+    
+    Implement the basic functions for MSI interrupt support with
+    hierarchical interrupt domains.
+    
+    [ tglx: Extracted and combined from several patches ]
+    
+    Signed-off-by: Jiang Liu <jiang.liu@linux.intel.com>
+    Cc: Bjorn Helgaas <bhelgaas@google.com>
+    Cc: Grant Likely <grant.likely@linaro.org>
+    Cc: Marc Zyngier <marc.zyngier@arm.com>
+    Cc: Yingjoe Chen <yingjoe.chen@mediatek.com>
+    Cc: Yijing Wang <wangyijing@huawei.com>
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+
+diff --git a/kernel/irq/msi.c b/kernel/irq/msi.c
+new file mode 100644
+index 000000000000..5e0cef4741d9
+--- /dev/null
++++ b/kernel/irq/msi.c
+@@ -0,0 +1,141 @@
++/*
++ * linux/kernel/irq/msi.c
++ *
++ * Copyright (C) 2014 Intel Corp.
++ * Author: Jiang Liu <jiang.liu@linux.intel.com>
++ *
++ * This file is licensed under GPLv2.
++ *
++ * This file contains common code to support Message Signalled Interrupt for
++ * PCI compatible and non PCI compatible devices.
++ */
++#include <linux/irq.h>
++#include <linux/irqdomain.h>
++#include <linux/msi.h>
++
++#ifdef CONFIG_GENERIC_MSI_IRQ_DOMAIN
++/**
++ * msi_domain_set_affinity - Generic affinity setter function for MSI domains
++ * @irq_data:	The irq data associated to the interrupt
++ * @mask:	The affinity mask to set
++ * @force:	Flag to enforce setting (disable online checks)
++ *
++ * Intended to be used by MSI interrupt controllers which are
++ * implemented with hierarchical domains.
++ */
++int msi_domain_set_affinity(struct irq_data *irq_data,
++			    const struct cpumask *mask, bool force)
++{
++	struct irq_data *parent = irq_data->parent_data;
++	struct msi_msg msg;
++	int ret;
++
++	ret = parent->chip->irq_set_affinity(parent, mask, force);
++	if (ret >= 0 && ret != IRQ_SET_MASK_OK_DONE) {
++		BUG_ON(irq_chip_compose_msi_msg(irq_data, &msg));
++		irq_chip_write_msi_msg(irq_data, &msg);
++	}
++
++	return ret;
++}
++
++static void msi_domain_activate(struct irq_domain *domain,
++				struct irq_data *irq_data)
++{
++	struct msi_msg msg;
++
++	BUG_ON(irq_chip_compose_msi_msg(irq_data, &msg));
++	irq_chip_write_msi_msg(irq_data, &msg);
++}
++
++static void msi_domain_deactivate(struct irq_domain *domain,
++				  struct irq_data *irq_data)
++{
++	struct msi_msg msg;
++
++	memset(&msg, 0, sizeof(msg));
++	irq_chip_write_msi_msg(irq_data, &msg);
++}
++
++static int msi_domain_alloc(struct irq_domain *domain, unsigned int virq,
++			    unsigned int nr_irqs, void *arg)
++{
++	struct msi_domain_info *info = domain->host_data;
++	struct msi_domain_ops *ops = info->ops;
++	irq_hw_number_t hwirq = ops->get_hwirq(info, arg);
++	int i, ret;
++
++	if (irq_find_mapping(domain, hwirq) > 0)
++		return -EEXIST;
++
++	ret = irq_domain_alloc_irqs_parent(domain, virq, nr_irqs, arg);
++	if (ret < 0)
++		return ret;
++
++	for (i = 0; i < nr_irqs; i++) {
++		ret = ops->msi_init(domain, info, virq + i, hwirq + i, arg);
++		if (ret < 0) {
++			if (ops->msi_free) {
++				for (i--; i > 0; i--)
++					ops->msi_free(domain, info, virq + i);
++			}
++			irq_domain_free_irqs_top(domain, virq, nr_irqs);
++			return ret;
++		}
++	}
++
++	return 0;
++}
++
++static void msi_domain_free(struct irq_domain *domain, unsigned int virq,
++			    unsigned int nr_irqs)
++{
++	struct msi_domain_info *info = domain->host_data;
++	int i;
++
++	if (info->ops->msi_free) {
++		for (i = 0; i < nr_irqs; i++)
++			info->ops->msi_free(domain, info, virq + i);
++	}
++	irq_domain_free_irqs_top(domain, virq, nr_irqs);
++}
++
++static struct irq_domain_ops msi_domain_ops = {
++	.alloc		= msi_domain_alloc,
++	.free		= msi_domain_free,
++	.activate	= msi_domain_activate,
++	.deactivate	= msi_domain_deactivate,
++};
++
++/**
++ * msi_create_irq_domain - Create a MSI interrupt domain
++ * @of_node:	Optional device-tree node of the interrupt controller
++ * @info:	MSI domain info
++ * @parent:	Parent irq domain
++ */
++struct irq_domain *msi_create_irq_domain(struct device_node *of_node,
++					 struct msi_domain_info *info,
++					 struct irq_domain *parent)
++{
++	struct irq_domain *domain;
++
++	domain = irq_domain_add_tree(of_node, &msi_domain_ops, info);
++	if (domain)
++		domain->parent = parent;
++
++	return domain;
++}
++
++/**
++ * msi_get_domain_info - Get the MSI interrupt domain info for @domain
++ * @domain:	The interrupt domain to retrieve data from
++ *
++ * Returns the pointer to the msi_domain_info stored in
++ * @domain->host_data.
++ */
++struct msi_domain_info *msi_get_domain_info(struct irq_domain *domain)
++{
++	return (struct msi_domain_info *)domain->host_data;
++}
++
++#endif /* CONFIG_GENERIC_MSI_IRQ_DOMAIN */

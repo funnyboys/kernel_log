@@ -1,0 +1,4460 @@
+commit 2522afb86a8cceba0f67dbf05772d21b76d79f06
+Author: Dan Williams <dan.j.williams@intel.com>
+Date:   Thu Jan 30 12:06:23 2020 -0800
+
+    libnvdimm/region: Introduce an 'align' attribute
+    
+    The align attribute applies an alignment constraint for namespace
+    creation in a region. Whereas the 'align' attribute of a namespace
+    applied alignment padding via an info block, the 'align' attribute
+    applies alignment constraints to the free space allocation.
+    
+    The default for 'align' is the maximum known memremap_compat_align()
+    across all archs (16MiB from PowerPC at time of writing) multiplied by
+    the number of interleave ways if there is blk-aliasing. The minimum is
+    PAGE_SIZE and allows for the creation of cross-arch incompatible
+    namespaces, just as previous kernels allowed, but the expectation is
+    cross-arch and mode-independent compatibility by default.
+    
+    The regression risk with this change is limited to cases that were
+    dependent on the ability to create unaligned namespaces, *and* for some
+    reason are unable to opt-out of aligned namespaces by writing to
+    'regionX/align'. If such a scenario arises the default can be flipped
+    from opt-out to opt-in of compat-aligned namespace creation, but that is
+    a last resort. The kernel will otherwise continue to support existing
+    defined misaligned namespaces.
+    
+    Unfortunately this change needs to touch several parts of the
+    implementation at once:
+    
+    - region/available_size: expand busy extents to current align
+    - region/max_available_extent: expand busy extents to current align
+    - namespace/size: trim free space to current align
+    
+    ...to keep the free space accounting conforming to the dynamic align
+    setting.
+    
+    Reported-by: Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+    Reported-by: Jeff Moyer <jmoyer@redhat.com>
+    Reviewed-by: Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+    Reviewed-by: Jeff Moyer <jmoyer@redhat.com>
+    Link: https://lore.kernel.org/r/158041478371.3889308.14542630147672668068.stgit@dwillia2-desk3.amr.corp.intel.com
+    Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+
+diff --git a/drivers/nvdimm/dimm_devs.c b/drivers/nvdimm/dimm_devs.c
+index 39a61a514746..b7b77e8d9027 100644
+--- a/drivers/nvdimm/dimm_devs.c
++++ b/drivers/nvdimm/dimm_devs.c
+@@ -563,6 +563,21 @@ int nvdimm_security_freeze(struct nvdimm *nvdimm)
+ 	return rc;
+ }
+ 
++static unsigned long dpa_align(struct nd_region *nd_region)
++{
++	struct device *dev = &nd_region->dev;
++
++	if (dev_WARN_ONCE(dev, !is_nvdimm_bus_locked(dev),
++				"bus lock required for capacity provision\n"))
++		return 0;
++	if (dev_WARN_ONCE(dev, !nd_region->ndr_mappings || nd_region->align
++				% nd_region->ndr_mappings,
++				"invalid region align %#lx mappings: %d\n",
++				nd_region->align, nd_region->ndr_mappings))
++		return 0;
++	return nd_region->align / nd_region->ndr_mappings;
++}
++
+ int alias_dpa_busy(struct device *dev, void *data)
+ {
+ 	resource_size_t map_end, blk_start, new;
+@@ -571,6 +586,7 @@ int alias_dpa_busy(struct device *dev, void *data)
+ 	struct nd_region *nd_region;
+ 	struct nvdimm_drvdata *ndd;
+ 	struct resource *res;
++	unsigned long align;
+ 	int i;
+ 
+ 	if (!is_memory(dev))
+@@ -608,13 +624,21 @@ int alias_dpa_busy(struct device *dev, void *data)
+ 	 * Find the free dpa from the end of the last pmem allocation to
+ 	 * the end of the interleave-set mapping.
+ 	 */
++	align = dpa_align(nd_region);
++	if (!align)
++		return 0;
++
+ 	for_each_dpa_resource(ndd, res) {
++		resource_size_t start, end;
++
+ 		if (strncmp(res->name, "pmem", 4) != 0)
+ 			continue;
+-		if ((res->start >= blk_start && res->start < map_end)
+-				|| (res->end >= blk_start
+-					&& res->end <= map_end)) {
+-			new = max(blk_start, min(map_end + 1, res->end + 1));
++
++		start = ALIGN_DOWN(res->start, align);
++		end = ALIGN(res->end + 1, align) - 1;
++		if ((start >= blk_start && start < map_end)
++				|| (end >= blk_start && end <= map_end)) {
++			new = max(blk_start, min(map_end, end) + 1);
+ 			if (new != blk_start) {
+ 				blk_start = new;
+ 				goto retry;
+@@ -654,6 +678,7 @@ resource_size_t nd_blk_available_dpa(struct nd_region *nd_region)
+ 		.res = NULL,
+ 	};
+ 	struct resource *res;
++	unsigned long align;
+ 
+ 	if (!ndd)
+ 		return 0;
+@@ -661,10 +686,20 @@ resource_size_t nd_blk_available_dpa(struct nd_region *nd_region)
+ 	device_for_each_child(&nvdimm_bus->dev, &info, alias_dpa_busy);
+ 
+ 	/* now account for busy blk allocations in unaliased dpa */
++	align = dpa_align(nd_region);
++	if (!align)
++		return 0;
+ 	for_each_dpa_resource(ndd, res) {
++		resource_size_t start, end, size;
++
+ 		if (strncmp(res->name, "blk", 3) != 0)
+ 			continue;
+-		info.available -= resource_size(res);
++		start = ALIGN_DOWN(res->start, align);
++		end = ALIGN(res->end + 1, align) - 1;
++		size = end - start + 1;
++		if (size >= info.available)
++			return 0;
++		info.available -= size;
+ 	}
+ 
+ 	return info.available;
+@@ -683,19 +718,31 @@ resource_size_t nd_pmem_max_contiguous_dpa(struct nd_region *nd_region,
+ 	struct nvdimm_bus *nvdimm_bus;
+ 	resource_size_t max = 0;
+ 	struct resource *res;
++	unsigned long align;
+ 
+ 	/* if a dimm is disabled the available capacity is zero */
+ 	if (!ndd)
+ 		return 0;
+ 
++	align = dpa_align(nd_region);
++	if (!align)
++		return 0;
++
+ 	nvdimm_bus = walk_to_nvdimm_bus(ndd->dev);
+ 	if (__reserve_free_pmem(&nd_region->dev, nd_mapping->nvdimm))
+ 		return 0;
+ 	for_each_dpa_resource(ndd, res) {
++		resource_size_t start, end;
++
+ 		if (strcmp(res->name, "pmem-reserve") != 0)
+ 			continue;
+-		if (resource_size(res) > max)
+-			max = resource_size(res);
++		/* trim free space relative to current alignment setting */
++		start = ALIGN(res->start, align);
++		end = ALIGN_DOWN(res->end + 1, align) - 1;
++		if (end < start)
++			continue;
++		if (end - start + 1 > max)
++			max = end - start + 1;
+ 	}
+ 	release_free_pmem(nvdimm_bus, nd_mapping);
+ 	return max;
+@@ -723,24 +770,33 @@ resource_size_t nd_pmem_available_dpa(struct nd_region *nd_region,
+ 	struct nvdimm_drvdata *ndd = to_ndd(nd_mapping);
+ 	struct resource *res;
+ 	const char *reason;
++	unsigned long align;
+ 
+ 	if (!ndd)
+ 		return 0;
+ 
++	align = dpa_align(nd_region);
++	if (!align)
++		return 0;
++
+ 	map_start = nd_mapping->start;
+ 	map_end = map_start + nd_mapping->size - 1;
+ 	blk_start = max(map_start, map_end + 1 - *overlap);
+ 	for_each_dpa_resource(ndd, res) {
+-		if (res->start >= map_start && res->start < map_end) {
++		resource_size_t start, end;
++
++		start = ALIGN_DOWN(res->start, align);
++		end = ALIGN(res->end + 1, align) - 1;
++		if (start >= map_start && start < map_end) {
+ 			if (strncmp(res->name, "blk", 3) == 0)
+ 				blk_start = min(blk_start,
+-						max(map_start, res->start));
+-			else if (res->end > map_end) {
++						max(map_start, start));
++			else if (end > map_end) {
+ 				reason = "misaligned to iset";
+ 				goto err;
+ 			} else
+-				busy += resource_size(res);
+-		} else if (res->end >= map_start && res->end <= map_end) {
++				busy += end - start + 1;
++		} else if (end >= map_start && end <= map_end) {
+ 			if (strncmp(res->name, "blk", 3) == 0) {
+ 				/*
+ 				 * If a BLK allocation overlaps the start of
+@@ -749,8 +805,8 @@ resource_size_t nd_pmem_available_dpa(struct nd_region *nd_region,
+ 				 */
+ 				blk_start = map_start;
+ 			} else
+-				busy += resource_size(res);
+-		} else if (map_start > res->start && map_start < res->end) {
++				busy += end - start + 1;
++		} else if (map_start > start && map_start < end) {
+ 			/* total eclipse of the mapping */
+ 			busy += nd_mapping->size;
+ 			blk_start = map_start;
+@@ -760,7 +816,7 @@ resource_size_t nd_pmem_available_dpa(struct nd_region *nd_region,
+ 	*overlap = map_end + 1 - blk_start;
+ 	available = blk_start - map_start;
+ 	if (busy < available)
+-		return available - busy;
++		return ALIGN_DOWN(available - busy, align);
+ 	return 0;
+ 
+  err:
+
+commit a0e374525def2ef18a078523e1faefb5ce2b05e5
+Author: Dan Williams <dan.j.williams@intel.com>
+Date:   Thu Jan 30 12:06:18 2020 -0800
+
+    libnvdimm/region: Introduce NDD_LABELING
+    
+    The NDD_ALIASING flag is used to indicate where pmem capacity might
+    alias with blk capacity and require labeling. It is also used to
+    indicate whether the DIMM supports labeling. Separate this latter
+    capability into its own flag so that the NDD_ALIASING flag is scoped to
+    true aliased configurations.
+    
+    To my knowledge aliased configurations only exist in the ACPI spec,
+    there are no known platforms that ship this support in production.
+    
+    This clarity allows namespace-capacity alignment constraints around
+    interleave-ways to be relaxed.
+    
+    Cc: Vishal Verma <vishal.l.verma@intel.com>
+    Cc: Oliver O'Halloran <oohall@gmail.com>
+    Reviewed-by: Jeff Moyer <jmoyer@redhat.com>
+    Reviewed-by: Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+    Link: https://lore.kernel.org/r/158041477856.3889308.4212605617834097674.stgit@dwillia2-desk3.amr.corp.intel.com
+    Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+
+diff --git a/drivers/nvdimm/dimm_devs.c b/drivers/nvdimm/dimm_devs.c
+index 94ea6dba6b4f..39a61a514746 100644
+--- a/drivers/nvdimm/dimm_devs.c
++++ b/drivers/nvdimm/dimm_devs.c
+@@ -32,7 +32,7 @@ int nvdimm_check_config_data(struct device *dev)
+ 
+ 	if (!nvdimm->cmd_mask ||
+ 	    !test_bit(ND_CMD_GET_CONFIG_DATA, &nvdimm->cmd_mask)) {
+-		if (test_bit(NDD_ALIASING, &nvdimm->flags))
++		if (test_bit(NDD_LABELING, &nvdimm->flags))
+ 			return -ENXIO;
+ 		else
+ 			return -ENOTTY;
+@@ -173,11 +173,11 @@ int nvdimm_set_config_data(struct nvdimm_drvdata *ndd, size_t offset,
+ 	return rc;
+ }
+ 
+-void nvdimm_set_aliasing(struct device *dev)
++void nvdimm_set_labeling(struct device *dev)
+ {
+ 	struct nvdimm *nvdimm = to_nvdimm(dev);
+ 
+-	set_bit(NDD_ALIASING, &nvdimm->flags);
++	set_bit(NDD_LABELING, &nvdimm->flags);
+ }
+ 
+ void nvdimm_set_locked(struct device *dev)
+@@ -312,8 +312,9 @@ static ssize_t flags_show(struct device *dev,
+ {
+ 	struct nvdimm *nvdimm = to_nvdimm(dev);
+ 
+-	return sprintf(buf, "%s%s\n",
++	return sprintf(buf, "%s%s%s\n",
+ 			test_bit(NDD_ALIASING, &nvdimm->flags) ? "alias " : "",
++			test_bit(NDD_LABELING, &nvdimm->flags) ? "label " : "",
+ 			test_bit(NDD_LOCKED, &nvdimm->flags) ? "lock " : "");
+ }
+ static DEVICE_ATTR_RO(flags);
+
+commit 360eba7ebdf716194ed2ede1ebc3ce0f9790a91c
+Author: Dan Williams <dan.j.williams@intel.com>
+Date:   Tue Nov 12 17:08:04 2019 -0800
+
+    libnvdimm: Move nvdimm_attribute_group to device_type
+    
+    A 'struct device_type' instance can carry default attributes for the
+    device. Use this facility to remove the export of
+    nvdimm_attribute_group and put the responsibility on the core rather
+    than leaf implementations to define this attribute.
+    
+    Cc: Ira Weiny <ira.weiny@intel.com>
+    Cc: Michael Ellerman <mpe@ellerman.id.au>
+    Cc: "Oliver O'Halloran" <oohall@gmail.com>
+    Cc: Vishal Verma <vishal.l.verma@intel.com>
+    Cc: Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+    Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+    Reviewed-by: Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+    Link: https://lore.kernel.org/r/157309903201.1582359.10966209746585062329.stgit@dwillia2-desk3.amr.corp.intel.com
+
+diff --git a/drivers/nvdimm/dimm_devs.c b/drivers/nvdimm/dimm_devs.c
+index 278867c68682..94ea6dba6b4f 100644
+--- a/drivers/nvdimm/dimm_devs.c
++++ b/drivers/nvdimm/dimm_devs.c
+@@ -202,22 +202,6 @@ static void nvdimm_release(struct device *dev)
+ 	kfree(nvdimm);
+ }
+ 
+-static const struct attribute_group *nvdimm_attribute_groups[] = {
+-	&nd_device_attribute_group,
+-	NULL,
+-};
+-
+-static const struct device_type nvdimm_device_type = {
+-	.name = "nvdimm",
+-	.release = nvdimm_release,
+-	.groups = nvdimm_attribute_groups,
+-};
+-
+-bool is_nvdimm(struct device *dev)
+-{
+-	return dev->type == &nvdimm_device_type;
+-}
+-
+ struct nvdimm *to_nvdimm(struct device *dev)
+ {
+ 	struct nvdimm *nvdimm = container_of(dev, struct nvdimm, dev);
+@@ -456,11 +440,27 @@ static umode_t nvdimm_visible(struct kobject *kobj, struct attribute *a, int n)
+ 	return 0;
+ }
+ 
+-struct attribute_group nvdimm_attribute_group = {
++static const struct attribute_group nvdimm_attribute_group = {
+ 	.attrs = nvdimm_attributes,
+ 	.is_visible = nvdimm_visible,
+ };
+-EXPORT_SYMBOL_GPL(nvdimm_attribute_group);
++
++static const struct attribute_group *nvdimm_attribute_groups[] = {
++	&nd_device_attribute_group,
++	&nvdimm_attribute_group,
++	NULL,
++};
++
++static const struct device_type nvdimm_device_type = {
++	.name = "nvdimm",
++	.release = nvdimm_release,
++	.groups = nvdimm_attribute_groups,
++};
++
++bool is_nvdimm(struct device *dev)
++{
++	return dev->type == &nvdimm_device_type;
++}
+ 
+ struct nvdimm *__nvdimm_create(struct nvdimm_bus *nvdimm_bus,
+ 		void *provider_data, const struct attribute_group **groups,
+
+commit adbb68293fc5950a46e3e22f9dc9c619661194ae
+Author: Dan Williams <dan.j.williams@intel.com>
+Date:   Tue Nov 12 17:00:24 2019 -0800
+
+    libnvdimm: Move nd_device_attribute_group to device_type
+    
+    A 'struct device_type' instance can carry default attributes for the
+    device. Use this facility to remove the export of
+    nd_device_attribute_group and put the responsibility on the core rather
+    than leaf implementations to define this attribute.
+    
+    For regions this creates a new nd_region_attribute_groups[] added to the
+    per-region device-type instances.
+    
+    Cc: Ira Weiny <ira.weiny@intel.com>
+    Cc: Michael Ellerman <mpe@ellerman.id.au>
+    Cc: "Oliver O'Halloran" <oohall@gmail.com>
+    Cc: Vishal Verma <vishal.l.verma@intel.com>
+    Cc: Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+    Reviewed-by: Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+    Link: https://lore.kernel.org/r/157309901138.1582359.12909354140826530394.stgit@dwillia2-desk3.amr.corp.intel.com
+    Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+
+diff --git a/drivers/nvdimm/dimm_devs.c b/drivers/nvdimm/dimm_devs.c
+index 196aa44c4936..278867c68682 100644
+--- a/drivers/nvdimm/dimm_devs.c
++++ b/drivers/nvdimm/dimm_devs.c
+@@ -202,9 +202,15 @@ static void nvdimm_release(struct device *dev)
+ 	kfree(nvdimm);
+ }
+ 
+-static struct device_type nvdimm_device_type = {
++static const struct attribute_group *nvdimm_attribute_groups[] = {
++	&nd_device_attribute_group,
++	NULL,
++};
++
++static const struct device_type nvdimm_device_type = {
+ 	.name = "nvdimm",
+ 	.release = nvdimm_release,
++	.groups = nvdimm_attribute_groups,
+ };
+ 
+ bool is_nvdimm(struct device *dev)
+
+commit 7b60422cb796d40431337becf2129fd9944b2f05
+Author: Dan Williams <dan.j.williams@intel.com>
+Date:   Mon Aug 26 17:55:05 2019 -0700
+
+    libnvdimm/security: Consolidate 'security' operations
+    
+    The security operations are exported from libnvdimm/security.c to
+    libnvdimm/dimm_devs.c, and libnvdimm/security.c is optionally compiled
+    based on the CONFIG_NVDIMM_KEYS config symbol.
+    
+    Rather than export the operations across compile objects, just move the
+    __security_store() entry point to live with the helpers.
+    
+    Acked-by: Jeff Moyer <jmoyer@redhat.com>
+    Reviewed-by: Dave Jiang <dave.jiang@intel.com>
+    Link: https://lore.kernel.org/r/156686730515.184120.10522747907309996674.stgit@dwillia2-desk3.amr.corp.intel.com
+    Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+
+diff --git a/drivers/nvdimm/dimm_devs.c b/drivers/nvdimm/dimm_devs.c
+index d837cb9be83d..196aa44c4936 100644
+--- a/drivers/nvdimm/dimm_devs.c
++++ b/drivers/nvdimm/dimm_devs.c
+@@ -393,88 +393,6 @@ static ssize_t frozen_show(struct device *dev,
+ }
+ static DEVICE_ATTR_RO(frozen);
+ 
+-#define OPS							\
+-	C( OP_FREEZE,		"freeze",		1),	\
+-	C( OP_DISABLE,		"disable",		2),	\
+-	C( OP_UPDATE,		"update",		3),	\
+-	C( OP_ERASE,		"erase",		2),	\
+-	C( OP_OVERWRITE,	"overwrite",		2),	\
+-	C( OP_MASTER_UPDATE,	"master_update",	3),	\
+-	C( OP_MASTER_ERASE,	"master_erase",		2)
+-#undef C
+-#define C(a, b, c) a
+-enum nvdimmsec_op_ids { OPS };
+-#undef C
+-#define C(a, b, c) { b, c }
+-static struct {
+-	const char *name;
+-	int args;
+-} ops[] = { OPS };
+-#undef C
+-
+-#define SEC_CMD_SIZE 32
+-#define KEY_ID_SIZE 10
+-
+-static ssize_t __security_store(struct device *dev, const char *buf, size_t len)
+-{
+-	struct nvdimm *nvdimm = to_nvdimm(dev);
+-	ssize_t rc;
+-	char cmd[SEC_CMD_SIZE+1], keystr[KEY_ID_SIZE+1],
+-		nkeystr[KEY_ID_SIZE+1];
+-	unsigned int key, newkey;
+-	int i;
+-
+-	rc = sscanf(buf, "%"__stringify(SEC_CMD_SIZE)"s"
+-			" %"__stringify(KEY_ID_SIZE)"s"
+-			" %"__stringify(KEY_ID_SIZE)"s",
+-			cmd, keystr, nkeystr);
+-	if (rc < 1)
+-		return -EINVAL;
+-	for (i = 0; i < ARRAY_SIZE(ops); i++)
+-		if (sysfs_streq(cmd, ops[i].name))
+-			break;
+-	if (i >= ARRAY_SIZE(ops))
+-		return -EINVAL;
+-	if (ops[i].args > 1)
+-		rc = kstrtouint(keystr, 0, &key);
+-	if (rc >= 0 && ops[i].args > 2)
+-		rc = kstrtouint(nkeystr, 0, &newkey);
+-	if (rc < 0)
+-		return rc;
+-
+-	if (i == OP_FREEZE) {
+-		dev_dbg(dev, "freeze\n");
+-		rc = nvdimm_security_freeze(nvdimm);
+-	} else if (i == OP_DISABLE) {
+-		dev_dbg(dev, "disable %u\n", key);
+-		rc = nvdimm_security_disable(nvdimm, key);
+-	} else if (i == OP_UPDATE || i == OP_MASTER_UPDATE) {
+-		dev_dbg(dev, "%s %u %u\n", ops[i].name, key, newkey);
+-		rc = nvdimm_security_update(nvdimm, key, newkey, i == OP_UPDATE
+-				? NVDIMM_USER : NVDIMM_MASTER);
+-	} else if (i == OP_ERASE || i == OP_MASTER_ERASE) {
+-		dev_dbg(dev, "%s %u\n", ops[i].name, key);
+-		if (atomic_read(&nvdimm->busy)) {
+-			dev_dbg(dev, "Unable to secure erase while DIMM active.\n");
+-			return -EBUSY;
+-		}
+-		rc = nvdimm_security_erase(nvdimm, key, i == OP_ERASE
+-				? NVDIMM_USER : NVDIMM_MASTER);
+-	} else if (i == OP_OVERWRITE) {
+-		dev_dbg(dev, "overwrite %u\n", key);
+-		if (atomic_read(&nvdimm->busy)) {
+-			dev_dbg(dev, "Unable to overwrite while DIMM active.\n");
+-			return -EBUSY;
+-		}
+-		rc = nvdimm_security_overwrite(nvdimm, key);
+-	} else
+-		return -EINVAL;
+-
+-	if (rc == 0)
+-		rc = len;
+-	return rc;
+-}
+-
+ static ssize_t security_store(struct device *dev,
+ 		struct device_attribute *attr, const char *buf, size_t len)
+ 
+@@ -489,7 +407,7 @@ static ssize_t security_store(struct device *dev,
+ 	nd_device_lock(dev);
+ 	nvdimm_bus_lock(dev);
+ 	wait_nvdimm_bus_probe_idle(dev);
+-	rc = __security_store(dev, buf, len);
++	rc = nvdimm_security_store(dev, buf, len);
+ 	nvdimm_bus_unlock(dev);
+ 	nd_device_unlock(dev);
+ 
+
+commit bc4f2199ca3107809df96cf72f618b9559b00a21
+Author: Dan Williams <dan.j.williams@intel.com>
+Date:   Mon Aug 26 17:55:00 2019 -0700
+
+    libnvdimm/security: Tighten scope of nvdimm->busy vs security operations
+    
+    An attempt to freeze DIMMs currently runs afoul of default blocking of
+    all security operations in the entry to the 'store' routine for the
+    'security' sysfs attribute.
+    
+    The blanket blocking of all security operations while the DIMM is in
+    active use in a region is too restrictive. The only security operations
+    that need to be aware of the ->busy state are those that mutate the
+    state of data, i.e. erase and overwrite.
+    
+    Refactor the ->busy checks to be applied at the entry common entry point
+    in __security_store() rather than each of the helper routines to enable
+    freeze to be run regardless of busy state.
+    
+    Reviewed-by: Dave Jiang <dave.jiang@intel.com>
+    Reviewed-by: Jeff Moyer <jmoyer@redhat.com>
+    Link: https://lore.kernel.org/r/156686729996.184120.3458026302402493937.stgit@dwillia2-desk3.amr.corp.intel.com
+    Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+
+diff --git a/drivers/nvdimm/dimm_devs.c b/drivers/nvdimm/dimm_devs.c
+index 53330625fe07..d837cb9be83d 100644
+--- a/drivers/nvdimm/dimm_devs.c
++++ b/drivers/nvdimm/dimm_devs.c
+@@ -424,9 +424,6 @@ static ssize_t __security_store(struct device *dev, const char *buf, size_t len)
+ 	unsigned int key, newkey;
+ 	int i;
+ 
+-	if (atomic_read(&nvdimm->busy))
+-		return -EBUSY;
+-
+ 	rc = sscanf(buf, "%"__stringify(SEC_CMD_SIZE)"s"
+ 			" %"__stringify(KEY_ID_SIZE)"s"
+ 			" %"__stringify(KEY_ID_SIZE)"s",
+@@ -451,23 +448,25 @@ static ssize_t __security_store(struct device *dev, const char *buf, size_t len)
+ 	} else if (i == OP_DISABLE) {
+ 		dev_dbg(dev, "disable %u\n", key);
+ 		rc = nvdimm_security_disable(nvdimm, key);
+-	} else if (i == OP_UPDATE) {
+-		dev_dbg(dev, "update %u %u\n", key, newkey);
+-		rc = nvdimm_security_update(nvdimm, key, newkey, NVDIMM_USER);
+-	} else if (i == OP_ERASE) {
+-		dev_dbg(dev, "erase %u\n", key);
+-		rc = nvdimm_security_erase(nvdimm, key, NVDIMM_USER);
++	} else if (i == OP_UPDATE || i == OP_MASTER_UPDATE) {
++		dev_dbg(dev, "%s %u %u\n", ops[i].name, key, newkey);
++		rc = nvdimm_security_update(nvdimm, key, newkey, i == OP_UPDATE
++				? NVDIMM_USER : NVDIMM_MASTER);
++	} else if (i == OP_ERASE || i == OP_MASTER_ERASE) {
++		dev_dbg(dev, "%s %u\n", ops[i].name, key);
++		if (atomic_read(&nvdimm->busy)) {
++			dev_dbg(dev, "Unable to secure erase while DIMM active.\n");
++			return -EBUSY;
++		}
++		rc = nvdimm_security_erase(nvdimm, key, i == OP_ERASE
++				? NVDIMM_USER : NVDIMM_MASTER);
+ 	} else if (i == OP_OVERWRITE) {
+ 		dev_dbg(dev, "overwrite %u\n", key);
++		if (atomic_read(&nvdimm->busy)) {
++			dev_dbg(dev, "Unable to overwrite while DIMM active.\n");
++			return -EBUSY;
++		}
+ 		rc = nvdimm_security_overwrite(nvdimm, key);
+-	} else if (i == OP_MASTER_UPDATE) {
+-		dev_dbg(dev, "master_update %u %u\n", key, newkey);
+-		rc = nvdimm_security_update(nvdimm, key, newkey,
+-				NVDIMM_MASTER);
+-	} else if (i == OP_MASTER_ERASE) {
+-		dev_dbg(dev, "master_erase %u\n", key);
+-		rc = nvdimm_security_erase(nvdimm, key,
+-				NVDIMM_MASTER);
+ 	} else
+ 		return -EINVAL;
+ 
+
+commit d78c620a2e824d7b01a6e991208a8aa2c938cabe
+Author: Dan Williams <dan.j.williams@intel.com>
+Date:   Mon Aug 26 17:54:54 2019 -0700
+
+    libnvdimm/security: Introduce a 'frozen' attribute
+    
+    In the process of debugging a system with an NVDIMM that was failing to
+    unlock it was found that the kernel is reporting 'locked' while the DIMM
+    security interface is 'frozen'. Unfortunately the security state is
+    tracked internally as an enum which prevents it from communicating the
+    difference between 'locked' and 'locked + frozen'. It follows that the
+    enum also prevents the kernel from communicating 'unlocked + frozen'
+    which would be useful for debugging why security operations like 'change
+    passphrase' are disabled.
+    
+    Ditch the security state enum for a set of flags and introduce a new
+    sysfs attribute explicitly for the 'frozen' state. The regression risk
+    is low because the 'frozen' state was already blocked behind the
+    'locked' state, but will need to revisit if there were cases where
+    applications need 'frozen' to show up in the primary 'security'
+    attribute. The expectation is that communicating 'frozen' is mostly a
+    helper for debug and status monitoring.
+    
+    Reviewed-by: Dave Jiang <dave.jiang@intel.com>
+    Reported-by: Jeff Moyer <jmoyer@redhat.com>
+    Reviewed-by: Jeff Moyer <jmoyer@redhat.com>
+    Link: https://lore.kernel.org/r/156686729474.184120.5835135644278860826.stgit@dwillia2-desk3.amr.corp.intel.com
+    Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+
+diff --git a/drivers/nvdimm/dimm_devs.c b/drivers/nvdimm/dimm_devs.c
+index 29a065e769ea..53330625fe07 100644
+--- a/drivers/nvdimm/dimm_devs.c
++++ b/drivers/nvdimm/dimm_devs.c
+@@ -372,24 +372,27 @@ __weak ssize_t security_show(struct device *dev,
+ {
+ 	struct nvdimm *nvdimm = to_nvdimm(dev);
+ 
+-	switch (nvdimm->sec.state) {
+-	case NVDIMM_SECURITY_DISABLED:
++	if (test_bit(NVDIMM_SECURITY_DISABLED, &nvdimm->sec.flags))
+ 		return sprintf(buf, "disabled\n");
+-	case NVDIMM_SECURITY_UNLOCKED:
++	if (test_bit(NVDIMM_SECURITY_UNLOCKED, &nvdimm->sec.flags))
+ 		return sprintf(buf, "unlocked\n");
+-	case NVDIMM_SECURITY_LOCKED:
++	if (test_bit(NVDIMM_SECURITY_LOCKED, &nvdimm->sec.flags))
+ 		return sprintf(buf, "locked\n");
+-	case NVDIMM_SECURITY_FROZEN:
+-		return sprintf(buf, "frozen\n");
+-	case NVDIMM_SECURITY_OVERWRITE:
++	if (test_bit(NVDIMM_SECURITY_OVERWRITE, &nvdimm->sec.flags))
+ 		return sprintf(buf, "overwrite\n");
+-	default:
+-		return -ENOTTY;
+-	}
+-
+ 	return -ENOTTY;
+ }
+ 
++static ssize_t frozen_show(struct device *dev,
++		struct device_attribute *attr, char *buf)
++{
++	struct nvdimm *nvdimm = to_nvdimm(dev);
++
++	return sprintf(buf, "%d\n", test_bit(NVDIMM_SECURITY_FROZEN,
++				&nvdimm->sec.flags));
++}
++static DEVICE_ATTR_RO(frozen);
++
+ #define OPS							\
+ 	C( OP_FREEZE,		"freeze",		1),	\
+ 	C( OP_DISABLE,		"disable",		2),	\
+@@ -501,6 +504,7 @@ static struct attribute *nvdimm_attributes[] = {
+ 	&dev_attr_commands.attr,
+ 	&dev_attr_available_slots.attr,
+ 	&dev_attr_security.attr,
++	&dev_attr_frozen.attr,
+ 	NULL,
+ };
+ 
+@@ -509,17 +513,24 @@ static umode_t nvdimm_visible(struct kobject *kobj, struct attribute *a, int n)
+ 	struct device *dev = container_of(kobj, typeof(*dev), kobj);
+ 	struct nvdimm *nvdimm = to_nvdimm(dev);
+ 
+-	if (a != &dev_attr_security.attr)
++	if (a != &dev_attr_security.attr && a != &dev_attr_frozen.attr)
+ 		return a->mode;
+-	if (nvdimm->sec.state < 0)
++	if (!nvdimm->sec.flags)
+ 		return 0;
+-	/* Are there any state mutation ops? */
+-	if (nvdimm->sec.ops->freeze || nvdimm->sec.ops->disable
+-			|| nvdimm->sec.ops->change_key
+-			|| nvdimm->sec.ops->erase
+-			|| nvdimm->sec.ops->overwrite)
++
++	if (a == &dev_attr_security.attr) {
++		/* Are there any state mutation ops (make writable)? */
++		if (nvdimm->sec.ops->freeze || nvdimm->sec.ops->disable
++				|| nvdimm->sec.ops->change_key
++				|| nvdimm->sec.ops->erase
++				|| nvdimm->sec.ops->overwrite)
++			return a->mode;
++		return 0444;
++	}
++
++	if (nvdimm->sec.ops->freeze)
+ 		return a->mode;
+-	return 0444;
++	return 0;
+ }
+ 
+ struct attribute_group nvdimm_attribute_group = {
+@@ -569,8 +580,8 @@ struct nvdimm *__nvdimm_create(struct nvdimm_bus *nvdimm_bus,
+ 	 * attribute visibility.
+ 	 */
+ 	/* get security state and extended (master) state */
+-	nvdimm->sec.state = nvdimm_security_state(nvdimm, NVDIMM_USER);
+-	nvdimm->sec.ext_state = nvdimm_security_state(nvdimm, NVDIMM_MASTER);
++	nvdimm->sec.flags = nvdimm_security_flags(nvdimm, NVDIMM_USER);
++	nvdimm->sec.ext_flags = nvdimm_security_flags(nvdimm, NVDIMM_MASTER);
+ 	nd_device_register(dev);
+ 
+ 	return nvdimm;
+@@ -588,7 +599,7 @@ int nvdimm_security_setup_events(struct device *dev)
+ {
+ 	struct nvdimm *nvdimm = to_nvdimm(dev);
+ 
+-	if (nvdimm->sec.state < 0 || !nvdimm->sec.ops
++	if (!nvdimm->sec.flags || !nvdimm->sec.ops
+ 			|| !nvdimm->sec.ops->overwrite)
+ 		return 0;
+ 	nvdimm->sec.overwrite_state = sysfs_get_dirent(dev->kobj.sd, "security");
+@@ -614,7 +625,7 @@ int nvdimm_security_freeze(struct nvdimm *nvdimm)
+ 	if (!nvdimm->sec.ops || !nvdimm->sec.ops->freeze)
+ 		return -EOPNOTSUPP;
+ 
+-	if (nvdimm->sec.state < 0)
++	if (!nvdimm->sec.flags)
+ 		return -EIO;
+ 
+ 	if (test_bit(NDD_SECURITY_OVERWRITE, &nvdimm->flags)) {
+@@ -623,7 +634,7 @@ int nvdimm_security_freeze(struct nvdimm *nvdimm)
+ 	}
+ 
+ 	rc = nvdimm->sec.ops->freeze(nvdimm);
+-	nvdimm->sec.state = nvdimm_security_state(nvdimm, NVDIMM_USER);
++	nvdimm->sec.flags = nvdimm_security_flags(nvdimm, NVDIMM_USER);
+ 
+ 	return rc;
+ }
+
+commit 87a30e1f05d73a34e6d1895065541369131aaf1c
+Author: Dan Williams <dan.j.williams@intel.com>
+Date:   Wed Jul 17 18:08:26 2019 -0700
+
+    driver-core, libnvdimm: Let device subsystems add local lockdep coverage
+    
+    For good reason, the standard device_lock() is marked
+    lockdep_set_novalidate_class() because there is simply no sane way to
+    describe the myriad ways the device_lock() ordered with other locks.
+    However, that leaves subsystems that know their own local device_lock()
+    ordering rules to find lock ordering mistakes manually. Instead,
+    introduce an optional / additional lockdep-enabled lock that a subsystem
+    can acquire in all the same paths that the device_lock() is acquired.
+    
+    A conversion of the NFIT driver and NVDIMM subsystem to a
+    lockdep-validate device_lock() scheme is included. The
+    debug_nvdimm_lock() implementation implements the correct lock-class and
+    stacking order for the libnvdimm device topology hierarchy.
+    
+    Yes, this is a hack, but hopefully it is a useful hack for other
+    subsystems device_lock() debug sessions. Quoting Greg:
+    
+        "Yeah, it feels a bit hacky but it's really up to a subsystem to mess up
+         using it as much as anything else, so user beware :)
+    
+         I don't object to it if it makes things easier for you to debug."
+    
+    Cc: Ingo Molnar <mingo@redhat.com>
+    Cc: Ira Weiny <ira.weiny@intel.com>
+    Cc: Will Deacon <will.deacon@arm.com>
+    Cc: Dave Jiang <dave.jiang@intel.com>
+    Cc: Keith Busch <keith.busch@intel.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Vishal Verma <vishal.l.verma@intel.com>
+    Cc: "Rafael J. Wysocki" <rjw@rjwysocki.net>
+    Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+    Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+    Acked-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+    Reviewed-by: Ira Weiny <ira.weiny@intel.com>
+    Link: https://lore.kernel.org/r/156341210661.292348.7014034644265455704.stgit@dwillia2-desk3.amr.corp.intel.com
+
+diff --git a/drivers/nvdimm/dimm_devs.c b/drivers/nvdimm/dimm_devs.c
+index dfecd6e17043..29a065e769ea 100644
+--- a/drivers/nvdimm/dimm_devs.c
++++ b/drivers/nvdimm/dimm_devs.c
+@@ -484,12 +484,12 @@ static ssize_t security_store(struct device *dev,
+ 	 * done while probing is idle and the DIMM is not in active use
+ 	 * in any region.
+ 	 */
+-	device_lock(dev);
++	nd_device_lock(dev);
+ 	nvdimm_bus_lock(dev);
+ 	wait_nvdimm_bus_probe_idle(dev);
+ 	rc = __security_store(dev, buf, len);
+ 	nvdimm_bus_unlock(dev);
+-	device_unlock(dev);
++	nd_device_unlock(dev);
+ 
+ 	return rc;
+ }
+
+commit 5b497af42fab12cadc0e29bcb7052cf9963603f5
+Author: Thomas Gleixner <tglx@linutronix.de>
+Date:   Wed May 29 07:18:09 2019 -0700
+
+    treewide: Replace GPLv2 boilerplate/reference with SPDX - rule 295
+    
+    Based on 1 normalized pattern(s):
+    
+      this program is free software you can redistribute it and or modify
+      it under the terms of version 2 of the gnu general public license as
+      published by the free software foundation this program is
+      distributed in the hope that it will be useful but without any
+      warranty without even the implied warranty of merchantability or
+      fitness for a particular purpose see the gnu general public license
+      for more details
+    
+    extracted by the scancode license scanner the SPDX license identifier
+    
+      GPL-2.0-only
+    
+    has been chosen to replace the boilerplate/reference in 64 file(s).
+    
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Reviewed-by: Alexios Zavras <alexios.zavras@intel.com>
+    Reviewed-by: Allison Randal <allison@lohutok.net>
+    Cc: linux-spdx@vger.kernel.org
+    Link: https://lkml.kernel.org/r/20190529141901.894819585@linutronix.de
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/nvdimm/dimm_devs.c b/drivers/nvdimm/dimm_devs.c
+index ecbab2d66e38..dfecd6e17043 100644
+--- a/drivers/nvdimm/dimm_devs.c
++++ b/drivers/nvdimm/dimm_devs.c
+@@ -1,14 +1,6 @@
++// SPDX-License-Identifier: GPL-2.0-only
+ /*
+  * Copyright(c) 2013-2015 Intel Corporation. All rights reserved.
+- *
+- * This program is free software; you can redistribute it and/or modify
+- * it under the terms of version 2 of the GNU General Public License as
+- * published by the Free Software Foundation.
+- *
+- * This program is distributed in the hope that it will be useful, but
+- * WITHOUT ANY WARRANTY; without even the implied warranty of
+- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+- * General Public License for more details.
+  */
+ #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+ #include <linux/moduleparam.h>
+
+commit 0968621917add2e0d60c8fbc4e24c670cb14319c
+Merge: 573de2a6e844 0f46c78391e1
+Author: Linus Torvalds <torvalds@linux-foundation.org>
+Date:   Tue May 7 09:18:12 2019 -0700
+
+    Merge tag 'printk-for-5.2' of git://git.kernel.org/pub/scm/linux/kernel/git/pmladek/printk
+    
+    Pull printk updates from Petr Mladek:
+    
+     - Allow state reset of printk_once() calls.
+    
+     - Prevent crashes when dereferencing invalid pointers in vsprintf().
+       Only the first byte is checked for simplicity.
+    
+     - Make vsprintf warnings consistent and inlined.
+    
+     - Treewide conversion of obsolete %pf, %pF to %ps, %pF printf
+       modifiers.
+    
+     - Some clean up of vsprintf and test_printf code.
+    
+    * tag 'printk-for-5.2' of git://git.kernel.org/pub/scm/linux/kernel/git/pmladek/printk:
+      lib/vsprintf: Make function pointer_string static
+      vsprintf: Limit the length of inlined error messages
+      vsprintf: Avoid confusion between invalid address and value
+      vsprintf: Prevent crash when dereferencing invalid pointers
+      vsprintf: Consolidate handling of unknown pointer specifiers
+      vsprintf: Factor out %pO handler as kobject_string()
+      vsprintf: Factor out %pV handler as va_format()
+      vsprintf: Factor out %p[iI] handler as ip_addr_string()
+      vsprintf: Do not check address of well-known strings
+      vsprintf: Consistent %pK handling for kptr_restrict == 0
+      vsprintf: Shuffle restricted_pointer()
+      printk: Tie printk_once / printk_deferred_once into .data.once for reset
+      treewide: Switch printk users from %pf and %pF to %ps and %pS, respectively
+      lib/test_printf: Switch to bitmap_zalloc()
+
+commit d75f773c86a2b8b7278e2c33343b46a4024bc002
+Author: Sakari Ailus <sakari.ailus@linux.intel.com>
+Date:   Mon Mar 25 21:32:28 2019 +0200
+
+    treewide: Switch printk users from %pf and %pF to %ps and %pS, respectively
+    
+    %pF and %pf are functionally equivalent to %pS and %ps conversion
+    specifiers. The former are deprecated, therefore switch the current users
+    to use the preferred variant.
+    
+    The changes have been produced by the following command:
+    
+            git grep -l '%p[fF]' | grep -v '^\(tools\|Documentation\)/' | \
+            while read i; do perl -i -pe 's/%pf/%ps/g; s/%pF/%pS/g;' $i; done
+    
+    And verifying the result.
+    
+    Link: http://lkml.kernel.org/r/20190325193229.23390-1-sakari.ailus@linux.intel.com
+    Cc: Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+    Cc: linux-arm-kernel@lists.infradead.org
+    Cc: sparclinux@vger.kernel.org
+    Cc: linux-um@lists.infradead.org
+    Cc: xen-devel@lists.xenproject.org
+    Cc: linux-acpi@vger.kernel.org
+    Cc: linux-pm@vger.kernel.org
+    Cc: drbd-dev@lists.linbit.com
+    Cc: linux-block@vger.kernel.org
+    Cc: linux-mmc@vger.kernel.org
+    Cc: linux-nvdimm@lists.01.org
+    Cc: linux-pci@vger.kernel.org
+    Cc: linux-scsi@vger.kernel.org
+    Cc: linux-btrfs@vger.kernel.org
+    Cc: linux-f2fs-devel@lists.sourceforge.net
+    Cc: linux-mm@kvack.org
+    Cc: ceph-devel@vger.kernel.org
+    Cc: netdev@vger.kernel.org
+    Signed-off-by: Sakari Ailus <sakari.ailus@linux.intel.com>
+    Acked-by: David Sterba <dsterba@suse.com> (for btrfs)
+    Acked-by: Mike Rapoport <rppt@linux.ibm.com> (for mm/memblock.c)
+    Acked-by: Bjorn Helgaas <bhelgaas@google.com> (for drivers/pci)
+    Acked-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+    Signed-off-by: Petr Mladek <pmladek@suse.com>
+
+diff --git a/drivers/nvdimm/dimm_devs.c b/drivers/nvdimm/dimm_devs.c
+index efe412a6b5b9..06f5087547ea 100644
+--- a/drivers/nvdimm/dimm_devs.c
++++ b/drivers/nvdimm/dimm_devs.c
+@@ -53,7 +53,7 @@ static int validate_dimm(struct nvdimm_drvdata *ndd)
+ 
+ 	rc = nvdimm_check_config_data(ndd->dev);
+ 	if (rc)
+-		dev_dbg(ndd->dev, "%pf: %s error: %d\n",
++		dev_dbg(ndd->dev, "%ps: %s error: %d\n",
+ 				__builtin_return_address(0), __func__, rc);
+ 	return rc;
+ }
+
+commit 451fed24e99d5368aab4a8977583710b692a15f0
+Merge: ebe9f6f19d80 075c3fdd56ac
+Author: Dan Williams <dan.j.williams@intel.com>
+Date:   Mon Mar 11 12:13:42 2019 -0700
+
+    Merge branch 'for-5.1/libnvdimm' into libnvdimm-for-next
+    
+    Merge miscellaneous libnvdimm sub-system updates for v5.1. Highlights
+    include:
+    
+    * Support for the Hyper-V family of device-specific-methods (DSMs)
+    * Several fixes and workarounds for Hyper-V compatibility.
+    * Fix for the support to cache the dirty-shutdown-count at init.
+
+commit d5d30d5a5c60628de5e77e3f292a8f9012d51350
+Author: Dan Williams <dan.j.williams@intel.com>
+Date:   Sat Feb 2 16:35:26 2019 -0800
+
+    libnvdimm/dimm: Add a no-BLK quirk based on NVDIMM family
+    
+    As Dexuan reports the NVDIMM_FAMILY_HYPERV platform is incompatible with
+    the existing Linux namespace implementation because it uses
+    NSLABEL_FLAG_LOCAL for x1-width PMEM interleave sets. Quirk it as an
+    platform / DIMM that does not provide BLK-aperture access. Allow the
+    libnvdimm core to assume no potential for aliasing. In case other
+    implementations make the same mistake, provide a "noblk" module
+    parameter to force-enable the quirk.
+    
+    Link: https://lkml.kernel.org/r/PU1P153MB0169977604493B82B662A01CBF920@PU1P153MB0169.APCP153.PROD.OUTLOOK.COM
+    Reported-by: Dexuan Cui <decui@microsoft.com>
+    Tested-by: Dexuan Cui <decui@microsoft.com>
+    Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+
+diff --git a/drivers/nvdimm/dimm_devs.c b/drivers/nvdimm/dimm_devs.c
+index 4890310df874..553aa78abeee 100644
+--- a/drivers/nvdimm/dimm_devs.c
++++ b/drivers/nvdimm/dimm_devs.c
+@@ -11,6 +11,7 @@
+  * General Public License for more details.
+  */
+ #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++#include <linux/moduleparam.h>
+ #include <linux/vmalloc.h>
+ #include <linux/device.h>
+ #include <linux/ndctl.h>
+@@ -25,6 +26,10 @@
+ 
+ static DEFINE_IDA(dimm_ida);
+ 
++static bool noblk;
++module_param(noblk, bool, 0444);
++MODULE_PARM_DESC(noblk, "force disable BLK / local alias support");
++
+ /*
+  * Retrieve bus and dimm handle and return if this bus supports
+  * get_config_data commands
+@@ -551,6 +556,8 @@ struct nvdimm *__nvdimm_create(struct nvdimm_bus *nvdimm_bus,
+ 
+ 	nvdimm->dimm_id = dimm_id;
+ 	nvdimm->provider_data = provider_data;
++	if (noblk)
++		flags |= 1 << NDD_NOBLK;
+ 	nvdimm->flags = flags;
+ 	nvdimm->cmd_mask = cmd_mask;
+ 	nvdimm->num_flush = num_flush;
+
+commit 1cd7386549f9b6f2f230da54aa9e7fe2d6c216d2
+Author: Dan Williams <dan.j.williams@intel.com>
+Date:   Sat Jan 19 08:45:56 2019 -0800
+
+    libnvdimm/security: Require nvdimm_security_setup_events() to succeed
+    
+    The following warning:
+    
+        ACPI0012:00: security event setup failed: -19
+    
+    ...is meant to capture exceptional failures of sysfs_get_dirent(),
+    however it will also fail in the common case when security support is
+    disabled. A few issues:
+    
+    1/ A dev_warn() report for a common case is too chatty
+    2/ The setup of this notifier is generic, no need for it to be driven
+       from the nfit driver, it can exist completely in the core.
+    3/ If it fails for any reason besides security support being disabled,
+       that's fatal and should abort DIMM activation. Userspace may hang if
+       it never gets overwrite notifications.
+    4/ The dirent needs to be released.
+    
+    Move the call to the core 'dimm' driver, make it conditional on security
+    support being active, make it fatal for the exceptional case, add the
+    missing sysfs_put() at device disable time.
+    
+    Fixes: 7d988097c546 ("...Add security DSM overwrite support")
+    Reviewed-by: Dave Jiang <dave.jiang@intel.com>
+    Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+
+diff --git a/drivers/nvdimm/dimm_devs.c b/drivers/nvdimm/dimm_devs.c
+index 4890310df874..efe412a6b5b9 100644
+--- a/drivers/nvdimm/dimm_devs.c
++++ b/drivers/nvdimm/dimm_devs.c
+@@ -578,13 +578,25 @@ struct nvdimm *__nvdimm_create(struct nvdimm_bus *nvdimm_bus,
+ }
+ EXPORT_SYMBOL_GPL(__nvdimm_create);
+ 
+-int nvdimm_security_setup_events(struct nvdimm *nvdimm)
++static void shutdown_security_notify(void *data)
+ {
+-	nvdimm->sec.overwrite_state = sysfs_get_dirent(nvdimm->dev.kobj.sd,
+-			"security");
++	struct nvdimm *nvdimm = data;
++
++	sysfs_put(nvdimm->sec.overwrite_state);
++}
++
++int nvdimm_security_setup_events(struct device *dev)
++{
++	struct nvdimm *nvdimm = to_nvdimm(dev);
++
++	if (nvdimm->sec.state < 0 || !nvdimm->sec.ops
++			|| !nvdimm->sec.ops->overwrite)
++		return 0;
++	nvdimm->sec.overwrite_state = sysfs_get_dirent(dev->kobj.sd, "security");
+ 	if (!nvdimm->sec.overwrite_state)
+-		return -ENODEV;
+-	return 0;
++		return -ENOMEM;
++
++	return devm_add_action_or_reset(dev, shutdown_security_notify, nvdimm);
+ }
+ EXPORT_SYMBOL_GPL(nvdimm_security_setup_events);
+ 
+
+commit 3c13e2ac747a37e683597d3d875f839f2bc150e1
+Author: Dave Jiang <dave.jiang@intel.com>
+Date:   Mon Dec 10 13:20:42 2018 -0700
+
+    tools/testing/nvdimm: Add test support for Intel nvdimm security DSMs
+    
+    Add nfit_test support for DSM functions "Get Security State",
+    "Set Passphrase", "Disable Passphrase", "Unlock Unit", "Freeze Lock",
+    and "Secure Erase" for the fake DIMMs.
+    
+    Also adding a sysfs knob in order to put the DIMMs in "locked" state. The
+    order of testing DIMM unlocking would be.
+    1a. Disable DIMM X.
+    1b. Set Passphrase to DIMM X.
+    2. Write to
+    /sys/devices/platform/nfit_test.0/nfit_test_dimm/test_dimmX/lock_dimm
+    3. Renable DIMM X
+    4. Check DIMM X state via sysfs "security" attribute for nmemX.
+    
+    Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+    Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+
+diff --git a/drivers/nvdimm/dimm_devs.c b/drivers/nvdimm/dimm_devs.c
+index bd3f156463b1..4890310df874 100644
+--- a/drivers/nvdimm/dimm_devs.c
++++ b/drivers/nvdimm/dimm_devs.c
+@@ -370,7 +370,7 @@ static ssize_t available_slots_show(struct device *dev,
+ }
+ static DEVICE_ATTR_RO(available_slots);
+ 
+-static ssize_t security_show(struct device *dev,
++__weak ssize_t security_show(struct device *dev,
+ 		struct device_attribute *attr, char *buf)
+ {
+ 	struct nvdimm *nvdimm = to_nvdimm(dev);
+
+commit 89fa9d8ea7bdfa841d19044485cec5f4171069e5
+Author: Dave Jiang <dave.jiang@intel.com>
+Date:   Mon Dec 10 10:53:22 2018 -0700
+
+    acpi/nfit, libnvdimm/security: add Intel DSM 1.8 master passphrase support
+    
+    With Intel DSM 1.8 [1] two new security DSMs are introduced. Enable/update
+    master passphrase and master secure erase. The master passphrase allows
+    a secure erase to be performed without the user passphrase that is set on
+    the NVDIMM. The commands of master_update and master_erase are added to
+    the sysfs knob in order to initiate the DSMs. They are similar in opeartion
+    mechanism compare to update and erase.
+    
+    [1]: http://pmem.io/documents/NVDIMM_DSM_Interface-V1.8.pdf
+    
+    Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+    Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+
+diff --git a/drivers/nvdimm/dimm_devs.c b/drivers/nvdimm/dimm_devs.c
+index 6affa270abd3..bd3f156463b1 100644
+--- a/drivers/nvdimm/dimm_devs.c
++++ b/drivers/nvdimm/dimm_devs.c
+@@ -386,17 +386,21 @@ static ssize_t security_show(struct device *dev,
+ 		return sprintf(buf, "frozen\n");
+ 	case NVDIMM_SECURITY_OVERWRITE:
+ 		return sprintf(buf, "overwrite\n");
++	default:
++		return -ENOTTY;
+ 	}
+ 
+ 	return -ENOTTY;
+ }
+ 
+-#define OPS						\
+-	C( OP_FREEZE,		"freeze",	1),	\
+-	C( OP_DISABLE,		"disable",	2),	\
+-	C( OP_UPDATE,		"update",	3),	\
+-	C( OP_ERASE,		"erase",	2),	\
+-	C( OP_OVERWRITE,	"overwrite",	2)
++#define OPS							\
++	C( OP_FREEZE,		"freeze",		1),	\
++	C( OP_DISABLE,		"disable",		2),	\
++	C( OP_UPDATE,		"update",		3),	\
++	C( OP_ERASE,		"erase",		2),	\
++	C( OP_OVERWRITE,	"overwrite",		2),	\
++	C( OP_MASTER_UPDATE,	"master_update",	3),	\
++	C( OP_MASTER_ERASE,	"master_erase",		2)
+ #undef C
+ #define C(a, b, c) a
+ enum nvdimmsec_op_ids { OPS };
+@@ -449,13 +453,21 @@ static ssize_t __security_store(struct device *dev, const char *buf, size_t len)
+ 		rc = nvdimm_security_disable(nvdimm, key);
+ 	} else if (i == OP_UPDATE) {
+ 		dev_dbg(dev, "update %u %u\n", key, newkey);
+-		rc = nvdimm_security_update(nvdimm, key, newkey);
++		rc = nvdimm_security_update(nvdimm, key, newkey, NVDIMM_USER);
+ 	} else if (i == OP_ERASE) {
+ 		dev_dbg(dev, "erase %u\n", key);
+-		rc = nvdimm_security_erase(nvdimm, key);
++		rc = nvdimm_security_erase(nvdimm, key, NVDIMM_USER);
+ 	} else if (i == OP_OVERWRITE) {
+ 		dev_dbg(dev, "overwrite %u\n", key);
+ 		rc = nvdimm_security_overwrite(nvdimm, key);
++	} else if (i == OP_MASTER_UPDATE) {
++		dev_dbg(dev, "master_update %u %u\n", key, newkey);
++		rc = nvdimm_security_update(nvdimm, key, newkey,
++				NVDIMM_MASTER);
++	} else if (i == OP_MASTER_ERASE) {
++		dev_dbg(dev, "master_erase %u\n", key);
++		rc = nvdimm_security_erase(nvdimm, key,
++				NVDIMM_MASTER);
+ 	} else
+ 		return -EINVAL;
+ 
+@@ -557,7 +569,9 @@ struct nvdimm *__nvdimm_create(struct nvdimm_bus *nvdimm_bus,
+ 	 * Security state must be initialized before device_add() for
+ 	 * attribute visibility.
+ 	 */
+-	nvdimm->sec.state = nvdimm_security_state(nvdimm);
++	/* get security state and extended (master) state */
++	nvdimm->sec.state = nvdimm_security_state(nvdimm, NVDIMM_USER);
++	nvdimm->sec.ext_state = nvdimm_security_state(nvdimm, NVDIMM_MASTER);
+ 	nd_device_register(dev);
+ 
+ 	return nvdimm;
+@@ -598,7 +612,7 @@ int nvdimm_security_freeze(struct nvdimm *nvdimm)
+ 	}
+ 
+ 	rc = nvdimm->sec.ops->freeze(nvdimm);
+-	nvdimm->sec.state = nvdimm_security_state(nvdimm);
++	nvdimm->sec.state = nvdimm_security_state(nvdimm, NVDIMM_USER);
+ 
+ 	return rc;
+ }
+
+commit 7d988097c546187ada602cc9bccd0f03d473eb8f
+Author: Dave Jiang <dave.jiang@intel.com>
+Date:   Thu Dec 13 15:36:18 2018 -0700
+
+    acpi/nfit, libnvdimm/security: Add security DSM overwrite support
+    
+    Add support for the NVDIMM_FAMILY_INTEL "ovewrite" capability as
+    described by the Intel DSM spec v1.7. This will allow triggering of
+    overwrite on Intel NVDIMMs. The overwrite operation can take tens of
+    minutes. When the overwrite DSM is issued successfully, the NVDIMMs will
+    be unaccessible. The kernel will do backoff polling to detect when the
+    overwrite process is completed. According to the DSM spec v1.7, the 128G
+    NVDIMMs can take up to 15mins to perform overwrite and larger DIMMs will
+    take longer.
+    
+    Given that overwrite puts the DIMM in an indeterminate state until it
+    completes introduce the NDD_SECURITY_OVERWRITE flag to prevent other
+    operations from executing when overwrite is happening. The
+    NDD_WORK_PENDING flag is added to denote that there is a device reference
+    on the nvdimm device for an async workqueue thread context.
+    
+    Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+    Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+
+diff --git a/drivers/nvdimm/dimm_devs.c b/drivers/nvdimm/dimm_devs.c
+index bc432b7c17b8..6affa270abd3 100644
+--- a/drivers/nvdimm/dimm_devs.c
++++ b/drivers/nvdimm/dimm_devs.c
+@@ -395,7 +395,8 @@ static ssize_t security_show(struct device *dev,
+ 	C( OP_FREEZE,		"freeze",	1),	\
+ 	C( OP_DISABLE,		"disable",	2),	\
+ 	C( OP_UPDATE,		"update",	3),	\
+-	C( OP_ERASE,		"erase",	2)
++	C( OP_ERASE,		"erase",	2),	\
++	C( OP_OVERWRITE,	"overwrite",	2)
+ #undef C
+ #define C(a, b, c) a
+ enum nvdimmsec_op_ids { OPS };
+@@ -452,6 +453,9 @@ static ssize_t __security_store(struct device *dev, const char *buf, size_t len)
+ 	} else if (i == OP_ERASE) {
+ 		dev_dbg(dev, "erase %u\n", key);
+ 		rc = nvdimm_security_erase(nvdimm, key);
++	} else if (i == OP_OVERWRITE) {
++		dev_dbg(dev, "overwrite %u\n", key);
++		rc = nvdimm_security_overwrite(nvdimm, key);
+ 	} else
+ 		return -EINVAL;
+ 
+@@ -503,7 +507,8 @@ static umode_t nvdimm_visible(struct kobject *kobj, struct attribute *a, int n)
+ 	/* Are there any state mutation ops? */
+ 	if (nvdimm->sec.ops->freeze || nvdimm->sec.ops->disable
+ 			|| nvdimm->sec.ops->change_key
+-			|| nvdimm->sec.ops->erase)
++			|| nvdimm->sec.ops->erase
++			|| nvdimm->sec.ops->overwrite)
+ 		return a->mode;
+ 	return 0444;
+ }
+@@ -546,6 +551,8 @@ struct nvdimm *__nvdimm_create(struct nvdimm_bus *nvdimm_bus,
+ 	dev->devt = MKDEV(nvdimm_major, nvdimm->id);
+ 	dev->groups = groups;
+ 	nvdimm->sec.ops = sec_ops;
++	nvdimm->sec.overwrite_tmo = 0;
++	INIT_DELAYED_WORK(&nvdimm->dwork, nvdimm_security_overwrite_query);
+ 	/*
+ 	 * Security state must be initialized before device_add() for
+ 	 * attribute visibility.
+@@ -557,6 +564,22 @@ struct nvdimm *__nvdimm_create(struct nvdimm_bus *nvdimm_bus,
+ }
+ EXPORT_SYMBOL_GPL(__nvdimm_create);
+ 
++int nvdimm_security_setup_events(struct nvdimm *nvdimm)
++{
++	nvdimm->sec.overwrite_state = sysfs_get_dirent(nvdimm->dev.kobj.sd,
++			"security");
++	if (!nvdimm->sec.overwrite_state)
++		return -ENODEV;
++	return 0;
++}
++EXPORT_SYMBOL_GPL(nvdimm_security_setup_events);
++
++int nvdimm_in_overwrite(struct nvdimm *nvdimm)
++{
++	return test_bit(NDD_SECURITY_OVERWRITE, &nvdimm->flags);
++}
++EXPORT_SYMBOL_GPL(nvdimm_in_overwrite);
++
+ int nvdimm_security_freeze(struct nvdimm *nvdimm)
+ {
+ 	int rc;
+@@ -569,6 +592,11 @@ int nvdimm_security_freeze(struct nvdimm *nvdimm)
+ 	if (nvdimm->sec.state < 0)
+ 		return -EIO;
+ 
++	if (test_bit(NDD_SECURITY_OVERWRITE, &nvdimm->flags)) {
++		dev_warn(&nvdimm->dev, "Overwrite operation in progress.\n");
++		return -EBUSY;
++	}
++
+ 	rc = nvdimm->sec.ops->freeze(nvdimm);
+ 	nvdimm->sec.state = nvdimm_security_state(nvdimm);
+ 
+
+commit 64e77c8c047fb91ea8c7800c1238108a72f0bf9c
+Author: Dave Jiang <dave.jiang@intel.com>
+Date:   Fri Dec 7 14:02:12 2018 -0700
+
+    acpi/nfit, libnvdimm: Add support for issue secure erase DSM to Intel nvdimm
+    
+    Add support to issue a secure erase DSM to the Intel nvdimm. The
+    required passphrase is acquired from an encrypted key in the kernel user
+    keyring. To trigger the action, "erase <keyid>" is written to the
+    "security" sysfs attribute.
+    
+    Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+    Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+
+diff --git a/drivers/nvdimm/dimm_devs.c b/drivers/nvdimm/dimm_devs.c
+index 1cc3a6af3d0e..bc432b7c17b8 100644
+--- a/drivers/nvdimm/dimm_devs.c
++++ b/drivers/nvdimm/dimm_devs.c
+@@ -394,7 +394,8 @@ static ssize_t security_show(struct device *dev,
+ #define OPS						\
+ 	C( OP_FREEZE,		"freeze",	1),	\
+ 	C( OP_DISABLE,		"disable",	2),	\
+-	C( OP_UPDATE,		"update",	3)
++	C( OP_UPDATE,		"update",	3),	\
++	C( OP_ERASE,		"erase",	2)
+ #undef C
+ #define C(a, b, c) a
+ enum nvdimmsec_op_ids { OPS };
+@@ -448,6 +449,9 @@ static ssize_t __security_store(struct device *dev, const char *buf, size_t len)
+ 	} else if (i == OP_UPDATE) {
+ 		dev_dbg(dev, "update %u %u\n", key, newkey);
+ 		rc = nvdimm_security_update(nvdimm, key, newkey);
++	} else if (i == OP_ERASE) {
++		dev_dbg(dev, "erase %u\n", key);
++		rc = nvdimm_security_erase(nvdimm, key);
+ 	} else
+ 		return -EINVAL;
+ 
+@@ -498,7 +502,8 @@ static umode_t nvdimm_visible(struct kobject *kobj, struct attribute *a, int n)
+ 		return 0;
+ 	/* Are there any state mutation ops? */
+ 	if (nvdimm->sec.ops->freeze || nvdimm->sec.ops->disable
+-			|| nvdimm->sec.ops->change_key)
++			|| nvdimm->sec.ops->change_key
++			|| nvdimm->sec.ops->erase)
+ 		return a->mode;
+ 	return 0444;
+ }
+
+commit d2a4ac73f56a5d0709d28b41fec8d15e4500f8f1
+Author: Dave Jiang <dave.jiang@intel.com>
+Date:   Fri Dec 7 13:29:09 2018 -0700
+
+    acpi/nfit, libnvdimm: Add enable/update passphrase support for Intel nvdimms
+    
+    Add support for enabling and updating passphrase on the Intel nvdimms.
+    The passphrase is the an encrypted key in the kernel user keyring.
+    We trigger the update via writing "update <old_keyid> <new_keyid>" to the
+    sysfs attribute "security". If no <old_keyid> exists (for enabling
+    security) then a 0 should be used.
+    
+    Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+    Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+
+diff --git a/drivers/nvdimm/dimm_devs.c b/drivers/nvdimm/dimm_devs.c
+index 7f42cc4e119b..1cc3a6af3d0e 100644
+--- a/drivers/nvdimm/dimm_devs.c
++++ b/drivers/nvdimm/dimm_devs.c
+@@ -392,8 +392,9 @@ static ssize_t security_show(struct device *dev,
+ }
+ 
+ #define OPS						\
+-	C( OP_FREEZE,        "freeze",        1),	\
+-	C( OP_DISABLE,       "disable",       2)
++	C( OP_FREEZE,		"freeze",	1),	\
++	C( OP_DISABLE,		"disable",	2),	\
++	C( OP_UPDATE,		"update",	3)
+ #undef C
+ #define C(a, b, c) a
+ enum nvdimmsec_op_ids { OPS };
+@@ -444,6 +445,9 @@ static ssize_t __security_store(struct device *dev, const char *buf, size_t len)
+ 	} else if (i == OP_DISABLE) {
+ 		dev_dbg(dev, "disable %u\n", key);
+ 		rc = nvdimm_security_disable(nvdimm, key);
++	} else if (i == OP_UPDATE) {
++		dev_dbg(dev, "update %u %u\n", key, newkey);
++		rc = nvdimm_security_update(nvdimm, key, newkey);
+ 	} else
+ 		return -EINVAL;
+ 
+@@ -493,7 +497,8 @@ static umode_t nvdimm_visible(struct kobject *kobj, struct attribute *a, int n)
+ 	if (nvdimm->sec.state < 0)
+ 		return 0;
+ 	/* Are there any state mutation ops? */
+-	if (nvdimm->sec.ops->freeze || nvdimm->sec.ops->disable)
++	if (nvdimm->sec.ops->freeze || nvdimm->sec.ops->disable
++			|| nvdimm->sec.ops->change_key)
+ 		return a->mode;
+ 	return 0444;
+ }
+
+commit 03b65b22ada8115a7a7bfdf0789f6a94adfd6070
+Author: Dave Jiang <dave.jiang@intel.com>
+Date:   Fri Dec 7 10:33:30 2018 -0700
+
+    acpi/nfit, libnvdimm: Add disable passphrase support to Intel nvdimm.
+    
+    Add support to disable passphrase (security) for the Intel nvdimm. The
+    passphrase used for disabling is pulled from an encrypted-key in the kernel
+    user keyring. The action is triggered by writing "disable <keyid>" to the
+    sysfs attribute "security".
+    
+    Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+    Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+
+diff --git a/drivers/nvdimm/dimm_devs.c b/drivers/nvdimm/dimm_devs.c
+index 8e0bd2ce4dd0..7f42cc4e119b 100644
+--- a/drivers/nvdimm/dimm_devs.c
++++ b/drivers/nvdimm/dimm_devs.c
+@@ -391,24 +391,65 @@ static ssize_t security_show(struct device *dev,
+ 	return -ENOTTY;
+ }
+ 
++#define OPS						\
++	C( OP_FREEZE,        "freeze",        1),	\
++	C( OP_DISABLE,       "disable",       2)
++#undef C
++#define C(a, b, c) a
++enum nvdimmsec_op_ids { OPS };
++#undef C
++#define C(a, b, c) { b, c }
++static struct {
++	const char *name;
++	int args;
++} ops[] = { OPS };
++#undef C
++
++#define SEC_CMD_SIZE 32
++#define KEY_ID_SIZE 10
++
+ static ssize_t __security_store(struct device *dev, const char *buf, size_t len)
+ {
+ 	struct nvdimm *nvdimm = to_nvdimm(dev);
+ 	ssize_t rc;
++	char cmd[SEC_CMD_SIZE+1], keystr[KEY_ID_SIZE+1],
++		nkeystr[KEY_ID_SIZE+1];
++	unsigned int key, newkey;
++	int i;
+ 
+ 	if (atomic_read(&nvdimm->busy))
+ 		return -EBUSY;
+ 
+-	if (sysfs_streq(buf, "freeze")) {
++	rc = sscanf(buf, "%"__stringify(SEC_CMD_SIZE)"s"
++			" %"__stringify(KEY_ID_SIZE)"s"
++			" %"__stringify(KEY_ID_SIZE)"s",
++			cmd, keystr, nkeystr);
++	if (rc < 1)
++		return -EINVAL;
++	for (i = 0; i < ARRAY_SIZE(ops); i++)
++		if (sysfs_streq(cmd, ops[i].name))
++			break;
++	if (i >= ARRAY_SIZE(ops))
++		return -EINVAL;
++	if (ops[i].args > 1)
++		rc = kstrtouint(keystr, 0, &key);
++	if (rc >= 0 && ops[i].args > 2)
++		rc = kstrtouint(nkeystr, 0, &newkey);
++	if (rc < 0)
++		return rc;
++
++	if (i == OP_FREEZE) {
+ 		dev_dbg(dev, "freeze\n");
+ 		rc = nvdimm_security_freeze(nvdimm);
++	} else if (i == OP_DISABLE) {
++		dev_dbg(dev, "disable %u\n", key);
++		rc = nvdimm_security_disable(nvdimm, key);
+ 	} else
+ 		return -EINVAL;
+ 
+ 	if (rc == 0)
+ 		rc = len;
+ 	return rc;
+-
+ }
+ 
+ static ssize_t security_store(struct device *dev,
+@@ -452,7 +493,7 @@ static umode_t nvdimm_visible(struct kobject *kobj, struct attribute *a, int n)
+ 	if (nvdimm->sec.state < 0)
+ 		return 0;
+ 	/* Are there any state mutation ops? */
+-	if (nvdimm->sec.ops->freeze)
++	if (nvdimm->sec.ops->freeze || nvdimm->sec.ops->disable)
+ 		return a->mode;
+ 	return 0444;
+ }
+
+commit 37833fb7989a9d3c3e26354e6878e682c340d718
+Author: Dave Jiang <dave.jiang@intel.com>
+Date:   Thu Dec 6 09:14:08 2018 -0800
+
+    acpi/nfit, libnvdimm: Add freeze security support to Intel nvdimm
+    
+    Add support for freeze security on Intel nvdimm. This locks out any
+    changes to security for the DIMM until a hard reset of the DIMM is
+    performed. This is triggered by writing "freeze" to the generic
+    nvdimm/nmemX "security" sysfs attribute.
+    
+    Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+    Co-developed-by: Dan Williams <dan.j.williams@intel.com>
+    Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+
+diff --git a/drivers/nvdimm/dimm_devs.c b/drivers/nvdimm/dimm_devs.c
+index 9609b671311b..8e0bd2ce4dd0 100644
+--- a/drivers/nvdimm/dimm_devs.c
++++ b/drivers/nvdimm/dimm_devs.c
+@@ -390,7 +390,48 @@ static ssize_t security_show(struct device *dev,
+ 
+ 	return -ENOTTY;
+ }
+-static DEVICE_ATTR_RO(security);
++
++static ssize_t __security_store(struct device *dev, const char *buf, size_t len)
++{
++	struct nvdimm *nvdimm = to_nvdimm(dev);
++	ssize_t rc;
++
++	if (atomic_read(&nvdimm->busy))
++		return -EBUSY;
++
++	if (sysfs_streq(buf, "freeze")) {
++		dev_dbg(dev, "freeze\n");
++		rc = nvdimm_security_freeze(nvdimm);
++	} else
++		return -EINVAL;
++
++	if (rc == 0)
++		rc = len;
++	return rc;
++
++}
++
++static ssize_t security_store(struct device *dev,
++		struct device_attribute *attr, const char *buf, size_t len)
++
++{
++	ssize_t rc;
++
++	/*
++	 * Require all userspace triggered security management to be
++	 * done while probing is idle and the DIMM is not in active use
++	 * in any region.
++	 */
++	device_lock(dev);
++	nvdimm_bus_lock(dev);
++	wait_nvdimm_bus_probe_idle(dev);
++	rc = __security_store(dev, buf, len);
++	nvdimm_bus_unlock(dev);
++	device_unlock(dev);
++
++	return rc;
++}
++static DEVICE_ATTR_RW(security);
+ 
+ static struct attribute *nvdimm_attributes[] = {
+ 	&dev_attr_state.attr,
+@@ -410,7 +451,10 @@ static umode_t nvdimm_visible(struct kobject *kobj, struct attribute *a, int n)
+ 		return a->mode;
+ 	if (nvdimm->sec.state < 0)
+ 		return 0;
+-	return a->mode;
++	/* Are there any state mutation ops? */
++	if (nvdimm->sec.ops->freeze)
++		return a->mode;
++	return 0444;
+ }
+ 
+ struct attribute_group nvdimm_attribute_group = {
+@@ -462,6 +506,24 @@ struct nvdimm *__nvdimm_create(struct nvdimm_bus *nvdimm_bus,
+ }
+ EXPORT_SYMBOL_GPL(__nvdimm_create);
+ 
++int nvdimm_security_freeze(struct nvdimm *nvdimm)
++{
++	int rc;
++
++	WARN_ON_ONCE(!is_nvdimm_bus_locked(&nvdimm->dev));
++
++	if (!nvdimm->sec.ops || !nvdimm->sec.ops->freeze)
++		return -EOPNOTSUPP;
++
++	if (nvdimm->sec.state < 0)
++		return -EIO;
++
++	rc = nvdimm->sec.ops->freeze(nvdimm);
++	nvdimm->sec.state = nvdimm_security_state(nvdimm);
++
++	return rc;
++}
++
+ int alias_dpa_busy(struct device *dev, void *data)
+ {
+ 	resource_size_t map_end, blk_start, new;
+
+commit f2989396553a0bd13f4b25f567a3dee3d722ce40
+Author: Dave Jiang <dave.jiang@intel.com>
+Date:   Wed Dec 5 23:39:29 2018 -0800
+
+    acpi/nfit, libnvdimm: Introduce nvdimm_security_ops
+    
+    Some NVDIMMs, like the ones defined by the NVDIMM_FAMILY_INTEL command
+    set, expose a security capability to lock the DIMMs at poweroff and
+    require a passphrase to unlock them. The security model is derived from
+    ATA security. In anticipation of other DIMMs implementing a similar
+    scheme, and to abstract the core security implementation away from the
+    device-specific details, introduce nvdimm_security_ops.
+    
+    Initially only a status retrieval operation, ->state(), is defined,
+    along with the base infrastructure and definitions for future
+    operations.
+    
+    Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+    Co-developed-by: Dan Williams <dan.j.williams@intel.com>
+    Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+
+diff --git a/drivers/nvdimm/dimm_devs.c b/drivers/nvdimm/dimm_devs.c
+index 508dd405f84f..9609b671311b 100644
+--- a/drivers/nvdimm/dimm_devs.c
++++ b/drivers/nvdimm/dimm_devs.c
+@@ -370,23 +370,60 @@ static ssize_t available_slots_show(struct device *dev,
+ }
+ static DEVICE_ATTR_RO(available_slots);
+ 
++static ssize_t security_show(struct device *dev,
++		struct device_attribute *attr, char *buf)
++{
++	struct nvdimm *nvdimm = to_nvdimm(dev);
++
++	switch (nvdimm->sec.state) {
++	case NVDIMM_SECURITY_DISABLED:
++		return sprintf(buf, "disabled\n");
++	case NVDIMM_SECURITY_UNLOCKED:
++		return sprintf(buf, "unlocked\n");
++	case NVDIMM_SECURITY_LOCKED:
++		return sprintf(buf, "locked\n");
++	case NVDIMM_SECURITY_FROZEN:
++		return sprintf(buf, "frozen\n");
++	case NVDIMM_SECURITY_OVERWRITE:
++		return sprintf(buf, "overwrite\n");
++	}
++
++	return -ENOTTY;
++}
++static DEVICE_ATTR_RO(security);
++
+ static struct attribute *nvdimm_attributes[] = {
+ 	&dev_attr_state.attr,
+ 	&dev_attr_flags.attr,
+ 	&dev_attr_commands.attr,
+ 	&dev_attr_available_slots.attr,
++	&dev_attr_security.attr,
+ 	NULL,
+ };
+ 
++static umode_t nvdimm_visible(struct kobject *kobj, struct attribute *a, int n)
++{
++	struct device *dev = container_of(kobj, typeof(*dev), kobj);
++	struct nvdimm *nvdimm = to_nvdimm(dev);
++
++	if (a != &dev_attr_security.attr)
++		return a->mode;
++	if (nvdimm->sec.state < 0)
++		return 0;
++	return a->mode;
++}
++
+ struct attribute_group nvdimm_attribute_group = {
+ 	.attrs = nvdimm_attributes,
++	.is_visible = nvdimm_visible,
+ };
+ EXPORT_SYMBOL_GPL(nvdimm_attribute_group);
+ 
+ struct nvdimm *__nvdimm_create(struct nvdimm_bus *nvdimm_bus,
+ 		void *provider_data, const struct attribute_group **groups,
+ 		unsigned long flags, unsigned long cmd_mask, int num_flush,
+-		struct resource *flush_wpq, const char *dimm_id)
++		struct resource *flush_wpq, const char *dimm_id,
++		const struct nvdimm_security_ops *sec_ops)
+ {
+ 	struct nvdimm *nvdimm = kzalloc(sizeof(*nvdimm), GFP_KERNEL);
+ 	struct device *dev;
+@@ -413,6 +450,12 @@ struct nvdimm *__nvdimm_create(struct nvdimm_bus *nvdimm_bus,
+ 	dev->type = &nvdimm_device_type;
+ 	dev->devt = MKDEV(nvdimm_major, nvdimm->id);
+ 	dev->groups = groups;
++	nvdimm->sec.ops = sec_ops;
++	/*
++	 * Security state must be initialized before device_add() for
++	 * attribute visibility.
++	 */
++	nvdimm->sec.state = nvdimm_security_state(nvdimm);
+ 	nd_device_register(dev);
+ 
+ 	return nvdimm;
+
+commit d6548ae4d16dc231dec22860c9c472bcb991fb15
+Author: Dave Jiang <dave.jiang@intel.com>
+Date:   Tue Dec 4 10:31:20 2018 -0800
+
+    acpi/nfit, libnvdimm: Store dimm id as a member to struct nvdimm
+    
+    The generated dimm id is needed for the sysfs attribute as well as being
+    used as the identifier/description for the security key. Since it's
+    constant and should never change, store it as a member of struct nvdimm.
+    
+    As nvdimm_create() continues to grow parameters relative to NFIT driver
+    requirements, do not require other implementations to keep pace.
+    Introduce __nvdimm_create() to carry the new parameters and keep
+    nvdimm_create() with the long standing default api.
+    
+    Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+    Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+
+diff --git a/drivers/nvdimm/dimm_devs.c b/drivers/nvdimm/dimm_devs.c
+index 6c3de2317390..508dd405f84f 100644
+--- a/drivers/nvdimm/dimm_devs.c
++++ b/drivers/nvdimm/dimm_devs.c
+@@ -383,10 +383,10 @@ struct attribute_group nvdimm_attribute_group = {
+ };
+ EXPORT_SYMBOL_GPL(nvdimm_attribute_group);
+ 
+-struct nvdimm *nvdimm_create(struct nvdimm_bus *nvdimm_bus, void *provider_data,
+-		const struct attribute_group **groups, unsigned long flags,
+-		unsigned long cmd_mask, int num_flush,
+-		struct resource *flush_wpq)
++struct nvdimm *__nvdimm_create(struct nvdimm_bus *nvdimm_bus,
++		void *provider_data, const struct attribute_group **groups,
++		unsigned long flags, unsigned long cmd_mask, int num_flush,
++		struct resource *flush_wpq, const char *dimm_id)
+ {
+ 	struct nvdimm *nvdimm = kzalloc(sizeof(*nvdimm), GFP_KERNEL);
+ 	struct device *dev;
+@@ -399,6 +399,8 @@ struct nvdimm *nvdimm_create(struct nvdimm_bus *nvdimm_bus, void *provider_data,
+ 		kfree(nvdimm);
+ 		return NULL;
+ 	}
++
++	nvdimm->dimm_id = dimm_id;
+ 	nvdimm->provider_data = provider_data;
+ 	nvdimm->flags = flags;
+ 	nvdimm->cmd_mask = cmd_mask;
+@@ -415,7 +417,7 @@ struct nvdimm *nvdimm_create(struct nvdimm_bus *nvdimm_bus, void *provider_data,
+ 
+ 	return nvdimm;
+ }
+-EXPORT_SYMBOL_GPL(nvdimm_create);
++EXPORT_SYMBOL_GPL(__nvdimm_create);
+ 
+ int alias_dpa_busy(struct device *dev, void *data)
+ {
+
+commit 2d657d17f72d2ae70c02f0d0ea6a04ad0f016b57
+Author: Alexander Duyck <alexander.h.duyck@linux.intel.com>
+Date:   Wed Oct 10 16:39:20 2018 -0700
+
+    nvdimm: Split label init out from the logic for getting config data
+    
+    This patch splits the initialization of the label data into two functions.
+    One for doing the init, and another for reading the actual configuration
+    data. The idea behind this is that by doing this we create a symmetry
+    between the getting and setting of config data in that we have a function
+    for both. In addition it will make it easier for us to identify the bits
+    that are related to init versus the pieces that are a wrapper for reading
+    data from the ACPI interface.
+    
+    So for example by splitting things out like this it becomes much more
+    obvious that we were performing checks that weren't necessarily related to
+    the set/get operations such as relying on ndd->data being present when the
+    set and get ops should not care about a locally cached copy of the label
+    area.
+    
+    Reviewed-by: Toshi Kani <toshi.kani@hpe.com>
+    Signed-off-by: Alexander Duyck <alexander.h.duyck@linux.intel.com>
+    Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+
+diff --git a/drivers/nvdimm/dimm_devs.c b/drivers/nvdimm/dimm_devs.c
+index 75ac78017b15..6c3de2317390 100644
+--- a/drivers/nvdimm/dimm_devs.c
++++ b/drivers/nvdimm/dimm_devs.c
+@@ -85,55 +85,47 @@ int nvdimm_init_nsarea(struct nvdimm_drvdata *ndd)
+ 	return cmd_rc;
+ }
+ 
+-int nvdimm_init_config_data(struct nvdimm_drvdata *ndd)
++int nvdimm_get_config_data(struct nvdimm_drvdata *ndd, void *buf,
++			   size_t offset, size_t len)
+ {
+ 	struct nvdimm_bus *nvdimm_bus = walk_to_nvdimm_bus(ndd->dev);
++	struct nvdimm_bus_descriptor *nd_desc = nvdimm_bus->nd_desc;
+ 	int rc = validate_dimm(ndd), cmd_rc = 0;
+ 	struct nd_cmd_get_config_data_hdr *cmd;
+-	struct nvdimm_bus_descriptor *nd_desc;
+-	u32 max_cmd_size, config_size;
+-	size_t offset;
++	size_t max_cmd_size, buf_offset;
+ 
+ 	if (rc)
+ 		return rc;
+ 
+-	if (ndd->data)
+-		return 0;
+-
+-	if (ndd->nsarea.status || ndd->nsarea.max_xfer == 0
+-			|| ndd->nsarea.config_size < ND_LABEL_MIN_SIZE) {
+-		dev_dbg(ndd->dev, "failed to init config data area: (%d:%d)\n",
+-				ndd->nsarea.max_xfer, ndd->nsarea.config_size);
++	if (offset + len > ndd->nsarea.config_size)
+ 		return -ENXIO;
+-	}
+ 
+-	ndd->data = kvmalloc(ndd->nsarea.config_size, GFP_KERNEL);
+-	if (!ndd->data)
+-		return -ENOMEM;
+-
+-	max_cmd_size = min_t(u32, ndd->nsarea.config_size, ndd->nsarea.max_xfer);
++	max_cmd_size = min_t(u32, len, ndd->nsarea.max_xfer);
+ 	cmd = kvzalloc(max_cmd_size + sizeof(*cmd), GFP_KERNEL);
+ 	if (!cmd)
+ 		return -ENOMEM;
+ 
+-	nd_desc = nvdimm_bus->nd_desc;
+-	for (config_size = ndd->nsarea.config_size, offset = 0;
+-			config_size; config_size -= cmd->in_length,
+-			offset += cmd->in_length) {
+-		cmd->in_length = min(config_size, max_cmd_size);
+-		cmd->in_offset = offset;
++	for (buf_offset = 0; len;
++	     len -= cmd->in_length, buf_offset += cmd->in_length) {
++		size_t cmd_size;
++
++		cmd->in_offset = offset + buf_offset;
++		cmd->in_length = min(max_cmd_size, len);
++
++		cmd_size = sizeof(*cmd) + cmd->in_length;
++
+ 		rc = nd_desc->ndctl(nd_desc, to_nvdimm(ndd->dev),
+-				ND_CMD_GET_CONFIG_DATA, cmd,
+-				cmd->in_length + sizeof(*cmd), &cmd_rc);
++				ND_CMD_GET_CONFIG_DATA, cmd, cmd_size, &cmd_rc);
+ 		if (rc < 0)
+ 			break;
+ 		if (cmd_rc < 0) {
+ 			rc = cmd_rc;
+ 			break;
+ 		}
+-		memcpy(ndd->data + offset, cmd->out_buf, cmd->in_length);
++
++		/* out_buf should be valid, copy it into our output buffer */
++		memcpy(buf + buf_offset, cmd->out_buf, cmd->in_length);
+ 	}
+-	dev_dbg(ndd->dev, "len: %zu rc: %d\n", offset, rc);
+ 	kvfree(cmd);
+ 
+ 	return rc;
+@@ -151,9 +143,6 @@ int nvdimm_set_config_data(struct nvdimm_drvdata *ndd, size_t offset,
+ 	if (rc)
+ 		return rc;
+ 
+-	if (!ndd->data)
+-		return -ENXIO;
+-
+ 	if (offset + len > ndd->nsarea.config_size)
+ 		return -ENXIO;
+ 
+
+commit d11cf4a7321b538563b0ab30dc0d1f18f9c56226
+Author: Dan Williams <dan.j.williams@intel.com>
+Date:   Wed Oct 10 16:38:24 2018 -0700
+
+    libnvdimm, dimm: Maximize label transfer size
+    
+    Use kvzalloc() to bypass the arbitrary PAGE_SIZE limit of label transfer
+    operations. Given the expense of calling into firmware, maximize the
+    amount of label data we transfer per call to be up to the total label
+    space if allowed by the firmware.
+    
+    Instead of limiting based on PAGE_SIZE we can instead simply limit the
+    maximum size based on either the config_size int he case of the get
+    operation, or the length of the write based on the set operation.
+    
+    On a system with 24 NVDIMM modules each with a config_size of 128K and a
+    maximum transfer size of 64K - 4, this patch reduces the init time for the
+    label data from around 24 seconds down to between 4-5 seconds.
+    
+    Reviewed-by: Toshi Kani <toshi.kani@hpe.com>
+    Signed-off-by: Alexander Duyck <alexander.h.duyck@linux.intel.com>
+    Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+
+diff --git a/drivers/nvdimm/dimm_devs.c b/drivers/nvdimm/dimm_devs.c
+index 863cabc35215..75ac78017b15 100644
+--- a/drivers/nvdimm/dimm_devs.c
++++ b/drivers/nvdimm/dimm_devs.c
+@@ -111,8 +111,8 @@ int nvdimm_init_config_data(struct nvdimm_drvdata *ndd)
+ 	if (!ndd->data)
+ 		return -ENOMEM;
+ 
+-	max_cmd_size = min_t(u32, PAGE_SIZE, ndd->nsarea.max_xfer);
+-	cmd = kzalloc(max_cmd_size + sizeof(*cmd), GFP_KERNEL);
++	max_cmd_size = min_t(u32, ndd->nsarea.config_size, ndd->nsarea.max_xfer);
++	cmd = kvzalloc(max_cmd_size + sizeof(*cmd), GFP_KERNEL);
+ 	if (!cmd)
+ 		return -ENOMEM;
+ 
+@@ -134,7 +134,7 @@ int nvdimm_init_config_data(struct nvdimm_drvdata *ndd)
+ 		memcpy(ndd->data + offset, cmd->out_buf, cmd->in_length);
+ 	}
+ 	dev_dbg(ndd->dev, "len: %zu rc: %d\n", offset, rc);
+-	kfree(cmd);
++	kvfree(cmd);
+ 
+ 	return rc;
+ }
+@@ -157,9 +157,8 @@ int nvdimm_set_config_data(struct nvdimm_drvdata *ndd, size_t offset,
+ 	if (offset + len > ndd->nsarea.config_size)
+ 		return -ENXIO;
+ 
+-	max_cmd_size = min_t(u32, PAGE_SIZE, len);
+-	max_cmd_size = min_t(u32, max_cmd_size, ndd->nsarea.max_xfer);
+-	cmd = kzalloc(max_cmd_size + sizeof(*cmd) + sizeof(u32), GFP_KERNEL);
++	max_cmd_size = min_t(u32, len, ndd->nsarea.max_xfer);
++	cmd = kvzalloc(max_cmd_size + sizeof(*cmd) + sizeof(u32), GFP_KERNEL);
+ 	if (!cmd)
+ 		return -ENOMEM;
+ 
+@@ -183,7 +182,7 @@ int nvdimm_set_config_data(struct nvdimm_drvdata *ndd, size_t offset,
+ 			break;
+ 		}
+ 	}
+-	kfree(cmd);
++	kvfree(cmd);
+ 
+ 	return rc;
+ }
+
+commit 12e3129e29b406c41bc89231092a20d79dbf802c
+Author: Keith Busch <keith.busch@intel.com>
+Date:   Tue Jul 24 15:07:57 2018 -0600
+
+    libnvdimm: Use max contiguous area for namespace size
+    
+    This patch will find the max contiguous area to determine the largest
+    pmem namespace size that can be created. If the requested size exceeds
+    the largest available, ENOSPC error will be returned.
+    
+    This fixes the allocation underrun error and wrong error return code
+    that have otherwise been observed as the following kernel warning:
+    
+      WARNING: CPU: <CPU> PID: <PID> at drivers/nvdimm/namespace_devs.c:913 size_store
+    
+    Fixes: a1f3e4d6a0c3 ("libnvdimm, region: update nd_region_available_dpa() for multi-pmem support")
+    Cc: <stable@vger.kernel.org>
+    Signed-off-by: Keith Busch <keith.busch@intel.com>
+    Reviewed-by: Vishal Verma <vishal.l.verma@intel.com>
+    Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+
+diff --git a/drivers/nvdimm/dimm_devs.c b/drivers/nvdimm/dimm_devs.c
+index 8d348b22ba45..863cabc35215 100644
+--- a/drivers/nvdimm/dimm_devs.c
++++ b/drivers/nvdimm/dimm_devs.c
+@@ -536,6 +536,37 @@ resource_size_t nd_blk_available_dpa(struct nd_region *nd_region)
+ 	return info.available;
+ }
+ 
++/**
++ * nd_pmem_max_contiguous_dpa - For the given dimm+region, return the max
++ *			   contiguous unallocated dpa range.
++ * @nd_region: constrain available space check to this reference region
++ * @nd_mapping: container of dpa-resource-root + labels
++ */
++resource_size_t nd_pmem_max_contiguous_dpa(struct nd_region *nd_region,
++					   struct nd_mapping *nd_mapping)
++{
++	struct nvdimm_drvdata *ndd = to_ndd(nd_mapping);
++	struct nvdimm_bus *nvdimm_bus;
++	resource_size_t max = 0;
++	struct resource *res;
++
++	/* if a dimm is disabled the available capacity is zero */
++	if (!ndd)
++		return 0;
++
++	nvdimm_bus = walk_to_nvdimm_bus(ndd->dev);
++	if (__reserve_free_pmem(&nd_region->dev, nd_mapping->nvdimm))
++		return 0;
++	for_each_dpa_resource(ndd, res) {
++		if (strcmp(res->name, "pmem-reserve") != 0)
++			continue;
++		if (resource_size(res) > max)
++			max = resource_size(res);
++	}
++	release_free_pmem(nvdimm_bus, nd_mapping);
++	return max;
++}
++
+ /**
+  * nd_pmem_available_dpa - for the given dimm+region account unallocated dpa
+  * @nd_mapping: container of dpa-resource-root + labels
+
+commit e7c5a571a8d6a266aee9ca3f3f26e5afe3717eca
+Author: Dan Williams <dan.j.williams@intel.com>
+Date:   Mon Apr 9 12:34:24 2018 -0700
+
+    libnvdimm, dimm: handle EACCES failures from label reads
+    
+    The new support for the standard _LSR and _LSW methods neglected to also
+    update the nvdimm_init_config_data() and nvdimm_set_config_data() to
+    return the translated error code from failed commands. This precision is
+    necessary because the locked status that was previously returned on
+    ND_CMD_GET_CONFIG_SIZE commands is now returned on
+    ND_CMD_{GET,SET}_CONFIG_DATA commands.
+    
+    If the kernel misses this indication it can inadvertently fall back to
+    label-less mode when it should otherwise avoid all access to locked
+    regions.
+    
+    Cc: <stable@vger.kernel.org>
+    Fixes: 4b27db7e26cd ("acpi, nfit: add support for the _LSI, _LSR, and...")
+    Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+
+diff --git a/drivers/nvdimm/dimm_devs.c b/drivers/nvdimm/dimm_devs.c
+index e00d45522b80..8d348b22ba45 100644
+--- a/drivers/nvdimm/dimm_devs.c
++++ b/drivers/nvdimm/dimm_devs.c
+@@ -88,9 +88,9 @@ int nvdimm_init_nsarea(struct nvdimm_drvdata *ndd)
+ int nvdimm_init_config_data(struct nvdimm_drvdata *ndd)
+ {
+ 	struct nvdimm_bus *nvdimm_bus = walk_to_nvdimm_bus(ndd->dev);
++	int rc = validate_dimm(ndd), cmd_rc = 0;
+ 	struct nd_cmd_get_config_data_hdr *cmd;
+ 	struct nvdimm_bus_descriptor *nd_desc;
+-	int rc = validate_dimm(ndd);
+ 	u32 max_cmd_size, config_size;
+ 	size_t offset;
+ 
+@@ -124,9 +124,11 @@ int nvdimm_init_config_data(struct nvdimm_drvdata *ndd)
+ 		cmd->in_offset = offset;
+ 		rc = nd_desc->ndctl(nd_desc, to_nvdimm(ndd->dev),
+ 				ND_CMD_GET_CONFIG_DATA, cmd,
+-				cmd->in_length + sizeof(*cmd), NULL);
+-		if (rc || cmd->status) {
+-			rc = -ENXIO;
++				cmd->in_length + sizeof(*cmd), &cmd_rc);
++		if (rc < 0)
++			break;
++		if (cmd_rc < 0) {
++			rc = cmd_rc;
+ 			break;
+ 		}
+ 		memcpy(ndd->data + offset, cmd->out_buf, cmd->in_length);
+@@ -140,9 +142,9 @@ int nvdimm_init_config_data(struct nvdimm_drvdata *ndd)
+ int nvdimm_set_config_data(struct nvdimm_drvdata *ndd, size_t offset,
+ 		void *buf, size_t len)
+ {
+-	int rc = validate_dimm(ndd);
+ 	size_t max_cmd_size, buf_offset;
+ 	struct nd_cmd_set_config_hdr *cmd;
++	int rc = validate_dimm(ndd), cmd_rc = 0;
+ 	struct nvdimm_bus *nvdimm_bus = walk_to_nvdimm_bus(ndd->dev);
+ 	struct nvdimm_bus_descriptor *nd_desc = nvdimm_bus->nd_desc;
+ 
+@@ -164,7 +166,6 @@ int nvdimm_set_config_data(struct nvdimm_drvdata *ndd, size_t offset,
+ 	for (buf_offset = 0; len; len -= cmd->in_length,
+ 			buf_offset += cmd->in_length) {
+ 		size_t cmd_size;
+-		u32 *status;
+ 
+ 		cmd->in_offset = offset + buf_offset;
+ 		cmd->in_length = min(max_cmd_size, len);
+@@ -172,12 +173,13 @@ int nvdimm_set_config_data(struct nvdimm_drvdata *ndd, size_t offset,
+ 
+ 		/* status is output in the last 4-bytes of the command buffer */
+ 		cmd_size = sizeof(*cmd) + cmd->in_length + sizeof(u32);
+-		status = ((void *) cmd) + cmd_size - sizeof(u32);
+ 
+ 		rc = nd_desc->ndctl(nd_desc, to_nvdimm(ndd->dev),
+-				ND_CMD_SET_CONFIG_DATA, cmd, cmd_size, NULL);
+-		if (rc || *status) {
+-			rc = rc ? rc : -ENXIO;
++				ND_CMD_SET_CONFIG_DATA, cmd, cmd_size, &cmd_rc);
++		if (rc < 0)
++			break;
++		if (cmd_rc < 0) {
++			rc = cmd_rc;
+ 			break;
+ 		}
+ 	}
+
+commit 426824d63b77bde61422ed6e19ac7c62c1f06fca
+Author: Dan Williams <dan.j.williams@intel.com>
+Date:   Mon Mar 5 16:39:31 2018 -0800
+
+    libnvdimm: remove redundant __func__ in dev_dbg
+    
+    Dynamic debug can be instructed to add the function name to the debug
+    output using the +f switch, so there is no need for the libnvdimm
+    modules to do it again. If a user decides to add the +f switch for
+    libnvdimm's dynamic debug this results in double prints of the function
+    name.
+    
+    Reported-by: Johannes Thumshirn <jthumshirn@suse.de>
+    Reported-by: Ross Zwisler <ross.zwisler@linux.intel.com>
+    Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+
+diff --git a/drivers/nvdimm/dimm_devs.c b/drivers/nvdimm/dimm_devs.c
+index 097794d9f786..e00d45522b80 100644
+--- a/drivers/nvdimm/dimm_devs.c
++++ b/drivers/nvdimm/dimm_devs.c
+@@ -131,7 +131,7 @@ int nvdimm_init_config_data(struct nvdimm_drvdata *ndd)
+ 		}
+ 		memcpy(ndd->data + offset, cmd->out_buf, cmd->in_length);
+ 	}
+-	dev_dbg(ndd->dev, "%s: len: %zu rc: %d\n", __func__, offset, rc);
++	dev_dbg(ndd->dev, "len: %zu rc: %d\n", offset, rc);
+ 	kfree(cmd);
+ 
+ 	return rc;
+@@ -266,8 +266,7 @@ void nvdimm_drvdata_release(struct kref *kref)
+ 	struct device *dev = ndd->dev;
+ 	struct resource *res, *_r;
+ 
+-	dev_dbg(dev, "%s\n", __func__);
+-
++	dev_dbg(dev, "trace\n");
+ 	nvdimm_bus_lock(dev);
+ 	for_each_dpa_resource_safe(ndd, res, _r)
+ 		nvdimm_free_dpa(ndd, res);
+@@ -660,7 +659,7 @@ int nvdimm_bus_check_dimm_count(struct nvdimm_bus *nvdimm_bus, int dimm_count)
+ 	nd_synchronize();
+ 
+ 	device_for_each_child(&nvdimm_bus->dev, &count, count_dimms);
+-	dev_dbg(&nvdimm_bus->dev, "%s: count: %d\n", __func__, count);
++	dev_dbg(&nvdimm_bus->dev, "count: %d\n", count);
+ 	if (count != dimm_count)
+ 		return -ENXIO;
+ 	return 0;
+
+commit efbf6f50ada168b68f5e3de474bc8dee4a02d046
+Author: Dan Williams <dan.j.williams@intel.com>
+Date:   Mon Sep 25 10:24:26 2017 -0700
+
+    libnvdimm: introduce 'flags' attribute for DIMM 'lock' and 'alias' status
+    
+    Given that we now how have two mechanisms for a DIMM to indicate that it
+    is locked:
+    
+        * NVDIMM_FAMILY_INTEL 'get_config_size' _DSM command
+    
+        * ACPI 6.2 Label Storage Read / Write commands
+    
+    ...export the generic libnvdimm DIMM status in a new 'flags' attribute.
+    
+    This attribute can also reflect the 'alias' state which indicates
+    whether the nvdimm core is enforcing labels for aliased-region-capacity
+    that the given dimm is an interleave-set member.
+    
+    Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+
+diff --git a/drivers/nvdimm/dimm_devs.c b/drivers/nvdimm/dimm_devs.c
+index 5f1385b96b13..097794d9f786 100644
+--- a/drivers/nvdimm/dimm_devs.c
++++ b/drivers/nvdimm/dimm_devs.c
+@@ -331,6 +331,17 @@ static ssize_t commands_show(struct device *dev,
+ }
+ static DEVICE_ATTR_RO(commands);
+ 
++static ssize_t flags_show(struct device *dev,
++		struct device_attribute *attr, char *buf)
++{
++	struct nvdimm *nvdimm = to_nvdimm(dev);
++
++	return sprintf(buf, "%s%s\n",
++			test_bit(NDD_ALIASING, &nvdimm->flags) ? "alias " : "",
++			test_bit(NDD_LOCKED, &nvdimm->flags) ? "lock " : "");
++}
++static DEVICE_ATTR_RO(flags);
++
+ static ssize_t state_show(struct device *dev, struct device_attribute *attr,
+ 		char *buf)
+ {
+@@ -372,6 +383,7 @@ static DEVICE_ATTR_RO(available_slots);
+ 
+ static struct attribute *nvdimm_attributes[] = {
+ 	&dev_attr_state.attr,
++	&dev_attr_flags.attr,
+ 	&dev_attr_commands.attr,
+ 	&dev_attr_available_slots.attr,
+ 	NULL,
+
+commit d34cb808402898e53b9a9bcbbedd01667a78723b
+Author: Dan Williams <dan.j.williams@intel.com>
+Date:   Mon Sep 25 11:01:31 2017 -0700
+
+    libnvdimm, dimm: clear 'locked' status on successful DIMM enable
+    
+    If we successfully enable a DIMM then it must not be locked and we can
+    clear the label-read failure condition. Otherwise, we need to reload the
+    entire bus provider driver to achieve the same effect, and that can
+    disrupt unrelated DIMMs and namespaces.
+    
+    Fixes: 9d62ed965118 ("libnvdimm: handle locked label storage areas")
+    Cc: <stable@vger.kernel.org>
+    Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+
+diff --git a/drivers/nvdimm/dimm_devs.c b/drivers/nvdimm/dimm_devs.c
+index f0d1b7e5de01..5f1385b96b13 100644
+--- a/drivers/nvdimm/dimm_devs.c
++++ b/drivers/nvdimm/dimm_devs.c
+@@ -200,6 +200,13 @@ void nvdimm_set_locked(struct device *dev)
+ 	set_bit(NDD_LOCKED, &nvdimm->flags);
+ }
+ 
++void nvdimm_clear_locked(struct device *dev)
++{
++	struct nvdimm *nvdimm = to_nvdimm(dev);
++
++	clear_bit(NDD_LOCKED, &nvdimm->flags);
++}
++
+ static void nvdimm_release(struct device *dev)
+ {
+ 	struct nvdimm *nvdimm = to_nvdimm(dev);
+
+commit c9e582aa689f5418ca30e1e7a975039772c3a757
+Author: Dan Williams <dan.j.williams@intel.com>
+Date:   Mon May 29 23:12:19 2017 -0700
+
+    libnvdimm, nfit: enable support for volatile ranges
+    
+    Allow volatile nfit ranges to participate in all the same infrastructure
+    provided for persistent memory regions. A resulting resulting namespace
+    device will still be called "pmem", but the parent region type will be
+    "nd_volatile". This is in preparation for disabling the dax ->flush()
+    operation in the pmem driver when it is hosted on a volatile range.
+    
+    Cc: Jan Kara <jack@suse.cz>
+    Cc: Jeff Moyer <jmoyer@redhat.com>
+    Cc: Christoph Hellwig <hch@lst.de>
+    Cc: Matthew Wilcox <mawilcox@microsoft.com>
+    Cc: Ross Zwisler <ross.zwisler@linux.intel.com>
+    Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+
+diff --git a/drivers/nvdimm/dimm_devs.c b/drivers/nvdimm/dimm_devs.c
+index 6a1e7a3c0c17..f0d1b7e5de01 100644
+--- a/drivers/nvdimm/dimm_devs.c
++++ b/drivers/nvdimm/dimm_devs.c
+@@ -419,7 +419,7 @@ int alias_dpa_busy(struct device *dev, void *data)
+ 	struct resource *res;
+ 	int i;
+ 
+-	if (!is_nd_pmem(dev))
++	if (!is_memory(dev))
+ 		return 0;
+ 
+ 	nd_region = to_nd_region(dev);
+
+commit ca6a4657e5420dec727256717e905ebc3c751352
+Author: Dan Williams <dan.j.williams@intel.com>
+Date:   Fri Jan 13 20:36:58 2017 -0800
+
+    x86, libnvdimm, pmem: remove global pmem api
+    
+    Now that all callers of the pmem api have been converted to dax helpers that
+    call back to the pmem driver, we can remove include/linux/pmem.h and
+    asm/pmem.h.
+    
+    Cc: <x86@kernel.org>
+    Cc: Jeff Moyer <jmoyer@redhat.com>
+    Cc: Ingo Molnar <mingo@redhat.com>
+    Cc: Christoph Hellwig <hch@lst.de>
+    Cc: Toshi Kani <toshi.kani@hpe.com>
+    Cc: Oliver O'Halloran <oohall@gmail.com>
+    Cc: Ross Zwisler <ross.zwisler@linux.intel.com>
+    Reviewed-by: Jan Kara <jack@suse.cz>
+    Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+
+diff --git a/drivers/nvdimm/dimm_devs.c b/drivers/nvdimm/dimm_devs.c
+index 9852a3355509..6a1e7a3c0c17 100644
+--- a/drivers/nvdimm/dimm_devs.c
++++ b/drivers/nvdimm/dimm_devs.c
+@@ -20,6 +20,7 @@
+ #include <linux/mm.h>
+ #include "nd-core.h"
+ #include "label.h"
++#include "pmem.h"
+ #include "nd.h"
+ 
+ static DEFINE_IDA(dimm_ida);
+@@ -235,6 +236,13 @@ struct nvdimm *nd_blk_region_to_dimm(struct nd_blk_region *ndbr)
+ }
+ EXPORT_SYMBOL_GPL(nd_blk_region_to_dimm);
+ 
++unsigned long nd_blk_memremap_flags(struct nd_blk_region *ndbr)
++{
++	/* pmem mapping properties are private to libnvdimm */
++	return ARCH_MEMREMAP_PMEM;
++}
++EXPORT_SYMBOL_GPL(nd_blk_memremap_flags);
++
+ struct nvdimm_drvdata *to_ndd(struct nd_mapping *nd_mapping)
+ {
+ 	struct nvdimm *nvdimm = nd_mapping->nvdimm;
+
+commit 752ade68cbd81d0321dfecc188f655a945551b25
+Author: Michal Hocko <mhocko@suse.com>
+Date:   Mon May 8 15:57:27 2017 -0700
+
+    treewide: use kv[mz]alloc* rather than opencoded variants
+    
+    There are many code paths opencoding kvmalloc.  Let's use the helper
+    instead.  The main difference to kvmalloc is that those users are
+    usually not considering all the aspects of the memory allocator.  E.g.
+    allocation requests <= 32kB (with 4kB pages) are basically never failing
+    and invoke OOM killer to satisfy the allocation.  This sounds too
+    disruptive for something that has a reasonable fallback - the vmalloc.
+    On the other hand those requests might fallback to vmalloc even when the
+    memory allocator would succeed after several more reclaim/compaction
+    attempts previously.  There is no guarantee something like that happens
+    though.
+    
+    This patch converts many of those places to kv[mz]alloc* helpers because
+    they are more conservative.
+    
+    Link: http://lkml.kernel.org/r/20170306103327.2766-2-mhocko@kernel.org
+    Signed-off-by: Michal Hocko <mhocko@suse.com>
+    Reviewed-by: Boris Ostrovsky <boris.ostrovsky@oracle.com> # Xen bits
+    Acked-by: Kees Cook <keescook@chromium.org>
+    Acked-by: Vlastimil Babka <vbabka@suse.cz>
+    Acked-by: Andreas Dilger <andreas.dilger@intel.com> # Lustre
+    Acked-by: Christian Borntraeger <borntraeger@de.ibm.com> # KVM/s390
+    Acked-by: Dan Williams <dan.j.williams@intel.com> # nvdim
+    Acked-by: David Sterba <dsterba@suse.com> # btrfs
+    Acked-by: Ilya Dryomov <idryomov@gmail.com> # Ceph
+    Acked-by: Tariq Toukan <tariqt@mellanox.com> # mlx4
+    Acked-by: Leon Romanovsky <leonro@mellanox.com> # mlx5
+    Cc: Martin Schwidefsky <schwidefsky@de.ibm.com>
+    Cc: Heiko Carstens <heiko.carstens@de.ibm.com>
+    Cc: Herbert Xu <herbert@gondor.apana.org.au>
+    Cc: Anton Vorontsov <anton@enomsg.org>
+    Cc: Colin Cross <ccross@android.com>
+    Cc: Tony Luck <tony.luck@intel.com>
+    Cc: "Rafael J. Wysocki" <rjw@rjwysocki.net>
+    Cc: Ben Skeggs <bskeggs@redhat.com>
+    Cc: Kent Overstreet <kent.overstreet@gmail.com>
+    Cc: Santosh Raspatur <santosh@chelsio.com>
+    Cc: Hariprasad S <hariprasad@chelsio.com>
+    Cc: Yishai Hadas <yishaih@mellanox.com>
+    Cc: Oleg Drokin <oleg.drokin@intel.com>
+    Cc: "Yan, Zheng" <zyan@redhat.com>
+    Cc: Alexander Viro <viro@zeniv.linux.org.uk>
+    Cc: Alexei Starovoitov <ast@kernel.org>
+    Cc: Eric Dumazet <eric.dumazet@gmail.com>
+    Cc: David Miller <davem@davemloft.net>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/drivers/nvdimm/dimm_devs.c b/drivers/nvdimm/dimm_devs.c
+index fac1e9fbd11d..9852a3355509 100644
+--- a/drivers/nvdimm/dimm_devs.c
++++ b/drivers/nvdimm/dimm_devs.c
+@@ -106,10 +106,7 @@ int nvdimm_init_config_data(struct nvdimm_drvdata *ndd)
+ 		return -ENXIO;
+ 	}
+ 
+-	ndd->data = kmalloc(ndd->nsarea.config_size, GFP_KERNEL);
+-	if (!ndd->data)
+-		ndd->data = vmalloc(ndd->nsarea.config_size);
+-
++	ndd->data = kvmalloc(ndd->nsarea.config_size, GFP_KERNEL);
+ 	if (!ndd->data)
+ 		return -ENOMEM;
+ 
+
+commit 9d62ed96511823fa9c2ac7a819d7b4be22a9a6de
+Author: Dan Williams <dan.j.williams@intel.com>
+Date:   Thu May 4 11:47:22 2017 -0700
+
+    libnvdimm: handle locked label storage areas
+    
+    Per the latest version of the "NVDIMM DSM Interface Example" [1], the
+    label data retrieval routine can report a "locked" status. In this case
+    all regions associated with that DIMM are disabled until the label area
+    is unlocked. Provide generic libnvdimm enabling for NVDIMMs with label
+    data area locking capabilities.
+    
+    [1]: http://pmem.io/documents/
+    
+    Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+
+diff --git a/drivers/nvdimm/dimm_devs.c b/drivers/nvdimm/dimm_devs.c
+index 7d1a3dbc7d5d..fac1e9fbd11d 100644
+--- a/drivers/nvdimm/dimm_devs.c
++++ b/drivers/nvdimm/dimm_devs.c
+@@ -67,6 +67,7 @@ int nvdimm_init_nsarea(struct nvdimm_drvdata *ndd)
+ 	struct nvdimm_bus *nvdimm_bus = walk_to_nvdimm_bus(ndd->dev);
+ 	struct nvdimm_bus_descriptor *nd_desc;
+ 	int rc = validate_dimm(ndd);
++	int cmd_rc = 0;
+ 
+ 	if (rc)
+ 		return rc;
+@@ -76,8 +77,11 @@ int nvdimm_init_nsarea(struct nvdimm_drvdata *ndd)
+ 
+ 	memset(cmd, 0, sizeof(*cmd));
+ 	nd_desc = nvdimm_bus->nd_desc;
+-	return nd_desc->ndctl(nd_desc, to_nvdimm(ndd->dev),
+-			ND_CMD_GET_CONFIG_SIZE, cmd, sizeof(*cmd), NULL);
++	rc = nd_desc->ndctl(nd_desc, to_nvdimm(ndd->dev),
++			ND_CMD_GET_CONFIG_SIZE, cmd, sizeof(*cmd), &cmd_rc);
++	if (rc < 0)
++		return rc;
++	return cmd_rc;
+ }
+ 
+ int nvdimm_init_config_data(struct nvdimm_drvdata *ndd)
+
+commit 8f078b38dd382710884ce7abd31a1935c440e6f8
+Author: Dan Williams <dan.j.williams@intel.com>
+Date:   Thu May 4 14:01:24 2017 -0700
+
+    libnvdimm: convert NDD_ flags to use bitops, introduce NDD_LOCKED
+    
+    This is a preparation patch for handling locked nvdimm label regions, a
+    new concept as introduced by the latest DSM document on pmem.io [1]. A
+    future patch will leverage nvdimm_set_locked() at DIMM probe time to
+    flag regions that can not be enabled. There should be no functional
+    difference resulting from this change.
+    
+    [1]: http://pmem.io/documents/NVDIMM_DSM_Interface_Example-V1.3.pdf
+    
+    Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+
+diff --git a/drivers/nvdimm/dimm_devs.c b/drivers/nvdimm/dimm_devs.c
+index 8b721321be5b..7d1a3dbc7d5d 100644
+--- a/drivers/nvdimm/dimm_devs.c
++++ b/drivers/nvdimm/dimm_devs.c
+@@ -34,7 +34,7 @@ int nvdimm_check_config_data(struct device *dev)
+ 
+ 	if (!nvdimm->cmd_mask ||
+ 	    !test_bit(ND_CMD_GET_CONFIG_DATA, &nvdimm->cmd_mask)) {
+-		if (nvdimm->flags & NDD_ALIASING)
++		if (test_bit(NDD_ALIASING, &nvdimm->flags))
+ 			return -ENXIO;
+ 		else
+ 			return -ENOTTY;
+@@ -188,7 +188,14 @@ void nvdimm_set_aliasing(struct device *dev)
+ {
+ 	struct nvdimm *nvdimm = to_nvdimm(dev);
+ 
+-	nvdimm->flags |= NDD_ALIASING;
++	set_bit(NDD_ALIASING, &nvdimm->flags);
++}
++
++void nvdimm_set_locked(struct device *dev)
++{
++	struct nvdimm *nvdimm = to_nvdimm(dev);
++
++	set_bit(NDD_LOCKED, &nvdimm->flags);
+ }
+ 
+ static void nvdimm_release(struct device *dev)
+
+commit fe514739d8538783749d3ce72f78e5a999ea5668
+Author: Dan Williams <dan.j.williams@intel.com>
+Date:   Tue Apr 4 15:08:36 2017 -0700
+
+    libnvdimm: fix blk free space accounting
+    
+    Commit a1f3e4d6a0c3 "libnvdimm, region: update nd_region_available_dpa()
+    for multi-pmem support" reworked blk dpa (DIMM Physical Address)
+    accounting to comprehend multiple pmem namespace allocations aliasing
+    with a given blk-dpa range.
+    
+    The following call trace is a result of failing to account for allocated
+    blk capacity.
+    
+     WARNING: CPU: 1 PID: 2433 at tools/testing/nvdimm/../../../drivers/nvdimm/names
+    4 size_store+0x6f3/0x930 [libnvdimm]
+     nd_region region5: allocation underrun: 0x0 of 0x1000000 bytes
+     [..]
+     Call Trace:
+      dump_stack+0x86/0xc3
+      __warn+0xcb/0xf0
+      warn_slowpath_fmt+0x5f/0x80
+      size_store+0x6f3/0x930 [libnvdimm]
+      dev_attr_store+0x18/0x30
+    
+    If a given blk-dpa allocation does not alias with any pmem ranges then
+    the full allocation should be accounted as busy space, not the size of
+    the current pmem contribution to the region.
+    
+    The thinkos that led to this confusion was not realizing that the struct
+    resource management is already guaranteeing no collisions between pmem
+    allocations and blk allocations on the same dimm. Also, we do not try to
+    support blk allocations in aliased pmem holes.
+    
+    This patch also fixes a case where the available blk goes negative.
+    
+    Cc: <stable@vger.kernel.org>
+    Fixes: a1f3e4d6a0c3 ("libnvdimm, region: update nd_region_available_dpa() for multi-pmem support").
+    Reported-by: Dariusz Dokupil <dariusz.dokupil@intel.com>
+    Reported-by: Dave Jiang <dave.jiang@intel.com>
+    Reported-by: Vishal Verma <vishal.l.verma@intel.com>
+    Tested-by: Dave Jiang <dave.jiang@intel.com>
+    Tested-by: Vishal Verma <vishal.l.verma@intel.com>
+    Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+
+diff --git a/drivers/nvdimm/dimm_devs.c b/drivers/nvdimm/dimm_devs.c
+index 0eedc49e0d47..8b721321be5b 100644
+--- a/drivers/nvdimm/dimm_devs.c
++++ b/drivers/nvdimm/dimm_devs.c
+@@ -395,7 +395,7 @@ EXPORT_SYMBOL_GPL(nvdimm_create);
+ 
+ int alias_dpa_busy(struct device *dev, void *data)
+ {
+-	resource_size_t map_end, blk_start, new, busy;
++	resource_size_t map_end, blk_start, new;
+ 	struct blk_alloc_info *info = data;
+ 	struct nd_mapping *nd_mapping;
+ 	struct nd_region *nd_region;
+@@ -436,29 +436,19 @@ int alias_dpa_busy(struct device *dev, void *data)
+  retry:
+ 	/*
+ 	 * Find the free dpa from the end of the last pmem allocation to
+-	 * the end of the interleave-set mapping that is not already
+-	 * covered by a blk allocation.
++	 * the end of the interleave-set mapping.
+ 	 */
+-	busy = 0;
+ 	for_each_dpa_resource(ndd, res) {
++		if (strncmp(res->name, "pmem", 4) != 0)
++			continue;
+ 		if ((res->start >= blk_start && res->start < map_end)
+ 				|| (res->end >= blk_start
+ 					&& res->end <= map_end)) {
+-			if (strncmp(res->name, "pmem", 4) == 0) {
+-				new = max(blk_start, min(map_end + 1,
+-							res->end + 1));
+-				if (new != blk_start) {
+-					blk_start = new;
+-					goto retry;
+-				}
+-			} else
+-				busy += min(map_end, res->end)
+-					- max(nd_mapping->start, res->start) + 1;
+-		} else if (nd_mapping->start > res->start
+-				&& map_end < res->end) {
+-			/* total eclipse of the PMEM region mapping */
+-			busy += nd_mapping->size;
+-			break;
++			new = max(blk_start, min(map_end + 1, res->end + 1));
++			if (new != blk_start) {
++				blk_start = new;
++				goto retry;
++			}
+ 		}
+ 	}
+ 
+@@ -470,52 +460,11 @@ int alias_dpa_busy(struct device *dev, void *data)
+ 		return 1;
+ 	}
+ 
+-	info->available -= blk_start - nd_mapping->start + busy;
++	info->available -= blk_start - nd_mapping->start;
+ 
+ 	return 0;
+ }
+ 
+-static int blk_dpa_busy(struct device *dev, void *data)
+-{
+-	struct blk_alloc_info *info = data;
+-	struct nd_mapping *nd_mapping;
+-	struct nd_region *nd_region;
+-	resource_size_t map_end;
+-	int i;
+-
+-	if (!is_nd_pmem(dev))
+-		return 0;
+-
+-	nd_region = to_nd_region(dev);
+-	for (i = 0; i < nd_region->ndr_mappings; i++) {
+-		nd_mapping  = &nd_region->mapping[i];
+-		if (nd_mapping->nvdimm == info->nd_mapping->nvdimm)
+-			break;
+-	}
+-
+-	if (i >= nd_region->ndr_mappings)
+-		return 0;
+-
+-	map_end = nd_mapping->start + nd_mapping->size - 1;
+-	if (info->res->start >= nd_mapping->start
+-			&& info->res->start < map_end) {
+-		if (info->res->end <= map_end) {
+-			info->busy = 0;
+-			return 1;
+-		} else {
+-			info->busy -= info->res->end - map_end;
+-			return 0;
+-		}
+-	} else if (info->res->end >= nd_mapping->start
+-			&& info->res->end <= map_end) {
+-		info->busy -= nd_mapping->start - info->res->start;
+-		return 0;
+-	} else {
+-		info->busy -= nd_mapping->size;
+-		return 0;
+-	}
+-}
+-
+ /**
+  * nd_blk_available_dpa - account the unused dpa of BLK region
+  * @nd_mapping: container of dpa-resource-root + labels
+@@ -545,11 +494,7 @@ resource_size_t nd_blk_available_dpa(struct nd_region *nd_region)
+ 	for_each_dpa_resource(ndd, res) {
+ 		if (strncmp(res->name, "blk", 3) != 0)
+ 			continue;
+-
+-		info.res = res;
+-		info.busy = resource_size(res);
+-		device_for_each_child(&nvdimm_bus->dev, &info, blk_dpa_busy);
+-		info.available -= info.busy;
++		info.available -= resource_size(res);
+ 	}
+ 
+ 	return info.available;
+
+commit 42237e393f64d619ed56e17fbf8fd27526485695
+Author: Dan Williams <dan.j.williams@intel.com>
+Date:   Sat Oct 15 15:33:52 2016 -0700
+
+    libnvdimm: allow a platform to force enable label support
+    
+    Platforms like QEMU-KVM implement an NFIT table and label DSMs.
+    However, since that environment does not define an aliased
+    configuration, the labels are currently ignored and the kernel registers
+    a single full-sized pmem-namespace per region. Now that the kernel
+    supports sub-divisions of pmem regions the labels have a purpose.
+    Arrange for the labels to be honored when we find an existing / valid
+    namespace index block.
+    
+    Cc: <qemu-devel@nongnu.org>
+    Cc: Haozhong Zhang <haozhong.zhang@intel.com>
+    Cc: Xiao Guangrong <guangrong.xiao@linux.intel.com>
+    Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+
+diff --git a/drivers/nvdimm/dimm_devs.c b/drivers/nvdimm/dimm_devs.c
+index d614493ad5ac..0eedc49e0d47 100644
+--- a/drivers/nvdimm/dimm_devs.c
++++ b/drivers/nvdimm/dimm_devs.c
+@@ -184,6 +184,13 @@ int nvdimm_set_config_data(struct nvdimm_drvdata *ndd, size_t offset,
+ 	return rc;
+ }
+ 
++void nvdimm_set_aliasing(struct device *dev)
++{
++	struct nvdimm *nvdimm = to_nvdimm(dev);
++
++	nvdimm->flags |= NDD_ALIASING;
++}
++
+ static void nvdimm_release(struct device *dev)
+ {
+ 	struct nvdimm *nvdimm = to_nvdimm(dev);
+
+commit 762d067dbad5f32560cb1657b7ca20034332dc56
+Author: Dan Williams <dan.j.williams@intel.com>
+Date:   Tue Oct 4 16:09:59 2016 -0700
+
+    libnvdimm, namespace: enable allocation of multiple pmem namespaces
+    
+    Now that we have nd_region_available_dpa() able to handle the presence
+    of multiple PMEM allocations in aliased PMEM regions, reuse that same
+    infrastructure to track allocations from free space.  In particular
+    handle allocating from an aliased PMEM region in the case where there
+    are dis-contiguous holes.  The allocation for BLK and PMEM are
+    documented in the space_valid() helper:
+    
+        BLK-space is valid as long as it does not precede a PMEM
+        allocation in a given region. PMEM-space must be contiguous
+        and adjacent to an existing existing allocation (if one
+        exists).
+    
+    Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+
+diff --git a/drivers/nvdimm/dimm_devs.c b/drivers/nvdimm/dimm_devs.c
+index 4b0296ccb375..d614493ad5ac 100644
+--- a/drivers/nvdimm/dimm_devs.c
++++ b/drivers/nvdimm/dimm_devs.c
+@@ -386,13 +386,7 @@ struct nvdimm *nvdimm_create(struct nvdimm_bus *nvdimm_bus, void *provider_data,
+ }
+ EXPORT_SYMBOL_GPL(nvdimm_create);
+ 
+-struct blk_alloc_info {
+-	struct nd_mapping *nd_mapping;
+-	resource_size_t available, busy;
+-	struct resource *res;
+-};
+-
+-static int alias_dpa_busy(struct device *dev, void *data)
++int alias_dpa_busy(struct device *dev, void *data)
+ {
+ 	resource_size_t map_end, blk_start, new, busy;
+ 	struct blk_alloc_info *info = data;
+@@ -418,6 +412,20 @@ static int alias_dpa_busy(struct device *dev, void *data)
+ 	ndd = to_ndd(nd_mapping);
+ 	map_end = nd_mapping->start + nd_mapping->size - 1;
+ 	blk_start = nd_mapping->start;
++
++	/*
++	 * In the allocation case ->res is set to free space that we are
++	 * looking to validate against PMEM aliasing collision rules
++	 * (i.e. BLK is allocated after all aliased PMEM).
++	 */
++	if (info->res) {
++		if (info->res->start >= nd_mapping->start
++				&& info->res->start < map_end)
++			/* pass */;
++		else
++			return 0;
++	}
++
+  retry:
+ 	/*
+ 	 * Find the free dpa from the end of the last pmem allocation to
+@@ -447,7 +455,16 @@ static int alias_dpa_busy(struct device *dev, void *data)
+ 		}
+ 	}
+ 
++	/* update the free space range with the probed blk_start */
++	if (info->res && blk_start > info->res->start) {
++		info->res->start = max(info->res->start, blk_start);
++		if (info->res->start > info->res->end)
++			info->res->end = info->res->start - 1;
++		return 1;
++	}
++
+ 	info->available -= blk_start - nd_mapping->start + busy;
++
+ 	return 0;
+ }
+ 
+@@ -508,6 +525,7 @@ resource_size_t nd_blk_available_dpa(struct nd_region *nd_region)
+ 	struct blk_alloc_info info = {
+ 		.nd_mapping = nd_mapping,
+ 		.available = nd_mapping->size,
++		.res = NULL,
+ 	};
+ 	struct resource *res;
+ 
+
+commit a1f3e4d6a0c322eb3e7fdfcc9facdcdf19130434
+Author: Dan Williams <dan.j.williams@intel.com>
+Date:   Fri Sep 30 17:28:58 2016 -0700
+
+    libnvdimm, region: update nd_region_available_dpa() for multi-pmem support
+    
+    The free dpa (dimm-physical-address) space calculation reports how much
+    free space is available with consideration for aliased BLK + PMEM
+    regions.  Recall that BLK capacity is allocated from high addresses and
+    PMEM is allocated from low addresses in their respective regions.
+    
+    nd_region_available_dpa() accounts for the fact that the largest
+    encroachment (lowest starting address) into PMEM capacity by a BLK
+    allocation limits the available capacity to that point, regardless if
+    there is BLK allocation hole at a higher address.  Similarly, for the
+    multi-pmem case we need to track the largest encroachment (highest
+     ending address) of a PMEM allocation in BLK capacity regardless of
+    whether there is an allocation hole that a BLK allocation could fill at
+    a lower address.
+    
+    Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+
+diff --git a/drivers/nvdimm/dimm_devs.c b/drivers/nvdimm/dimm_devs.c
+index cf36470e94c0..4b0296ccb375 100644
+--- a/drivers/nvdimm/dimm_devs.c
++++ b/drivers/nvdimm/dimm_devs.c
+@@ -386,40 +386,148 @@ struct nvdimm *nvdimm_create(struct nvdimm_bus *nvdimm_bus, void *provider_data,
+ }
+ EXPORT_SYMBOL_GPL(nvdimm_create);
+ 
++struct blk_alloc_info {
++	struct nd_mapping *nd_mapping;
++	resource_size_t available, busy;
++	struct resource *res;
++};
++
++static int alias_dpa_busy(struct device *dev, void *data)
++{
++	resource_size_t map_end, blk_start, new, busy;
++	struct blk_alloc_info *info = data;
++	struct nd_mapping *nd_mapping;
++	struct nd_region *nd_region;
++	struct nvdimm_drvdata *ndd;
++	struct resource *res;
++	int i;
++
++	if (!is_nd_pmem(dev))
++		return 0;
++
++	nd_region = to_nd_region(dev);
++	for (i = 0; i < nd_region->ndr_mappings; i++) {
++		nd_mapping  = &nd_region->mapping[i];
++		if (nd_mapping->nvdimm == info->nd_mapping->nvdimm)
++			break;
++	}
++
++	if (i >= nd_region->ndr_mappings)
++		return 0;
++
++	ndd = to_ndd(nd_mapping);
++	map_end = nd_mapping->start + nd_mapping->size - 1;
++	blk_start = nd_mapping->start;
++ retry:
++	/*
++	 * Find the free dpa from the end of the last pmem allocation to
++	 * the end of the interleave-set mapping that is not already
++	 * covered by a blk allocation.
++	 */
++	busy = 0;
++	for_each_dpa_resource(ndd, res) {
++		if ((res->start >= blk_start && res->start < map_end)
++				|| (res->end >= blk_start
++					&& res->end <= map_end)) {
++			if (strncmp(res->name, "pmem", 4) == 0) {
++				new = max(blk_start, min(map_end + 1,
++							res->end + 1));
++				if (new != blk_start) {
++					blk_start = new;
++					goto retry;
++				}
++			} else
++				busy += min(map_end, res->end)
++					- max(nd_mapping->start, res->start) + 1;
++		} else if (nd_mapping->start > res->start
++				&& map_end < res->end) {
++			/* total eclipse of the PMEM region mapping */
++			busy += nd_mapping->size;
++			break;
++		}
++	}
++
++	info->available -= blk_start - nd_mapping->start + busy;
++	return 0;
++}
++
++static int blk_dpa_busy(struct device *dev, void *data)
++{
++	struct blk_alloc_info *info = data;
++	struct nd_mapping *nd_mapping;
++	struct nd_region *nd_region;
++	resource_size_t map_end;
++	int i;
++
++	if (!is_nd_pmem(dev))
++		return 0;
++
++	nd_region = to_nd_region(dev);
++	for (i = 0; i < nd_region->ndr_mappings; i++) {
++		nd_mapping  = &nd_region->mapping[i];
++		if (nd_mapping->nvdimm == info->nd_mapping->nvdimm)
++			break;
++	}
++
++	if (i >= nd_region->ndr_mappings)
++		return 0;
++
++	map_end = nd_mapping->start + nd_mapping->size - 1;
++	if (info->res->start >= nd_mapping->start
++			&& info->res->start < map_end) {
++		if (info->res->end <= map_end) {
++			info->busy = 0;
++			return 1;
++		} else {
++			info->busy -= info->res->end - map_end;
++			return 0;
++		}
++	} else if (info->res->end >= nd_mapping->start
++			&& info->res->end <= map_end) {
++		info->busy -= nd_mapping->start - info->res->start;
++		return 0;
++	} else {
++		info->busy -= nd_mapping->size;
++		return 0;
++	}
++}
++
+ /**
+  * nd_blk_available_dpa - account the unused dpa of BLK region
+  * @nd_mapping: container of dpa-resource-root + labels
+  *
+- * Unlike PMEM, BLK namespaces can occupy discontiguous DPA ranges.
++ * Unlike PMEM, BLK namespaces can occupy discontiguous DPA ranges, but
++ * we arrange for them to never start at an lower dpa than the last
++ * PMEM allocation in an aliased region.
+  */
+-resource_size_t nd_blk_available_dpa(struct nd_mapping *nd_mapping)
++resource_size_t nd_blk_available_dpa(struct nd_region *nd_region)
+ {
++	struct nvdimm_bus *nvdimm_bus = walk_to_nvdimm_bus(&nd_region->dev);
++	struct nd_mapping *nd_mapping = &nd_region->mapping[0];
+ 	struct nvdimm_drvdata *ndd = to_ndd(nd_mapping);
+-	resource_size_t map_end, busy = 0, available;
++	struct blk_alloc_info info = {
++		.nd_mapping = nd_mapping,
++		.available = nd_mapping->size,
++	};
+ 	struct resource *res;
+ 
+ 	if (!ndd)
+ 		return 0;
+ 
+-	map_end = nd_mapping->start + nd_mapping->size - 1;
+-	for_each_dpa_resource(ndd, res)
+-		if (res->start >= nd_mapping->start && res->start < map_end) {
+-			resource_size_t end = min(map_end, res->end);
++	device_for_each_child(&nvdimm_bus->dev, &info, alias_dpa_busy);
+ 
+-			busy += end - res->start + 1;
+-		} else if (res->end >= nd_mapping->start
+-				&& res->end <= map_end) {
+-			busy += res->end - nd_mapping->start;
+-		} else if (nd_mapping->start > res->start
+-				&& nd_mapping->start < res->end) {
+-			/* total eclipse of the BLK region mapping */
+-			busy += nd_mapping->size;
+-		}
++	/* now account for busy blk allocations in unaliased dpa */
++	for_each_dpa_resource(ndd, res) {
++		if (strncmp(res->name, "blk", 3) != 0)
++			continue;
+ 
+-	available = map_end - nd_mapping->start + 1;
+-	if (busy < available)
+-		return available - busy;
+-	return 0;
++		info.res = res;
++		info.busy = resource_size(res);
++		device_for_each_child(&nvdimm_bus->dev, &info, blk_dpa_busy);
++		info.available -= info.busy;
++	}
++
++	return info.available;
+ }
+ 
+ /**
+@@ -451,21 +559,16 @@ resource_size_t nd_pmem_available_dpa(struct nd_region *nd_region,
+ 	map_start = nd_mapping->start;
+ 	map_end = map_start + nd_mapping->size - 1;
+ 	blk_start = max(map_start, map_end + 1 - *overlap);
+-	for_each_dpa_resource(ndd, res)
++	for_each_dpa_resource(ndd, res) {
+ 		if (res->start >= map_start && res->start < map_end) {
+ 			if (strncmp(res->name, "blk", 3) == 0)
+-				blk_start = min(blk_start, res->start);
+-			else if (res->start != map_start) {
++				blk_start = min(blk_start,
++						max(map_start, res->start));
++			else if (res->end > map_end) {
+ 				reason = "misaligned to iset";
+ 				goto err;
+-			} else {
+-				if (busy) {
+-					reason = "duplicate overlapping PMEM reservations?";
+-					goto err;
+-				}
++			} else
+ 				busy += resource_size(res);
+-				continue;
+-			}
+ 		} else if (res->end >= map_start && res->end <= map_end) {
+ 			if (strncmp(res->name, "blk", 3) == 0) {
+ 				/*
+@@ -474,15 +577,14 @@ resource_size_t nd_pmem_available_dpa(struct nd_region *nd_region,
+ 				 * be used for BLK.
+ 				 */
+ 				blk_start = map_start;
+-			} else {
+-				reason = "misaligned to iset";
+-				goto err;
+-			}
++			} else
++				busy += resource_size(res);
+ 		} else if (map_start > res->start && map_start < res->end) {
+ 			/* total eclipse of the mapping */
+ 			busy += nd_mapping->size;
+ 			blk_start = map_start;
+ 		}
++	}
+ 
+ 	*overlap = map_end + 1 - blk_start;
+ 	available = blk_start - map_start;
+@@ -491,10 +593,6 @@ resource_size_t nd_pmem_available_dpa(struct nd_region *nd_region,
+ 	return 0;
+ 
+  err:
+-	/*
+-	 * Something is wrong, PMEM must align with the start of the
+-	 * interleave set, and there can only be one allocation per set.
+-	 */
+ 	nd_dbg_dpa(nd_region, ndd, res, "%s\n", reason);
+ 	return 0;
+ }
+
+commit aee6598748335794dc25d7c4f16f0d4801f6b584
+Author: Toshi Kani <toshi.kani@hpe.com>
+Date:   Tue Aug 16 13:08:40 2016 -0600
+
+    libnvdimm: Fix nvdimm_probe error on NVDIMM-N
+    
+    'ndctl list --buses --dimms' does not list any NVDIMM-Ns since
+    they are considered as idle.  ndctl checks if any driver is
+    attached to nmem device.  nvdimm_probe() always fails in
+    nvdimm_init_nsarea() since NVDIMM-Ns do not implement optinal
+    ND_CMD_GET_CONFIG_DATA command.
+    
+    Change nvdimm_probe() to accept the case that the CONFIG_DATA
+    command is not implemented for NVDIMM-Ns.  The driver attaches
+    without ndd, which keeps it no-op to the device.
+    
+    Reported-by: Brian Boylston <brian.boylston@hpe.com>
+    Signed-off-by: Toshi Kani <toshi.kani@hpe.com>
+    Cc: Dan Williams <dan.j.williams@intel.com>
+    Tested-by: Johannes Thumshirn <jthumshirn@suse.de>
+    Acked-by: Johannes Thumshirn <jthumshirn@suse.de>
+    Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+
+diff --git a/drivers/nvdimm/dimm_devs.c b/drivers/nvdimm/dimm_devs.c
+index ce75cc3f41fb..cf36470e94c0 100644
+--- a/drivers/nvdimm/dimm_devs.c
++++ b/drivers/nvdimm/dimm_devs.c
+@@ -28,28 +28,30 @@ static DEFINE_IDA(dimm_ida);
+  * Retrieve bus and dimm handle and return if this bus supports
+  * get_config_data commands
+  */
+-static int __validate_dimm(struct nvdimm_drvdata *ndd)
++int nvdimm_check_config_data(struct device *dev)
+ {
+-	struct nvdimm *nvdimm;
+-
+-	if (!ndd)
+-		return -EINVAL;
+-
+-	nvdimm = to_nvdimm(ndd->dev);
++	struct nvdimm *nvdimm = to_nvdimm(dev);
+ 
+-	if (!nvdimm->cmd_mask)
+-		return -ENXIO;
+-	if (!test_bit(ND_CMD_GET_CONFIG_DATA, &nvdimm->cmd_mask))
+-		return -ENXIO;
++	if (!nvdimm->cmd_mask ||
++	    !test_bit(ND_CMD_GET_CONFIG_DATA, &nvdimm->cmd_mask)) {
++		if (nvdimm->flags & NDD_ALIASING)
++			return -ENXIO;
++		else
++			return -ENOTTY;
++	}
+ 
+ 	return 0;
+ }
+ 
+ static int validate_dimm(struct nvdimm_drvdata *ndd)
+ {
+-	int rc = __validate_dimm(ndd);
++	int rc;
++
++	if (!ndd)
++		return -EINVAL;
+ 
+-	if (rc && ndd)
++	rc = nvdimm_check_config_data(ndd->dev);
++	if (rc)
+ 		dev_dbg(ndd->dev, "%pf: %s error: %d\n",
+ 				__builtin_return_address(0), __func__, rc);
+ 	return rc;
+
+commit ba9c8dd3c22275e46feef429f343b85e9cf3924c
+Author: Dan Williams <dan.j.williams@intel.com>
+Date:   Mon Aug 22 19:28:37 2016 -0700
+
+    acpi, nfit: add dimm device notification support
+    
+    Per "ACPI 6.1 Section 9.20.3" NVDIMM devices, children of the ACPI0012
+    NVDIMM Root device, can receive health event notifications.
+    
+    Given that these devices are precluded from registering a notification
+    handler via acpi_driver.acpi_device_ops (due to no _HID), we use
+    acpi_install_notify_handler() directly.  The registered handler,
+    acpi_nvdimm_notify(), triggers a poll(2) event on the nmemX/nfit/flags
+    sysfs attribute when a health event notification is received.
+    
+    Cc: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+    Tested-by: Toshi Kani <toshi.kani@hpe.com>
+    Reviewed-by: Vishal Verma <vishal.l.verma@intel.com>
+    Acked-by: Rafael J. Wysocki <rafael@kernel.org>
+    Reviewed-by: Toshi Kani <toshi.kani@hpe.com>
+    Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+
+diff --git a/drivers/nvdimm/dimm_devs.c b/drivers/nvdimm/dimm_devs.c
+index d9bba5edd8dc..ce75cc3f41fb 100644
+--- a/drivers/nvdimm/dimm_devs.c
++++ b/drivers/nvdimm/dimm_devs.c
+@@ -263,6 +263,12 @@ const char *nvdimm_name(struct nvdimm *nvdimm)
+ }
+ EXPORT_SYMBOL_GPL(nvdimm_name);
+ 
++struct kobject *nvdimm_kobj(struct nvdimm *nvdimm)
++{
++	return &nvdimm->dev.kobj;
++}
++EXPORT_SYMBOL_GPL(nvdimm_kobj);
++
+ unsigned long nvdimm_cmd_mask(struct nvdimm *nvdimm)
+ {
+ 	return nvdimm->cmd_mask;
+
+commit e5ae3b252c6732f838f5695170bbf2ea9fb5b9ff
+Author: Dan Williams <dan.j.williams@intel.com>
+Date:   Tue Jun 7 17:00:04 2016 -0700
+
+    libnvdimm, nfit: move flush hint mapping to region-device driver-data
+    
+    In preparation for triggering flushes of a DIMM's writes-posted-queue
+    (WPQ) via the pmem driver move mapping of flush hint addresses to the
+    region driver.  Since this uses devm_nvdimm_memremap() the flush
+    addresses will remain mapped while any region to which the dimm belongs
+    is active.
+    
+    We need to communicate more information to the nvdimm core to facilitate
+    this mapping, namely each dimm object now carries an array of flush hint
+    address resources.
+    
+    Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+
+diff --git a/drivers/nvdimm/dimm_devs.c b/drivers/nvdimm/dimm_devs.c
+index bbde28d3dec5..d9bba5edd8dc 100644
+--- a/drivers/nvdimm/dimm_devs.c
++++ b/drivers/nvdimm/dimm_devs.c
+@@ -346,7 +346,8 @@ EXPORT_SYMBOL_GPL(nvdimm_attribute_group);
+ 
+ struct nvdimm *nvdimm_create(struct nvdimm_bus *nvdimm_bus, void *provider_data,
+ 		const struct attribute_group **groups, unsigned long flags,
+-		unsigned long cmd_mask)
++		unsigned long cmd_mask, int num_flush,
++		struct resource *flush_wpq)
+ {
+ 	struct nvdimm *nvdimm = kzalloc(sizeof(*nvdimm), GFP_KERNEL);
+ 	struct device *dev;
+@@ -362,6 +363,8 @@ struct nvdimm *nvdimm_create(struct nvdimm_bus *nvdimm_bus, void *provider_data,
+ 	nvdimm->provider_data = provider_data;
+ 	nvdimm->flags = flags;
+ 	nvdimm->cmd_mask = cmd_mask;
++	nvdimm->num_flush = num_flush;
++	nvdimm->flush_wpq = flush_wpq;
+ 	atomic_set(&nvdimm->busy, 0);
+ 	dev = &nvdimm->dev;
+ 	dev_set_name(dev, "nmem%d", nvdimm->id);
+
+commit 36092ee8ba695fce023b2118ececa6c2a56b1331
+Merge: 1b982baf75e7 03dca343afe0
+Author: Dan Williams <dan.j.williams@intel.com>
+Date:   Sat May 21 12:33:04 2016 -0700
+
+    Merge branch 'for-4.7/dax' into libnvdimm-for-next
+
+commit b354aba0165519a74f540f2ba89d7ec78efca21d
+Author: Dan Williams <dan.j.williams@intel.com>
+Date:   Tue May 17 20:24:16 2016 -0700
+
+    libnvdimm: release ida resources
+    
+    ida instances allocate some internal memory for ->free_bitmap in
+    addition to the base 'struct ida'.  Use ida_destroy() to release that
+    memory at module_exit().
+    
+    Reported-by: Johannes Thumshirn <jthumshirn@suse.de>
+    Reviewed-by: Johannes Thumshirn <jthumshirn@suse.de>
+    Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+
+diff --git a/drivers/nvdimm/dimm_devs.c b/drivers/nvdimm/dimm_devs.c
+index c56f88217924..6cca03eaa345 100644
+--- a/drivers/nvdimm/dimm_devs.c
++++ b/drivers/nvdimm/dimm_devs.c
+@@ -546,3 +546,8 @@ int nvdimm_bus_check_dimm_count(struct nvdimm_bus *nvdimm_bus, int dimm_count)
+ 	return 0;
+ }
+ EXPORT_SYMBOL_GPL(nvdimm_bus_check_dimm_count);
++
++void __exit nvdimm_devs_exit(void)
++{
++	ida_destroy(&dimm_ida);
++}
+
+commit e3654eca70d63704c94a60a2aafc0b3c7b46a00b
+Author: Dan Williams <dan.j.williams@intel.com>
+Date:   Thu Apr 28 16:17:07 2016 -0700
+
+    nfit, libnvdimm: clarify "commands" vs "_DSMs"
+    
+    Clarify the distinction between "commands", the ioctls userspace calls
+    to request the kernel take some action on a given dimm device, and
+    "_DSMs", the actual function numbers used in the firmware interface to
+    the DIMM.  _DSMs are ACPI specific whereas commands are Linux kernel
+    generic.
+    
+    This is in preparation for breaking the 1:1 implicit relationship
+    between the kernel ioctl number space and the firmware specific function
+    numbers.
+    
+    Cc: Jerry Hoemann <jerry.hoemann@hpe.com>
+    Cc: Christoph Hellwig <hch@infradead.org>
+    Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+
+diff --git a/drivers/nvdimm/dimm_devs.c b/drivers/nvdimm/dimm_devs.c
+index c56f88217924..79a35a02053c 100644
+--- a/drivers/nvdimm/dimm_devs.c
++++ b/drivers/nvdimm/dimm_devs.c
+@@ -37,9 +37,9 @@ static int __validate_dimm(struct nvdimm_drvdata *ndd)
+ 
+ 	nvdimm = to_nvdimm(ndd->dev);
+ 
+-	if (!nvdimm->dsm_mask)
++	if (!nvdimm->cmd_mask)
+ 		return -ENXIO;
+-	if (!test_bit(ND_CMD_GET_CONFIG_DATA, nvdimm->dsm_mask))
++	if (!test_bit(ND_CMD_GET_CONFIG_DATA, &nvdimm->cmd_mask))
+ 		return -ENXIO;
+ 
+ 	return 0;
+@@ -263,6 +263,12 @@ const char *nvdimm_name(struct nvdimm *nvdimm)
+ }
+ EXPORT_SYMBOL_GPL(nvdimm_name);
+ 
++unsigned long nvdimm_cmd_mask(struct nvdimm *nvdimm)
++{
++	return nvdimm->cmd_mask;
++}
++EXPORT_SYMBOL_GPL(nvdimm_cmd_mask);
++
+ void *nvdimm_provider_data(struct nvdimm *nvdimm)
+ {
+ 	if (nvdimm)
+@@ -277,10 +283,10 @@ static ssize_t commands_show(struct device *dev,
+ 	struct nvdimm *nvdimm = to_nvdimm(dev);
+ 	int cmd, len = 0;
+ 
+-	if (!nvdimm->dsm_mask)
++	if (!nvdimm->cmd_mask)
+ 		return sprintf(buf, "\n");
+ 
+-	for_each_set_bit(cmd, nvdimm->dsm_mask, BITS_PER_LONG)
++	for_each_set_bit(cmd, &nvdimm->cmd_mask, BITS_PER_LONG)
+ 		len += sprintf(buf + len, "%s ", nvdimm_cmd_name(cmd));
+ 	len += sprintf(buf + len, "\n");
+ 	return len;
+@@ -340,7 +346,7 @@ EXPORT_SYMBOL_GPL(nvdimm_attribute_group);
+ 
+ struct nvdimm *nvdimm_create(struct nvdimm_bus *nvdimm_bus, void *provider_data,
+ 		const struct attribute_group **groups, unsigned long flags,
+-		unsigned long *dsm_mask)
++		unsigned long cmd_mask)
+ {
+ 	struct nvdimm *nvdimm = kzalloc(sizeof(*nvdimm), GFP_KERNEL);
+ 	struct device *dev;
+@@ -355,7 +361,7 @@ struct nvdimm *nvdimm_create(struct nvdimm_bus *nvdimm_bus, void *provider_data,
+ 	}
+ 	nvdimm->provider_data = provider_data;
+ 	nvdimm->flags = flags;
+-	nvdimm->dsm_mask = dsm_mask;
++	nvdimm->cmd_mask = cmd_mask;
+ 	atomic_set(&nvdimm->busy, 0);
+ 	dev = &nvdimm->dev;
+ 	dev_set_name(dev, "nmem%d", nvdimm->id);
+
+commit aef25338226660cdd4df908c2eff1abdcfca65e5
+Author: Dan Williams <dan.j.williams@intel.com>
+Date:   Fri Feb 12 17:01:11 2016 -0800
+
+    libnvdimm, nfit: centralize command status translation
+    
+    The return value from an 'ndctl_fn' reports the command execution
+    status, i.e. was the command properly formatted and was it successfully
+    submitted to the bus provider.  The new 'cmd_rc' parameter allows the bus
+    provider to communicate command specific results, translated into
+    common error codes.
+    
+    Convert the ARS commands to this scheme to:
+    
+    1/ Consolidate status reporting
+    
+    2/ Prepare for for expanding ars unit test cases
+    
+    3/ Make the implementation more generic
+    
+    Cc: Vishal Verma <vishal.l.verma@intel.com>
+    Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+
+diff --git a/drivers/nvdimm/dimm_devs.c b/drivers/nvdimm/dimm_devs.c
+index 651b8d19d324..c56f88217924 100644
+--- a/drivers/nvdimm/dimm_devs.c
++++ b/drivers/nvdimm/dimm_devs.c
+@@ -75,7 +75,7 @@ int nvdimm_init_nsarea(struct nvdimm_drvdata *ndd)
+ 	memset(cmd, 0, sizeof(*cmd));
+ 	nd_desc = nvdimm_bus->nd_desc;
+ 	return nd_desc->ndctl(nd_desc, to_nvdimm(ndd->dev),
+-			ND_CMD_GET_CONFIG_SIZE, cmd, sizeof(*cmd));
++			ND_CMD_GET_CONFIG_SIZE, cmd, sizeof(*cmd), NULL);
+ }
+ 
+ int nvdimm_init_config_data(struct nvdimm_drvdata *ndd)
+@@ -120,7 +120,7 @@ int nvdimm_init_config_data(struct nvdimm_drvdata *ndd)
+ 		cmd->in_offset = offset;
+ 		rc = nd_desc->ndctl(nd_desc, to_nvdimm(ndd->dev),
+ 				ND_CMD_GET_CONFIG_DATA, cmd,
+-				cmd->in_length + sizeof(*cmd));
++				cmd->in_length + sizeof(*cmd), NULL);
+ 		if (rc || cmd->status) {
+ 			rc = -ENXIO;
+ 			break;
+@@ -171,7 +171,7 @@ int nvdimm_set_config_data(struct nvdimm_drvdata *ndd, size_t offset,
+ 		status = ((void *) cmd) + cmd_size - sizeof(u32);
+ 
+ 		rc = nd_desc->ndctl(nd_desc, to_nvdimm(ndd->dev),
+-				ND_CMD_SET_CONFIG_DATA, cmd, cmd_size);
++				ND_CMD_SET_CONFIG_DATA, cmd, cmd_size, NULL);
+ 		if (rc || *status) {
+ 			rc = rc ? rc : -ENXIO;
+ 			break;
+
+commit a06a7576526e10a99ea7721533e7f2df3e26baad
+Author: yalin wang <yalin.wang2010@gmail.com>
+Date:   Thu Aug 27 19:35:48 2015 -0400
+
+    nvdimm: change to use generic kvfree()
+    
+    Signed-off-by: yalin wang <yalin.wang2010@gmail.com>
+    Reviewed-by: Ross Zwisler <ross.zwisler@linux.intel.com>
+    Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+
+diff --git a/drivers/nvdimm/dimm_devs.c b/drivers/nvdimm/dimm_devs.c
+index c05eb807d674..651b8d19d324 100644
+--- a/drivers/nvdimm/dimm_devs.c
++++ b/drivers/nvdimm/dimm_devs.c
+@@ -241,10 +241,7 @@ void nvdimm_drvdata_release(struct kref *kref)
+ 		nvdimm_free_dpa(ndd, res);
+ 	nvdimm_bus_unlock(dev);
+ 
+-	if (ndd->data && is_vmalloc_addr(ndd->data))
+-		vfree(ndd->data);
+-	else
+-		kfree(ndd->data);
++	kvfree(ndd->data);
+ 	kfree(ndd);
+ 	put_device(dev);
+ }
+
+commit 047fc8a1f9a6330eacc80374dff087e20dc2304b
+Author: Ross Zwisler <ross.zwisler@linux.intel.com>
+Date:   Thu Jun 25 04:21:02 2015 -0400
+
+    libnvdimm, nfit, nd_blk: driver for BLK-mode access persistent memory
+    
+    The libnvdimm implementation handles allocating dimm address space (DPA)
+    between PMEM and BLK mode interfaces.  After DPA has been allocated from
+    a BLK-region to a BLK-namespace the nd_blk driver attaches to handle I/O
+    as a struct bio based block device. Unlike PMEM, BLK is required to
+    handle platform specific details like mmio register formats and memory
+    controller interleave.  For this reason the libnvdimm generic nd_blk
+    driver calls back into the bus provider to carry out the I/O.
+    
+    This initial implementation handles the BLK interface defined by the
+    ACPI 6 NFIT [1] and the NVDIMM DSM Interface Example [2] composed from
+    DCR (dimm control region), BDW (block data window), IDT (interleave
+    descriptor) NFIT structures and the hardware register format.
+    [1]: http://www.uefi.org/sites/default/files/resources/ACPI_6.0.pdf
+    [2]: http://pmem.io/documents/NVDIMM_DSM_Interface_Example.pdf
+    
+    Cc: Andy Lutomirski <luto@amacapital.net>
+    Cc: Boaz Harrosh <boaz@plexistor.com>
+    Cc: H. Peter Anvin <hpa@zytor.com>
+    Cc: Jens Axboe <axboe@fb.com>
+    Cc: Ingo Molnar <mingo@kernel.org>
+    Cc: Christoph Hellwig <hch@lst.de>
+    Signed-off-by: Ross Zwisler <ross.zwisler@linux.intel.com>
+    Acked-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+    Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+
+diff --git a/drivers/nvdimm/dimm_devs.c b/drivers/nvdimm/dimm_devs.c
+index 83b179ed6d61..c05eb807d674 100644
+--- a/drivers/nvdimm/dimm_devs.c
++++ b/drivers/nvdimm/dimm_devs.c
+@@ -209,6 +209,15 @@ struct nvdimm *to_nvdimm(struct device *dev)
+ }
+ EXPORT_SYMBOL_GPL(to_nvdimm);
+ 
++struct nvdimm *nd_blk_region_to_dimm(struct nd_blk_region *ndbr)
++{
++	struct nd_region *nd_region = &ndbr->nd_region;
++	struct nd_mapping *nd_mapping = &nd_region->mapping[0];
++
++	return nd_mapping->nvdimm;
++}
++EXPORT_SYMBOL_GPL(nd_blk_region_to_dimm);
++
+ struct nvdimm_drvdata *to_ndd(struct nd_mapping *nd_mapping)
+ {
+ 	struct nvdimm *nvdimm = nd_mapping->nvdimm;
+
+commit 0ba1c634892b3590779803a701bcb82e8c32cc7a
+Author: Dan Williams <dan.j.williams@intel.com>
+Date:   Sat May 30 12:35:36 2015 -0400
+
+    libnvdimm: write blk label set
+    
+    After 'uuid', 'size', 'sector_size', and optionally 'alt_name' have been
+    set to valid values the labels on the dimm can be updated.  The
+    difference with the pmem case is that blk namespaces are limited to one
+    dimm and can cover discontiguous ranges in dpa space.
+    
+    Also, after allocating label slots, it is useful for userspace to know
+    how many slots are left.  Export this information in sysfs.
+    
+    Cc: Greg KH <gregkh@linuxfoundation.org>
+    Cc: Neil Brown <neilb@suse.de>
+    Acked-by: Christoph Hellwig <hch@lst.de>
+    Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+
+diff --git a/drivers/nvdimm/dimm_devs.c b/drivers/nvdimm/dimm_devs.c
+index 156d518a089c..83b179ed6d61 100644
+--- a/drivers/nvdimm/dimm_devs.c
++++ b/drivers/nvdimm/dimm_devs.c
+@@ -19,6 +19,7 @@
+ #include <linux/fs.h>
+ #include <linux/mm.h>
+ #include "nd-core.h"
++#include "label.h"
+ #include "nd.h"
+ 
+ static DEFINE_IDA(dimm_ida);
+@@ -296,9 +297,33 @@ static ssize_t state_show(struct device *dev, struct device_attribute *attr,
+ }
+ static DEVICE_ATTR_RO(state);
+ 
++static ssize_t available_slots_show(struct device *dev,
++		struct device_attribute *attr, char *buf)
++{
++	struct nvdimm_drvdata *ndd = dev_get_drvdata(dev);
++	ssize_t rc;
++	u32 nfree;
++
++	if (!ndd)
++		return -ENXIO;
++
++	nvdimm_bus_lock(dev);
++	nfree = nd_label_nfree(ndd);
++	if (nfree - 1 > nfree) {
++		dev_WARN_ONCE(dev, 1, "we ate our last label?\n");
++		nfree = 0;
++	} else
++		nfree--;
++	rc = sprintf(buf, "%d\n", nfree);
++	nvdimm_bus_unlock(dev);
++	return rc;
++}
++static DEVICE_ATTR_RO(available_slots);
++
+ static struct attribute *nvdimm_attributes[] = {
+ 	&dev_attr_state.attr,
+ 	&dev_attr_commands.attr,
++	&dev_attr_available_slots.attr,
+ 	NULL,
+ };
+ 
+
+commit f524bf271a5cf12a44253194abcf8b6688ff5b9d
+Author: Dan Williams <dan.j.williams@intel.com>
+Date:   Sat May 30 12:36:02 2015 -0400
+
+    libnvdimm: write pmem label set
+    
+    After 'uuid', 'size', and optionally 'alt_name' have been set to valid
+    values the labels on the dimms can be updated.
+    
+    Write procedure is:
+    1/ Allocate and write new labels in the "next" index
+    2/ Free the old labels in the working copy
+    3/ Write the bitmap and the label space on the dimm
+    4/ Write the index to make the update valid
+    
+    Label ranges directly mirror the dpa resource values for the given
+    label_id of the namespace.
+    
+    Cc: Greg KH <gregkh@linuxfoundation.org>
+    Cc: Neil Brown <neilb@suse.de>
+    Acked-by: Christoph Hellwig <hch@lst.de>
+    Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+
+diff --git a/drivers/nvdimm/dimm_devs.c b/drivers/nvdimm/dimm_devs.c
+index 101d3b76e405..156d518a089c 100644
+--- a/drivers/nvdimm/dimm_devs.c
++++ b/drivers/nvdimm/dimm_devs.c
+@@ -132,6 +132,55 @@ int nvdimm_init_config_data(struct nvdimm_drvdata *ndd)
+ 	return rc;
+ }
+ 
++int nvdimm_set_config_data(struct nvdimm_drvdata *ndd, size_t offset,
++		void *buf, size_t len)
++{
++	int rc = validate_dimm(ndd);
++	size_t max_cmd_size, buf_offset;
++	struct nd_cmd_set_config_hdr *cmd;
++	struct nvdimm_bus *nvdimm_bus = walk_to_nvdimm_bus(ndd->dev);
++	struct nvdimm_bus_descriptor *nd_desc = nvdimm_bus->nd_desc;
++
++	if (rc)
++		return rc;
++
++	if (!ndd->data)
++		return -ENXIO;
++
++	if (offset + len > ndd->nsarea.config_size)
++		return -ENXIO;
++
++	max_cmd_size = min_t(u32, PAGE_SIZE, len);
++	max_cmd_size = min_t(u32, max_cmd_size, ndd->nsarea.max_xfer);
++	cmd = kzalloc(max_cmd_size + sizeof(*cmd) + sizeof(u32), GFP_KERNEL);
++	if (!cmd)
++		return -ENOMEM;
++
++	for (buf_offset = 0; len; len -= cmd->in_length,
++			buf_offset += cmd->in_length) {
++		size_t cmd_size;
++		u32 *status;
++
++		cmd->in_offset = offset + buf_offset;
++		cmd->in_length = min(max_cmd_size, len);
++		memcpy(cmd->in_buf, buf + buf_offset, cmd->in_length);
++
++		/* status is output in the last 4-bytes of the command buffer */
++		cmd_size = sizeof(*cmd) + cmd->in_length + sizeof(u32);
++		status = ((void *) cmd) + cmd_size - sizeof(u32);
++
++		rc = nd_desc->ndctl(nd_desc, to_nvdimm(ndd->dev),
++				ND_CMD_SET_CONFIG_DATA, cmd, cmd_size);
++		if (rc || *status) {
++			rc = rc ? rc : -ENXIO;
++			break;
++		}
++	}
++	kfree(cmd);
++
++	return rc;
++}
++
+ static void nvdimm_release(struct device *dev)
+ {
+ 	struct nvdimm *nvdimm = to_nvdimm(dev);
+
+commit 1b40e09a1232de537b193fa1b6b3ef16d3a1e397
+Author: Dan Williams <dan.j.williams@intel.com>
+Date:   Fri May 1 13:34:01 2015 -0400
+
+    libnvdimm: blk labels and namespace instantiation
+    
+    A blk label set describes a namespace comprised of one or more
+    discontiguous dpa ranges on a single dimm.  They may alias with one or
+    more pmem interleave sets that include the given dimm.
+    
+    This is the runtime/volatile configuration infrastructure for sysfs
+    manipulation of 'alt_name', 'uuid', 'size', and 'sector_size'.  A later
+    patch will make these settings persistent by writing back the label(s).
+    
+    Unlike pmem namespaces, multiple blk namespaces can be created per
+    region.  Once a blk namespace has been created a new seed device
+    (unconfigured child of a parent blk region) is instantiated.  As long as
+    a region has 'available_size' != 0 new child namespaces may be created.
+    
+    Cc: Greg KH <gregkh@linuxfoundation.org>
+    Cc: Neil Brown <neilb@suse.de>
+    Acked-by: Christoph Hellwig <hch@lst.de>
+    Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+
+diff --git a/drivers/nvdimm/dimm_devs.c b/drivers/nvdimm/dimm_devs.c
+index b55acef179ba..101d3b76e405 100644
+--- a/drivers/nvdimm/dimm_devs.c
++++ b/drivers/nvdimm/dimm_devs.c
+@@ -289,6 +289,42 @@ struct nvdimm *nvdimm_create(struct nvdimm_bus *nvdimm_bus, void *provider_data,
+ }
+ EXPORT_SYMBOL_GPL(nvdimm_create);
+ 
++/**
++ * nd_blk_available_dpa - account the unused dpa of BLK region
++ * @nd_mapping: container of dpa-resource-root + labels
++ *
++ * Unlike PMEM, BLK namespaces can occupy discontiguous DPA ranges.
++ */
++resource_size_t nd_blk_available_dpa(struct nd_mapping *nd_mapping)
++{
++	struct nvdimm_drvdata *ndd = to_ndd(nd_mapping);
++	resource_size_t map_end, busy = 0, available;
++	struct resource *res;
++
++	if (!ndd)
++		return 0;
++
++	map_end = nd_mapping->start + nd_mapping->size - 1;
++	for_each_dpa_resource(ndd, res)
++		if (res->start >= nd_mapping->start && res->start < map_end) {
++			resource_size_t end = min(map_end, res->end);
++
++			busy += end - res->start + 1;
++		} else if (res->end >= nd_mapping->start
++				&& res->end <= map_end) {
++			busy += res->end - nd_mapping->start;
++		} else if (nd_mapping->start > res->start
++				&& nd_mapping->start < res->end) {
++			/* total eclipse of the BLK region mapping */
++			busy += nd_mapping->size;
++		}
++
++	available = map_end - nd_mapping->start + 1;
++	if (busy < available)
++		return available - busy;
++	return 0;
++}
++
+ /**
+  * nd_pmem_available_dpa - for the given dimm+region account unallocated dpa
+  * @nd_mapping: container of dpa-resource-root + labels
+
+commit bf9bccc14c05dae8caba29df6187c731710f5380
+Author: Dan Williams <dan.j.williams@intel.com>
+Date:   Wed Jun 17 17:14:46 2015 -0400
+
+    libnvdimm: pmem label sets and namespace instantiation.
+    
+    A complete label set is a PMEM-label per-dimm per-interleave-set where
+    all the UUIDs match and the interleave set cookie matches the hosting
+    interleave set.
+    
+    Present sysfs attributes for manipulation of a PMEM-namespace's
+    'alt_name', 'uuid', and 'size' attributes.  A later patch will make
+    these settings persistent by writing back the label.
+    
+    Note that PMEM allocations grow forwards from the start of an interleave
+    set (lowest dimm-physical-address (DPA)).  BLK-namespaces that alias
+    with a PMEM interleave set will grow allocations backward from the
+    highest DPA.
+    
+    Cc: Greg KH <gregkh@linuxfoundation.org>
+    Cc: Neil Brown <neilb@suse.de>
+    Acked-by: Christoph Hellwig <hch@lst.de>
+    Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+
+diff --git a/drivers/nvdimm/dimm_devs.c b/drivers/nvdimm/dimm_devs.c
+index d2ef02e4be6c..b55acef179ba 100644
+--- a/drivers/nvdimm/dimm_devs.c
++++ b/drivers/nvdimm/dimm_devs.c
+@@ -159,6 +159,48 @@ struct nvdimm *to_nvdimm(struct device *dev)
+ }
+ EXPORT_SYMBOL_GPL(to_nvdimm);
+ 
++struct nvdimm_drvdata *to_ndd(struct nd_mapping *nd_mapping)
++{
++	struct nvdimm *nvdimm = nd_mapping->nvdimm;
++
++	WARN_ON_ONCE(!is_nvdimm_bus_locked(&nvdimm->dev));
++
++	return dev_get_drvdata(&nvdimm->dev);
++}
++EXPORT_SYMBOL(to_ndd);
++
++void nvdimm_drvdata_release(struct kref *kref)
++{
++	struct nvdimm_drvdata *ndd = container_of(kref, typeof(*ndd), kref);
++	struct device *dev = ndd->dev;
++	struct resource *res, *_r;
++
++	dev_dbg(dev, "%s\n", __func__);
++
++	nvdimm_bus_lock(dev);
++	for_each_dpa_resource_safe(ndd, res, _r)
++		nvdimm_free_dpa(ndd, res);
++	nvdimm_bus_unlock(dev);
++
++	if (ndd->data && is_vmalloc_addr(ndd->data))
++		vfree(ndd->data);
++	else
++		kfree(ndd->data);
++	kfree(ndd);
++	put_device(dev);
++}
++
++void get_ndd(struct nvdimm_drvdata *ndd)
++{
++	kref_get(&ndd->kref);
++}
++
++void put_ndd(struct nvdimm_drvdata *ndd)
++{
++	if (ndd)
++		kref_put(&ndd->kref, nvdimm_drvdata_release);
++}
++
+ const char *nvdimm_name(struct nvdimm *nvdimm)
+ {
+ 	return dev_name(&nvdimm->dev);
+@@ -247,6 +289,83 @@ struct nvdimm *nvdimm_create(struct nvdimm_bus *nvdimm_bus, void *provider_data,
+ }
+ EXPORT_SYMBOL_GPL(nvdimm_create);
+ 
++/**
++ * nd_pmem_available_dpa - for the given dimm+region account unallocated dpa
++ * @nd_mapping: container of dpa-resource-root + labels
++ * @nd_region: constrain available space check to this reference region
++ * @overlap: calculate available space assuming this level of overlap
++ *
++ * Validate that a PMEM label, if present, aligns with the start of an
++ * interleave set and truncate the available size at the lowest BLK
++ * overlap point.
++ *
++ * The expectation is that this routine is called multiple times as it
++ * probes for the largest BLK encroachment for any single member DIMM of
++ * the interleave set.  Once that value is determined the PMEM-limit for
++ * the set can be established.
++ */
++resource_size_t nd_pmem_available_dpa(struct nd_region *nd_region,
++		struct nd_mapping *nd_mapping, resource_size_t *overlap)
++{
++	resource_size_t map_start, map_end, busy = 0, available, blk_start;
++	struct nvdimm_drvdata *ndd = to_ndd(nd_mapping);
++	struct resource *res;
++	const char *reason;
++
++	if (!ndd)
++		return 0;
++
++	map_start = nd_mapping->start;
++	map_end = map_start + nd_mapping->size - 1;
++	blk_start = max(map_start, map_end + 1 - *overlap);
++	for_each_dpa_resource(ndd, res)
++		if (res->start >= map_start && res->start < map_end) {
++			if (strncmp(res->name, "blk", 3) == 0)
++				blk_start = min(blk_start, res->start);
++			else if (res->start != map_start) {
++				reason = "misaligned to iset";
++				goto err;
++			} else {
++				if (busy) {
++					reason = "duplicate overlapping PMEM reservations?";
++					goto err;
++				}
++				busy += resource_size(res);
++				continue;
++			}
++		} else if (res->end >= map_start && res->end <= map_end) {
++			if (strncmp(res->name, "blk", 3) == 0) {
++				/*
++				 * If a BLK allocation overlaps the start of
++				 * PMEM the entire interleave set may now only
++				 * be used for BLK.
++				 */
++				blk_start = map_start;
++			} else {
++				reason = "misaligned to iset";
++				goto err;
++			}
++		} else if (map_start > res->start && map_start < res->end) {
++			/* total eclipse of the mapping */
++			busy += nd_mapping->size;
++			blk_start = map_start;
++		}
++
++	*overlap = map_end + 1 - blk_start;
++	available = blk_start - map_start;
++	if (busy < available)
++		return available - busy;
++	return 0;
++
++ err:
++	/*
++	 * Something is wrong, PMEM must align with the start of the
++	 * interleave set, and there can only be one allocation per set.
++	 */
++	nd_dbg_dpa(nd_region, ndd, res, "%s\n", reason);
++	return 0;
++}
++
+ void nvdimm_free_dpa(struct nvdimm_drvdata *ndd, struct resource *res)
+ {
+ 	WARN_ON_ONCE(!is_nvdimm_bus_locked(ndd->dev));
+@@ -271,6 +390,24 @@ struct resource *nvdimm_allocate_dpa(struct nvdimm_drvdata *ndd,
+ 	return res;
+ }
+ 
++/**
++ * nvdimm_allocated_dpa - sum up the dpa currently allocated to this label_id
++ * @nvdimm: container of dpa-resource-root + labels
++ * @label_id: dpa resource name of the form {pmem|blk}-<human readable uuid>
++ */
++resource_size_t nvdimm_allocated_dpa(struct nvdimm_drvdata *ndd,
++		struct nd_label_id *label_id)
++{
++	resource_size_t allocated = 0;
++	struct resource *res;
++
++	for_each_dpa_resource(ndd, res)
++		if (strcmp(res->name, label_id->id) == 0)
++			allocated += resource_size(res);
++
++	return allocated;
++}
++
+ static int count_dimms(struct device *dev, void *c)
+ {
+ 	int *count = c;
+
+commit 4a826c83db4edc040da3a66dbefd53f0cfcf457d
+Author: Dan Williams <dan.j.williams@intel.com>
+Date:   Tue Jun 9 16:09:36 2015 -0400
+
+    libnvdimm: namespace indices: read and validate
+    
+    This on media label format [1] consists of two index blocks followed by
+    an array of labels.  None of these structures are ever updated in place.
+    A sequence number tracks the current active index and the next one to
+    write, while labels are written to free slots.
+    
+        +------------+
+        |            |
+        |  nsindex0  |
+        |            |
+        +------------+
+        |            |
+        |  nsindex1  |
+        |            |
+        +------------+
+        |   label0   |
+        +------------+
+        |   label1   |
+        +------------+
+        |            |
+         ....nslot...
+        |            |
+        +------------+
+        |   labelN   |
+        +------------+
+    
+    After reading valid labels, store the dpa ranges they claim into
+    per-dimm resource trees.
+    
+    [1]: http://pmem.io/documents/NVDIMM_Namespace_Spec.pdf
+    
+    Cc: Neil Brown <neilb@suse.de>
+    Acked-by: Christoph Hellwig <hch@lst.de>
+    Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+
+diff --git a/drivers/nvdimm/dimm_devs.c b/drivers/nvdimm/dimm_devs.c
+index bdf8241b6525..d2ef02e4be6c 100644
+--- a/drivers/nvdimm/dimm_devs.c
++++ b/drivers/nvdimm/dimm_devs.c
+@@ -92,8 +92,12 @@ int nvdimm_init_config_data(struct nvdimm_drvdata *ndd)
+ 	if (ndd->data)
+ 		return 0;
+ 
+-	if (ndd->nsarea.status || ndd->nsarea.max_xfer == 0)
++	if (ndd->nsarea.status || ndd->nsarea.max_xfer == 0
++			|| ndd->nsarea.config_size < ND_LABEL_MIN_SIZE) {
++		dev_dbg(ndd->dev, "failed to init config data area: (%d:%d)\n",
++				ndd->nsarea.max_xfer, ndd->nsarea.config_size);
+ 		return -ENXIO;
++	}
+ 
+ 	ndd->data = kmalloc(ndd->nsarea.config_size, GFP_KERNEL);
+ 	if (!ndd->data)
+@@ -243,6 +247,30 @@ struct nvdimm *nvdimm_create(struct nvdimm_bus *nvdimm_bus, void *provider_data,
+ }
+ EXPORT_SYMBOL_GPL(nvdimm_create);
+ 
++void nvdimm_free_dpa(struct nvdimm_drvdata *ndd, struct resource *res)
++{
++	WARN_ON_ONCE(!is_nvdimm_bus_locked(ndd->dev));
++	kfree(res->name);
++	__release_region(&ndd->dpa, res->start, resource_size(res));
++}
++
++struct resource *nvdimm_allocate_dpa(struct nvdimm_drvdata *ndd,
++		struct nd_label_id *label_id, resource_size_t start,
++		resource_size_t n)
++{
++	char *name = kmemdup(label_id, sizeof(*label_id), GFP_KERNEL);
++	struct resource *res;
++
++	if (!name)
++		return NULL;
++
++	WARN_ON_ONCE(!is_nvdimm_bus_locked(ndd->dev));
++	res = __request_region(&ndd->dpa, start, n, name, 0);
++	if (!res)
++		kfree(name);
++	return res;
++}
++
+ static int count_dimms(struct device *dev, void *c)
+ {
+ 	int *count = c;
+
+commit eaf961536e1622ad21247ac8d44acd48ba65566e
+Author: Dan Williams <dan.j.williams@intel.com>
+Date:   Fri May 1 13:11:27 2015 -0400
+
+    libnvdimm, nfit: add interleave-set state-tracking infrastructure
+    
+    On platforms that have firmware support for reading/writing per-dimm
+    label space, a portion of the dimm may be accessible via an interleave
+    set PMEM mapping in addition to the dimm's BLK (block-data-window
+    aperture(s)) interface.  A label, stored in a "configuration data
+    region" on the dimm, disambiguates which dimm addresses are accessed
+    through which exclusive interface.
+    
+    Add infrastructure that allows the kernel to block modifications to a
+    label in the set while any member dimm is active.  Note that this is
+    meant only for enforcing "no modifications of active labels" via the
+    coarse ioctl command.  Adding/deleting namespaces from an active
+    interleave set is always possible via sysfs.
+    
+    Another aspect of tracking interleave sets is tracking their integrity
+    when DIMMs in a set are physically re-ordered.  For this purpose we
+    generate an "interleave-set cookie" that can be recorded in a label and
+    validated against the current configuration.  It is the bus provider
+    implementation's responsibility to calculate the interleave set cookie
+    and attach it to a given region.
+    
+    Cc: Neil Brown <neilb@suse.de>
+    Cc: <linux-acpi@vger.kernel.org>
+    Cc: Greg KH <gregkh@linuxfoundation.org>
+    Cc: Robert Moore <robert.moore@intel.com>
+    Cc: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+    Acked-by: Christoph Hellwig <hch@lst.de>
+    Acked-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+    Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+
+diff --git a/drivers/nvdimm/dimm_devs.c b/drivers/nvdimm/dimm_devs.c
+index b3ae86f2e1da..bdf8241b6525 100644
+--- a/drivers/nvdimm/dimm_devs.c
++++ b/drivers/nvdimm/dimm_devs.c
+@@ -185,7 +185,24 @@ static ssize_t commands_show(struct device *dev,
+ }
+ static DEVICE_ATTR_RO(commands);
+ 
++static ssize_t state_show(struct device *dev, struct device_attribute *attr,
++		char *buf)
++{
++	struct nvdimm *nvdimm = to_nvdimm(dev);
++
++	/*
++	 * The state may be in the process of changing, userspace should
++	 * quiesce probing if it wants a static answer
++	 */
++	nvdimm_bus_lock(dev);
++	nvdimm_bus_unlock(dev);
++	return sprintf(buf, "%s\n", atomic_read(&nvdimm->busy)
++			? "active" : "idle");
++}
++static DEVICE_ATTR_RO(state);
++
+ static struct attribute *nvdimm_attributes[] = {
++	&dev_attr_state.attr,
+ 	&dev_attr_commands.attr,
+ 	NULL,
+ };
+@@ -213,7 +230,7 @@ struct nvdimm *nvdimm_create(struct nvdimm_bus *nvdimm_bus, void *provider_data,
+ 	nvdimm->provider_data = provider_data;
+ 	nvdimm->flags = flags;
+ 	nvdimm->dsm_mask = dsm_mask;
+-
++	atomic_set(&nvdimm->busy, 0);
+ 	dev = &nvdimm->dev;
+ 	dev_set_name(dev, "nmem%d", nvdimm->id);
+ 	dev->parent = &nvdimm_bus->dev;
+
+commit 4d88a97aa9e8cfa6460aab119c5da60ad2267423
+Author: Dan Williams <dan.j.williams@intel.com>
+Date:   Sun May 31 14:41:48 2015 -0400
+
+    libnvdimm, nvdimm: dimm driver and base libnvdimm device-driver infrastructure
+    
+    * Implement the device-model infrastructure for loading modules and
+      attaching drivers to nvdimm devices.  This is a simple association of a
+      nd-device-type number with a driver that has a bitmask of supported
+      device types.  To facilitate userspace bind/unbind operations 'modalias'
+      and 'devtype', that also appear in the uevent, are added as generic
+      sysfs attributes for all nvdimm devices.  The reason for the device-type
+      number is to support sub-types within a given parent devtype, be it a
+      vendor-specific sub-type or otherwise.
+    
+    * The first consumer of this infrastructure is the driver
+      for dimm devices.  It simply uses control messages to retrieve and
+      store the configuration-data image (label set) from each dimm.
+    
+    Note: nd_device_register() arranges for asynchronous registration of
+          nvdimm bus devices by default.
+    
+    Cc: Greg KH <gregkh@linuxfoundation.org>
+    Cc: Neil Brown <neilb@suse.de>
+    Acked-by: Christoph Hellwig <hch@lst.de>
+    Tested-by: Toshi Kani <toshi.kani@hp.com>
+    Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+
+diff --git a/drivers/nvdimm/dimm_devs.c b/drivers/nvdimm/dimm_devs.c
+index c3dd7227d1bb..b3ae86f2e1da 100644
+--- a/drivers/nvdimm/dimm_devs.c
++++ b/drivers/nvdimm/dimm_devs.c
+@@ -11,6 +11,7 @@
+  * General Public License for more details.
+  */
+ #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++#include <linux/vmalloc.h>
+ #include <linux/device.h>
+ #include <linux/ndctl.h>
+ #include <linux/slab.h>
+@@ -18,9 +19,115 @@
+ #include <linux/fs.h>
+ #include <linux/mm.h>
+ #include "nd-core.h"
++#include "nd.h"
+ 
+ static DEFINE_IDA(dimm_ida);
+ 
++/*
++ * Retrieve bus and dimm handle and return if this bus supports
++ * get_config_data commands
++ */
++static int __validate_dimm(struct nvdimm_drvdata *ndd)
++{
++	struct nvdimm *nvdimm;
++
++	if (!ndd)
++		return -EINVAL;
++
++	nvdimm = to_nvdimm(ndd->dev);
++
++	if (!nvdimm->dsm_mask)
++		return -ENXIO;
++	if (!test_bit(ND_CMD_GET_CONFIG_DATA, nvdimm->dsm_mask))
++		return -ENXIO;
++
++	return 0;
++}
++
++static int validate_dimm(struct nvdimm_drvdata *ndd)
++{
++	int rc = __validate_dimm(ndd);
++
++	if (rc && ndd)
++		dev_dbg(ndd->dev, "%pf: %s error: %d\n",
++				__builtin_return_address(0), __func__, rc);
++	return rc;
++}
++
++/**
++ * nvdimm_init_nsarea - determine the geometry of a dimm's namespace area
++ * @nvdimm: dimm to initialize
++ */
++int nvdimm_init_nsarea(struct nvdimm_drvdata *ndd)
++{
++	struct nd_cmd_get_config_size *cmd = &ndd->nsarea;
++	struct nvdimm_bus *nvdimm_bus = walk_to_nvdimm_bus(ndd->dev);
++	struct nvdimm_bus_descriptor *nd_desc;
++	int rc = validate_dimm(ndd);
++
++	if (rc)
++		return rc;
++
++	if (cmd->config_size)
++		return 0; /* already valid */
++
++	memset(cmd, 0, sizeof(*cmd));
++	nd_desc = nvdimm_bus->nd_desc;
++	return nd_desc->ndctl(nd_desc, to_nvdimm(ndd->dev),
++			ND_CMD_GET_CONFIG_SIZE, cmd, sizeof(*cmd));
++}
++
++int nvdimm_init_config_data(struct nvdimm_drvdata *ndd)
++{
++	struct nvdimm_bus *nvdimm_bus = walk_to_nvdimm_bus(ndd->dev);
++	struct nd_cmd_get_config_data_hdr *cmd;
++	struct nvdimm_bus_descriptor *nd_desc;
++	int rc = validate_dimm(ndd);
++	u32 max_cmd_size, config_size;
++	size_t offset;
++
++	if (rc)
++		return rc;
++
++	if (ndd->data)
++		return 0;
++
++	if (ndd->nsarea.status || ndd->nsarea.max_xfer == 0)
++		return -ENXIO;
++
++	ndd->data = kmalloc(ndd->nsarea.config_size, GFP_KERNEL);
++	if (!ndd->data)
++		ndd->data = vmalloc(ndd->nsarea.config_size);
++
++	if (!ndd->data)
++		return -ENOMEM;
++
++	max_cmd_size = min_t(u32, PAGE_SIZE, ndd->nsarea.max_xfer);
++	cmd = kzalloc(max_cmd_size + sizeof(*cmd), GFP_KERNEL);
++	if (!cmd)
++		return -ENOMEM;
++
++	nd_desc = nvdimm_bus->nd_desc;
++	for (config_size = ndd->nsarea.config_size, offset = 0;
++			config_size; config_size -= cmd->in_length,
++			offset += cmd->in_length) {
++		cmd->in_length = min(config_size, max_cmd_size);
++		cmd->in_offset = offset;
++		rc = nd_desc->ndctl(nd_desc, to_nvdimm(ndd->dev),
++				ND_CMD_GET_CONFIG_DATA, cmd,
++				cmd->in_length + sizeof(*cmd));
++		if (rc || cmd->status) {
++			rc = -ENXIO;
++			break;
++		}
++		memcpy(ndd->data + offset, cmd->out_buf, cmd->in_length);
++	}
++	dev_dbg(ndd->dev, "%s: len: %zu rc: %d\n", __func__, offset, rc);
++	kfree(cmd);
++
++	return rc;
++}
++
+ static void nvdimm_release(struct device *dev)
+ {
+ 	struct nvdimm *nvdimm = to_nvdimm(dev);
+@@ -111,14 +218,33 @@ struct nvdimm *nvdimm_create(struct nvdimm_bus *nvdimm_bus, void *provider_data,
+ 	dev_set_name(dev, "nmem%d", nvdimm->id);
+ 	dev->parent = &nvdimm_bus->dev;
+ 	dev->type = &nvdimm_device_type;
+-	dev->bus = &nvdimm_bus_type;
+ 	dev->devt = MKDEV(nvdimm_major, nvdimm->id);
+ 	dev->groups = groups;
+-	if (device_register(dev) != 0) {
+-		put_device(dev);
+-		return NULL;
+-	}
++	nd_device_register(dev);
+ 
+ 	return nvdimm;
+ }
+ EXPORT_SYMBOL_GPL(nvdimm_create);
++
++static int count_dimms(struct device *dev, void *c)
++{
++	int *count = c;
++
++	if (is_nvdimm(dev))
++		(*count)++;
++	return 0;
++}
++
++int nvdimm_bus_check_dimm_count(struct nvdimm_bus *nvdimm_bus, int dimm_count)
++{
++	int count = 0;
++	/* Flush any possible dimm registration failures */
++	nd_synchronize();
++
++	device_for_each_child(&nvdimm_bus->dev, &count, count_dimms);
++	dev_dbg(&nvdimm_bus->dev, "%s: count: %d\n", __func__, count);
++	if (count != dimm_count)
++		return -ENXIO;
++	return 0;
++}
++EXPORT_SYMBOL_GPL(nvdimm_bus_check_dimm_count);
+
+commit 62232e45f4a265abb43f0acf16e58f5d0b6e1ec9
+Author: Dan Williams <dan.j.williams@intel.com>
+Date:   Mon Jun 8 14:27:06 2015 -0400
+
+    libnvdimm: control (ioctl) messages for nvdimm_bus and nvdimm devices
+    
+    Most discovery/configuration of the nvdimm-subsystem is done via sysfs
+    attributes.  However, some nvdimm_bus instances, particularly the
+    ACPI.NFIT bus, define a small set of messages that can be passed to the
+    platform.  For convenience we derive the initial libnvdimm-ioctl command
+    formats directly from the NFIT DSM Interface Example formats.
+    
+        ND_CMD_SMART: media health and diagnostics
+        ND_CMD_GET_CONFIG_SIZE: size of the label space
+        ND_CMD_GET_CONFIG_DATA: read label space
+        ND_CMD_SET_CONFIG_DATA: write label space
+        ND_CMD_VENDOR: vendor-specific command passthrough
+        ND_CMD_ARS_CAP: report address-range-scrubbing capabilities
+        ND_CMD_ARS_START: initiate scrubbing
+        ND_CMD_ARS_STATUS: report on scrubbing state
+        ND_CMD_SMART_THRESHOLD: configure alarm thresholds for smart events
+    
+    If a platform later defines different commands than this set it is
+    straightforward to extend support to those formats.
+    
+    Most of the commands target a specific dimm.  However, the
+    address-range-scrubbing commands target the bus.  The 'commands'
+    attribute in sysfs of an nvdimm_bus, or nvdimm, enumerate the supported
+    commands for that object.
+    
+    Cc: <linux-acpi@vger.kernel.org>
+    Cc: Robert Moore <robert.moore@intel.com>
+    Cc: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+    Reported-by: Nicholas Moulin <nicholas.w.moulin@linux.intel.com>
+    Acked-by: Christoph Hellwig <hch@lst.de>
+    Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+
+diff --git a/drivers/nvdimm/dimm_devs.c b/drivers/nvdimm/dimm_devs.c
+index 51ea52cc2079..c3dd7227d1bb 100644
+--- a/drivers/nvdimm/dimm_devs.c
++++ b/drivers/nvdimm/dimm_devs.c
+@@ -12,6 +12,7 @@
+  */
+ #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+ #include <linux/device.h>
++#include <linux/ndctl.h>
+ #include <linux/slab.h>
+ #include <linux/io.h>
+ #include <linux/fs.h>
+@@ -33,7 +34,7 @@ static struct device_type nvdimm_device_type = {
+ 	.release = nvdimm_release,
+ };
+ 
+-static bool is_nvdimm(struct device *dev)
++bool is_nvdimm(struct device *dev)
+ {
+ 	return dev->type == &nvdimm_device_type;
+ }
+@@ -55,12 +56,41 @@ EXPORT_SYMBOL_GPL(nvdimm_name);
+ 
+ void *nvdimm_provider_data(struct nvdimm *nvdimm)
+ {
+-	return nvdimm->provider_data;
++	if (nvdimm)
++		return nvdimm->provider_data;
++	return NULL;
+ }
+ EXPORT_SYMBOL_GPL(nvdimm_provider_data);
+ 
++static ssize_t commands_show(struct device *dev,
++		struct device_attribute *attr, char *buf)
++{
++	struct nvdimm *nvdimm = to_nvdimm(dev);
++	int cmd, len = 0;
++
++	if (!nvdimm->dsm_mask)
++		return sprintf(buf, "\n");
++
++	for_each_set_bit(cmd, nvdimm->dsm_mask, BITS_PER_LONG)
++		len += sprintf(buf + len, "%s ", nvdimm_cmd_name(cmd));
++	len += sprintf(buf + len, "\n");
++	return len;
++}
++static DEVICE_ATTR_RO(commands);
++
++static struct attribute *nvdimm_attributes[] = {
++	&dev_attr_commands.attr,
++	NULL,
++};
++
++struct attribute_group nvdimm_attribute_group = {
++	.attrs = nvdimm_attributes,
++};
++EXPORT_SYMBOL_GPL(nvdimm_attribute_group);
++
+ struct nvdimm *nvdimm_create(struct nvdimm_bus *nvdimm_bus, void *provider_data,
+-		const struct attribute_group **groups, unsigned long flags)
++		const struct attribute_group **groups, unsigned long flags,
++		unsigned long *dsm_mask)
+ {
+ 	struct nvdimm *nvdimm = kzalloc(sizeof(*nvdimm), GFP_KERNEL);
+ 	struct device *dev;
+@@ -75,12 +105,14 @@ struct nvdimm *nvdimm_create(struct nvdimm_bus *nvdimm_bus, void *provider_data,
+ 	}
+ 	nvdimm->provider_data = provider_data;
+ 	nvdimm->flags = flags;
++	nvdimm->dsm_mask = dsm_mask;
+ 
+ 	dev = &nvdimm->dev;
+ 	dev_set_name(dev, "nmem%d", nvdimm->id);
+ 	dev->parent = &nvdimm_bus->dev;
+ 	dev->type = &nvdimm_device_type;
+ 	dev->bus = &nvdimm_bus_type;
++	dev->devt = MKDEV(nvdimm_major, nvdimm->id);
+ 	dev->groups = groups;
+ 	if (device_register(dev) != 0) {
+ 		put_device(dev);
+
+commit e6dfb2de47768efe8cc37c9a1863d2aff81440fb
+Author: Dan Williams <dan.j.williams@intel.com>
+Date:   Sat Apr 25 03:56:17 2015 -0400
+
+    libnvdimm, nfit: dimm/memory-devices
+    
+    Enable nvdimm devices to be registered on a nvdimm_bus.  The kernel
+    assigned device id for nvdimm devicesis dynamic.  If userspace needs a
+    more static identifier it should consult a provider-specific attribute.
+    In the case where NFIT is the provider, the 'nmemX/nfit/handle' or
+    'nmemX/nfit/serial' attributes may be used for this purpose.
+    
+    Cc: Neil Brown <neilb@suse.de>
+    Cc: <linux-acpi@vger.kernel.org>
+    Cc: Greg KH <gregkh@linuxfoundation.org>
+    Cc: Robert Moore <robert.moore@intel.com>
+    Cc: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+    Acked-by: Christoph Hellwig <hch@lst.de>
+    Acked-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+    Tested-by: Toshi Kani <toshi.kani@hp.com>
+    Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+
+diff --git a/drivers/nvdimm/dimm_devs.c b/drivers/nvdimm/dimm_devs.c
+new file mode 100644
+index 000000000000..51ea52cc2079
+--- /dev/null
++++ b/drivers/nvdimm/dimm_devs.c
+@@ -0,0 +1,92 @@
++/*
++ * Copyright(c) 2013-2015 Intel Corporation. All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of version 2 of the GNU General Public License as
++ * published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ */
++#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++#include <linux/device.h>
++#include <linux/slab.h>
++#include <linux/io.h>
++#include <linux/fs.h>
++#include <linux/mm.h>
++#include "nd-core.h"
++
++static DEFINE_IDA(dimm_ida);
++
++static void nvdimm_release(struct device *dev)
++{
++	struct nvdimm *nvdimm = to_nvdimm(dev);
++
++	ida_simple_remove(&dimm_ida, nvdimm->id);
++	kfree(nvdimm);
++}
++
++static struct device_type nvdimm_device_type = {
++	.name = "nvdimm",
++	.release = nvdimm_release,
++};
++
++static bool is_nvdimm(struct device *dev)
++{
++	return dev->type == &nvdimm_device_type;
++}
++
++struct nvdimm *to_nvdimm(struct device *dev)
++{
++	struct nvdimm *nvdimm = container_of(dev, struct nvdimm, dev);
++
++	WARN_ON(!is_nvdimm(dev));
++	return nvdimm;
++}
++EXPORT_SYMBOL_GPL(to_nvdimm);
++
++const char *nvdimm_name(struct nvdimm *nvdimm)
++{
++	return dev_name(&nvdimm->dev);
++}
++EXPORT_SYMBOL_GPL(nvdimm_name);
++
++void *nvdimm_provider_data(struct nvdimm *nvdimm)
++{
++	return nvdimm->provider_data;
++}
++EXPORT_SYMBOL_GPL(nvdimm_provider_data);
++
++struct nvdimm *nvdimm_create(struct nvdimm_bus *nvdimm_bus, void *provider_data,
++		const struct attribute_group **groups, unsigned long flags)
++{
++	struct nvdimm *nvdimm = kzalloc(sizeof(*nvdimm), GFP_KERNEL);
++	struct device *dev;
++
++	if (!nvdimm)
++		return NULL;
++
++	nvdimm->id = ida_simple_get(&dimm_ida, 0, 0, GFP_KERNEL);
++	if (nvdimm->id < 0) {
++		kfree(nvdimm);
++		return NULL;
++	}
++	nvdimm->provider_data = provider_data;
++	nvdimm->flags = flags;
++
++	dev = &nvdimm->dev;
++	dev_set_name(dev, "nmem%d", nvdimm->id);
++	dev->parent = &nvdimm_bus->dev;
++	dev->type = &nvdimm_device_type;
++	dev->bus = &nvdimm_bus_type;
++	dev->groups = groups;
++	if (device_register(dev) != 0) {
++		put_device(dev);
++		return NULL;
++	}
++
++	return nvdimm;
++}
++EXPORT_SYMBOL_GPL(nvdimm_create);

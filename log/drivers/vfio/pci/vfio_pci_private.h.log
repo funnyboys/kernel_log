@@ -1,0 +1,1428 @@
+commit abafbc551fddede3e0a08dee1dcde08fc0eb8476
+Author: Alex Williamson <alex.williamson@redhat.com>
+Date:   Wed Apr 22 13:48:11 2020 -0600
+
+    vfio-pci: Invalidate mmaps and block MMIO access on disabled memory
+    
+    Accessing the disabled memory space of a PCI device would typically
+    result in a master abort response on conventional PCI, or an
+    unsupported request on PCI express.  The user would generally see
+    these as a -1 response for the read return data and the write would be
+    silently discarded, possibly with an uncorrected, non-fatal AER error
+    triggered on the host.  Some systems however take it upon themselves
+    to bring down the entire system when they see something that might
+    indicate a loss of data, such as this discarded write to a disabled
+    memory space.
+    
+    To avoid this, we want to try to block the user from accessing memory
+    spaces while they're disabled.  We start with a semaphore around the
+    memory enable bit, where writers modify the memory enable state and
+    must be serialized, while readers make use of the memory region and
+    can access in parallel.  Writers include both direct manipulation via
+    the command register, as well as any reset path where the internal
+    mechanics of the reset may both explicitly and implicitly disable
+    memory access, and manipulation of the MSI-X configuration, where the
+    MSI-X vector table resides in MMIO space of the device.  Readers
+    include the read and write file ops to access the vfio device fd
+    offsets as well as memory mapped access.  In the latter case, we make
+    use of our new vma list support to zap, or invalidate, those memory
+    mappings in order to force them to be faulted back in on access.
+    
+    Our semaphore usage will stall user access to MMIO spaces across
+    internal operations like reset, but the user might experience new
+    behavior when trying to access the MMIO space while disabled via the
+    PCI command register.  Access via read or write while disabled will
+    return -EIO and access via memory maps will result in a SIGBUS.  This
+    is expected to be compatible with known use cases and potentially
+    provides better error handling capabilities than present in the
+    hardware, while avoiding the more readily accessible and severe
+    platform error responses that might otherwise occur.
+    
+    Fixes: CVE-2020-12888
+    Reviewed-by: Peter Xu <peterx@redhat.com>
+    Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+
+diff --git a/drivers/vfio/pci/vfio_pci_private.h b/drivers/vfio/pci/vfio_pci_private.h
+index 9b25f9f6ce1d..86a02aff8735 100644
+--- a/drivers/vfio/pci/vfio_pci_private.h
++++ b/drivers/vfio/pci/vfio_pci_private.h
+@@ -139,6 +139,7 @@ struct vfio_pci_device {
+ 	struct notifier_block	nb;
+ 	struct mutex		vma_lock;
+ 	struct list_head	vma_list;
++	struct rw_semaphore	memory_lock;
+ };
+ 
+ #define is_intx(vdev) (vdev->irq_type == VFIO_PCI_INTX_IRQ_INDEX)
+@@ -181,6 +182,13 @@ extern int vfio_pci_register_dev_region(struct vfio_pci_device *vdev,
+ extern int vfio_pci_set_power_state(struct vfio_pci_device *vdev,
+ 				    pci_power_t state);
+ 
++extern bool __vfio_pci_memory_enabled(struct vfio_pci_device *vdev);
++extern void vfio_pci_zap_and_down_write_memory_lock(struct vfio_pci_device
++						    *vdev);
++extern u16 vfio_pci_memory_lock_and_enable(struct vfio_pci_device *vdev);
++extern void vfio_pci_memory_unlock_and_restore(struct vfio_pci_device *vdev,
++					       u16 cmd);
++
+ #ifdef CONFIG_VFIO_PCI_IGD
+ extern int vfio_pci_igd_init(struct vfio_pci_device *vdev);
+ #else
+
+commit 11c4cd07ba111a09f49625f9e4c851d83daf0a22
+Author: Alex Williamson <alex.williamson@redhat.com>
+Date:   Tue Apr 28 13:12:20 2020 -0600
+
+    vfio-pci: Fault mmaps to enable vma tracking
+    
+    Rather than calling remap_pfn_range() when a region is mmap'd, setup
+    a vm_ops handler to support dynamic faulting of the range on access.
+    This allows us to manage a list of vmas actively mapping the area that
+    we can later use to invalidate those mappings.  The open callback
+    invalidates the vma range so that all tracking is inserted in the
+    fault handler and removed in the close handler.
+    
+    Reviewed-by: Peter Xu <peterx@redhat.com>
+    Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+
+diff --git a/drivers/vfio/pci/vfio_pci_private.h b/drivers/vfio/pci/vfio_pci_private.h
+index 36ec69081ecd..9b25f9f6ce1d 100644
+--- a/drivers/vfio/pci/vfio_pci_private.h
++++ b/drivers/vfio/pci/vfio_pci_private.h
+@@ -92,6 +92,11 @@ struct vfio_pci_vf_token {
+ 	int			users;
+ };
+ 
++struct vfio_pci_mmap_vma {
++	struct vm_area_struct	*vma;
++	struct list_head	vma_next;
++};
++
+ struct vfio_pci_device {
+ 	struct pci_dev		*pdev;
+ 	void __iomem		*barmap[PCI_STD_NUM_BARS];
+@@ -132,6 +137,8 @@ struct vfio_pci_device {
+ 	struct list_head	ioeventfds_list;
+ 	struct vfio_pci_vf_token	*vf_token;
+ 	struct notifier_block	nb;
++	struct mutex		vma_lock;
++	struct list_head	vma_list;
+ };
+ 
+ #define is_intx(vdev) (vdev->irq_type == VFIO_PCI_INTX_IRQ_INDEX)
+
+commit 137e5531351db258eff58ea28f4dc8fdf7ca2990
+Author: Alex Williamson <alex.williamson@redhat.com>
+Date:   Tue Mar 24 09:28:28 2020 -0600
+
+    vfio/pci: Add sriov_configure support
+    
+    With the VF Token interface we can now expect that a vfio userspace
+    driver must be in collaboration with the PF driver, an unwitting
+    userspace driver will not be able to get past the GET_DEVICE_FD step
+    in accessing the device.  We can now move on to actually allowing
+    SR-IOV to be enabled by vfio-pci on the PF.  Support for this is not
+    enabled by default in this commit, but it does provide a module option
+    for this to be enabled (enable_sriov=1).  Enabling VFs is rather
+    straightforward, except we don't want to risk that a VF might get
+    autoprobed and bound to other drivers, so a bus notifier is used to
+    "capture" VFs to vfio-pci using the driver_override support.  We
+    assume any later action to bind the device to other drivers is
+    condoned by the system admin and allow it with a log warning.
+    
+    vfio-pci will disable SR-IOV on a PF before releasing the device,
+    allowing a VF driver to be assured other drivers cannot take over the
+    PF and that any other userspace driver must know the shared VF token.
+    This support also does not provide a mechanism for the PF userspace
+    driver itself to manipulate SR-IOV through the vfio API.  With this
+    patch SR-IOV can only be enabled via the host sysfs interface and the
+    PF driver user cannot create or remove VFs.
+    
+    Reviewed-by: Cornelia Huck <cohuck@redhat.com>
+    Reviewed-by: Kevin Tian <kevin.tian@intel.com>
+    Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+
+diff --git a/drivers/vfio/pci/vfio_pci_private.h b/drivers/vfio/pci/vfio_pci_private.h
+index 76c11c915949..36ec69081ecd 100644
+--- a/drivers/vfio/pci/vfio_pci_private.h
++++ b/drivers/vfio/pci/vfio_pci_private.h
+@@ -13,6 +13,7 @@
+ #include <linux/irqbypass.h>
+ #include <linux/types.h>
+ #include <linux/uuid.h>
++#include <linux/notifier.h>
+ 
+ #ifndef VFIO_PCI_PRIVATE_H
+ #define VFIO_PCI_PRIVATE_H
+@@ -130,6 +131,7 @@ struct vfio_pci_device {
+ 	struct mutex		ioeventfds_lock;
+ 	struct list_head	ioeventfds_list;
+ 	struct vfio_pci_vf_token	*vf_token;
++	struct notifier_block	nb;
+ };
+ 
+ #define is_intx(vdev) (vdev->irq_type == VFIO_PCI_INTX_IRQ_INDEX)
+
+commit cc20d7999000996557333910bcc99399b7244cd9
+Author: Alex Williamson <alex.williamson@redhat.com>
+Date:   Tue Mar 24 09:28:27 2020 -0600
+
+    vfio/pci: Introduce VF token
+    
+    If we enable SR-IOV on a vfio-pci owned PF, the resulting VFs are not
+    fully isolated from the PF.  The PF can always cause a denial of service
+    to the VF, even if by simply resetting itself.  The degree to which a PF
+    can access the data passed through a VF or interfere with its operation
+    is dependent on a given SR-IOV implementation.  Therefore we want to
+    avoid a scenario where an existing vfio-pci based userspace driver might
+    assume the PF driver is trusted, for example assigning a PF to one VM
+    and VF to another with some expectation of isolation.  IOMMU grouping
+    could be a solution to this, but imposes an unnecessarily strong
+    relationship between PF and VF drivers if they need to operate with the
+    same IOMMU context.  Instead we introduce a "VF token", which is
+    essentially just a shared secret between PF and VF drivers, implemented
+    as a UUID.
+    
+    The VF token can be set by a vfio-pci based PF driver and must be known
+    by the vfio-pci based VF driver in order to gain access to the device.
+    This allows the degree to which this VF token is considered secret to be
+    determined by the applications and environment.  For example a VM might
+    generate a random UUID known only internally to the hypervisor while a
+    userspace networking appliance might use a shared, or even well know,
+    UUID among the application drivers.
+    
+    To incorporate this VF token, the VFIO_GROUP_GET_DEVICE_FD interface is
+    extended to accept key=value pairs in addition to the device name.  This
+    allows us to most easily deny user access to the device without risk
+    that existing userspace drivers assume region offsets, IRQs, and other
+    device features, leading to more elaborate error paths.  The format of
+    these options are expected to take the form:
+    
+    "$DEVICE_NAME $OPTION1=$VALUE1 $OPTION2=$VALUE2"
+    
+    Where the device name is always provided first for compatibility and
+    additional options are specified in a space separated list.  The
+    relation between and requirements for the additional options will be
+    vfio bus driver dependent, however unknown or unused option within this
+    schema should return error.  This allow for future use of unknown
+    options as well as a positive indication to the user that an option is
+    used.
+    
+    An example VF token option would take this form:
+    
+    "0000:03:00.0 vf_token=2ab74924-c335-45f4-9b16-8569e5b08258"
+    
+    When accessing a VF where the PF is making use of vfio-pci, the user
+    MUST provide the current vf_token.  When accessing a PF, the user MUST
+    provide the current vf_token IF there are active VF users or MAY provide
+    a vf_token in order to set the current VF token when no VF users are
+    active.  The former requirement assures VF users that an unassociated
+    driver cannot usurp the PF device.  These semantics also imply that a
+    VF token MUST be set by a PF driver before VF drivers can access their
+    device, the default token is random and mechanisms to read the token are
+    not provided in order to protect the VF token of previous users.  Use of
+    the vf_token option outside of these cases will return an error, as
+    discussed above.
+    
+    Reviewed-by: Cornelia Huck <cohuck@redhat.com>
+    Reviewed-by: Kevin Tian <kevin.tian@intel.com>
+    Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+
+diff --git a/drivers/vfio/pci/vfio_pci_private.h b/drivers/vfio/pci/vfio_pci_private.h
+index 8a2c7607d513..76c11c915949 100644
+--- a/drivers/vfio/pci/vfio_pci_private.h
++++ b/drivers/vfio/pci/vfio_pci_private.h
+@@ -12,6 +12,7 @@
+ #include <linux/pci.h>
+ #include <linux/irqbypass.h>
+ #include <linux/types.h>
++#include <linux/uuid.h>
+ 
+ #ifndef VFIO_PCI_PRIVATE_H
+ #define VFIO_PCI_PRIVATE_H
+@@ -84,6 +85,12 @@ struct vfio_pci_reflck {
+ 	struct mutex		lock;
+ };
+ 
++struct vfio_pci_vf_token {
++	struct mutex		lock;
++	uuid_t			uuid;
++	int			users;
++};
++
+ struct vfio_pci_device {
+ 	struct pci_dev		*pdev;
+ 	void __iomem		*barmap[PCI_STD_NUM_BARS];
+@@ -122,6 +129,7 @@ struct vfio_pci_device {
+ 	struct list_head	dummy_resources_list;
+ 	struct mutex		ioeventfds_lock;
+ 	struct list_head	ioeventfds_list;
++	struct vfio_pci_vf_token	*vf_token;
+ };
+ 
+ #define is_intx(vdev) (vdev->irq_type == VFIO_PCI_INTX_IRQ_INDEX)
+
+commit c9c13ba428ef90a9b408a6cdf874e14ab5754516
+Author: Denis Efremov <efremov@linux.com>
+Date:   Sat Sep 28 02:43:08 2019 +0300
+
+    PCI: Add PCI_STD_NUM_BARS for the number of standard BARs
+    
+    Code that iterates over all standard PCI BARs typically uses
+    PCI_STD_RESOURCE_END.  However, that requires the unusual test
+    "i <= PCI_STD_RESOURCE_END" rather than something the typical
+    "i < PCI_STD_NUM_BARS".
+    
+    Add a definition for PCI_STD_NUM_BARS and change loops to use the more
+    idiomatic C style to help avoid fencepost errors.
+    
+    Link: https://lore.kernel.org/r/20190927234026.23342-1-efremov@linux.com
+    Link: https://lore.kernel.org/r/20190927234308.23935-1-efremov@linux.com
+    Link: https://lore.kernel.org/r/20190916204158.6889-3-efremov@linux.com
+    Signed-off-by: Denis Efremov <efremov@linux.com>
+    Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+    Acked-by: Sebastian Ott <sebott@linux.ibm.com>                  # arch/s390/
+    Acked-by: Bartlomiej Zolnierkiewicz <b.zolnierkie@samsung.com>  # video/fbdev/
+    Acked-by: Gustavo Pimentel <gustavo.pimentel@synopsys.com>      # pci/controller/dwc/
+    Acked-by: Jack Wang <jinpu.wang@cloud.ionos.com>                # scsi/pm8001/
+    Acked-by: Martin K. Petersen <martin.petersen@oracle.com>       # scsi/pm8001/
+    Acked-by: Ulf Hansson <ulf.hansson@linaro.org>                  # memstick/
+
+diff --git a/drivers/vfio/pci/vfio_pci_private.h b/drivers/vfio/pci/vfio_pci_private.h
+index ee6ee91718a4..8a2c7607d513 100644
+--- a/drivers/vfio/pci/vfio_pci_private.h
++++ b/drivers/vfio/pci/vfio_pci_private.h
+@@ -86,8 +86,8 @@ struct vfio_pci_reflck {
+ 
+ struct vfio_pci_device {
+ 	struct pci_dev		*pdev;
+-	void __iomem		*barmap[PCI_STD_RESOURCE_END + 1];
+-	bool			bar_mmap_supported[PCI_STD_RESOURCE_END + 1];
++	void __iomem		*barmap[PCI_STD_NUM_BARS];
++	bool			bar_mmap_supported[PCI_STD_NUM_BARS];
+ 	u8			*pci_config_map;
+ 	u8			*vconfig;
+ 	struct perm_bits	*msi_perm;
+
+commit d2912cb15bdda8ba4a5dd73396ad62641af2f520
+Author: Thomas Gleixner <tglx@linutronix.de>
+Date:   Tue Jun 4 10:11:33 2019 +0200
+
+    treewide: Replace GPLv2 boilerplate/reference with SPDX - rule 500
+    
+    Based on 2 normalized pattern(s):
+    
+      this program is free software you can redistribute it and or modify
+      it under the terms of the gnu general public license version 2 as
+      published by the free software foundation
+    
+      this program is free software you can redistribute it and or modify
+      it under the terms of the gnu general public license version 2 as
+      published by the free software foundation #
+    
+    extracted by the scancode license scanner the SPDX license identifier
+    
+      GPL-2.0-only
+    
+    has been chosen to replace the boilerplate/reference in 4122 file(s).
+    
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Reviewed-by: Enrico Weigelt <info@metux.net>
+    Reviewed-by: Kate Stewart <kstewart@linuxfoundation.org>
+    Reviewed-by: Allison Randal <allison@lohutok.net>
+    Cc: linux-spdx@vger.kernel.org
+    Link: https://lkml.kernel.org/r/20190604081206.933168790@linutronix.de
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/drivers/vfio/pci/vfio_pci_private.h b/drivers/vfio/pci/vfio_pci_private.h
+index 1812cf22fc4f..ee6ee91718a4 100644
+--- a/drivers/vfio/pci/vfio_pci_private.h
++++ b/drivers/vfio/pci/vfio_pci_private.h
+@@ -1,11 +1,8 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
+ /*
+  * Copyright (C) 2012 Red Hat, Inc.  All rights reserved.
+  *     Author: Alex Williamson <alex.williamson@redhat.com>
+  *
+- * This program is free software; you can redistribute it and/or modify
+- * it under the terms of the GNU General Public License version 2 as
+- * published by the Free Software Foundation.
+- *
+  * Derived from original vfio:
+  * Copyright 2010 Cisco Systems, Inc.  All rights reserved.
+  * Author: Tom Lyon, pugs@cisco.com
+
+commit 51ef3a004b1eb6241e56b3aa8495769a092a4dc2
+Author: Alex Williamson <alex.williamson@redhat.com>
+Date:   Sat Feb 9 13:43:30 2019 -0700
+
+    vfio/pci: Restore device state on PM transition
+    
+    PCI core handles save and restore of device state around reset, but
+    when using pci_set_power_state() we can unintentionally trigger a soft
+    reset of the device, where PCI core only restores the BAR state.  If
+    we're using vfio-pci's idle D3 support to try to put devices into low
+    power when unused, this might trigger a reset when the device is woken
+    for use.  Also power state management by the user, or within a guest,
+    can put the device into D3 power state with potentially limited
+    ability to restore the device if it should undergo a reset.  The PCI
+    spec does not define the extent of a soft reset and many devices
+    reporting soft reset on D3->D0 transition do not undergo a PCI config
+    space reset.  It's therefore assumed safe to unconditionally restore
+    the remainder of the state if the device indicates soft reset
+    support, even on a user initiated wakeup.
+    
+    Implement a wrapper in vfio-pci to tag devices reporting PM reset
+    support, save their state on transitions into D3 and restore on
+    transitions back to D0.
+    
+    Reported-by: Alexander Duyck <alexander.h.duyck@linux.intel.com>
+    Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+
+diff --git a/drivers/vfio/pci/vfio_pci_private.h b/drivers/vfio/pci/vfio_pci_private.h
+index 8c0009f00818..1812cf22fc4f 100644
+--- a/drivers/vfio/pci/vfio_pci_private.h
++++ b/drivers/vfio/pci/vfio_pci_private.h
+@@ -114,7 +114,9 @@ struct vfio_pci_device {
+ 	bool			has_vga;
+ 	bool			needs_reset;
+ 	bool			nointx;
++	bool			needs_pm_restore;
+ 	struct pci_saved_state	*pci_saved_state;
++	struct pci_saved_state	*pm_save;
+ 	struct vfio_pci_reflck	*reflck;
+ 	int			refcnt;
+ 	int			ioeventfds_nr;
+@@ -161,6 +163,10 @@ extern int vfio_pci_register_dev_region(struct vfio_pci_device *vdev,
+ 					unsigned int type, unsigned int subtype,
+ 					const struct vfio_pci_regops *ops,
+ 					size_t size, u32 flags, void *data);
++
++extern int vfio_pci_set_power_state(struct vfio_pci_device *vdev,
++				    pci_power_t state);
++
+ #ifdef CONFIG_VFIO_PCI_IGD
+ extern int vfio_pci_igd_init(struct vfio_pci_device *vdev);
+ #else
+
+commit 1984f65c2fbc0d2b557d6e89ece9b39267e215c6
+Merge: f346b0becb1b 8ba35b3a0046
+Author: Linus Torvalds <torvalds@linux-foundation.org>
+Date:   Fri Dec 28 19:41:58 2018 -0800
+
+    Merge tag 'vfio-v4.21-rc1' of git://github.com/awilliam/linux-vfio
+    
+    Pull VFIO updates from Alex Williamson:
+    
+     - Replace global vfio-pci lock with per bus lock to allow concurrent
+       open and release (Alex Williamson)
+    
+     - Declare mdev function as static (Paolo Cretaro)
+    
+     - Convert char to u8 in mdev/mtty sample driver (Nathan Chancellor)
+    
+    * tag 'vfio-v4.21-rc1' of git://github.com/awilliam/linux-vfio:
+      vfio-mdev/samples: Use u8 instead of char for handle functions
+      vfio/mdev: add static modifier to add_mdev_supported_type
+      vfio/pci: Parallelize device open and release
+
+commit 7f92891778dff62303c070ac81de7b7d80de331a
+Author: Alexey Kardashevskiy <aik@ozlabs.ru>
+Date:   Thu Dec 20 12:10:36 2018 +1100
+
+    vfio_pci: Add NVIDIA GV100GL [Tesla V100 SXM2] subdriver
+    
+    POWER9 Witherspoon machines come with 4 or 6 V100 GPUs which are not
+    pluggable PCIe devices but still have PCIe links which are used
+    for config space and MMIO. In addition to that the GPUs have 6 NVLinks
+    which are connected to other GPUs and the POWER9 CPU. POWER9 chips
+    have a special unit on a die called an NPU which is an NVLink2 host bus
+    adapter with p2p connections to 2 to 3 GPUs, 3 or 2 NVLinks to each.
+    These systems also support ATS (address translation services) which is
+    a part of the NVLink2 protocol. Such GPUs also share on-board RAM
+    (16GB or 32GB) to the system via the same NVLink2 so a CPU has
+    cache-coherent access to a GPU RAM.
+    
+    This exports GPU RAM to the userspace as a new VFIO device region. This
+    preregisters the new memory as device memory as it might be used for DMA.
+    This inserts pfns from the fault handler as the GPU memory is not onlined
+    until the vendor driver is loaded and trained the NVLinks so doing this
+    earlier causes low level errors which we fence in the firmware so
+    it does not hurt the host system but still better be avoided; for the same
+    reason this does not map GPU RAM into the host kernel (usual thing for
+    emulated access otherwise).
+    
+    This exports an ATSD (Address Translation Shootdown) register of NPU which
+    allows TLB invalidations inside GPU for an operating system. The register
+    conveniently occupies a single 64k page. It is also presented to
+    the userspace as a new VFIO device region. One NPU has 8 ATSD registers,
+    each of them can be used for TLB invalidation in a GPU linked to this NPU.
+    This allocates one ATSD register per an NVLink bridge allowing passing
+    up to 6 registers. Due to the host firmware bug (just recently fixed),
+    only 1 ATSD register per NPU was actually advertised to the host system
+    so this passes that alone register via the first NVLink bridge device in
+    the group which is still enough as QEMU collects them all back and
+    presents to the guest via vPHB to mimic the emulated NPU PHB on the host.
+    
+    In order to provide the userspace with the information about GPU-to-NVLink
+    connections, this exports an additional capability called "tgt"
+    (which is an abbreviated host system bus address). The "tgt" property
+    tells the GPU its own system address and allows the guest driver to
+    conglomerate the routing information so each GPU knows how to get directly
+    to the other GPUs.
+    
+    For ATS to work, the nest MMU (an NVIDIA block in a P9 CPU) needs to
+    know LPID (a logical partition ID or a KVM guest hardware ID in other
+    words) and PID (a memory context ID of a userspace process, not to be
+    confused with a linux pid). This assigns a GPU to LPID in the NPU and
+    this is why this adds a listener for KVM on an IOMMU group. A PID comes
+    via NVLink from a GPU and NPU uses a PID wildcard to pass it through.
+    
+    This requires coherent memory and ATSD to be available on the host as
+    the GPU vendor only supports configurations with both features enabled
+    and other configurations are known not to work. Because of this and
+    because of the ways the features are advertised to the host system
+    (which is a device tree with very platform specific properties),
+    this requires enabled POWERNV platform.
+    
+    The V100 GPUs do not advertise any of these capabilities via the config
+    space and there are more than just one device ID so this relies on
+    the platform to tell whether these GPUs have special abilities such as
+    NVLinks.
+    
+    Signed-off-by: Alexey Kardashevskiy <aik@ozlabs.ru>
+    Acked-by: Alex Williamson <alex.williamson@redhat.com>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+
+diff --git a/drivers/vfio/pci/vfio_pci_private.h b/drivers/vfio/pci/vfio_pci_private.h
+index 93c1738dae11..127071b84dd7 100644
+--- a/drivers/vfio/pci/vfio_pci_private.h
++++ b/drivers/vfio/pci/vfio_pci_private.h
+@@ -163,4 +163,18 @@ static inline int vfio_pci_igd_init(struct vfio_pci_device *vdev)
+ 	return -ENODEV;
+ }
+ #endif
++#ifdef CONFIG_VFIO_PCI_NVLINK2
++extern int vfio_pci_nvdia_v100_nvlink2_init(struct vfio_pci_device *vdev);
++extern int vfio_pci_ibm_npu2_init(struct vfio_pci_device *vdev);
++#else
++static inline int vfio_pci_nvdia_v100_nvlink2_init(struct vfio_pci_device *vdev)
++{
++	return -ENODEV;
++}
++
++static inline int vfio_pci_ibm_npu2_init(struct vfio_pci_device *vdev)
++{
++	return -ENODEV;
++}
++#endif
+ #endif /* VFIO_PCI_PRIVATE_H */
+
+commit c2c0f1cde0ef56ba5d6f553db73f51e753d7550a
+Author: Alexey Kardashevskiy <aik@ozlabs.ru>
+Date:   Wed Dec 19 19:52:31 2018 +1100
+
+    vfio_pci: Allow regions to add own capabilities
+    
+    VFIO regions already support region capabilities with a limited set of
+    fields. However the subdriver might have to report to the userspace
+    additional bits.
+    
+    This adds an add_capability() hook to vfio_pci_regops.
+    
+    Signed-off-by: Alexey Kardashevskiy <aik@ozlabs.ru>
+    Acked-by: Alex Williamson <alex.williamson@redhat.com>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+
+diff --git a/drivers/vfio/pci/vfio_pci_private.h b/drivers/vfio/pci/vfio_pci_private.h
+index 86aab05d3d46..93c1738dae11 100644
+--- a/drivers/vfio/pci/vfio_pci_private.h
++++ b/drivers/vfio/pci/vfio_pci_private.h
+@@ -62,6 +62,9 @@ struct vfio_pci_regops {
+ 	int	(*mmap)(struct vfio_pci_device *vdev,
+ 			struct vfio_pci_region *region,
+ 			struct vm_area_struct *vma);
++	int	(*add_capability)(struct vfio_pci_device *vdev,
++				  struct vfio_pci_region *region,
++				  struct vfio_info_cap *caps);
+ };
+ 
+ struct vfio_pci_region {
+
+commit a15b1883fee11e07e5db7f003a863cc419647e79
+Author: Alexey Kardashevskiy <aik@ozlabs.ru>
+Date:   Wed Dec 19 19:52:30 2018 +1100
+
+    vfio_pci: Allow mapping extra regions
+    
+    So far we only allowed mapping of MMIO BARs to the userspace. However
+    there are GPUs with on-board coherent RAM accessible via side
+    channels which we also want to map to the userspace. The first client
+    for this is NVIDIA V100 GPU with NVLink2 direct links to a POWER9
+    NPU-enabled CPU; such GPUs have 16GB RAM which is coherently mapped
+    to the system address space, we are going to export these as an extra
+    PCI region.
+    
+    We already support extra PCI regions and this adds support for mapping
+    them to the userspace.
+    
+    Signed-off-by: Alexey Kardashevskiy <aik@ozlabs.ru>
+    Reviewed-by: David Gibson <david@gibson.dropbear.id.au>
+    Acked-by: Alex Williamson <alex.williamson@redhat.com>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+
+diff --git a/drivers/vfio/pci/vfio_pci_private.h b/drivers/vfio/pci/vfio_pci_private.h
+index cde3b5d3441a..86aab05d3d46 100644
+--- a/drivers/vfio/pci/vfio_pci_private.h
++++ b/drivers/vfio/pci/vfio_pci_private.h
+@@ -59,6 +59,9 @@ struct vfio_pci_regops {
+ 		      size_t count, loff_t *ppos, bool iswrite);
+ 	void	(*release)(struct vfio_pci_device *vdev,
+ 			   struct vfio_pci_region *region);
++	int	(*mmap)(struct vfio_pci_device *vdev,
++			struct vfio_pci_region *region,
++			struct vm_area_struct *vma);
+ };
+ 
+ struct vfio_pci_region {
+
+commit e309df5b0c9e67cc929eedd3e32f4907fa49543e
+Author: Alex Williamson <alex.williamson@redhat.com>
+Date:   Wed Dec 12 12:51:07 2018 -0700
+
+    vfio/pci: Parallelize device open and release
+    
+    In commit 61d792562b53 ("vfio-pci: Use mutex around open, release, and
+    remove") a mutex was added to freeze the refcnt for a device so that
+    we can handle errors and perform bus resets on final close.  However,
+    bus resets can be rather slow and a global mutex here is undesirable.
+    Evaluating the potential locking granularity, a per-device mutex
+    provides the best resolution but with multiple devices on a bus all
+    released concurrently, they'll race to acquire each other's mutex,
+    likely resulting in no reset at all if we use trylock.  We therefore
+    lock at the granularity of the bus/slot reset as we're only attempting
+    a single reset for this group of devices anyway.  This allows much
+    greater scaling as we're bounded in the number of devices protected by
+    a single reflck object.
+    
+    Reported-by: Christian Ehrhardt <christian.ehrhardt@canonical.com>
+    Tested-by: Christian Ehrhardt <christian.ehrhardt@canonical.com>
+    Reviewed-by: Eric Auger <eric.auger@redhat.com>
+    Reviewed-by: Cornelia Huck <cohuck@redhat.com>
+    Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+
+diff --git a/drivers/vfio/pci/vfio_pci_private.h b/drivers/vfio/pci/vfio_pci_private.h
+index cde3b5d3441a..aa2355e67340 100644
+--- a/drivers/vfio/pci/vfio_pci_private.h
++++ b/drivers/vfio/pci/vfio_pci_private.h
+@@ -76,6 +76,11 @@ struct vfio_pci_dummy_resource {
+ 	struct list_head	res_next;
+ };
+ 
++struct vfio_pci_reflck {
++	struct kref		kref;
++	struct mutex		lock;
++};
++
+ struct vfio_pci_device {
+ 	struct pci_dev		*pdev;
+ 	void __iomem		*barmap[PCI_STD_RESOURCE_END + 1];
+@@ -104,6 +109,7 @@ struct vfio_pci_device {
+ 	bool			needs_reset;
+ 	bool			nointx;
+ 	struct pci_saved_state	*pci_saved_state;
++	struct vfio_pci_reflck	*reflck;
+ 	int			refcnt;
+ 	int			ioeventfds_nr;
+ 	struct eventfd_ctx	*err_trigger;
+
+commit 30656177c4080460b936709ff6648f201d7d2c1a
+Author: Alex Williamson <alex.williamson@redhat.com>
+Date:   Wed Mar 21 12:46:21 2018 -0600
+
+    vfio/pci: Add ioeventfd support
+    
+    The ioeventfd here is actually irqfd handling of an ioeventfd such as
+    supported in KVM.  A user is able to pre-program a device write to
+    occur when the eventfd triggers.  This is yet another instance of
+    eventfd-irqfd triggering between KVM and vfio.  The impetus for this
+    is high frequency writes to pages which are virtualized in QEMU.
+    Enabling this near-direct write path for selected registers within
+    the virtualized page can improve performance and reduce overhead.
+    Specifically this is initially targeted at NVIDIA graphics cards where
+    the driver issues a write to an MMIO register within a virtualized
+    region in order to allow the MSI interrupt to re-trigger.
+    
+    Reviewed-by: Peter Xu <peterx@redhat.com>
+    Reviewed-by: Alexey Kardashevskiy <aik@ozlabs.ru>
+    Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+
+diff --git a/drivers/vfio/pci/vfio_pci_private.h b/drivers/vfio/pci/vfio_pci_private.h
+index f561ac1c78a0..cde3b5d3441a 100644
+--- a/drivers/vfio/pci/vfio_pci_private.h
++++ b/drivers/vfio/pci/vfio_pci_private.h
+@@ -29,6 +29,19 @@
+ #define PCI_CAP_ID_INVALID		0xFF	/* default raw access */
+ #define PCI_CAP_ID_INVALID_VIRT		0xFE	/* default virt access */
+ 
++/* Cap maximum number of ioeventfds per device (arbitrary) */
++#define VFIO_PCI_IOEVENTFD_MAX		1000
++
++struct vfio_pci_ioeventfd {
++	struct list_head	next;
++	struct virqfd		*virqfd;
++	void __iomem		*addr;
++	uint64_t		data;
++	loff_t			pos;
++	int			bar;
++	int			count;
++};
++
+ struct vfio_pci_irq_ctx {
+ 	struct eventfd_ctx	*trigger;
+ 	struct virqfd		*unmask;
+@@ -92,9 +105,12 @@ struct vfio_pci_device {
+ 	bool			nointx;
+ 	struct pci_saved_state	*pci_saved_state;
+ 	int			refcnt;
++	int			ioeventfds_nr;
+ 	struct eventfd_ctx	*err_trigger;
+ 	struct eventfd_ctx	*req_trigger;
+ 	struct list_head	dummy_resources_list;
++	struct mutex		ioeventfds_lock;
++	struct list_head	ioeventfds_list;
+ };
+ 
+ #define is_intx(vdev) (vdev->irq_type == VFIO_PCI_INTX_IRQ_INDEX)
+@@ -120,6 +136,9 @@ extern ssize_t vfio_pci_bar_rw(struct vfio_pci_device *vdev, char __user *buf,
+ extern ssize_t vfio_pci_vga_rw(struct vfio_pci_device *vdev, char __user *buf,
+ 			       size_t count, loff_t *ppos, bool iswrite);
+ 
++extern long vfio_pci_ioeventfd(struct vfio_pci_device *vdev, loff_t offset,
++			       uint64_t data, int count, int fd);
++
+ extern int vfio_pci_init_perm_bits(void);
+ extern void vfio_pci_uninit_perm_bits(void);
+ 
+
+commit 61771468e0a567f007fc450725063bb9cf7eb199
+Author: Christoph Hellwig <hch@lst.de>
+Date:   Sun Sep 11 15:31:26 2016 +0200
+
+    vfio_pci: use pci_alloc_irq_vectors
+    
+    Simplify the interrupt setup by using the new PCI layer helpers.
+    
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+
+diff --git a/drivers/vfio/pci/vfio_pci_private.h b/drivers/vfio/pci/vfio_pci_private.h
+index 2128de86c80d..f561ac1c78a0 100644
+--- a/drivers/vfio/pci/vfio_pci_private.h
++++ b/drivers/vfio/pci/vfio_pci_private.h
+@@ -72,7 +72,6 @@ struct vfio_pci_device {
+ 	struct perm_bits	*msi_perm;
+ 	spinlock_t		irqlock;
+ 	struct mutex		igate;
+-	struct msix_entry	*msix;
+ 	struct vfio_pci_irq_ctx	*ctx;
+ 	int			num_ctx;
+ 	int			irq_type;
+
+commit 05f0c03fbac1819e86c9d5db4e208b68fc1b9b5e
+Author: Yongji Xie <xyjxie@linux.vnet.ibm.com>
+Date:   Thu Jun 30 15:21:24 2016 +0800
+
+    vfio-pci: Allow to mmap sub-page MMIO BARs if the mmio page is exclusive
+    
+    Current vfio-pci implementation disallows to mmap
+    sub-page(size < PAGE_SIZE) MMIO BARs because these BARs' mmio
+    page may be shared with other BARs. This will cause some
+    performance issues when we passthrough a PCI device with
+    this kind of BARs. Guest will be not able to handle the mmio
+    accesses to the BARs which leads to mmio emulations in host.
+    
+    However, not all sub-page BARs will share page with other BARs.
+    We should allow to mmap the sub-page MMIO BARs which we can
+    make sure will not share page with other BARs.
+    
+    This patch adds support for this case. And we try to add a
+    dummy resource to reserve the remainder of the page which
+    hot-add device's BAR might be assigned into. But it's not
+    necessary to handle the case when the BAR is not page aligned.
+    Because we can't expect the BAR will be assigned into the same
+    location in a page in guest when we passthrough the BAR. And
+    it's hard to access this BAR in userspace because we have
+    no way to get the BAR's location in a page.
+    
+    Signed-off-by: Yongji Xie <xyjxie@linux.vnet.ibm.com>
+    Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+
+diff --git a/drivers/vfio/pci/vfio_pci_private.h b/drivers/vfio/pci/vfio_pci_private.h
+index 016c14a1b454..2128de86c80d 100644
+--- a/drivers/vfio/pci/vfio_pci_private.h
++++ b/drivers/vfio/pci/vfio_pci_private.h
+@@ -57,9 +57,16 @@ struct vfio_pci_region {
+ 	u32				flags;
+ };
+ 
++struct vfio_pci_dummy_resource {
++	struct resource		resource;
++	int			index;
++	struct list_head	res_next;
++};
++
+ struct vfio_pci_device {
+ 	struct pci_dev		*pdev;
+ 	void __iomem		*barmap[PCI_STD_RESOURCE_END + 1];
++	bool			bar_mmap_supported[PCI_STD_RESOURCE_END + 1];
+ 	u8			*pci_config_map;
+ 	u8			*vconfig;
+ 	struct perm_bits	*msi_perm;
+@@ -88,6 +95,7 @@ struct vfio_pci_device {
+ 	int			refcnt;
+ 	struct eventfd_ctx	*err_trigger;
+ 	struct eventfd_ctx	*req_trigger;
++	struct list_head	dummy_resources_list;
+ };
+ 
+ #define is_intx(vdev) (vdev->irq_type == VFIO_PCI_INTX_IRQ_INDEX)
+
+commit 450744051d201c4d72436ebf5b04b9a06ba2cf30
+Author: Alex Williamson <alex.williamson@redhat.com>
+Date:   Thu Mar 24 13:05:18 2016 -0600
+
+    vfio/pci: Hide broken INTx support from user
+    
+    INTx masking has two components, the first is that we need the ability
+    to prevent the device from continuing to assert INTx.  This is
+    provided via the DisINTx bit in the command register and is the only
+    thing we can really probe for when testing if INTx masking is
+    supported.  The second component is that the device needs to indicate
+    if INTx is asserted via the interrupt status bit in the device status
+    register.  With these two features we can generically determine if one
+    of the devices we own is asserting INTx, signal the user, and mask the
+    interrupt while the user services the device.
+    
+    Generally if one or both of these components is broken we resort to
+    APIC level interrupt masking, which requires an exclusive interrupt
+    since we have no way to determine the source of the interrupt in a
+    shared configuration.  This often makes it difficult or impossible to
+    configure the system for userspace use of the device, for an interrupt
+    mode that the user may not need.
+    
+    One possible configuration of broken INTx masking is that the DisINTx
+    support is fully functional, but the interrupt status bit never
+    signals interrupt assertion.  In this case we do have the ability to
+    prevent the device from asserting INTx, but lack the ability to
+    identify the interrupt source.  For this case we can simply pretend
+    that the device lacks INTx support entirely, keeping DisINTx set on
+    the physical device, virtualizing this bit for the user, and
+    virtualizing the interrupt pin register to indicate no INTx support.
+    We already support virtualization of the DisINTx bit and already
+    virtualize the interrupt pin for platforms without INTx support.  By
+    tying these components together, setting DisINTx on open and reset,
+    and identifying devices broken in this particular way, we can provide
+    support for them w/o the handicap of APIC level INTx masking.
+    
+    Intel i40e (XL710/X710) 10/20/40GbE NICs have been identified as being
+    broken in this specific way.  We leave the vfio-pci.nointxmask option
+    as a mechanism to bypass this support, enabling INTx on the device
+    with all the requirements of APIC level masking.
+    
+    Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+    Cc: John Ronciak <john.ronciak@intel.com>
+    Cc: Jesse Brandeburg <jesse.brandeburg@intel.com>
+
+diff --git a/drivers/vfio/pci/vfio_pci_private.h b/drivers/vfio/pci/vfio_pci_private.h
+index 8a7d546d18a0..016c14a1b454 100644
+--- a/drivers/vfio/pci/vfio_pci_private.h
++++ b/drivers/vfio/pci/vfio_pci_private.h
+@@ -83,6 +83,7 @@ struct vfio_pci_device {
+ 	bool			bardirty;
+ 	bool			has_vga;
+ 	bool			needs_reset;
++	bool			nointx;
+ 	struct pci_saved_state	*pci_saved_state;
+ 	int			refcnt;
+ 	struct eventfd_ctx	*err_trigger;
+
+commit f572a960a15e8bb56599f6d2358a9c18f0808e91
+Author: Alex Williamson <alex.williamson@redhat.com>
+Date:   Mon Feb 22 16:02:45 2016 -0700
+
+    vfio/pci: Intel IGD host and LCP bridge config space access
+    
+    Provide read-only access to PCI config space of the PCI host bridge
+    and LPC bridge through device specific regions.  This may be used to
+    configure a VM with matching register contents to satisfy driver
+    requirements.  Providing this through the vfio file descriptor removes
+    an additional userspace requirement for access through pci-sysfs and
+    removes the CAP_SYS_ADMIN requirement that doesn't appear to apply to
+    the specific devices we're accessing.
+    
+    Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+
+diff --git a/drivers/vfio/pci/vfio_pci_private.h b/drivers/vfio/pci/vfio_pci_private.h
+index 19f7699ac699..8a7d546d18a0 100644
+--- a/drivers/vfio/pci/vfio_pci_private.h
++++ b/drivers/vfio/pci/vfio_pci_private.h
+@@ -123,9 +123,9 @@ extern int vfio_pci_register_dev_region(struct vfio_pci_device *vdev,
+ 					const struct vfio_pci_regops *ops,
+ 					size_t size, u32 flags, void *data);
+ #ifdef CONFIG_VFIO_PCI_IGD
+-extern int vfio_pci_igd_opregion_init(struct vfio_pci_device *vdev);
++extern int vfio_pci_igd_init(struct vfio_pci_device *vdev);
+ #else
+-static inline int vfio_pci_igd_opregion_init(struct vfio_pci_device *vdev)
++static inline int vfio_pci_igd_init(struct vfio_pci_device *vdev)
+ {
+ 	return -ENODEV;
+ }
+
+commit 5846ff54e87d8bab4f1e330af0b5407747a0a57e
+Author: Alex Williamson <alex.williamson@redhat.com>
+Date:   Mon Feb 22 16:02:43 2016 -0700
+
+    vfio/pci: Intel IGD OpRegion support
+    
+    This is the first consumer of vfio device specific resource support,
+    providing read-only access to the OpRegion for Intel graphics devices.
+    
+    Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+
+diff --git a/drivers/vfio/pci/vfio_pci_private.h b/drivers/vfio/pci/vfio_pci_private.h
+index b1e403235feb..19f7699ac699 100644
+--- a/drivers/vfio/pci/vfio_pci_private.h
++++ b/drivers/vfio/pci/vfio_pci_private.h
+@@ -122,4 +122,12 @@ extern int vfio_pci_register_dev_region(struct vfio_pci_device *vdev,
+ 					unsigned int type, unsigned int subtype,
+ 					const struct vfio_pci_regops *ops,
+ 					size_t size, u32 flags, void *data);
++#ifdef CONFIG_VFIO_PCI_IGD
++extern int vfio_pci_igd_opregion_init(struct vfio_pci_device *vdev);
++#else
++static inline int vfio_pci_igd_opregion_init(struct vfio_pci_device *vdev)
++{
++	return -ENODEV;
++}
++#endif
+ #endif /* VFIO_PCI_PRIVATE_H */
+
+commit 345d710491e2d2c4a9406c1d530adb37cc0429c1
+Author: Alex Williamson <alex.williamson@redhat.com>
+Date:   Mon Feb 22 16:02:41 2016 -0700
+
+    vfio/pci: Enable virtual register in PCI config space
+    
+    Typically config space for a device is mapped out into capability
+    specific handlers and unassigned space.  The latter allows direct
+    read/write access to config space.  Sometimes we know about registers
+    living in this void space and would like an easy way to virtualize
+    them, similar to how BAR registers are managed.  To do this, create
+    one more pseudo (fake) PCI capability to be handled as purely virtual
+    space.  Reads and writes are serviced entirely from virtual config
+    space.
+    
+    Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+
+diff --git a/drivers/vfio/pci/vfio_pci_private.h b/drivers/vfio/pci/vfio_pci_private.h
+index 0710bda5ae2c..b1e403235feb 100644
+--- a/drivers/vfio/pci/vfio_pci_private.h
++++ b/drivers/vfio/pci/vfio_pci_private.h
+@@ -25,6 +25,10 @@
+ #define VFIO_PCI_INDEX_TO_OFFSET(index)	((u64)(index) << VFIO_PCI_OFFSET_SHIFT)
+ #define VFIO_PCI_OFFSET_MASK	(((u64)(1) << VFIO_PCI_OFFSET_SHIFT) - 1)
+ 
++/* Special capability IDs predefined access */
++#define PCI_CAP_ID_INVALID		0xFF	/* default raw access */
++#define PCI_CAP_ID_INVALID_VIRT		0xFE	/* default virt access */
++
+ struct vfio_pci_irq_ctx {
+ 	struct eventfd_ctx	*trigger;
+ 	struct virqfd		*unmask;
+
+commit 28541d41c9e04cb2ddbf93facd1e376dd5613360
+Author: Alex Williamson <alex.williamson@redhat.com>
+Date:   Mon Feb 22 16:02:39 2016 -0700
+
+    vfio/pci: Add infrastructure for additional device specific regions
+    
+    Add support for additional regions with indexes started after the
+    already defined fixed regions.  Device specific code can register
+    these regions with the new vfio_pci_register_dev_region() function.
+    The ops structure per region currently only includes read/write
+    access and a release function, allowing automatic cleanup when the
+    device is closed.  mmap support is only missing here because it's
+    not needed by the first user queued for this support.
+    
+    Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+
+diff --git a/drivers/vfio/pci/vfio_pci_private.h b/drivers/vfio/pci/vfio_pci_private.h
+index 0e7394f8f69b..0710bda5ae2c 100644
+--- a/drivers/vfio/pci/vfio_pci_private.h
++++ b/drivers/vfio/pci/vfio_pci_private.h
+@@ -14,6 +14,7 @@
+ #include <linux/mutex.h>
+ #include <linux/pci.h>
+ #include <linux/irqbypass.h>
++#include <linux/types.h>
+ 
+ #ifndef VFIO_PCI_PRIVATE_H
+ #define VFIO_PCI_PRIVATE_H
+@@ -33,6 +34,25 @@ struct vfio_pci_irq_ctx {
+ 	struct irq_bypass_producer	producer;
+ };
+ 
++struct vfio_pci_device;
++struct vfio_pci_region;
++
++struct vfio_pci_regops {
++	size_t	(*rw)(struct vfio_pci_device *vdev, char __user *buf,
++		      size_t count, loff_t *ppos, bool iswrite);
++	void	(*release)(struct vfio_pci_device *vdev,
++			   struct vfio_pci_region *region);
++};
++
++struct vfio_pci_region {
++	u32				type;
++	u32				subtype;
++	const struct vfio_pci_regops	*ops;
++	void				*data;
++	size_t				size;
++	u32				flags;
++};
++
+ struct vfio_pci_device {
+ 	struct pci_dev		*pdev;
+ 	void __iomem		*barmap[PCI_STD_RESOURCE_END + 1];
+@@ -45,6 +65,8 @@ struct vfio_pci_device {
+ 	struct vfio_pci_irq_ctx	*ctx;
+ 	int			num_ctx;
+ 	int			irq_type;
++	int			num_regions;
++	struct vfio_pci_region	*region;
+ 	u8			msi_qmax;
+ 	u8			msix_bar;
+ 	u16			msix_size;
+@@ -91,4 +113,9 @@ extern void vfio_pci_uninit_perm_bits(void);
+ 
+ extern int vfio_config_init(struct vfio_pci_device *vdev);
+ extern void vfio_config_free(struct vfio_pci_device *vdev);
++
++extern int vfio_pci_register_dev_region(struct vfio_pci_device *vdev,
++					unsigned int type, unsigned int subtype,
++					const struct vfio_pci_regops *ops,
++					size_t size, u32 flags, void *data);
+ #endif /* VFIO_PCI_PRIVATE_H */
+
+commit 6d7425f109d2629d1f4b4b146eca8e43701bf966
+Author: Feng Wu <feng.wu@intel.com>
+Date:   Fri Sep 18 22:29:50 2015 +0800
+
+    vfio: Register/unregister irq_bypass_producer
+    
+    This patch adds the registration/unregistration of an
+    irq_bypass_producer for MSI/MSIx on vfio pci devices.
+    
+    Acked-by: Alex Williamson <alex.williamson@redhat.com>
+    Signed-off-by: Feng Wu <feng.wu@intel.com>
+    Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+
+diff --git a/drivers/vfio/pci/vfio_pci_private.h b/drivers/vfio/pci/vfio_pci_private.h
+index ae0e1b4c1711..0e7394f8f69b 100644
+--- a/drivers/vfio/pci/vfio_pci_private.h
++++ b/drivers/vfio/pci/vfio_pci_private.h
+@@ -13,6 +13,7 @@
+ 
+ #include <linux/mutex.h>
+ #include <linux/pci.h>
++#include <linux/irqbypass.h>
+ 
+ #ifndef VFIO_PCI_PRIVATE_H
+ #define VFIO_PCI_PRIVATE_H
+@@ -29,6 +30,7 @@ struct vfio_pci_irq_ctx {
+ 	struct virqfd		*mask;
+ 	char			*name;
+ 	bool			masked;
++	struct irq_bypass_producer	producer;
+ };
+ 
+ struct vfio_pci_device {
+
+commit 7e992d692750b2938224eb43fee907181d92a602
+Author: Antonios Motakis <a.motakis@virtualopensystems.com>
+Date:   Mon Mar 16 14:08:54 2015 -0600
+
+    vfio: move eventfd support code for VFIO_PCI to a separate file
+    
+    The virqfd functionality that is used by VFIO_PCI to implement interrupt
+    masking and unmasking via an eventfd, is generic enough and can be reused
+    by another driver. Move it to a separate file in order to allow the code
+    to be shared.
+    
+    Signed-off-by: Antonios Motakis <a.motakis@virtualopensystems.com>
+    Signed-off-by: Baptiste Reynal <b.reynal@virtualopensystems.com>
+    Reviewed-by: Eric Auger <eric.auger@linaro.org>
+    Tested-by: Eric Auger <eric.auger@linaro.org>
+    Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+
+diff --git a/drivers/vfio/pci/vfio_pci_private.h b/drivers/vfio/pci/vfio_pci_private.h
+index 02539651bc3a..ae0e1b4c1711 100644
+--- a/drivers/vfio/pci/vfio_pci_private.h
++++ b/drivers/vfio/pci/vfio_pci_private.h
+@@ -87,9 +87,6 @@ extern ssize_t vfio_pci_vga_rw(struct vfio_pci_device *vdev, char __user *buf,
+ extern int vfio_pci_init_perm_bits(void);
+ extern void vfio_pci_uninit_perm_bits(void);
+ 
+-extern int vfio_virqfd_init(void);
+-extern void vfio_virqfd_exit(void);
+-
+ extern int vfio_config_init(struct vfio_pci_device *vdev);
+ extern void vfio_config_free(struct vfio_pci_device *vdev);
+ #endif /* VFIO_PCI_PRIVATE_H */
+
+commit bb78e9eaab919b1ede37d62056b554bba611a012
+Author: Antonios Motakis <a.motakis@virtualopensystems.com>
+Date:   Mon Mar 16 14:08:52 2015 -0600
+
+    vfio: virqfd: rename vfio_pci_virqfd_init and vfio_pci_virqfd_exit
+    
+    The functions vfio_pci_virqfd_init and vfio_pci_virqfd_exit are not really
+    PCI specific, since we plan to reuse the virqfd code with more VFIO drivers
+    in addition to VFIO_PCI.
+    
+    Signed-off-by: Antonios Motakis <a.motakis@virtualopensystems.com>
+    [Baptiste Reynal: Move rename vfio_pci_virqfd_init and vfio_pci_virqfd_exit
+    from "vfio: add a vfio_ prefix to virqfd_enable and virqfd_disable and export"]
+    Signed-off-by: Baptiste Reynal <b.reynal@virtualopensystems.com>
+    Reviewed-by: Eric Auger <eric.auger@linaro.org>
+    Tested-by: Eric Auger <eric.auger@linaro.org>
+    Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+
+diff --git a/drivers/vfio/pci/vfio_pci_private.h b/drivers/vfio/pci/vfio_pci_private.h
+index c9f9b323f152..02539651bc3a 100644
+--- a/drivers/vfio/pci/vfio_pci_private.h
++++ b/drivers/vfio/pci/vfio_pci_private.h
+@@ -87,8 +87,8 @@ extern ssize_t vfio_pci_vga_rw(struct vfio_pci_device *vdev, char __user *buf,
+ extern int vfio_pci_init_perm_bits(void);
+ extern void vfio_pci_uninit_perm_bits(void);
+ 
+-extern int vfio_pci_virqfd_init(void);
+-extern void vfio_pci_virqfd_exit(void);
++extern int vfio_virqfd_init(void);
++extern void vfio_virqfd_exit(void);
+ 
+ extern int vfio_config_init(struct vfio_pci_device *vdev);
+ extern void vfio_config_free(struct vfio_pci_device *vdev);
+
+commit 6140a8f5623820cec7f56c63444b9551d8d35775
+Author: Alex Williamson <alex.williamson@redhat.com>
+Date:   Fri Feb 6 15:05:08 2015 -0700
+
+    vfio-pci: Add device request interface
+    
+    Userspace can opt to receive a device request notification,
+    indicating that the device should be released.  This is setup
+    the same way as the error IRQ and also supports eventfd signaling.
+    Future support may forcefully remove the device from the user if
+    the request is ignored.
+    
+    Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+
+diff --git a/drivers/vfio/pci/vfio_pci_private.h b/drivers/vfio/pci/vfio_pci_private.h
+index 671c17a6e6d0..c9f9b323f152 100644
+--- a/drivers/vfio/pci/vfio_pci_private.h
++++ b/drivers/vfio/pci/vfio_pci_private.h
+@@ -58,6 +58,7 @@ struct vfio_pci_device {
+ 	struct pci_saved_state	*pci_saved_state;
+ 	int			refcnt;
+ 	struct eventfd_ctx	*err_trigger;
++	struct eventfd_ctx	*req_trigger;
+ };
+ 
+ #define is_intx(vdev) (vdev->irq_type == VFIO_PCI_INTX_IRQ_INDEX)
+
+commit bc4fba77124e2fe4eb14bcb52875c0b0228deace
+Author: Alex Williamson <alex.williamson@redhat.com>
+Date:   Thu Aug 7 11:12:07 2014 -0600
+
+    vfio-pci: Attempt bus/slot reset on release
+    
+    Each time a device is released, mark whether a local reset was
+    successful or whether a bus/slot reset is needed.  If a reset is
+    needed and all of the affected devices are bound to vfio-pci and
+    unused, allow the reset.  This is most useful when the userspace
+    driver is killed and releases all the devices in an unclean state,
+    such as when a QEMU VM quits.
+    
+    Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+
+diff --git a/drivers/vfio/pci/vfio_pci_private.h b/drivers/vfio/pci/vfio_pci_private.h
+index 31e7a30196ab..671c17a6e6d0 100644
+--- a/drivers/vfio/pci/vfio_pci_private.h
++++ b/drivers/vfio/pci/vfio_pci_private.h
+@@ -54,6 +54,7 @@ struct vfio_pci_device {
+ 	bool			extended_caps;
+ 	bool			bardirty;
+ 	bool			has_vga;
++	bool			needs_reset;
+ 	struct pci_saved_state	*pci_saved_state;
+ 	int			refcnt;
+ 	struct eventfd_ctx	*err_trigger;
+
+commit 61d792562b53c610f9fe917f2bbc22218aa39c22
+Author: Alex Williamson <alex.williamson@redhat.com>
+Date:   Thu Aug 7 11:12:04 2014 -0600
+
+    vfio-pci: Use mutex around open, release, and remove
+    
+    Serializing open/release allows us to fix a refcnt error if we fail
+    to enable the device and lets us prevent devices from being unbound
+    or opened, giving us an opportunity to do bus resets on release.  No
+    restriction added to serialize binding devices to vfio-pci while the
+    mutex is held though.
+    
+    Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+
+diff --git a/drivers/vfio/pci/vfio_pci_private.h b/drivers/vfio/pci/vfio_pci_private.h
+index 9c6d5d0f3b02..31e7a30196ab 100644
+--- a/drivers/vfio/pci/vfio_pci_private.h
++++ b/drivers/vfio/pci/vfio_pci_private.h
+@@ -55,7 +55,7 @@ struct vfio_pci_device {
+ 	bool			bardirty;
+ 	bool			has_vga;
+ 	struct pci_saved_state	*pci_saved_state;
+-	atomic_t		refcnt;
++	int			refcnt;
+ 	struct eventfd_ctx	*err_trigger;
+ };
+ 
+
+commit dad9f8972e04cd081a028d8fb1249d746d97fc03
+Author: Vijay Mohan Pandarathil <vijaymohan.pandarathil@hp.com>
+Date:   Mon Mar 11 09:31:22 2013 -0600
+
+    VFIO-AER: Vfio-pci driver changes for supporting AER
+    
+    - New VFIO_SET_IRQ ioctl option to pass the eventfd that is signaled when
+      an error occurs in the vfio_pci_device
+    
+    - Register pci_error_handler for the vfio_pci driver
+    
+    - When the device encounters an error, the error handler registered by
+      the vfio_pci driver gets invoked by the AER infrastructure
+    
+    - In the error handler, signal the eventfd registered for the device.
+    
+    - This results in the qemu eventfd handler getting invoked and
+      appropriate action taken for the guest.
+    
+    Signed-off-by: Vijay Mohan Pandarathil <vijaymohan.pandarathil@hp.com>
+    Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+
+diff --git a/drivers/vfio/pci/vfio_pci_private.h b/drivers/vfio/pci/vfio_pci_private.h
+index d7e55d03f49e..9c6d5d0f3b02 100644
+--- a/drivers/vfio/pci/vfio_pci_private.h
++++ b/drivers/vfio/pci/vfio_pci_private.h
+@@ -56,6 +56,7 @@ struct vfio_pci_device {
+ 	bool			has_vga;
+ 	struct pci_saved_state	*pci_saved_state;
+ 	atomic_t		refcnt;
++	struct eventfd_ctx	*err_trigger;
+ };
+ 
+ #define is_intx(vdev) (vdev->irq_type == VFIO_PCI_INTX_IRQ_INDEX)
+
+commit 84237a826b261de7ddd3d09ee53ee68cb4138937
+Author: Alex Williamson <alex.williamson@redhat.com>
+Date:   Mon Feb 18 10:11:13 2013 -0700
+
+    vfio-pci: Add support for VGA region access
+    
+    PCI defines display class VGA regions at I/O port address 0x3b0, 0x3c0
+    and MMIO address 0xa0000.  As these are non-overlapping, we can ignore
+    the I/O port vs MMIO difference and expose them both in a single
+    region.  We make use of the VGA arbiter around each access to
+    configure chipset access as necessary.
+    
+    Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+
+diff --git a/drivers/vfio/pci/vfio_pci_private.h b/drivers/vfio/pci/vfio_pci_private.h
+index 00d19b953ce4..d7e55d03f49e 100644
+--- a/drivers/vfio/pci/vfio_pci_private.h
++++ b/drivers/vfio/pci/vfio_pci_private.h
+@@ -53,6 +53,7 @@ struct vfio_pci_device {
+ 	bool			reset_works;
+ 	bool			extended_caps;
+ 	bool			bardirty;
++	bool			has_vga;
+ 	struct pci_saved_state	*pci_saved_state;
+ 	atomic_t		refcnt;
+ };
+@@ -77,6 +78,9 @@ extern ssize_t vfio_pci_config_rw(struct vfio_pci_device *vdev,
+ extern ssize_t vfio_pci_bar_rw(struct vfio_pci_device *vdev, char __user *buf,
+ 			       size_t count, loff_t *ppos, bool iswrite);
+ 
++extern ssize_t vfio_pci_vga_rw(struct vfio_pci_device *vdev, char __user *buf,
++			       size_t count, loff_t *ppos, bool iswrite);
++
+ extern int vfio_pci_init_perm_bits(void);
+ extern void vfio_pci_uninit_perm_bits(void);
+ 
+
+commit 906ee99dd2a5c819c1171ce5eaf6c080c027e58c
+Author: Alex Williamson <alex.williamson@redhat.com>
+Date:   Thu Feb 14 14:02:12 2013 -0700
+
+    vfio-pci: Cleanup BAR access
+    
+    We can actually handle MMIO and I/O port from the same access function
+    since PCI already does abstraction of this.  The ROM BAR only requires
+    a minor difference, so it gets included too.  vfio_pci_config_readwrite
+    gets renamed for consistency.
+    
+    Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+
+diff --git a/drivers/vfio/pci/vfio_pci_private.h b/drivers/vfio/pci/vfio_pci_private.h
+index 611827cba8cd..00d19b953ce4 100644
+--- a/drivers/vfio/pci/vfio_pci_private.h
++++ b/drivers/vfio/pci/vfio_pci_private.h
+@@ -70,15 +70,12 @@ extern int vfio_pci_set_irqs_ioctl(struct vfio_pci_device *vdev,
+ 				   uint32_t flags, unsigned index,
+ 				   unsigned start, unsigned count, void *data);
+ 
+-extern ssize_t vfio_pci_config_readwrite(struct vfio_pci_device *vdev,
+-					 char __user *buf, size_t count,
+-					 loff_t *ppos, bool iswrite);
+-extern ssize_t vfio_pci_mem_readwrite(struct vfio_pci_device *vdev,
+-				      char __user *buf, size_t count,
+-				      loff_t *ppos, bool iswrite);
+-extern ssize_t vfio_pci_io_readwrite(struct vfio_pci_device *vdev,
+-				     char __user *buf, size_t count,
+-				     loff_t *ppos, bool iswrite);
++extern ssize_t vfio_pci_config_rw(struct vfio_pci_device *vdev,
++				  char __user *buf, size_t count,
++				  loff_t *ppos, bool iswrite);
++
++extern ssize_t vfio_pci_bar_rw(struct vfio_pci_device *vdev, char __user *buf,
++			       size_t count, loff_t *ppos, bool iswrite);
+ 
+ extern int vfio_pci_init_perm_bits(void);
+ extern void vfio_pci_uninit_perm_bits(void);
+
+commit 89e1f7d4c66d85f42c3d52ea3866eb10cadf6153
+Author: Alex Williamson <alex.williamson@redhat.com>
+Date:   Tue Jul 31 08:16:24 2012 -0600
+
+    vfio: Add PCI device driver
+    
+    Add PCI device support for VFIO.  PCI devices expose regions
+    for accessing config space, I/O port space, and MMIO areas
+    of the device.  PCI config access is virtualized in the kernel,
+    allowing us to ensure the integrity of the system, by preventing
+    various accesses while reducing duplicate support across various
+    userspace drivers.  I/O port supports read/write access while
+    MMIO also supports mmap of sufficiently sized regions.  Support
+    for INTx, MSI, and MSI-X interrupts are provided using eventfds to
+    userspace.
+    
+    Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+
+diff --git a/drivers/vfio/pci/vfio_pci_private.h b/drivers/vfio/pci/vfio_pci_private.h
+new file mode 100644
+index 000000000000..611827cba8cd
+--- /dev/null
++++ b/drivers/vfio/pci/vfio_pci_private.h
+@@ -0,0 +1,91 @@
++/*
++ * Copyright (C) 2012 Red Hat, Inc.  All rights reserved.
++ *     Author: Alex Williamson <alex.williamson@redhat.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ * Derived from original vfio:
++ * Copyright 2010 Cisco Systems, Inc.  All rights reserved.
++ * Author: Tom Lyon, pugs@cisco.com
++ */
++
++#include <linux/mutex.h>
++#include <linux/pci.h>
++
++#ifndef VFIO_PCI_PRIVATE_H
++#define VFIO_PCI_PRIVATE_H
++
++#define VFIO_PCI_OFFSET_SHIFT   40
++
++#define VFIO_PCI_OFFSET_TO_INDEX(off)	(off >> VFIO_PCI_OFFSET_SHIFT)
++#define VFIO_PCI_INDEX_TO_OFFSET(index)	((u64)(index) << VFIO_PCI_OFFSET_SHIFT)
++#define VFIO_PCI_OFFSET_MASK	(((u64)(1) << VFIO_PCI_OFFSET_SHIFT) - 1)
++
++struct vfio_pci_irq_ctx {
++	struct eventfd_ctx	*trigger;
++	struct virqfd		*unmask;
++	struct virqfd		*mask;
++	char			*name;
++	bool			masked;
++};
++
++struct vfio_pci_device {
++	struct pci_dev		*pdev;
++	void __iomem		*barmap[PCI_STD_RESOURCE_END + 1];
++	u8			*pci_config_map;
++	u8			*vconfig;
++	struct perm_bits	*msi_perm;
++	spinlock_t		irqlock;
++	struct mutex		igate;
++	struct msix_entry	*msix;
++	struct vfio_pci_irq_ctx	*ctx;
++	int			num_ctx;
++	int			irq_type;
++	u8			msi_qmax;
++	u8			msix_bar;
++	u16			msix_size;
++	u32			msix_offset;
++	u32			rbar[7];
++	bool			pci_2_3;
++	bool			virq_disabled;
++	bool			reset_works;
++	bool			extended_caps;
++	bool			bardirty;
++	struct pci_saved_state	*pci_saved_state;
++	atomic_t		refcnt;
++};
++
++#define is_intx(vdev) (vdev->irq_type == VFIO_PCI_INTX_IRQ_INDEX)
++#define is_msi(vdev) (vdev->irq_type == VFIO_PCI_MSI_IRQ_INDEX)
++#define is_msix(vdev) (vdev->irq_type == VFIO_PCI_MSIX_IRQ_INDEX)
++#define is_irq_none(vdev) (!(is_intx(vdev) || is_msi(vdev) || is_msix(vdev)))
++#define irq_is(vdev, type) (vdev->irq_type == type)
++
++extern void vfio_pci_intx_mask(struct vfio_pci_device *vdev);
++extern void vfio_pci_intx_unmask(struct vfio_pci_device *vdev);
++
++extern int vfio_pci_set_irqs_ioctl(struct vfio_pci_device *vdev,
++				   uint32_t flags, unsigned index,
++				   unsigned start, unsigned count, void *data);
++
++extern ssize_t vfio_pci_config_readwrite(struct vfio_pci_device *vdev,
++					 char __user *buf, size_t count,
++					 loff_t *ppos, bool iswrite);
++extern ssize_t vfio_pci_mem_readwrite(struct vfio_pci_device *vdev,
++				      char __user *buf, size_t count,
++				      loff_t *ppos, bool iswrite);
++extern ssize_t vfio_pci_io_readwrite(struct vfio_pci_device *vdev,
++				     char __user *buf, size_t count,
++				     loff_t *ppos, bool iswrite);
++
++extern int vfio_pci_init_perm_bits(void);
++extern void vfio_pci_uninit_perm_bits(void);
++
++extern int vfio_pci_virqfd_init(void);
++extern void vfio_pci_virqfd_exit(void);
++
++extern int vfio_config_init(struct vfio_pci_device *vdev);
++extern void vfio_config_free(struct vfio_pci_device *vdev);
++#endif /* VFIO_PCI_PRIVATE_H */

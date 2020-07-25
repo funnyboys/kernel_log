@@ -1,0 +1,3904 @@
+commit 0094368e3bb97a710ce163f9c06d290c1c308621
+Author: Michael Ellerman <mpe@ellerman.id.au>
+Date:   Sun May 3 00:33:16 2020 +1000
+
+    powerpc/64s: Fix unrecoverable SLB crashes due to preemption check
+    
+    Hugh reported that his trusty G5 crashed after a few hours under load
+    with an "Unrecoverable exception 380".
+    
+    The crash is in interrupt_return() where we check lazy_irq_pending(),
+    which calls get_paca() and with CONFIG_DEBUG_PREEMPT=y that goes to
+    check_preemption_disabled() via debug_smp_processor_id().
+    
+    As Nick explained on the list:
+    
+      Problem is MSR[RI] is cleared here, ready to do the last few things
+      for interrupt return where we're not allowed to take any other
+      interrupts.
+    
+      SLB interrupts can happen just about anywhere aside from kernel
+      text, global variables, and stack. When that hits, it appears to be
+      unrecoverable due to RI=0.
+    
+    The problematic access is in preempt_count() which is:
+    
+            return READ_ONCE(current_thread_info()->preempt_count);
+    
+    Because of THREAD_INFO_IN_TASK, current_thread_info() just points to
+    current, so the access is to somewhere in kernel memory, but not on
+    the stack or in .data, which means it can cause an SLB miss. If we
+    take an SLB miss with RI=0 it is fatal.
+    
+    The easiest solution is to add a version of lazy_irq_pending() that
+    doesn't do the preemption check and call it from the interrupt return
+    path.
+    
+    Fixes: 68b34588e202 ("powerpc/64/sycall: Implement syscall entry/exit logic in C")
+    Reported-by: Hugh Dickins <hughd@google.com>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+    Link: https://lore.kernel.org/r/20200502143316.929341-1-mpe@ellerman.id.au
+
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+index e0e71777961f..3a0db7b0b46e 100644
+--- a/arch/powerpc/include/asm/hw_irq.h
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -250,9 +250,27 @@ static inline bool arch_irqs_disabled(void)
+ 	}								\
+ } while(0)
+ 
++static inline bool __lazy_irq_pending(u8 irq_happened)
++{
++	return !!(irq_happened & ~PACA_IRQ_HARD_DIS);
++}
++
++/*
++ * Check if a lazy IRQ is pending. Should be called with IRQs hard disabled.
++ */
+ static inline bool lazy_irq_pending(void)
+ {
+-	return !!(get_paca()->irq_happened & ~PACA_IRQ_HARD_DIS);
++	return __lazy_irq_pending(get_paca()->irq_happened);
++}
++
++/*
++ * Check if a lazy IRQ is pending, with no debugging checks.
++ * Should be called with IRQs hard disabled.
++ * For use in RI disabled code or other constrained situations.
++ */
++static inline bool lazy_irq_pending_nocheck(void)
++{
++	return __lazy_irq_pending(local_paca->irq_happened);
+ }
+ 
+ /*
+
+commit 6cc0c16d82f889f0083f3608237189afb55b67be
+Author: Nicholas Piggin <npiggin@gmail.com>
+Date:   Wed Feb 26 03:35:37 2020 +1000
+
+    powerpc/64s: Implement interrupt exit logic in C
+    
+    Implement the bulk of interrupt return logic in C. The asm return code
+    must handle a few cases: restoring full GPRs, and emulating stack
+    store.
+    
+    The stack store emulation is significantly simplfied, rather than
+    creating a new return frame and switching to that before performing
+    the store, it uses the PACA to keep a scratch register around to
+    perform the store.
+    
+    The asm return code is moved into 64e for now. The new logic has made
+    allowance for 64e, but I don't have a full environment that works well
+    to test it, and even booting in emulated qemu is not great for stress
+    testing. 64e shouldn't be too far off working with this, given a bit
+    more testing and auditing of the logic.
+    
+    This is slightly faster on a POWER9 (page fault speed increases about
+    1.1%), probably due to reduced mtmsrd.
+    
+    mpe: Includes fixes from Nick for _TIF_EMULATE_STACK_STORE
+    handling (including the fast_interrupt_return path), to remove
+    trace_hardirqs_on(), and fixes the interrupt-return part of the
+    MSR_VSX restore bug caught by tm-unavailable selftest.
+    
+    mpe: Incorporate fix from Nick:
+    
+    The return-to-kernel path has to replay any soft-pending interrupts if
+    it is returning to a context that had interrupts soft-enabled. It has
+    to do this carefully and avoid plain enabling interrupts if this is an
+    irq context, which can cause multiple nesting of interrupts on the
+    stack, and other unexpected issues.
+    
+    The code which avoided this case got the soft-mask state wrong, and
+    marked interrupts as enabled before going around again to retry. This
+    seems to be mostly harmless except when PREEMPT=y, this calls
+    preempt_schedule_irq with irqs apparently enabled and runs into a BUG
+    in kernel/sched/core.c
+    
+    Signed-off-by: Nicholas Piggin <npiggin@gmail.com>
+    Signed-off-by: Michal Suchanek <msuchanek@suse.de>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+    Link: https://lore.kernel.org/r/20200225173541.1549955-29-npiggin@gmail.com
+
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+index 0e9a9598f91f..e0e71777961f 100644
+--- a/arch/powerpc/include/asm/hw_irq.h
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -52,6 +52,7 @@
+ #ifndef __ASSEMBLY__
+ 
+ extern void replay_system_reset(void);
++extern void replay_soft_interrupts(void);
+ 
+ extern void timer_interrupt(struct pt_regs *);
+ extern void timer_broadcast_interrupt(void);
+
+commit 3282a3da25bd63fdb7240bc35dbdefa4b1947005
+Author: Nicholas Piggin <npiggin@gmail.com>
+Date:   Wed Feb 26 03:35:36 2020 +1000
+
+    powerpc/64: Implement soft interrupt replay in C
+    
+    When local_irq_enable() finds a pending soft-masked interrupt, it
+    "replays" it by setting up registers like the initial interrupt entry,
+    then calls into the low level handler to set up an interrupt stack
+    frame and process the interrupt.
+    
+    This is not necessary, and uses more stack than needed. The high level
+    interrupt handler can be called directly from C, with just pt_regs set
+    up on stack. This should be faster and use less stack.
+    
+    Signed-off-by: Nicholas Piggin <npiggin@gmail.com>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+    Link: https://lore.kernel.org/r/20200225173541.1549955-28-npiggin@gmail.com
+
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+index 310583e62bd9..0e9a9598f91f 100644
+--- a/arch/powerpc/include/asm/hw_irq.h
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -52,7 +52,6 @@
+ #ifndef __ASSEMBLY__
+ 
+ extern void replay_system_reset(void);
+-extern void __replay_interrupt(unsigned int vector);
+ 
+ extern void timer_interrupt(struct pt_regs *);
+ extern void timer_broadcast_interrupt(void);
+
+commit 68b34588e2027f699a3c034235f21cd19356b2e6
+Author: Nicholas Piggin <npiggin@gmail.com>
+Date:   Wed Feb 26 03:35:34 2020 +1000
+
+    powerpc/64/sycall: Implement syscall entry/exit logic in C
+    
+    System call entry and particularly exit code is beyond the limit of
+    what is reasonable to implement in asm.
+    
+    This conversion moves all conditional branches out of the asm code,
+    except for the case that all GPRs should be restored at exit.
+    
+    Null syscall test is about 5% faster after this patch, because the
+    exit work is handled under local_irq_disable, and the hard mask and
+    pending interrupt replay is handled after that, which avoids games
+    with MSR.
+    
+    mpe: Includes subsequent fixes from Nick:
+    
+    This fixes 4 issues caught by TM selftests. First was a tm-syscall bug
+    that hit due to tabort_syscall being called after interrupts were
+    reconciled (in a subsequent patch), which led to interrupts being
+    enabled before tabort_syscall was called. Rather than going through an
+    un-reconciling interrupts for the return, I just go back to putting
+    the test early in asm, the C-ification of that wasn't a big win
+    anyway.
+    
+    Second is the syscall return _TIF_USER_WORK_MASK check would go into
+    an infinite loop if _TIF_RESTORE_TM became set. The asm code uses
+    _TIF_USER_WORK_MASK to brach to slowpath which includes
+    restore_tm_state.
+    
+    Third is system call return was not calling restore_tm_state, I missed
+    this completely (alhtough it's in the return from interrupt C
+    conversion because when the asm syscall code encountered problems it
+    would branch to the interrupt return code.
+    
+    Fourth is MSR_VEC missing from restore_math, which was caught by
+    tm-unavailable selftest taking an unexpected facility unavailable
+    interrupt when testing VSX unavailble exception with MSR.FP=1
+    MSR.VEC=1. Fourth case also has a fixup in a subsequent patch.
+    
+    Signed-off-by: Nicholas Piggin <npiggin@gmail.com>
+    Signed-off-by: Michal Suchanek <msuchanek@suse.de>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+    Link: https://lore.kernel.org/r/20200225173541.1549955-26-npiggin@gmail.com
+
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+index e3a905e3d573..310583e62bd9 100644
+--- a/arch/powerpc/include/asm/hw_irq.h
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -228,9 +228,13 @@ static inline bool arch_irqs_disabled(void)
+ #ifdef CONFIG_PPC_BOOK3E
+ #define __hard_irq_enable()	wrtee(MSR_EE)
+ #define __hard_irq_disable()	wrtee(0)
++#define __hard_EE_RI_disable()	wrtee(0)
++#define __hard_RI_enable()	do { } while (0)
+ #else
+ #define __hard_irq_enable()	__mtmsrd(MSR_EE|MSR_RI, 1)
+ #define __hard_irq_disable()	__mtmsrd(MSR_RI, 1)
++#define __hard_EE_RI_disable()	__mtmsrd(0, 1)
++#define __hard_RI_enable()	__mtmsrd(MSR_RI, 1)
+ #endif
+ 
+ #define hard_irq_disable()	do {					\
+
+commit b020aa9d1e875c1c91b1390acdf42320e7060d84
+Author: Christophe Leroy <christophe.leroy@c-s.fr>
+Date:   Thu Aug 29 08:45:13 2019 +0000
+
+    powerpc: cleanup hw_irq.h
+    
+    SET_MSR_EE() is just use in this file and doesn't provide
+    any added value compared to mtmsr(). Drop it.
+    
+    Add a wrtee() inline function to use wrtee/wrteei insn.
+    
+    Replace #ifdefs by IS_ENABLED()
+    
+    Signed-off-by: Christophe Leroy <christophe.leroy@c-s.fr>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+    Link: https://lore.kernel.org/r/a28a20514d5f6df9629c1a117b667e48c4272736.1567068137.git.christophe.leroy@c-s.fr
+
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+index 32a18f2f49bc..e3a905e3d573 100644
+--- a/arch/powerpc/include/asm/hw_irq.h
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -226,8 +226,8 @@ static inline bool arch_irqs_disabled(void)
+ #endif /* CONFIG_PPC_BOOK3S */
+ 
+ #ifdef CONFIG_PPC_BOOK3E
+-#define __hard_irq_enable()	asm volatile("wrteei 1" : : : "memory")
+-#define __hard_irq_disable()	asm volatile("wrteei 0" : : : "memory")
++#define __hard_irq_enable()	wrtee(MSR_EE)
++#define __hard_irq_disable()	wrtee(0)
+ #else
+ #define __hard_irq_enable()	__mtmsrd(MSR_EE|MSR_RI, 1)
+ #define __hard_irq_disable()	__mtmsrd(MSR_RI, 1)
+@@ -280,8 +280,6 @@ extern void force_external_irq_replay(void);
+ 
+ #else /* CONFIG_PPC64 */
+ 
+-#define SET_MSR_EE(x)	mtmsr(x)
+-
+ static inline unsigned long arch_local_save_flags(void)
+ {
+ 	return mfmsr();
+@@ -289,47 +287,44 @@ static inline unsigned long arch_local_save_flags(void)
+ 
+ static inline void arch_local_irq_restore(unsigned long flags)
+ {
+-#if defined(CONFIG_BOOKE)
+-	asm volatile("wrtee %0" : : "r" (flags) : "memory");
+-#else
+-	mtmsr(flags);
+-#endif
++	if (IS_ENABLED(CONFIG_BOOKE))
++		wrtee(flags);
++	else
++		mtmsr(flags);
+ }
+ 
+ static inline unsigned long arch_local_irq_save(void)
+ {
+ 	unsigned long flags = arch_local_save_flags();
+-#ifdef CONFIG_BOOKE
+-	asm volatile("wrteei 0" : : : "memory");
+-#elif defined(CONFIG_PPC_8xx)
+-	wrtspr(SPRN_EID);
+-#else
+-	SET_MSR_EE(flags & ~MSR_EE);
+-#endif
++
++	if (IS_ENABLED(CONFIG_BOOKE))
++		wrtee(0);
++	else if (IS_ENABLED(CONFIG_PPC_8xx))
++		wrtspr(SPRN_EID);
++	else
++		mtmsr(flags & ~MSR_EE);
++
+ 	return flags;
+ }
+ 
+ static inline void arch_local_irq_disable(void)
+ {
+-#ifdef CONFIG_BOOKE
+-	asm volatile("wrteei 0" : : : "memory");
+-#elif defined(CONFIG_PPC_8xx)
+-	wrtspr(SPRN_EID);
+-#else
+-	arch_local_irq_save();
+-#endif
++	if (IS_ENABLED(CONFIG_BOOKE))
++		wrtee(0);
++	else if (IS_ENABLED(CONFIG_PPC_8xx))
++		wrtspr(SPRN_EID);
++	else
++		mtmsr(mfmsr() & ~MSR_EE);
+ }
+ 
+ static inline void arch_local_irq_enable(void)
+ {
+-#ifdef CONFIG_BOOKE
+-	asm volatile("wrteei 1" : : : "memory");
+-#elif defined(CONFIG_PPC_8xx)
+-	wrtspr(SPRN_EIE);
+-#else
+-	unsigned long msr = mfmsr();
+-	SET_MSR_EE(msr | MSR_EE);
+-#endif
++	if (IS_ENABLED(CONFIG_BOOKE))
++		wrtee(MSR_EE);
++	else if (IS_ENABLED(CONFIG_PPC_8xx))
++		wrtspr(SPRN_EIE);
++	else
++		mtmsr(mfmsr() | MSR_EE);
+ }
+ 
+ static inline bool arch_irqs_disabled_flags(unsigned long flags)
+
+commit 9b81c0211c249c1bc8caec2ddbc86e36c550ce0f
+Author: Nicholas Piggin <npiggin@gmail.com>
+Date:   Sun Jun 3 22:24:32 2018 +1000
+
+    powerpc/64s: make PACA_IRQ_HARD_DIS track MSR[EE] closely
+    
+    When the masked interrupt handler clears MSR[EE] for an interrupt in
+    the PACA_IRQ_MUST_HARD_MASK set, it does not set PACA_IRQ_HARD_DIS.
+    This makes them get out of synch.
+    
+    With that taken into account, it's only low level irq manipulation
+    (and interrupt entry before reconcile) where they can be out of synch.
+    This makes the code less surprising.
+    
+    It also allows the IRQ replay code to rely on the IRQ_HARD_DIS value
+    and not have to mtmsrd again in this case (e.g., for an external
+    interrupt that has been masked). The bigger benefit might just be
+    that there is not such an element of surprise in these two bits of
+    state.
+    
+    Signed-off-by: Nicholas Piggin <npiggin@gmail.com>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+index e151774cb577..32a18f2f49bc 100644
+--- a/arch/powerpc/include/asm/hw_irq.h
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -253,14 +253,16 @@ static inline bool lazy_irq_pending(void)
+ 
+ /*
+  * This is called by asynchronous interrupts to conditionally
+- * re-enable hard interrupts when soft-disabled after having
+- * cleared the source of the interrupt
++ * re-enable hard interrupts after having cleared the source
++ * of the interrupt. They are kept disabled if there is a different
++ * soft-masked interrupt pending that requires hard masking.
+  */
+ static inline void may_hard_irq_enable(void)
+ {
+-	get_paca()->irq_happened &= ~PACA_IRQ_HARD_DIS;
+-	if (!(get_paca()->irq_happened & PACA_IRQ_MUST_HARD_MASK))
++	if (!(get_paca()->irq_happened & PACA_IRQ_MUST_HARD_MASK)) {
++		get_paca()->irq_happened &= ~PACA_IRQ_HARD_DIS;
+ 		__hard_irq_enable();
++	}
+ }
+ 
+ static inline bool arch_irq_disabled_regs(struct pt_regs *regs)
+
+commit 7b08729cb272b4cd5c657cd5ac0dddae15a593ff
+Author: Michael Ellerman <mpe@ellerman.id.au>
+Date:   Wed May 2 23:07:26 2018 +1000
+
+    powerpc/64: Save stack pointer when we hard disable interrupts
+    
+    A CPU that gets stuck with interrupts hard disable can be difficult to
+    debug, as on some platforms we have no way to interrupt the CPU to
+    find out what it's doing.
+    
+    A stop-gap is to have the CPU save it's stack pointer (r1) in its paca
+    when it hard disables interrupts. That way if we can't interrupt it,
+    we can at least trace the stack based on where it last disabled
+    interrupts.
+    
+    In some cases that will be total junk, but the stack trace code should
+    handle that. In the simple case of a CPU that disable interrupts and
+    then gets stuck in a loop, the stack trace should be informative.
+    
+    We could clear the saved stack pointer when we enable interrupts, but
+    that loses information which could be useful if we have nothing else
+    to go on.
+    
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+    Reviewed-by: Nicholas Piggin <npiggin@gmail.com>
+
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+index 9aec7237f8c2..e151774cb577 100644
+--- a/arch/powerpc/include/asm/hw_irq.h
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -238,8 +238,12 @@ static inline bool arch_irqs_disabled(void)
+ 	__hard_irq_disable();						\
+ 	flags = irq_soft_mask_set_return(IRQS_ALL_DISABLED);		\
+ 	local_paca->irq_happened |= PACA_IRQ_HARD_DIS;			\
+-	if (!arch_irqs_disabled_flags(flags))				\
++	if (!arch_irqs_disabled_flags(flags)) {				\
++		asm ("stdx %%r1, 0, %1 ;"				\
++		     : "=m" (local_paca->saved_r1)			\
++		     : "b" (&local_paca->saved_r1));			\
+ 		trace_hardirqs_off();					\
++	}								\
+ } while(0)
+ 
+ static inline bool lazy_irq_pending(void)
+
+commit 3f984620f9a4fe089c0a3c951b75a460211394bb
+Author: Nicholas Piggin <npiggin@gmail.com>
+Date:   Sat May 5 03:19:31 2018 +1000
+
+    powerpc: generic clockevents broadcast receiver call tick_receive_broadcast
+    
+    The broadcast tick recipient can call tick_receive_broadcast rather
+    than re-running the full timer interrupt.
+    
+    It does not have to check for the next event time, because the sender
+    already determined the timer has expired. It does not have to test
+    irq_work_pending, because that's a direct decrementer interrupt and
+    does not go through the clock events subsystem. And it does not have
+    to read PURR because that was removed with the previous patch.
+    
+    This results in no code size change, but both the decrementer and
+    broadcast path lengths are reduced.
+    
+    Cc: Srivatsa S. Bhat <srivatsa.bhat@linux.vnet.ibm.com>
+    Cc: Preeti U Murthy <preeti@linux.vnet.ibm.com>
+    Signed-off-by: Nicholas Piggin <npiggin@gmail.com>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+index 3be8766427ef..9aec7237f8c2 100644
+--- a/arch/powerpc/include/asm/hw_irq.h
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -55,6 +55,7 @@ extern void replay_system_reset(void);
+ extern void __replay_interrupt(unsigned int vector);
+ 
+ extern void timer_interrupt(struct pt_regs *);
++extern void timer_broadcast_interrupt(void);
+ extern void performance_monitor_exception(struct pt_regs *regs);
+ extern void WatchdogException(struct pt_regs *regs);
+ extern void unknown_exception(struct pt_regs *regs);
+
+commit 54071e4176f0cedc39809f51cdbc78edd38ee77a
+Author: Nicholas Piggin <npiggin@gmail.com>
+Date:   Sat May 5 03:19:28 2018 +1000
+
+    powerpc/64s: micro-optimise __hard_irq_enable() for mtmsrd L=1 support
+    
+    Book3S minimum supported ISA version now requires mtmsrd L=1. This
+    instruction does not require bits other than RI and EE to be supplied,
+    so __hard_irq_enable() and __hard_irq_disable() does not have to read
+    the kernel_msr from paca.
+    
+    Interrupt entry code already relies on L=1 support.
+    
+    Signed-off-by: Nicholas Piggin <npiggin@gmail.com>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+index 855e17d158b1..3be8766427ef 100644
+--- a/arch/powerpc/include/asm/hw_irq.h
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -228,8 +228,8 @@ static inline bool arch_irqs_disabled(void)
+ #define __hard_irq_enable()	asm volatile("wrteei 1" : : : "memory")
+ #define __hard_irq_disable()	asm volatile("wrteei 0" : : : "memory")
+ #else
+-#define __hard_irq_enable()	__mtmsrd(local_paca->kernel_msr | MSR_EE, 1)
+-#define __hard_irq_disable()	__mtmsrd(local_paca->kernel_msr, 1)
++#define __hard_irq_enable()	__mtmsrd(MSR_EE|MSR_RI, 1)
++#define __hard_irq_disable()	__mtmsrd(MSR_RI, 1)
+ #endif
+ 
+ #define hard_irq_disable()	do {					\
+
+commit 6cc3f91bf69fc8c1719704607474f9b9df56f348
+Author: Nicholas Piggin <npiggin@gmail.com>
+Date:   Sat Feb 3 17:17:50 2018 +1000
+
+    powerpc/64s: Fix may_hard_irq_enable() for PMI soft masking
+    
+    The soft IRQ masking code has to hard-disable interrupts in cases
+    where the exception is not cleared by the masked handler. External
+    interrupts used this approach for soft masking. Now recently PMU
+    interrupts do the same thing.
+    
+    The soft IRQ masking code additionally allowed for interrupt handlers
+    to hard-enable interrupts after soft-disabling them. The idea is to
+    allow PMU interrupts through to profile interrupt handlers.
+    
+    So when interrupts are being replayed when there is a pending
+    interrupt that requires hard-disabling, there is a test to prevent
+    those handlers from hard-enabling them if there is a pending external
+    interrupt. may_hard_irq_enable() handles this.
+    
+    After f442d00480 ("powerpc/64s: Add support to mask perf interrupts
+    and replay them"), may_hard_irq_enable() could prematurely enable
+    MSR[EE] when a PMU exception exists, which would result in the
+    interrupt firing again while masked, and MSR[EE] being disabled again.
+    
+    I haven't seen that this could cause a serious problem, but it's
+    more consistent to handle these soft-masked interrupts in the same
+    way. So introduce a define for all types of interrupts that require
+    MSR[EE] masking in their soft-disable handlers, and use that in
+    may_hard_irq_enable().
+    
+    Fixes: f442d004806e ("powerpc/64s: Add support to mask perf interrupts and replay them")
+    Signed-off-by: Nicholas Piggin <npiggin@gmail.com>
+    Reviewed-by: Madhavan Srinivasan <maddy@linux.vnet.ibm.com>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+index 88e5e8f17e98..855e17d158b1 100644
+--- a/arch/powerpc/include/asm/hw_irq.h
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -29,6 +29,16 @@
+ #define PACA_IRQ_HMI		0x20
+ #define PACA_IRQ_PMI		0x40
+ 
++/*
++ * Some soft-masked interrupts must be hard masked until they are replayed
++ * (e.g., because the soft-masked handler does not clear the exception).
++ */
++#ifdef CONFIG_PPC_BOOK3S
++#define PACA_IRQ_MUST_HARD_MASK	(PACA_IRQ_EE|PACA_IRQ_PMI)
++#else
++#define PACA_IRQ_MUST_HARD_MASK	(PACA_IRQ_EE)
++#endif
++
+ /*
+  * flags for paca->irq_soft_mask
+  */
+@@ -244,7 +254,7 @@ static inline bool lazy_irq_pending(void)
+ static inline void may_hard_irq_enable(void)
+ {
+ 	get_paca()->irq_happened &= ~PACA_IRQ_HARD_DIS;
+-	if (!(get_paca()->irq_happened & PACA_IRQ_EE))
++	if (!(get_paca()->irq_happened & PACA_IRQ_MUST_HARD_MASK))
+ 		__hard_irq_enable();
+ }
+ 
+
+commit c6424382de996c216e81cfccf5cf2371157df651
+Author: Madhavan Srinivasan <maddy@linux.vnet.ibm.com>
+Date:   Wed Dec 20 09:25:55 2017 +0530
+
+    powerpc/64s: Add new set of irq_soft_mask_ functions for PMI masking
+    
+    To support soft-masking of the performance monitor interrupt, a set of
+    new powerpc_local_irq_pmu_save() and powerpc_local_irq_restore()
+    functions are added. And powerpc_local_irq_save() implemented, by
+    adding a new irq_soft_mask manipulation function
+    irq_soft_mask_or_return().
+    
+    Local_irq_pmu_* macros are provided to access these
+    powerpc_local_irq_pmu* functions which includes
+    trace_hardirqs_on|off() to match what we have in
+    include/linux/irqflags.h.
+    
+    Signed-off-by: Madhavan Srinivasan <maddy@linux.vnet.ibm.com>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+index f40da3bd079b..88e5e8f17e98 100644
+--- a/arch/powerpc/include/asm/hw_irq.h
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -115,6 +115,24 @@ static inline notrace unsigned long irq_soft_mask_set_return(unsigned long mask)
+ 	return flags;
+ }
+ 
++static inline notrace unsigned long irq_soft_mask_or_return(unsigned long mask)
++{
++	unsigned long flags, tmp;
++
++	asm volatile(
++		"lbz %0,%2(13); or %1,%0,%3; stb %1,%2(13)"
++		: "=&r" (flags), "=r" (tmp)
++		: "i" (offsetof(struct paca_struct, irq_soft_mask)),
++		  "r" (mask)
++		: "memory");
++
++#ifdef CONFIG_PPC_IRQ_SOFT_MASK_DEBUG
++	WARN_ON((mask | flags) && !((mask | flags) & IRQS_DISABLED));
++#endif
++
++	return flags;
++}
++
+ static inline unsigned long arch_local_save_flags(void)
+ {
+ 	return irq_soft_mask_return();
+@@ -147,6 +165,55 @@ static inline bool arch_irqs_disabled(void)
+ 	return arch_irqs_disabled_flags(arch_local_save_flags());
+ }
+ 
++#ifdef CONFIG_PPC_BOOK3S
++/*
++ * To support disabling and enabling of irq with PMI, set of
++ * new powerpc_local_irq_pmu_save() and powerpc_local_irq_restore()
++ * functions are added. These macros are implemented using generic
++ * linux local_irq_* code from include/linux/irqflags.h.
++ */
++#define raw_local_irq_pmu_save(flags)					\
++	do {								\
++		typecheck(unsigned long, flags);			\
++		flags = irq_soft_mask_or_return(IRQS_DISABLED |	\
++				IRQS_PMI_DISABLED);			\
++	} while(0)
++
++#define raw_local_irq_pmu_restore(flags)				\
++	do {								\
++		typecheck(unsigned long, flags);			\
++		arch_local_irq_restore(flags);				\
++	} while(0)
++
++#ifdef CONFIG_TRACE_IRQFLAGS
++#define powerpc_local_irq_pmu_save(flags)			\
++	 do {							\
++		raw_local_irq_pmu_save(flags);			\
++		trace_hardirqs_off();				\
++	} while(0)
++#define powerpc_local_irq_pmu_restore(flags)			\
++	do {							\
++		if (raw_irqs_disabled_flags(flags)) {		\
++			raw_local_irq_pmu_restore(flags);	\
++			trace_hardirqs_off();			\
++		} else {					\
++			trace_hardirqs_on();			\
++			raw_local_irq_pmu_restore(flags);	\
++		}						\
++	} while(0)
++#else
++#define powerpc_local_irq_pmu_save(flags)			\
++	do {							\
++		raw_local_irq_pmu_save(flags);			\
++	} while(0)
++#define powerpc_local_irq_pmu_restore(flags)			\
++	do {							\
++		raw_local_irq_pmu_restore(flags);		\
++	} while (0)
++#endif  /* CONFIG_TRACE_IRQFLAGS */
++
++#endif /* CONFIG_PPC_BOOK3S */
++
+ #ifdef CONFIG_PPC_BOOK3E
+ #define __hard_irq_enable()	asm volatile("wrteei 1" : : : "memory")
+ #define __hard_irq_disable()	asm volatile("wrteei 0" : : : "memory")
+
+commit 9aa88188ee87f4cc5c4e1bce15754bfcde8e900f
+Author: Madhavan Srinivasan <maddy@linux.vnet.ibm.com>
+Date:   Wed Dec 20 09:25:54 2017 +0530
+
+    powerpc: Add new kconfig CONFIG_PPC_IRQ_SOFT_MASK_DEBUG
+    
+    New Kconfig is added "CONFIG_PPC_IRQ_SOFT_MASK_DEBUG" to add WARN_ON
+    to alert the invalid transitions. Also moved the code under the
+    CONFIG_TRACE_IRQFLAGS in arch_local_irq_restore() to new Kconfig.
+    
+    Reviewed-by: Nicholas Piggin <npiggin@gmail.com>
+    Signed-off-by: Madhavan Srinivasan <maddy@linux.vnet.ibm.com>
+    [mpe: Fix name of CONFIG option in change log]
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+index 552a2c6e428f..f40da3bd079b 100644
+--- a/arch/powerpc/include/asm/hw_irq.h
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -71,7 +71,7 @@ static inline notrace unsigned long irq_soft_mask_return(void)
+  */
+ static inline notrace void irq_soft_mask_set(unsigned long mask)
+ {
+-#ifdef CONFIG_TRACE_IRQFLAGS
++#ifdef CONFIG_PPC_IRQ_SOFT_MASK_DEBUG
+ 	/*
+ 	 * The irq mask must always include the STD bit if any are set.
+ 	 *
+@@ -101,7 +101,7 @@ static inline notrace unsigned long irq_soft_mask_set_return(unsigned long mask)
+ {
+ 	unsigned long flags;
+ 
+-#ifdef CONFIG_TRACE_IRQFLAGS
++#ifdef CONFIG_PPC_IRQ_SOFT_MASK_DEBUG
+ 	WARN_ON(mask && !(mask & IRQS_DISABLED));
+ #endif
+ 
+
+commit f442d004806e31fe5aab614ec48e53f7b38f7c2d
+Author: Madhavan Srinivasan <maddy@linux.vnet.ibm.com>
+Date:   Wed Dec 20 09:25:53 2017 +0530
+
+    powerpc/64s: Add support to mask perf interrupts and replay them
+    
+    Two new bit mask field "IRQ_DISABLE_MASK_PMU" is introduced to support
+    the masking of PMI and "IRQ_DISABLE_MASK_ALL" to aid interrupt masking
+    checking.
+    
+    Couple of new irq #defs "PACA_IRQ_PMI" and "SOFTEN_VALUE_0xf0*" added
+    to use in the exception code to check for PMI interrupts.
+    
+    In the masked_interrupt handler, for PMIs we reset the MSR[EE] and
+    return. In the __check_irq_replay(), replay the PMI interrupt by
+    calling performance_monitor_common handler.
+    
+    Signed-off-by: Madhavan Srinivasan <maddy@linux.vnet.ibm.com>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+index 5c82bb116832..552a2c6e428f 100644
+--- a/arch/powerpc/include/asm/hw_irq.h
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -27,12 +27,15 @@
+ #define PACA_IRQ_DEC		0x08 /* Or FIT */
+ #define PACA_IRQ_EE_EDGE	0x10 /* BookE only */
+ #define PACA_IRQ_HMI		0x20
++#define PACA_IRQ_PMI		0x40
+ 
+ /*
+  * flags for paca->irq_soft_mask
+  */
+ #define IRQS_ENABLED		0
+-#define IRQS_DISABLED		1
++#define IRQS_DISABLED		1 /* local_irq_disable() interrupts */
++#define IRQS_PMI_DISABLED	2
++#define IRQS_ALL_DISABLED	(IRQS_DISABLED | IRQS_PMI_DISABLED)
+ 
+ #endif /* CONFIG_PPC64 */
+ 
+@@ -152,13 +155,13 @@ static inline bool arch_irqs_disabled(void)
+ #define __hard_irq_disable()	__mtmsrd(local_paca->kernel_msr, 1)
+ #endif
+ 
+-#define hard_irq_disable()	do {				\
+-	unsigned long flags;					\
+-	__hard_irq_disable();					\
+-	flags = irq_soft_mask_set_return(IRQS_DISABLED);	\
+-	local_paca->irq_happened |= PACA_IRQ_HARD_DIS;		\
+-	if (!arch_irqs_disabled_flags(flags))			\
+-		trace_hardirqs_off();				\
++#define hard_irq_disable()	do {					\
++	unsigned long flags;						\
++	__hard_irq_disable();						\
++	flags = irq_soft_mask_set_return(IRQS_ALL_DISABLED);		\
++	local_paca->irq_happened |= PACA_IRQ_HARD_DIS;			\
++	if (!arch_irqs_disabled_flags(flags))				\
++		trace_hardirqs_off();					\
+ } while(0)
+ 
+ static inline bool lazy_irq_pending(void)
+
+commit 4e26bc4a4ed683c42ba45f09050575a671c6f1f4
+Author: Madhavan Srinivasan <maddy@linux.vnet.ibm.com>
+Date:   Wed Dec 20 09:25:50 2017 +0530
+
+    powerpc/64: Rename soft_enabled to irq_soft_mask
+    
+    Rename the paca->soft_enabled to paca->irq_soft_mask as it is no
+    longer used as a flag for interrupt state, but a mask.
+    
+    Signed-off-by: Madhavan Srinivasan <maddy@linux.vnet.ibm.com>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+index f96280ee9540..5c82bb116832 100644
+--- a/arch/powerpc/include/asm/hw_irq.h
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -29,7 +29,7 @@
+ #define PACA_IRQ_HMI		0x20
+ 
+ /*
+- * flags for paca->soft_enabled
++ * flags for paca->irq_soft_mask
+  */
+ #define IRQS_ENABLED		0
+ #define IRQS_DISABLED		1
+@@ -49,14 +49,14 @@ extern void unknown_exception(struct pt_regs *regs);
+ #ifdef CONFIG_PPC64
+ #include <asm/paca.h>
+ 
+-static inline notrace unsigned long soft_enabled_return(void)
++static inline notrace unsigned long irq_soft_mask_return(void)
+ {
+ 	unsigned long flags;
+ 
+ 	asm volatile(
+ 		"lbz %0,%1(13)"
+ 		: "=r" (flags)
+-		: "i" (offsetof(struct paca_struct, soft_enabled)));
++		: "i" (offsetof(struct paca_struct, irq_soft_mask)));
+ 
+ 	return flags;
+ }
+@@ -64,18 +64,24 @@ static inline notrace unsigned long soft_enabled_return(void)
+ /*
+  * The "memory" clobber acts as both a compiler barrier
+  * for the critical section and as a clobber because
+- * we changed paca->soft_enabled
++ * we changed paca->irq_soft_mask
+  */
+-static inline notrace void soft_enabled_set(unsigned long enable)
++static inline notrace void irq_soft_mask_set(unsigned long mask)
+ {
+ #ifdef CONFIG_TRACE_IRQFLAGS
+ 	/*
+-	 * mask must always include LINUX bit if any are set, and
+-	 * interrupts don't get replayed until the Linux interrupt is
+-	 * unmasked. This could be changed to replay partial unmasks
+-	 * in future, which would allow Linux masks to nest inside
+-	 * other masks, among other things. For now, be very dumb and
+-	 * simple.
++	 * The irq mask must always include the STD bit if any are set.
++	 *
++	 * and interrupts don't get replayed until the standard
++	 * interrupt (local_irq_disable()) is unmasked.
++	 *
++	 * Other masks must only provide additional masking beyond
++	 * the standard, and they are also not replayed until the
++	 * standard interrupt becomes unmasked.
++	 *
++	 * This could be changed, but it will require partial
++	 * unmasks to be replayed, among other things. For now, take
++	 * the simple approach.
+ 	 */
+ 	WARN_ON(mask && !(mask & IRQS_DISABLED));
+ #endif
+@@ -83,12 +89,12 @@ static inline notrace void soft_enabled_set(unsigned long enable)
+ 	asm volatile(
+ 		"stb %0,%1(13)"
+ 		:
+-		: "r" (enable),
+-		  "i" (offsetof(struct paca_struct, soft_enabled))
++		: "r" (mask),
++		  "i" (offsetof(struct paca_struct, irq_soft_mask))
+ 		: "memory");
+ }
+ 
+-static inline notrace unsigned long soft_enabled_set_return(unsigned long mask)
++static inline notrace unsigned long irq_soft_mask_set_return(unsigned long mask)
+ {
+ 	unsigned long flags;
+ 
+@@ -99,7 +105,7 @@ static inline notrace unsigned long soft_enabled_set_return(unsigned long mask)
+ 	asm volatile(
+ 		"lbz %0,%1(13); stb %2,%1(13)"
+ 		: "=&r" (flags)
+-		: "i" (offsetof(struct paca_struct, soft_enabled)),
++		: "i" (offsetof(struct paca_struct, irq_soft_mask)),
+ 		  "r" (mask)
+ 		: "memory");
+ 
+@@ -108,12 +114,12 @@ static inline notrace unsigned long soft_enabled_set_return(unsigned long mask)
+ 
+ static inline unsigned long arch_local_save_flags(void)
+ {
+-	return soft_enabled_return();
++	return irq_soft_mask_return();
+ }
+ 
+ static inline void arch_local_irq_disable(void)
+ {
+-	soft_enabled_set(IRQS_DISABLED);
++	irq_soft_mask_set(IRQS_DISABLED);
+ }
+ 
+ extern void arch_local_irq_restore(unsigned long);
+@@ -125,7 +131,7 @@ static inline void arch_local_irq_enable(void)
+ 
+ static inline unsigned long arch_local_irq_save(void)
+ {
+-	return soft_enabled_set_return(IRQS_DISABLED);
++	return irq_soft_mask_set_return(IRQS_DISABLED);
+ }
+ 
+ static inline bool arch_irqs_disabled_flags(unsigned long flags)
+@@ -146,13 +152,13 @@ static inline bool arch_irqs_disabled(void)
+ #define __hard_irq_disable()	__mtmsrd(local_paca->kernel_msr, 1)
+ #endif
+ 
+-#define hard_irq_disable()	do {			\
+-	unsigned long flags;				\
+-	__hard_irq_disable();				\
+-	flags = soft_enabled_set_return(IRQS_DISABLED);\
+-	local_paca->irq_happened |= PACA_IRQ_HARD_DIS;	\
+-	if (!arch_irqs_disabled_flags(flags))		\
+-		trace_hardirqs_off();			\
++#define hard_irq_disable()	do {				\
++	unsigned long flags;					\
++	__hard_irq_disable();					\
++	flags = irq_soft_mask_set_return(IRQS_DISABLED);	\
++	local_paca->irq_happened |= PACA_IRQ_HARD_DIS;		\
++	if (!arch_irqs_disabled_flags(flags))			\
++		trace_hardirqs_off();				\
+ } while(0)
+ 
+ static inline bool lazy_irq_pending(void)
+
+commit 01417c6cc7dc9195f721f7f9e9ea066090ccc99d
+Author: Madhavan Srinivasan <maddy@linux.vnet.ibm.com>
+Date:   Wed Dec 20 09:25:49 2017 +0530
+
+    powerpc/64: Change soft_enabled from flag to bitmask
+    
+    "paca->soft_enabled" is used as a flag to mask some of interrupts.
+    Currently supported flags values and their details:
+    
+    soft_enabled    MSR[EE]
+    
+    0               0       Disabled (PMI and HMI not masked)
+    1               1       Enabled
+    
+    "paca->soft_enabled" is initialized to 1 to make the interripts as
+    enabled. arch_local_irq_disable() will toggle the value when
+    interrupts needs to disbled. At this point, the interrupts are not
+    actually disabled, instead, interrupt vector has code to check for the
+    flag and mask it when it occurs. By "mask it", it update interrupt
+    paca->irq_happened and return. arch_local_irq_restore() is called to
+    re-enable interrupts, which checks and replays interrupts if any
+    occured.
+    
+    Now, as mentioned, current logic doesnot mask "performance monitoring
+    interrupts" and PMIs are implemented as NMI. But this patchset depends
+    on local_irq_* for a successful local_* update. Meaning, mask all
+    possible interrupts during local_* update and replay them after the
+    update.
+    
+    So the idea here is to reserve the "paca->soft_enabled" logic. New
+    values and details:
+    
+    soft_enabled    MSR[EE]
+    
+    1               0       Disabled  (PMI and HMI not masked)
+    0               1       Enabled
+    
+    Reason for the this change is to create foundation for a third mask
+    value "0x2" for "soft_enabled" to add support to mask PMIs. When
+    ->soft_enabled is set to a value "3", PMI interrupts are mask and when
+    set to a value of "1", PMI are not mask. With this patch also extends
+    soft_enabled as interrupt disable mask.
+    
+    Current flags are renamed from IRQ_[EN?DIS}ABLED to
+    IRQS_ENABLED and IRQS_DISABLED.
+    
+    Patch also fixes the ptrace call to force the user to see the softe
+    value to be alway 1. Reason being, even though userspace has no
+    business knowing about softe, it is part of pt_regs. Like-wise in
+    signal context.
+    
+    Signed-off-by: Madhavan Srinivasan <maddy@linux.vnet.ibm.com>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+index 52afb1595cb0..f96280ee9540 100644
+--- a/arch/powerpc/include/asm/hw_irq.h
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -31,8 +31,8 @@
+ /*
+  * flags for paca->soft_enabled
+  */
+-#define IRQS_ENABLED	1
+-#define IRQS_DISABLED	0
++#define IRQS_ENABLED		0
++#define IRQS_DISABLED		1
+ 
+ #endif /* CONFIG_PPC64 */
+ 
+@@ -68,6 +68,18 @@ static inline notrace unsigned long soft_enabled_return(void)
+  */
+ static inline notrace void soft_enabled_set(unsigned long enable)
+ {
++#ifdef CONFIG_TRACE_IRQFLAGS
++	/*
++	 * mask must always include LINUX bit if any are set, and
++	 * interrupts don't get replayed until the Linux interrupt is
++	 * unmasked. This could be changed to replay partial unmasks
++	 * in future, which would allow Linux masks to nest inside
++	 * other masks, among other things. For now, be very dumb and
++	 * simple.
++	 */
++	WARN_ON(mask && !(mask & IRQS_DISABLED));
++#endif
++
+ 	asm volatile(
+ 		"stb %0,%1(13)"
+ 		:
+@@ -76,15 +88,19 @@ static inline notrace void soft_enabled_set(unsigned long enable)
+ 		: "memory");
+ }
+ 
+-static inline notrace unsigned long soft_enabled_set_return(unsigned long enable)
++static inline notrace unsigned long soft_enabled_set_return(unsigned long mask)
+ {
+ 	unsigned long flags;
+ 
++#ifdef CONFIG_TRACE_IRQFLAGS
++	WARN_ON(mask && !(mask & IRQS_DISABLED));
++#endif
++
+ 	asm volatile(
+ 		"lbz %0,%1(13); stb %2,%1(13)"
+ 		: "=&r" (flags)
+ 		: "i" (offsetof(struct paca_struct, soft_enabled)),
+-		  "r" (enable)
++		  "r" (mask)
+ 		: "memory");
+ 
+ 	return flags;
+@@ -114,7 +130,7 @@ static inline unsigned long arch_local_irq_save(void)
+ 
+ static inline bool arch_irqs_disabled_flags(unsigned long flags)
+ {
+-	return flags == IRQS_DISABLED;
++	return flags & IRQS_DISABLED;
+ }
+ 
+ static inline bool arch_irqs_disabled(void)
+@@ -133,7 +149,7 @@ static inline bool arch_irqs_disabled(void)
+ #define hard_irq_disable()	do {			\
+ 	unsigned long flags;				\
+ 	__hard_irq_disable();				\
+-	flags = soft_enabled_set_return(IRQS_DISABLED);	\
++	flags = soft_enabled_set_return(IRQS_DISABLED);\
+ 	local_paca->irq_happened |= PACA_IRQ_HARD_DIS;	\
+ 	if (!arch_irqs_disabled_flags(flags))		\
+ 		trace_hardirqs_off();			\
+@@ -158,7 +174,7 @@ static inline void may_hard_irq_enable(void)
+ 
+ static inline bool arch_irq_disabled_regs(struct pt_regs *regs)
+ {
+-	return (regs->softe == IRQS_DISABLED);
++	return (regs->softe & IRQS_DISABLED);
+ }
+ 
+ extern bool prep_irq_for_idle(void);
+
+commit acb396d7c2b8b5f0f567c980185bbddd10534b56
+Author: Madhavan Srinivasan <maddy@linux.vnet.ibm.com>
+Date:   Wed Dec 20 09:25:48 2017 +0530
+
+    powerpc/64: Cleanup hard_irq_disable() macro
+    
+    Minor cleanup to use helper function for manipulating
+    paca->soft_enabled variable.
+    
+    Suggested-by: Nicholas Piggin <npiggin@gmail.com>
+    Signed-off-by: Madhavan Srinivasan <maddy@linux.vnet.ibm.com>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+index c1764fabf181..52afb1595cb0 100644
+--- a/arch/powerpc/include/asm/hw_irq.h
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -131,12 +131,11 @@ static inline bool arch_irqs_disabled(void)
+ #endif
+ 
+ #define hard_irq_disable()	do {			\
+-	u8 _was_enabled;				\
++	unsigned long flags;				\
+ 	__hard_irq_disable();				\
+-	_was_enabled = local_paca->soft_enabled;	\
+-	local_paca->soft_enabled = IRQS_DISABLED;\
++	flags = soft_enabled_set_return(IRQS_DISABLED);	\
+ 	local_paca->irq_happened |= PACA_IRQ_HARD_DIS;	\
+-	if (_was_enabled == IRQS_ENABLED)	\
++	if (!arch_irqs_disabled_flags(flags))		\
+ 		trace_hardirqs_off();			\
+ } while(0)
+ 
+
+commit a67c543aacb247a74e9d48fd9fde6d8369cea10b
+Author: Madhavan Srinivasan <maddy@linux.vnet.ibm.com>
+Date:   Wed Dec 20 09:25:47 2017 +0530
+
+    powerpc/64: Implement and use soft_enabled_set_return API
+    
+    Add a new wrapper function, soft_enabled_set_return(), added to do the
+    paca->soft_enabled updates requiring a set-return.
+    
+    Signed-off-by: Madhavan Srinivasan <maddy@linux.vnet.ibm.com>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+index f9791884af08..c1764fabf181 100644
+--- a/arch/powerpc/include/asm/hw_irq.h
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -76,6 +76,20 @@ static inline notrace void soft_enabled_set(unsigned long enable)
+ 		: "memory");
+ }
+ 
++static inline notrace unsigned long soft_enabled_set_return(unsigned long enable)
++{
++	unsigned long flags;
++
++	asm volatile(
++		"lbz %0,%1(13); stb %2,%1(13)"
++		: "=&r" (flags)
++		: "i" (offsetof(struct paca_struct, soft_enabled)),
++		  "r" (enable)
++		: "memory");
++
++	return flags;
++}
++
+ static inline unsigned long arch_local_save_flags(void)
+ {
+ 	return soft_enabled_return();
+@@ -95,16 +109,7 @@ static inline void arch_local_irq_enable(void)
+ 
+ static inline unsigned long arch_local_irq_save(void)
+ {
+-	unsigned long flags;
+-
+-	asm volatile(
+-		"lbz %0,%1(13); stb %2,%1(13)"
+-		: "=&r" (flags)
+-		: "i" (offsetof(struct paca_struct, soft_enabled)),
+-		  "r" (IRQS_DISABLED)
+-		: "memory");
+-
+-	return flags;
++	return soft_enabled_set_return(IRQS_DISABLED);
+ }
+ 
+ static inline bool arch_irqs_disabled_flags(unsigned long flags)
+
+commit e0b5687bed13ddbf99985d77910b9adfd429bf12
+Author: Madhavan Srinivasan <maddy@linux.vnet.ibm.com>
+Date:   Wed Dec 20 09:25:46 2017 +0530
+
+    powerpc/64: Implement and use soft_enabled_return API
+    
+    Add a new wrapper function, soft_enabled_return(), added to return
+    paca->soft_enabled value.
+    
+    Signed-off-by: Madhavan Srinivasan <maddy@linux.vnet.ibm.com>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+index d046d9f3b777..f9791884af08 100644
+--- a/arch/powerpc/include/asm/hw_irq.h
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -49,6 +49,18 @@ extern void unknown_exception(struct pt_regs *regs);
+ #ifdef CONFIG_PPC64
+ #include <asm/paca.h>
+ 
++static inline notrace unsigned long soft_enabled_return(void)
++{
++	unsigned long flags;
++
++	asm volatile(
++		"lbz %0,%1(13)"
++		: "=r" (flags)
++		: "i" (offsetof(struct paca_struct, soft_enabled)));
++
++	return flags;
++}
++
+ /*
+  * The "memory" clobber acts as both a compiler barrier
+  * for the critical section and as a clobber because
+@@ -66,14 +78,7 @@ static inline notrace void soft_enabled_set(unsigned long enable)
+ 
+ static inline unsigned long arch_local_save_flags(void)
+ {
+-	unsigned long flags;
+-
+-	asm volatile(
+-		"lbz %0,%1(13)"
+-		: "=r" (flags)
+-		: "i" (offsetof(struct paca_struct, soft_enabled)));
+-
+-	return flags;
++	return soft_enabled_return();
+ }
+ 
+ static inline void arch_local_irq_disable(void)
+
+commit 0b63acf4a0eb8843f83954ea1bd29ccdfcbaa778
+Author: Madhavan Srinivasan <maddy@linux.vnet.ibm.com>
+Date:   Wed Dec 20 09:25:45 2017 +0530
+
+    powerpc/64: Move set_soft_enabled() and rename
+    
+    Move set_soft_enabled() from powerpc/kernel/irq.c to asm/hw_irq.c, to
+    encourage updates to paca->soft_enabled done via these access
+    function. Add "memory" clobber to hint compiler since
+    paca->soft_enabled memory is the target here.
+    
+    Renaming it as soft_enabled_set() will make namespaces works better as
+    prefix than a postfix when new soft_enabled manipulation functions are
+    introduced.
+    
+    Reviewed-by: Nicholas Piggin <npiggin@gmail.com>
+    Signed-off-by: Madhavan Srinivasan <maddy@linux.vnet.ibm.com>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+index 4c54db29104f..d046d9f3b777 100644
+--- a/arch/powerpc/include/asm/hw_irq.h
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -49,6 +49,21 @@ extern void unknown_exception(struct pt_regs *regs);
+ #ifdef CONFIG_PPC64
+ #include <asm/paca.h>
+ 
++/*
++ * The "memory" clobber acts as both a compiler barrier
++ * for the critical section and as a clobber because
++ * we changed paca->soft_enabled
++ */
++static inline notrace void soft_enabled_set(unsigned long enable)
++{
++	asm volatile(
++		"stb %0,%1(13)"
++		:
++		: "r" (enable),
++		  "i" (offsetof(struct paca_struct, soft_enabled))
++		: "memory");
++}
++
+ static inline unsigned long arch_local_save_flags(void)
+ {
+ 	unsigned long flags;
+@@ -63,12 +78,7 @@ static inline unsigned long arch_local_save_flags(void)
+ 
+ static inline void arch_local_irq_disable(void)
+ {
+-	asm volatile(
+-		"stb %0,%1(13)"
+-		:
+-		: "r" (IRQS_DISABLED),
+-		  "i" (offsetof(struct paca_struct, soft_enabled))
+-		: "memory");
++	soft_enabled_set(IRQS_DISABLED);
+ }
+ 
+ extern void arch_local_irq_restore(unsigned long);
+
+commit b5c1bd62c054f3cff1a672f9bf1dddefafadffec
+Author: Madhavan Srinivasan <maddy@linux.vnet.ibm.com>
+Date:   Wed Dec 20 09:25:44 2017 +0530
+
+    powerpc/64: Fix arch_local_irq_disable() prototype
+    
+    In powerpc/64, the arch_local_irq_disable() function returns unsigned
+    long, which is not consistent with other architectures.
+    
+    Move that set-return asm implementation into arch_local_irq_save(),
+    and make arch_local_irq_disable() return void, simplifying the
+    assembly.
+    
+    Suggested-by: Nicholas Piggin <npiggin@gmail.com>
+    Signed-off-by: Madhavan Srinivasan <maddy@linux.vnet.ibm.com>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+index 4210ddbf38b0..4c54db29104f 100644
+--- a/arch/powerpc/include/asm/hw_irq.h
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -61,18 +61,14 @@ static inline unsigned long arch_local_save_flags(void)
+ 	return flags;
+ }
+ 
+-static inline unsigned long arch_local_irq_disable(void)
++static inline void arch_local_irq_disable(void)
+ {
+-	unsigned long flags;
+-
+ 	asm volatile(
+-		"lbz %0,%1(13); stb %2,%1(13)"
+-		: "=&r" (flags)
+-		: "i" (offsetof(struct paca_struct, soft_enabled)),
+-		  "r" (IRQS_DISABLED)
++		"stb %0,%1(13)"
++		:
++		: "r" (IRQS_DISABLED),
++		  "i" (offsetof(struct paca_struct, soft_enabled))
+ 		: "memory");
+-
+-	return flags;
+ }
+ 
+ extern void arch_local_irq_restore(unsigned long);
+@@ -84,7 +80,16 @@ static inline void arch_local_irq_enable(void)
+ 
+ static inline unsigned long arch_local_irq_save(void)
+ {
+-	return arch_local_irq_disable();
++	unsigned long flags;
++
++	asm volatile(
++		"lbz %0,%1(13); stb %2,%1(13)"
++		: "=&r" (flags)
++		: "i" (offsetof(struct paca_struct, soft_enabled)),
++		  "r" (IRQS_DISABLED)
++		: "memory");
++
++	return flags;
+ }
+ 
+ static inline bool arch_irqs_disabled_flags(unsigned long flags)
+
+commit 9f83e00f4cc1c560b6847acecba2b3746c8d8c06
+Author: Nicholas Piggin <npiggin@gmail.com>
+Date:   Wed Dec 20 09:25:43 2017 +0530
+
+    powerpc/64: Improve inline asm in arch_local_irq_disable
+    
+    arch_local_irq_disable is implemented strangely, with a temporary
+    output register being set to the desired soft_enabled value via an
+    immediate input, which is then used to store to memory. This is not
+    required, the immediate can be specified directly as a register input.
+    
+    For simple cases at least, assembly is unchanged except register
+    mapping.
+    
+    Reviewed-by: Madhavan Srinivasan <maddy@linux.vnet.ibm.com>
+    Signed-off-by: Nicholas Piggin <npiggin@gmail.com>
+    Signed-off-by: Madhavan Srinivasan <maddy@linux.vnet.ibm.com>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+index 7c2717dfd89a..4210ddbf38b0 100644
+--- a/arch/powerpc/include/asm/hw_irq.h
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -63,13 +63,13 @@ static inline unsigned long arch_local_save_flags(void)
+ 
+ static inline unsigned long arch_local_irq_disable(void)
+ {
+-	unsigned long flags, zero;
++	unsigned long flags;
+ 
+ 	asm volatile(
+-		"li %1,%3; lbz %0,%2(13); stb %1,%2(13)"
+-		: "=r" (flags), "=&r" (zero)
+-		: "i" (offsetof(struct paca_struct, soft_enabled)),\
+-		  "i" (IRQS_DISABLED)
++		"lbz %0,%1(13); stb %2,%1(13)"
++		: "=&r" (flags)
++		: "i" (offsetof(struct paca_struct, soft_enabled)),
++		  "r" (IRQS_DISABLED)
+ 		: "memory");
+ 
+ 	return flags;
+
+commit c2e480ba822718190e58849b79a76db13c3dac18
+Author: Madhavan Srinivasan <maddy@linux.vnet.ibm.com>
+Date:   Wed Dec 20 09:25:42 2017 +0530
+
+    powerpc/64: Add #defines for paca->soft_enabled flags
+    
+    Two #defines IRQS_ENABLED and IRQS_DISABLED are added to be used when
+    updating paca->soft_enabled. Replace the hardcoded values used when
+    updating paca->soft_enabled with IRQ_(EN|DIS)ABLED #define. No logic
+    change.
+    
+    Reviewed-by: Nicholas Piggin <npiggin@gmail.com>
+    Signed-off-by: Madhavan Srinivasan <maddy@linux.vnet.ibm.com>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+index 3818fa0164f0..7c2717dfd89a 100644
+--- a/arch/powerpc/include/asm/hw_irq.h
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -28,6 +28,12 @@
+ #define PACA_IRQ_EE_EDGE	0x10 /* BookE only */
+ #define PACA_IRQ_HMI		0x20
+ 
++/*
++ * flags for paca->soft_enabled
++ */
++#define IRQS_ENABLED	1
++#define IRQS_DISABLED	0
++
+ #endif /* CONFIG_PPC64 */
+ 
+ #ifndef __ASSEMBLY__
+@@ -60,9 +66,10 @@ static inline unsigned long arch_local_irq_disable(void)
+ 	unsigned long flags, zero;
+ 
+ 	asm volatile(
+-		"li %1,0; lbz %0,%2(13); stb %1,%2(13)"
++		"li %1,%3; lbz %0,%2(13); stb %1,%2(13)"
+ 		: "=r" (flags), "=&r" (zero)
+-		: "i" (offsetof(struct paca_struct, soft_enabled))
++		: "i" (offsetof(struct paca_struct, soft_enabled)),\
++		  "i" (IRQS_DISABLED)
+ 		: "memory");
+ 
+ 	return flags;
+@@ -72,7 +79,7 @@ extern void arch_local_irq_restore(unsigned long);
+ 
+ static inline void arch_local_irq_enable(void)
+ {
+-	arch_local_irq_restore(1);
++	arch_local_irq_restore(IRQS_ENABLED);
+ }
+ 
+ static inline unsigned long arch_local_irq_save(void)
+@@ -82,7 +89,7 @@ static inline unsigned long arch_local_irq_save(void)
+ 
+ static inline bool arch_irqs_disabled_flags(unsigned long flags)
+ {
+-	return flags == 0;
++	return flags == IRQS_DISABLED;
+ }
+ 
+ static inline bool arch_irqs_disabled(void)
+@@ -102,9 +109,9 @@ static inline bool arch_irqs_disabled(void)
+ 	u8 _was_enabled;				\
+ 	__hard_irq_disable();				\
+ 	_was_enabled = local_paca->soft_enabled;	\
+-	local_paca->soft_enabled = 0;			\
++	local_paca->soft_enabled = IRQS_DISABLED;\
+ 	local_paca->irq_happened |= PACA_IRQ_HARD_DIS;	\
+-	if (_was_enabled)				\
++	if (_was_enabled == IRQS_ENABLED)	\
+ 		trace_hardirqs_off();			\
+ } while(0)
+ 
+@@ -127,7 +134,7 @@ static inline void may_hard_irq_enable(void)
+ 
+ static inline bool arch_irq_disabled_regs(struct pt_regs *regs)
+ {
+-	return !regs->softe;
++	return (regs->softe == IRQS_DISABLED);
+ }
+ 
+ extern bool prep_irq_for_idle(void);
+
+commit 5b0e2cb020085efe202123162502e0b551e49a0e
+Merge: 758f875848d7 3ffa9d9e2a7c
+Author: Linus Torvalds <torvalds@linux-foundation.org>
+Date:   Thu Nov 16 12:47:46 2017 -0800
+
+    Merge tag 'powerpc-4.15-1' of git://git.kernel.org/pub/scm/linux/kernel/git/powerpc/linux
+    
+    Pull powerpc updates from Michael Ellerman:
+     "A bit of a small release, I suspect in part due to me travelling for
+      KS. But my backlog of patches to review is smaller than usual, so I
+      think in part folks just didn't send as much this cycle.
+    
+      Non-highlights:
+    
+       - Five fixes for the >128T address space handling, both to fix bugs
+         in our implementation and to bring the semantics exactly into line
+         with x86.
+    
+      Highlights:
+    
+       - Support for a new OPAL call on bare metal machines which gives us a
+         true NMI (ie. is not masked by MSR[EE]=0) for debugging etc.
+    
+       - Support for Power9 DD2 in the CXL driver.
+    
+       - Improvements to machine check handling so that uncorrectable errors
+         can be reported into the generic memory_failure() machinery.
+    
+       - Some fixes and improvements for VPHN, which is used under PowerVM
+         to notify the Linux partition of topology changes.
+    
+       - Plumbing to enable TM (transactional memory) without suspend on
+         some Power9 processors (PPC_FEATURE2_HTM_NO_SUSPEND).
+    
+       - Support for emulating vector loads form cache-inhibited memory, on
+         some Power9 revisions.
+    
+       - Disable the fast-endian switch "syscall" by default (behind a
+         CONFIG), we believe it has never had any users.
+    
+       - A major rework of the API drivers use when initiating and waiting
+         for long running operations performed by OPAL firmware, and changes
+         to the powernv_flash driver to use the new API.
+    
+       - Several fixes for the handling of FP/VMX/VSX while processes are
+         using transactional memory.
+    
+       - Optimisations of TLB range flushes when using the radix MMU on
+         Power9.
+    
+       - Improvements to the VAS facility used to access coprocessors on
+         Power9, and related improvements to the way the NX crypto driver
+         handles requests.
+    
+       - Implementation of PMEM_API and UACCESS_FLUSHCACHE for 64-bit.
+    
+      Thanks to: Alexey Kardashevskiy, Alistair Popple, Allen Pais, Andrew
+      Donnellan, Aneesh Kumar K.V, Arnd Bergmann, Balbir Singh, Benjamin
+      Herrenschmidt, Breno Leitao, Christophe Leroy, Christophe Lombard,
+      Cyril Bur, Frederic Barrat, Gautham R. Shenoy, Geert Uytterhoeven,
+      Guilherme G. Piccoli, Gustavo Romero, Haren Myneni, Joel Stanley,
+      Kamalesh Babulal, Kautuk Consul, Markus Elfring, Masami Hiramatsu,
+      Michael Bringmann, Michael Neuling, Michal Suchanek, Naveen N. Rao,
+      Nicholas Piggin, Oliver O'Halloran, Paul Mackerras, Pedro Miraglia
+      Franco de Carvalho, Philippe Bergheaud, Sandipan Das, Seth Forshee,
+      Shriya, Stephen Rothwell, Stewart Smith, Sukadev Bhattiprolu, Tyrel
+      Datwyler, Vaibhav Jain, Vaidyanathan Srinivasan, and William A.
+      Kennington III"
+    
+    * tag 'powerpc-4.15-1' of git://git.kernel.org/pub/scm/linux/kernel/git/powerpc/linux: (151 commits)
+      powerpc/64s: Fix Power9 DD2.0 workarounds by adding DD2.1 feature
+      powerpc/64s: Fix masking of SRR1 bits on instruction fault
+      powerpc/64s: mm_context.addr_limit is only used on hash
+      powerpc/64s/radix: Fix 128TB-512TB virtual address boundary case allocation
+      powerpc/64s/hash: Allow MAP_FIXED allocations to cross 128TB boundary
+      powerpc/64s/hash: Fix fork() with 512TB process address space
+      powerpc/64s/hash: Fix 128TB-512TB virtual address boundary case allocation
+      powerpc/64s/hash: Fix 512T hint detection to use >= 128T
+      powerpc: Fix DABR match on hash based systems
+      powerpc/signal: Properly handle return value from uprobe_deny_signal()
+      powerpc/fadump: use kstrtoint to handle sysfs store
+      powerpc/lib: Implement UACCESS_FLUSHCACHE API
+      powerpc/lib: Implement PMEM API
+      powerpc/powernv/npu: Don't explicitly flush nmmu tlb
+      powerpc/powernv/npu: Use flush_all_mm() instead of flush_tlb_mm()
+      powerpc/powernv/idle: Round up latency and residency values
+      powerpc/kprobes: refactor kprobe_lookup_name for safer string operations
+      powerpc/kprobes: Blacklist emulate_update_regs() from kprobes
+      powerpc/kprobes: Do not disable interrupts for optprobes and kprobes_on_ftrace
+      powerpc/kprobes: Disable preemption before invoking probe handler for optprobes
+      ...
+
+commit 6de6638b35daa0dfb7daefd78d55015655b4d8f3
+Author: Nicholas Piggin <npiggin@gmail.com>
+Date:   Sun Nov 5 23:33:55 2017 +1100
+
+    KVM: PPC: Book3S HV: Handle host system reset in guest mode
+    
+    If the host takes a system reset interrupt while a guest is running,
+    the CPU must exit the guest before processing the host exception
+    handler.
+    
+    After this patch, taking a sysrq+x with a CPU running in a guest
+    gives a trace like this:
+    
+       cpu 0x27: Vector: 100 (System Reset) at [c000000fdf5776f0]
+           pc: c008000010158b80: kvmppc_run_core+0x16b8/0x1ad0 [kvm_hv]
+           lr: c008000010158b80: kvmppc_run_core+0x16b8/0x1ad0 [kvm_hv]
+           sp: c000000fdf577850
+          msr: 9000000002803033
+         current = 0xc000000fdf4b1e00
+         paca    = 0xc00000000fd4d680        softe: 3        irq_happened: 0x01
+           pid   = 6608, comm = qemu-system-ppc
+       Linux version 4.14.0-rc7-01489-g47e1893a404a-dirty #26 SMP
+       [c000000fdf577a00] c008000010159dd4 kvmppc_vcpu_run_hv+0x3dc/0x12d0 [kvm_hv]
+       [c000000fdf577b30] c0080000100a537c kvmppc_vcpu_run+0x44/0x60 [kvm]
+       [c000000fdf577b60] c0080000100a1ae0 kvm_arch_vcpu_ioctl_run+0x118/0x310 [kvm]
+       [c000000fdf577c00] c008000010093e98 kvm_vcpu_ioctl+0x530/0x7c0 [kvm]
+       [c000000fdf577d50] c000000000357bf8 do_vfs_ioctl+0xd8/0x8c0
+       [c000000fdf577df0] c000000000358448 SyS_ioctl+0x68/0x100
+       [c000000fdf577e30] c00000000000b220 system_call+0x58/0x6c
+       --- Exception: c01 (System Call) at 00007fff76868df0
+       SP (7fff7069baf0) is in userspace
+    
+    Fixes: e36d0a2ed5 ("powerpc/powernv: Implement NMI IPI with OPAL_SIGNAL_SYSTEM_RESET")
+    Signed-off-by: Nicholas Piggin <npiggin@gmail.com>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+index c1dd1929342d..d2ef36111518 100644
+--- a/arch/powerpc/include/asm/hw_irq.h
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -31,6 +31,7 @@
+ 
+ #ifndef __ASSEMBLY__
+ 
++extern void replay_system_reset(void);
+ extern void __replay_interrupt(unsigned int vector);
+ 
+ extern void timer_interrupt(struct pt_regs *);
+
+commit b24413180f5600bcb3bb70fbed5cf186b60864bd
+Author: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Date:   Wed Nov 1 15:07:57 2017 +0100
+
+    License cleanup: add SPDX GPL-2.0 license identifier to files with no license
+    
+    Many source files in the tree are missing licensing information, which
+    makes it harder for compliance tools to determine the correct license.
+    
+    By default all files without license information are under the default
+    license of the kernel, which is GPL version 2.
+    
+    Update the files which contain no license information with the 'GPL-2.0'
+    SPDX license identifier.  The SPDX identifier is a legally binding
+    shorthand, which can be used instead of the full boiler plate text.
+    
+    This patch is based on work done by Thomas Gleixner and Kate Stewart and
+    Philippe Ombredanne.
+    
+    How this work was done:
+    
+    Patches were generated and checked against linux-4.14-rc6 for a subset of
+    the use cases:
+     - file had no licensing information it it.
+     - file was a */uapi/* one with no licensing information in it,
+     - file was a */uapi/* one with existing licensing information,
+    
+    Further patches will be generated in subsequent months to fix up cases
+    where non-standard license headers were used, and references to license
+    had to be inferred by heuristics based on keywords.
+    
+    The analysis to determine which SPDX License Identifier to be applied to
+    a file was done in a spreadsheet of side by side results from of the
+    output of two independent scanners (ScanCode & Windriver) producing SPDX
+    tag:value files created by Philippe Ombredanne.  Philippe prepared the
+    base worksheet, and did an initial spot review of a few 1000 files.
+    
+    The 4.13 kernel was the starting point of the analysis with 60,537 files
+    assessed.  Kate Stewart did a file by file comparison of the scanner
+    results in the spreadsheet to determine which SPDX license identifier(s)
+    to be applied to the file. She confirmed any determination that was not
+    immediately clear with lawyers working with the Linux Foundation.
+    
+    Criteria used to select files for SPDX license identifier tagging was:
+     - Files considered eligible had to be source code files.
+     - Make and config files were included as candidates if they contained >5
+       lines of source
+     - File already had some variant of a license header in it (even if <5
+       lines).
+    
+    All documentation files were explicitly excluded.
+    
+    The following heuristics were used to determine which SPDX license
+    identifiers to apply.
+    
+     - when both scanners couldn't find any license traces, file was
+       considered to have no license information in it, and the top level
+       COPYING file license applied.
+    
+       For non */uapi/* files that summary was:
+    
+       SPDX license identifier                            # files
+       ---------------------------------------------------|-------
+       GPL-2.0                                              11139
+    
+       and resulted in the first patch in this series.
+    
+       If that file was a */uapi/* path one, it was "GPL-2.0 WITH
+       Linux-syscall-note" otherwise it was "GPL-2.0".  Results of that was:
+    
+       SPDX license identifier                            # files
+       ---------------------------------------------------|-------
+       GPL-2.0 WITH Linux-syscall-note                        930
+    
+       and resulted in the second patch in this series.
+    
+     - if a file had some form of licensing information in it, and was one
+       of the */uapi/* ones, it was denoted with the Linux-syscall-note if
+       any GPL family license was found in the file or had no licensing in
+       it (per prior point).  Results summary:
+    
+       SPDX license identifier                            # files
+       ---------------------------------------------------|------
+       GPL-2.0 WITH Linux-syscall-note                       270
+       GPL-2.0+ WITH Linux-syscall-note                      169
+       ((GPL-2.0 WITH Linux-syscall-note) OR BSD-2-Clause)    21
+       ((GPL-2.0 WITH Linux-syscall-note) OR BSD-3-Clause)    17
+       LGPL-2.1+ WITH Linux-syscall-note                      15
+       GPL-1.0+ WITH Linux-syscall-note                       14
+       ((GPL-2.0+ WITH Linux-syscall-note) OR BSD-3-Clause)    5
+       LGPL-2.0+ WITH Linux-syscall-note                       4
+       LGPL-2.1 WITH Linux-syscall-note                        3
+       ((GPL-2.0 WITH Linux-syscall-note) OR MIT)              3
+       ((GPL-2.0 WITH Linux-syscall-note) AND MIT)             1
+    
+       and that resulted in the third patch in this series.
+    
+     - when the two scanners agreed on the detected license(s), that became
+       the concluded license(s).
+    
+     - when there was disagreement between the two scanners (one detected a
+       license but the other didn't, or they both detected different
+       licenses) a manual inspection of the file occurred.
+    
+     - In most cases a manual inspection of the information in the file
+       resulted in a clear resolution of the license that should apply (and
+       which scanner probably needed to revisit its heuristics).
+    
+     - When it was not immediately clear, the license identifier was
+       confirmed with lawyers working with the Linux Foundation.
+    
+     - If there was any question as to the appropriate license identifier,
+       the file was flagged for further research and to be revisited later
+       in time.
+    
+    In total, over 70 hours of logged manual review was done on the
+    spreadsheet to determine the SPDX license identifiers to apply to the
+    source files by Kate, Philippe, Thomas and, in some cases, confirmation
+    by lawyers working with the Linux Foundation.
+    
+    Kate also obtained a third independent scan of the 4.13 code base from
+    FOSSology, and compared selected files where the other two scanners
+    disagreed against that SPDX file, to see if there was new insights.  The
+    Windriver scanner is based on an older version of FOSSology in part, so
+    they are related.
+    
+    Thomas did random spot checks in about 500 files from the spreadsheets
+    for the uapi headers and agreed with SPDX license identifier in the
+    files he inspected. For the non-uapi files Thomas did random spot checks
+    in about 15000 files.
+    
+    In initial set of patches against 4.14-rc6, 3 files were found to have
+    copy/paste license identifier errors, and have been fixed to reflect the
+    correct identifier.
+    
+    Additionally Philippe spent 10 hours this week doing a detailed manual
+    inspection and review of the 12,461 patched files from the initial patch
+    version early this week with:
+     - a full scancode scan run, collecting the matched texts, detected
+       license ids and scores
+     - reviewing anything where there was a license detected (about 500+
+       files) to ensure that the applied SPDX license was correct
+     - reviewing anything where there was no detection but the patch license
+       was not GPL-2.0 WITH Linux-syscall-note to ensure that the applied
+       SPDX license was correct
+    
+    This produced a worksheet with 20 files needing minor correction.  This
+    worksheet was then exported into 3 different .csv files for the
+    different types of files to be modified.
+    
+    These .csv files were then reviewed by Greg.  Thomas wrote a script to
+    parse the csv files and add the proper SPDX tag to the file, in the
+    format that the file expected.  This script was further refined by Greg
+    based on the output to detect more types of files automatically and to
+    distinguish between header and source .c files (which need different
+    comment types.)  Finally Greg ran the script using the .csv files to
+    generate the patches.
+    
+    Reviewed-by: Kate Stewart <kstewart@linuxfoundation.org>
+    Reviewed-by: Philippe Ombredanne <pombredanne@nexb.com>
+    Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+index c1dd1929342d..abd04c36c251 100644
+--- a/arch/powerpc/include/asm/hw_irq.h
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -1,3 +1,4 @@
++/* SPDX-License-Identifier: GPL-2.0 */
+ /*
+  * Copyright (C) 1999 Cort Dougan <cort@cs.nmt.edu>
+  */
+
+commit 771d4304d07f080b6ce751e12f3579cb012a1b22
+Author: Nicholas Piggin <npiggin@gmail.com>
+Date:   Tue Jun 13 23:05:47 2017 +1000
+
+    powerpc/64s/idle: Process interrupts from system reset wakeup
+    
+    When the CPU wakes from low power state, it begins at the system reset
+    interrupt with the exception that caused the wakeup encoded in SRR1.
+    
+    Today, powernv idle wakeup ignores the wakeup reason (except a special
+    case for HMI), and the regular interrupt corresponding to the
+    exception will fire after the idle wakeup exits.
+    
+    Change this to replay the interrupt from the idle wakeup before
+    interrupts are hard-enabled.
+    
+    Test on POWER8 of context_switch selftests benchmark with polling idle
+    disabled (e.g., always nap, giving cross-CPU IPIs) gives the following
+    results:
+    
+                                    original         wakeup direct
+    Different threads, same core:   315k/s           264k/s
+    Different cores:                235k/s           242k/s
+    
+    There is a slowdown for doorbell IPI (same core) case because system
+    reset wakeup does not clear the message and the doorbell interrupt
+    fires again needlessly.
+    
+    Signed-off-by: Nicholas Piggin <npiggin@gmail.com>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+index f06112cf8734..c1dd1929342d 100644
+--- a/arch/powerpc/include/asm/hw_irq.h
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -130,6 +130,7 @@ static inline bool arch_irq_disabled_regs(struct pt_regs *regs)
+ 
+ extern bool prep_irq_for_idle(void);
+ extern bool prep_irq_for_idle_irqsoff(void);
++extern void irq_set_pending_from_srr1(unsigned long srr1);
+ 
+ #define fini_irq_for_idle_irqsoff() trace_hardirqs_off();
+ 
+
+commit 2201f994a5742c03e660623c385fd6897dd1fa2f
+Author: Nicholas Piggin <npiggin@gmail.com>
+Date:   Tue Jun 13 23:05:45 2017 +1000
+
+    powerpc/64s/idle: Move soft interrupt mask logic into C code
+    
+    This simplifies the asm and fixes irq-off tracing over sleep
+    instructions.
+    
+    Also move powersave_nap check for POWER8 into C code, and move
+    PSSCR register value calculation for POWER9 into C.
+    
+    Reviewed-by: Gautham R. Shenoy <ego@linux.vnet.ibm.com>
+    Signed-off-by: Nicholas Piggin <npiggin@gmail.com>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+index eba60416536e..f06112cf8734 100644
+--- a/arch/powerpc/include/asm/hw_irq.h
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -129,6 +129,9 @@ static inline bool arch_irq_disabled_regs(struct pt_regs *regs)
+ }
+ 
+ extern bool prep_irq_for_idle(void);
++extern bool prep_irq_for_idle_irqsoff(void);
++
++#define fini_irq_for_idle_irqsoff() trace_hardirqs_off();
+ 
+ extern void force_external_irq_replay(void);
+ 
+
+commit 834e5a692120cc25c3935e8652a1989c2bc1c9e9
+Author: Christophe Leroy <christophe.leroy@c-s.fr>
+Date:   Tue Aug 23 15:58:56 2016 +0200
+
+    powerpc/8xx: use SPRN_EIE and SPRN_EID to enable/disable interrupts
+    
+    The 8xx has two special registers called EID (External Interrupt
+    Disable) and EIE (External Interrupt Enable) for clearing/setting
+    EE in MSR. It avoids the three instructions set mfmsr/ori/mtmsr or
+    mfmsr/rlwinm/mtmsr and it avoids using a general register.
+    
+    We just have to write something in the special register to change MSR EE
+    bit. So we write r0 into the register, regardless of r0 value.
+    
+    Writing to one of those two special registers also set the MSR RI bit,
+    but this bit is only unset during beginning of exception prolog and end
+    of exception epilog. When executing C-functions MSR RI is always set.
+    
+    Signed-off-by: Christophe Leroy <christophe.leroy@c-s.fr>
+    Signed-off-by: Scott Wood <oss@buserror.net>
+
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+index c7d82ff62a33..eba60416536e 100644
+--- a/arch/powerpc/include/asm/hw_irq.h
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -155,6 +155,8 @@ static inline unsigned long arch_local_irq_save(void)
+ 	unsigned long flags = arch_local_save_flags();
+ #ifdef CONFIG_BOOKE
+ 	asm volatile("wrteei 0" : : : "memory");
++#elif defined(CONFIG_PPC_8xx)
++	wrtspr(SPRN_EID);
+ #else
+ 	SET_MSR_EE(flags & ~MSR_EE);
+ #endif
+@@ -165,6 +167,8 @@ static inline void arch_local_irq_disable(void)
+ {
+ #ifdef CONFIG_BOOKE
+ 	asm volatile("wrteei 0" : : : "memory");
++#elif defined(CONFIG_PPC_8xx)
++	wrtspr(SPRN_EID);
+ #else
+ 	arch_local_irq_save();
+ #endif
+@@ -174,6 +178,8 @@ static inline void arch_local_irq_enable(void)
+ {
+ #ifdef CONFIG_BOOKE
+ 	asm volatile("wrteei 1" : : : "memory");
++#elif defined(CONFIG_PPC_8xx)
++	wrtspr(SPRN_EIE);
+ #else
+ 	unsigned long msr = mfmsr();
+ 	SET_MSR_EE(msr | MSR_EE);
+
+commit 1d607bb3bd60f404d1ceb0d6ebceadf261068422
+Author: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+Date:   Fri Jul 8 16:37:07 2016 +1000
+
+    powerpc/irq: Add mechanism to force a replay of interrupts
+    
+    Calling this function with interrupts soft-disabled will cause
+    a replay of the external interrupt vector when they are re-enabled.
+    
+    This will be used by the OPAL XICS backend (and latter by the native
+    XIVE code) to handle EOI signaling that there are more interrupts to
+    fetch from the hardware since the hardware won't issue another HW
+    interrupt in that case.
+    
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+    Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+index b59ac27a6b7d..c7d82ff62a33 100644
+--- a/arch/powerpc/include/asm/hw_irq.h
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -130,6 +130,8 @@ static inline bool arch_irq_disabled_regs(struct pt_regs *regs)
+ 
+ extern bool prep_irq_for_idle(void);
+ 
++extern void force_external_irq_replay(void);
++
+ #else /* CONFIG_PPC64 */
+ 
+ #define SET_MSR_EE(x)	mtmsr(x)
+
+commit 0869b6fd209bda402576a9a559120ddd4f61198e
+Author: Mahesh Salgaonkar <mahesh@linux.vnet.ibm.com>
+Date:   Tue Jul 29 18:40:01 2014 +0530
+
+    powerpc/book3s: Add basic infrastructure to handle HMI in Linux.
+    
+    Handle Hypervisor Maintenance Interrupt (HMI) in Linux. This patch implements
+    basic infrastructure to handle HMI in Linux host. The design is to invoke
+    opal handle hmi in real mode for recovery and set irq_pending when we hit HMI.
+    During check_irq_replay pull opal hmi event and print hmi info on console.
+    
+    Signed-off-by: Mahesh Salgaonkar <mahesh@linux.vnet.ibm.com>
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+index 10be1dd01c6b..b59ac27a6b7d 100644
+--- a/arch/powerpc/include/asm/hw_irq.h
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -25,6 +25,7 @@
+ #define PACA_IRQ_EE		0x04
+ #define PACA_IRQ_DEC		0x08 /* Or FIT */
+ #define PACA_IRQ_EE_EDGE	0x10 /* BookE only */
++#define PACA_IRQ_HMI		0x20
+ 
+ #endif /* CONFIG_PPC64 */
+ 
+
+commit 0b88f772bdf2847461debf417b1ee96043a7cb1b
+Author: Tiejun Chen <tiejun.chen@windriver.com>
+Date:   Mon Jul 15 10:36:04 2013 +0800
+
+    powerpc: Access local paca after hard irq disabled
+    
+    In hard_irq_disable(), we accessed the PACA before we hard disabled
+    the interrupts, potentially causing a warning as get_paca() will
+    us debug_smp_processor_id().
+    
+    Move that to after the disabling, and also use local_paca directly
+    rather than get_paca() to avoid several redundant and useless checks.
+    
+    Signed-off-by: Tiejun Chen <tiejun.chen@windriver.com>
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+index ba713f166fa5..10be1dd01c6b 100644
+--- a/arch/powerpc/include/asm/hw_irq.h
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -96,10 +96,11 @@ static inline bool arch_irqs_disabled(void)
+ #endif
+ 
+ #define hard_irq_disable()	do {			\
+-	u8 _was_enabled = get_paca()->soft_enabled;	\
++	u8 _was_enabled;				\
+ 	__hard_irq_disable();				\
+-	get_paca()->soft_enabled = 0;			\
+-	get_paca()->irq_happened |= PACA_IRQ_HARD_DIS;	\
++	_was_enabled = local_paca->soft_enabled;	\
++	local_paca->soft_enabled = 0;			\
++	local_paca->irq_happened |= PACA_IRQ_HARD_DIS;	\
+ 	if (_was_enabled)				\
+ 		trace_hardirqs_off();			\
+ } while(0)
+
+commit 4a3b8d0b833707811011ad14dd12dabf31fa690a
+Author: Scott Wood <scottwood@freescale.com>
+Date:   Thu May 9 22:09:41 2013 -0500
+
+    powerpc: hard_irq_disable(): Call trace_hardirqs_off after disabling
+    
+    lockdep.c has this:
+            /*
+             * So we're supposed to get called after you mask local IRQs,
+             * but for some reason the hardware doesn't quite think you did
+             * a proper job.
+             */
+            if (DEBUG_LOCKS_WARN_ON(!irqs_disabled()))
+                    return;
+    
+    Since irqs_disabled() is based on soft_enabled(), that (not just the
+    hard EE bit) needs to be 0 before we call trace_hardirqs_off.
+    
+    Signed-off-by: Scott Wood <scottwood@freescale.com>
+
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+index d615b28dda82..ba713f166fa5 100644
+--- a/arch/powerpc/include/asm/hw_irq.h
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -96,11 +96,12 @@ static inline bool arch_irqs_disabled(void)
+ #endif
+ 
+ #define hard_irq_disable()	do {			\
++	u8 _was_enabled = get_paca()->soft_enabled;	\
+ 	__hard_irq_disable();				\
+-	if (local_paca->soft_enabled)			\
+-		trace_hardirqs_off();			\
+ 	get_paca()->soft_enabled = 0;			\
+ 	get_paca()->irq_happened |= PACA_IRQ_HARD_DIS;	\
++	if (_was_enabled)				\
++		trace_hardirqs_off();			\
+ } while(0)
+ 
+ static inline bool lazy_irq_pending(void)
+
+commit 5737789c8340620d7b542d1d4e9b197de8eb2801
+Author: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+Date:   Mon May 6 21:04:02 2013 +0000
+
+    powerpc: Make hard_irq_disable() do the right thing vs. irq tracing
+    
+    If hard_irq_disable() is called while interrupts are already soft-disabled
+    (which is the most common case) all is already well.
+    
+    However you can (and in some cases want) to call it while everything is
+    enabled (to make sure you don't get a lazy even, for example before entry
+    into KVM guests) and in this case we need to inform the irq tracer that
+    the irqs are going off.
+    
+    We have to change the inline into a macro to avoid an include circular
+    dependency hell hole.
+    
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+index e45c4947a772..d615b28dda82 100644
+--- a/arch/powerpc/include/asm/hw_irq.h
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -95,15 +95,13 @@ static inline bool arch_irqs_disabled(void)
+ #define __hard_irq_disable()	__mtmsrd(local_paca->kernel_msr, 1)
+ #endif
+ 
+-static inline void hard_irq_disable(void)
+-{
+-	__hard_irq_disable();
+-	get_paca()->soft_enabled = 0;
+-	get_paca()->irq_happened |= PACA_IRQ_HARD_DIS;
+-}
+-
+-/* include/linux/interrupt.h needs hard_irq_disable to be a macro */
+-#define hard_irq_disable	hard_irq_disable
++#define hard_irq_disable()	do {			\
++	__hard_irq_disable();				\
++	if (local_paca->soft_enabled)			\
++		trace_hardirqs_off();			\
++	get_paca()->soft_enabled = 0;			\
++	get_paca()->irq_happened |= PACA_IRQ_HARD_DIS;	\
++} while(0)
+ 
+ static inline bool lazy_irq_pending(void)
+ {
+
+commit 5fecc9d8f59e765c2a48379dd7c6f5cf88c7d75a
+Merge: 3c4cfadef6a1 1a577b72475d
+Author: Linus Torvalds <torvalds@linux-foundation.org>
+Date:   Tue Jul 24 12:01:20 2012 -0700
+
+    Merge tag 'kvm-3.6-1' of git://git.kernel.org/pub/scm/virt/kvm/kvm
+    
+    Pull KVM updates from Avi Kivity:
+     "Highlights include
+      - full big real mode emulation on pre-Westmere Intel hosts (can be
+        disabled with emulate_invalid_guest_state=0)
+      - relatively small ppc and s390 updates
+      - PCID/INVPCID support in guests
+      - EOI avoidance; 3.6 guests should perform better on 3.6 hosts on
+        interrupt intensive workloads)
+      - Lockless write faults during live migration
+      - EPT accessed/dirty bits support for new Intel processors"
+    
+    Fix up conflicts in:
+     - Documentation/virtual/kvm/api.txt:
+    
+       Stupid subchapter numbering, added next to each other.
+    
+     - arch/powerpc/kvm/booke_interrupts.S:
+    
+       PPC asm changes clashing with the KVM fixes
+    
+     - arch/s390/include/asm/sigp.h, arch/s390/kvm/sigp.c:
+    
+       Duplicated commits through the kvm tree and the s390 tree, with
+       subsequent edits in the KVM tree.
+    
+    * tag 'kvm-3.6-1' of git://git.kernel.org/pub/scm/virt/kvm/kvm: (93 commits)
+      KVM: fix race with level interrupts
+      x86, hyper: fix build with !CONFIG_KVM_GUEST
+      Revert "apic: fix kvm build on UP without IOAPIC"
+      KVM guest: switch to apic_set_eoi_write, apic_write
+      apic: add apic_set_eoi_write for PV use
+      KVM: VMX: Implement PCID/INVPCID for guests with EPT
+      KVM: Add x86_hyper_kvm to complete detect_hypervisor_platform check
+      KVM: PPC: Critical interrupt emulation support
+      KVM: PPC: e500mc: Fix tlbilx emulation for 64-bit guests
+      KVM: PPC64: booke: Set interrupt computation mode for 64-bit host
+      KVM: PPC: bookehv: Add ESR flag to Data Storage Interrupt
+      KVM: PPC: bookehv64: Add support for std/ld emulation.
+      booke: Added crit/mc exception handler for e500v2
+      booke/bookehv: Add host crit-watchdog exception support
+      KVM: MMU: document mmu-lock and fast page fault
+      KVM: MMU: fix kvm_mmu_pagetable_walk tracepoint
+      KVM: MMU: trace fast page fault
+      KVM: MMU: fast path of handling guest page fault
+      KVM: MMU: introduce SPTE_MMU_WRITEABLE bit
+      KVM: MMU: fold tlb flush judgement into mmu_spte_update
+      ...
+
+commit 6328e593c3df5e81ad7d18a2752ef2235391e9cc
+Author: Bharat Bhushan <r65777@freescale.com>
+Date:   Wed Jun 20 05:56:53 2012 +0000
+
+    booke/bookehv: Add host crit-watchdog exception support
+    
+    Signed-off-by: Bharat Bhushan <bharat.bhushan@freescale.com>
+    Signed-off-by: Alexander Graf <agraf@suse.de>
+
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+index c9aac24b02e2..2aadb47efaec 100644
+--- a/arch/powerpc/include/asm/hw_irq.h
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -34,6 +34,8 @@ extern void __replay_interrupt(unsigned int vector);
+ 
+ extern void timer_interrupt(struct pt_regs *);
+ extern void performance_monitor_exception(struct pt_regs *regs);
++extern void WatchdogException(struct pt_regs *regs);
++extern void unknown_exception(struct pt_regs *regs);
+ 
+ #ifdef CONFIG_PPC64
+ #include <asm/paca.h>
+
+commit 21b2de341270bd7bb7a811027ffe63276d9b3b75
+Author: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+Date:   Tue Jul 10 18:37:56 2012 +1000
+
+    powerpc: Fix build of some debug irq code
+    
+    There was a typo, checking for CONFIG_TRACE_IRQFLAG instead of
+    CONFIG_TRACE_IRQFLAGS causing some useful debug code to not be
+    built
+    
+    This in turns causes a build error on BookE 64-bit due to incorrect
+    semicolons at the end of a couple of macros, so let's fix that too
+    
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+    CC: stable@vger.kernel.org [v3.4]
+
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+index 92224b7fd702..0554ab062bdc 100644
+--- a/arch/powerpc/include/asm/hw_irq.h
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -86,8 +86,8 @@ static inline bool arch_irqs_disabled(void)
+ }
+ 
+ #ifdef CONFIG_PPC_BOOK3E
+-#define __hard_irq_enable()	asm volatile("wrteei 1" : : : "memory");
+-#define __hard_irq_disable()	asm volatile("wrteei 0" : : : "memory");
++#define __hard_irq_enable()	asm volatile("wrteei 1" : : : "memory")
++#define __hard_irq_disable()	asm volatile("wrteei 0" : : : "memory")
+ #else
+ #define __hard_irq_enable()	__mtmsrd(local_paca->kernel_msr | MSR_EE, 1)
+ #define __hard_irq_disable()	__mtmsrd(local_paca->kernel_msr, 1)
+
+commit be2cf20a5ad31ebb13562c1c866ecc626fbd721e
+Author: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+Date:   Tue Jul 10 18:36:40 2012 +1000
+
+    powerpc: More fixes for lazy IRQ vs. idle
+    
+    Looks like we still have issues with pSeries and Cell idle code
+    vs. the lazy irq state. In fact, the reset fixes that went upstream
+    are exposing the problem more by causing BUG_ON() to trigger (which
+    this patch turns into a WARN_ON instead).
+    
+    We need to be careful when using a variant of low power state that
+    has the side effect of turning interrupts back on, to properly set
+    all the SW & lazy state to look as if everything is enabled before
+    we enter the low power state with MSR:EE off as we will return with
+    MSR:EE on. If not, we have a discrepancy of state which can cause
+    things to go very wrong later on.
+    
+    This patch moves the logic into a helper and uses it from the
+    pseries and cell idle code. The power4/970 idle code already got
+    things right (in assembly even !) so I'm not touching it. The power7
+    "bare metal" idle code is subtly different and correct. Remains PA6T
+    and some hypervisor based Cell platforms which have questionable
+    code in there, but they are mostly dead platforms so I'll fix them
+    when I manage to get final answers from the respective maintainers
+    about how the low power state actually works on them.
+    
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+    CC: stable@vger.kernel.org [v3.4]
+
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+index 6eb75b80488c..92224b7fd702 100644
+--- a/arch/powerpc/include/asm/hw_irq.h
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -125,6 +125,8 @@ static inline bool arch_irq_disabled_regs(struct pt_regs *regs)
+ 	return !regs->softe;
+ }
+ 
++extern bool prep_irq_for_idle(void);
++
+ #else /* CONFIG_PPC64 */
+ 
+ #define SET_MSR_EE(x)	mtmsr(x)
+
+commit 0b17ba7258db83cd02da560884e053b85de371f2
+Author: Anton Blanchard <anton@samba.org>
+Date:   Wed Jun 27 13:13:52 2012 +0000
+
+    powerpc: check_and_cede_processor() never cedes
+    
+    Commit f948501b36c6 ("Make hard_irq_disable() actually hard-disable
+    interrupts") caused check_and_cede_processor to stop working.
+    ->irq_happened will never be zero right after a hard_irq_disable
+    so the compiler removes the call to cede_processor completely.
+    
+    The bug was introduced back in the lazy interrupt handling rework
+    of 3.4 but was hidden until recently because hard_irq_disable did
+    nothing.
+    
+    This issue will eventually appear in 3.4 stable since the
+    hard_irq_disable fix is marked stable, so mark this one for stable
+    too.
+    
+    Signed-off-by: Anton Blanchard <anton@samba.org>
+    Cc: stable@vger.kernel.org
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+index 32b394f3b854..6eb75b80488c 100644
+--- a/arch/powerpc/include/asm/hw_irq.h
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -103,6 +103,11 @@ static inline void hard_irq_disable(void)
+ /* include/linux/interrupt.h needs hard_irq_disable to be a macro */
+ #define hard_irq_disable	hard_irq_disable
+ 
++static inline bool lazy_irq_pending(void)
++{
++	return !!(get_paca()->irq_happened & ~PACA_IRQ_HARD_DIS);
++}
++
+ /*
+  * This is called by asynchronous interrupts to conditionally
+  * re-enable hard interrupts when soft-disabled after having
+
+commit f948501b36c6b3d9352ce212a197098a7e958971
+Author: Paul Mackerras <paulus@samba.org>
+Date:   Fri Jun 15 14:51:39 2012 +1000
+
+    Make hard_irq_disable() actually hard-disable interrupts
+    
+    At present, hard_irq_disable() does nothing on powerpc because of
+    this code in include/linux/interrupt.h:
+    
+        #ifndef hard_irq_disable
+        #define hard_irq_disable()      do { } while(0)
+        #endif
+    
+    So we need to make our hard_irq_disable be a macro.  It was previously
+    a macro until commit 7230c56441 ("powerpc: Rework lazy-interrupt
+    handling") changed it to a static inline function.
+    
+    Cc: stable@vger.kernel.org
+    Acked-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+    Signed-off-by: Paul Mackerras <paulus@samba.org>
+    --
+     arch/powerpc/include/asm/hw_irq.h |    3 +++
+     1 file changed, 3 insertions(+)
+
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+index c9aac24b02e2..32b394f3b854 100644
+--- a/arch/powerpc/include/asm/hw_irq.h
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -100,6 +100,9 @@ static inline void hard_irq_disable(void)
+ 	get_paca()->irq_happened |= PACA_IRQ_HARD_DIS;
+ }
+ 
++/* include/linux/interrupt.h needs hard_irq_disable to be a macro */
++#define hard_irq_disable	hard_irq_disable
++
+ /*
+  * This is called by asynchronous interrupts to conditionally
+  * re-enable hard interrupts when soft-disabled after having
+
+commit 7cc1e8ee78f469ecff8aa29465325f1e4c5e1b5f
+Author: Alexander Graf <agraf@suse.de>
+Date:   Wed Feb 22 16:26:34 2012 +0100
+
+    KVM: PPC: booke: Reinject performance monitor interrupts
+    
+    When we get a performance monitor interrupt, we need to make sure that
+    the host receives it. So reinject it like we reinject the other host
+    destined interrupts.
+    
+    Signed-off-by: Alexander Graf <agraf@suse.de>
+    Signed-off-by: Avi Kivity <avi@redhat.com>
+
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+index 51010bfc792e..c9aac24b02e2 100644
+--- a/arch/powerpc/include/asm/hw_irq.h
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -33,6 +33,7 @@
+ extern void __replay_interrupt(unsigned int vector);
+ 
+ extern void timer_interrupt(struct pt_regs *);
++extern void performance_monitor_exception(struct pt_regs *regs);
+ 
+ #ifdef CONFIG_PPC64
+ #include <asm/paca.h>
+
+commit 7230c5644188cd9e3fb380cc97dde00c464a3ba7
+Author: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+Date:   Tue Mar 6 18:27:59 2012 +1100
+
+    powerpc: Rework lazy-interrupt handling
+    
+    The current implementation of lazy interrupts handling has some
+    issues that this tries to address.
+    
+    We don't do the various workarounds we need to do when re-enabling
+    interrupts in some cases such as when returning from an interrupt
+    and thus we may still lose or get delayed decrementer or doorbell
+    interrupts.
+    
+    The current scheme also makes it much harder to handle the external
+    "edge" interrupts provided by some BookE processors when using the
+    EPR facility (External Proxy) and the Freescale Hypervisor.
+    
+    Additionally, we tend to keep interrupts hard disabled in a number
+    of cases, such as decrementer interrupts, external interrupts, or
+    when a masked decrementer interrupt is pending. This is sub-optimal.
+    
+    This is an attempt at fixing it all in one go by reworking the way
+    we do the lazy interrupt disabling from the ground up.
+    
+    The base idea is to replace the "hard_enabled" field with a
+    "irq_happened" field in which we store a bit mask of what interrupt
+    occurred while soft-disabled.
+    
+    When re-enabling, either via arch_local_irq_restore() or when returning
+    from an interrupt, we can now decide what to do by testing bits in that
+    field.
+    
+    We then implement replaying of the missed interrupts either by
+    re-using the existing exception frame (in exception exit case) or via
+    the creation of a new one from an assembly trampoline (in the
+    arch_local_irq_enable case).
+    
+    This removes the need to play with the decrementer to try to create
+    fake interrupts, among others.
+    
+    In addition, this adds a few refinements:
+    
+     - We no longer  hard disable decrementer interrupts that occur
+    while soft-disabled. We now simply bump the decrementer back to max
+    (on BookS) or leave it stopped (on BookE) and continue with hard interrupts
+    enabled, which means that we'll potentially get better sample quality from
+    performance monitor interrupts.
+    
+     - Timer, decrementer and doorbell interrupts now hard-enable
+    shortly after removing the source of the interrupt, which means
+    they no longer run entirely hard disabled. Again, this will improve
+    perf sample quality.
+    
+     - On Book3E 64-bit, we now make the performance monitor interrupt
+    act as an NMI like Book3S (the necessary C code for that to work
+    appear to already be present in the FSL perf code, notably calling
+    nmi_enter instead of irq_enter). (This also fixes a bug where BookE
+    perfmon interrupts could clobber r14 ... oops)
+    
+     - We could make "masked" decrementer interrupts act as NMIs when doing
+    timer-based perf sampling to improve the sample quality.
+    
+    Signed-off-by-yet: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+    ---
+    
+    v2:
+    
+    - Add hard-enable to decrementer, timer and doorbells
+    - Fix CR clobber in masked irq handling on BookE
+    - Make embedded perf interrupt act as an NMI
+    - Add a PACA_HAPPENED_EE_EDGE for use by FSL if they want
+      to retrigger an interrupt without preventing hard-enable
+    
+    v3:
+    
+     - Fix or vs. ori bug on Book3E
+     - Fix enabling of interrupts for some exceptions on Book3E
+    
+    v4:
+    
+     - Fix resend of doorbells on return from interrupt on Book3E
+    
+    v5:
+    
+     - Rebased on top of my latest series, which involves some significant
+    rework of some aspects of the patch.
+    
+    v6:
+     - 32-bit compile fix
+     - more compile fixes with various .config combos
+     - factor out the asm code to soft-disable interrupts
+     - remove the C wrapper around preempt_schedule_irq
+    
+    v7:
+     - Fix a bug with hard irq state tracking on native power7
+
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+index 6c6fa955baa7..51010bfc792e 100644
+--- a/arch/powerpc/include/asm/hw_irq.h
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -11,6 +11,27 @@
+ #include <asm/ptrace.h>
+ #include <asm/processor.h>
+ 
++#ifdef CONFIG_PPC64
++
++/*
++ * PACA flags in paca->irq_happened.
++ *
++ * This bits are set when interrupts occur while soft-disabled
++ * and allow a proper replay. Additionally, PACA_IRQ_HARD_DIS
++ * is set whenever we manually hard disable.
++ */
++#define PACA_IRQ_HARD_DIS	0x01
++#define PACA_IRQ_DBELL		0x02
++#define PACA_IRQ_EE		0x04
++#define PACA_IRQ_DEC		0x08 /* Or FIT */
++#define PACA_IRQ_EE_EDGE	0x10 /* BookE only */
++
++#endif /* CONFIG_PPC64 */
++
++#ifndef __ASSEMBLY__
++
++extern void __replay_interrupt(unsigned int vector);
++
+ extern void timer_interrupt(struct pt_regs *);
+ 
+ #ifdef CONFIG_PPC64
+@@ -42,7 +63,6 @@ static inline unsigned long arch_local_irq_disable(void)
+ }
+ 
+ extern void arch_local_irq_restore(unsigned long);
+-extern void iseries_handle_interrupts(void);
+ 
+ static inline void arch_local_irq_enable(void)
+ {
+@@ -72,12 +92,24 @@ static inline bool arch_irqs_disabled(void)
+ #define __hard_irq_disable()	__mtmsrd(local_paca->kernel_msr, 1)
+ #endif
+ 
+-#define  hard_irq_disable()			\
+-	do {					\
+-		__hard_irq_disable();		\
+-		get_paca()->soft_enabled = 0;	\
+-		get_paca()->hard_enabled = 0;	\
+-	} while(0)
++static inline void hard_irq_disable(void)
++{
++	__hard_irq_disable();
++	get_paca()->soft_enabled = 0;
++	get_paca()->irq_happened |= PACA_IRQ_HARD_DIS;
++}
++
++/*
++ * This is called by asynchronous interrupts to conditionally
++ * re-enable hard interrupts when soft-disabled after having
++ * cleared the source of the interrupt
++ */
++static inline void may_hard_irq_enable(void)
++{
++	get_paca()->irq_happened &= ~PACA_IRQ_HARD_DIS;
++	if (!(get_paca()->irq_happened & PACA_IRQ_EE))
++		__hard_irq_enable();
++}
+ 
+ static inline bool arch_irq_disabled_regs(struct pt_regs *regs)
+ {
+@@ -149,6 +181,8 @@ static inline bool arch_irq_disabled_regs(struct pt_regs *regs)
+ 	return !(regs->msr & MSR_EE);
+ }
+ 
++static inline void may_hard_irq_enable(void) { }
++
+ #endif /* CONFIG_PPC64 */
+ 
+ #define ARCH_IRQ_INIT_FLAGS	IRQ_NOREQUEST
+@@ -159,5 +193,6 @@ static inline bool arch_irq_disabled_regs(struct pt_regs *regs)
+  */
+ struct irq_chip;
+ 
++#endif  /* __ASSEMBLY__ */
+ #endif	/* __KERNEL__ */
+ #endif	/* _ASM_POWERPC_HW_IRQ_H */
+
+commit d9ada91ae2969ae6b6dc3574fd08a6ebda5df766
+Author: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+Date:   Fri Mar 2 11:33:52 2012 +1100
+
+    powerpc: Replace mfmsr instructions with load from PACA kernel_msr field
+    
+    On 64-bit, the mfmsr instruction can be quite slow, slower
+    than loading a field from the cache-hot PACA, which happens
+    to already contain the value we want in most cases.
+    
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+index 531ba00fcbab..6c6fa955baa7 100644
+--- a/arch/powerpc/include/asm/hw_irq.h
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -68,8 +68,8 @@ static inline bool arch_irqs_disabled(void)
+ #define __hard_irq_enable()	asm volatile("wrteei 1" : : : "memory");
+ #define __hard_irq_disable()	asm volatile("wrteei 0" : : : "memory");
+ #else
+-#define __hard_irq_enable()	__mtmsrd(mfmsr() | MSR_EE, 1)
+-#define __hard_irq_disable()	__mtmsrd(mfmsr() & ~MSR_EE, 1)
++#define __hard_irq_enable()	__mtmsrd(local_paca->kernel_msr | MSR_EE, 1)
++#define __hard_irq_disable()	__mtmsrd(local_paca->kernel_msr, 1)
+ #endif
+ 
+ #define  hard_irq_disable()			\
+
+commit a546498f3bf9aac311c66f965186373aee2ca0b0
+Author: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+Date:   Wed Mar 7 16:48:45 2012 +1100
+
+    powerpc: Call do_page_fault() with interrupts off
+    
+    We currently turn interrupts back to their previous state before
+    calling do_page_fault(). This can be annoying when debugging as
+    a bad fault will potentially have lost some processor state before
+    getting into the debugger.
+    
+    We also end up calling some generic code with interrupts enabled
+    such as notify_page_fault() with interrupts enabled, which could
+    be unexpected.
+    
+    This changes our code to behave more like other architectures,
+    and make the assembly entry code call into do_page_faults() with
+    interrupts disabled. They are conditionally re-enabled from
+    within do_page_fault() in the same spot x86 does it.
+    
+    While there, add the might_sleep() test in the case of a successful
+    trylock of the mmap semaphore, again like x86.
+    
+    Also fix a bug in the existing assembly where r12 (_MSR) could get
+    clobbered by C calls (the DTL accounting in the exception common
+    macro and DISABLE_INTS) in some cases.
+    
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+    ---
+    
+    v2. Add the r12 clobber fix
+
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+index bb712c9488b3..531ba00fcbab 100644
+--- a/arch/powerpc/include/asm/hw_irq.h
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -79,6 +79,11 @@ static inline bool arch_irqs_disabled(void)
+ 		get_paca()->hard_enabled = 0;	\
+ 	} while(0)
+ 
++static inline bool arch_irq_disabled_regs(struct pt_regs *regs)
++{
++	return !regs->softe;
++}
++
+ #else /* CONFIG_PPC64 */
+ 
+ #define SET_MSR_EE(x)	mtmsr(x)
+@@ -139,6 +144,11 @@ static inline bool arch_irqs_disabled(void)
+ 
+ #define hard_irq_disable()		arch_local_irq_disable()
+ 
++static inline bool arch_irq_disabled_regs(struct pt_regs *regs)
++{
++	return !(regs->msr & MSR_EE);
++}
++
+ #endif /* CONFIG_PPC64 */
+ 
+ #define ARCH_IRQ_INIT_FLAGS	IRQ_NOREQUEST
+
+commit 089fb442f3018a3ed094f8ac7a7cc2d3bd03b114
+Author: Thomas Gleixner <tglx@linutronix.de>
+Date:   Fri Jan 21 06:12:28 2011 +0000
+
+    powerpc: Use ARCH_IRQ_INIT_FLAGS
+    
+    Define the ARCH_IRQ_INIT_FLAGS instead of fixing it up in a loop.
+    
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+index ff08b70b36d4..bb712c9488b3 100644
+--- a/arch/powerpc/include/asm/hw_irq.h
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -141,6 +141,8 @@ static inline bool arch_irqs_disabled(void)
+ 
+ #endif /* CONFIG_PPC64 */
+ 
++#define ARCH_IRQ_INIT_FLAGS	IRQ_NOREQUEST
++
+ /*
+  * interrupt-retrigger: should we handle this via lost interrupts and IPIs
+  * or should we not care like we do now ? --BenH.
+
+commit df9ee29270c11dba7d0fe0b83ce47a4d8e8d2101
+Author: David Howells <dhowells@redhat.com>
+Date:   Thu Oct 7 14:08:55 2010 +0100
+
+    Fix IRQ flag handling naming
+    
+    Fix the IRQ flag handling naming.  In linux/irqflags.h under one configuration,
+    it maps:
+    
+            local_irq_enable() -> raw_local_irq_enable()
+            local_irq_disable() -> raw_local_irq_disable()
+            local_irq_save() -> raw_local_irq_save()
+            ...
+    
+    and under the other configuration, it maps:
+    
+            raw_local_irq_enable() -> local_irq_enable()
+            raw_local_irq_disable() -> local_irq_disable()
+            raw_local_irq_save() -> local_irq_save()
+            ...
+    
+    This is quite confusing.  There should be one set of names expected of the
+    arch, and this should be wrapped to give another set of names that are expected
+    by users of this facility.
+    
+    Change this to have the arch provide:
+    
+            flags = arch_local_save_flags()
+            flags = arch_local_irq_save()
+            arch_local_irq_restore(flags)
+            arch_local_irq_disable()
+            arch_local_irq_enable()
+            arch_irqs_disabled_flags(flags)
+            arch_irqs_disabled()
+            arch_safe_halt()
+    
+    Then linux/irqflags.h wraps these to provide:
+    
+            raw_local_save_flags(flags)
+            raw_local_irq_save(flags)
+            raw_local_irq_restore(flags)
+            raw_local_irq_disable()
+            raw_local_irq_enable()
+            raw_irqs_disabled_flags(flags)
+            raw_irqs_disabled()
+            raw_safe_halt()
+    
+    with type checking on the flags 'arguments', and then wraps those to provide:
+    
+            local_save_flags(flags)
+            local_irq_save(flags)
+            local_irq_restore(flags)
+            local_irq_disable()
+            local_irq_enable()
+            irqs_disabled_flags(flags)
+            irqs_disabled()
+            safe_halt()
+    
+    with tracing included if enabled.
+    
+    The arch functions can now all be inline functions rather than some of them
+    having to be macros.
+    
+    Signed-off-by: David Howells <dhowells@redhat.com> [X86, FRV, MN10300]
+    Signed-off-by: Chris Metcalf <cmetcalf@tilera.com> [Tile]
+    Signed-off-by: Michal Simek <monstr@monstr.eu> [Microblaze]
+    Tested-by: Catalin Marinas <catalin.marinas@arm.com> [ARM]
+    Acked-by: Thomas Gleixner <tglx@linutronix.de>
+    Acked-by: Haavard Skinnemoen <haavard.skinnemoen@atmel.com> [AVR]
+    Acked-by: Tony Luck <tony.luck@intel.com> [IA-64]
+    Acked-by: Hirokazu Takata <takata@linux-m32r.org> [M32R]
+    Acked-by: Greg Ungerer <gerg@uclinux.org> [M68K/M68KNOMMU]
+    Acked-by: Ralf Baechle <ralf@linux-mips.org> [MIPS]
+    Acked-by: Kyle McMartin <kyle@mcmartin.ca> [PA-RISC]
+    Acked-by: Paul Mackerras <paulus@samba.org> [PowerPC]
+    Acked-by: Martin Schwidefsky <schwidefsky@de.ibm.com> [S390]
+    Acked-by: Chen Liqin <liqin.chen@sunplusct.com> [Score]
+    Acked-by: Matt Fleming <matt@console-pimps.org> [SH]
+    Acked-by: David S. Miller <davem@davemloft.net> [Sparc]
+    Acked-by: Chris Zankel <chris@zankel.net> [Xtensa]
+    Reviewed-by: Richard Henderson <rth@twiddle.net> [Alpha]
+    Reviewed-by: Yoshinori Sato <ysato@users.sourceforge.jp> [H8300]
+    Cc: starvik@axis.com [CRIS]
+    Cc: jesper.nilsson@axis.com [CRIS]
+    Cc: linux-cris-kernel@axis.com
+
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+index bd100fcf40d0..ff08b70b36d4 100644
+--- a/arch/powerpc/include/asm/hw_irq.h
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -16,42 +16,57 @@ extern void timer_interrupt(struct pt_regs *);
+ #ifdef CONFIG_PPC64
+ #include <asm/paca.h>
+ 
+-static inline unsigned long local_get_flags(void)
++static inline unsigned long arch_local_save_flags(void)
+ {
+ 	unsigned long flags;
+ 
+-	__asm__ __volatile__("lbz %0,%1(13)"
+-	: "=r" (flags)
+-	: "i" (offsetof(struct paca_struct, soft_enabled)));
++	asm volatile(
++		"lbz %0,%1(13)"
++		: "=r" (flags)
++		: "i" (offsetof(struct paca_struct, soft_enabled)));
+ 
+ 	return flags;
+ }
+ 
+-static inline unsigned long raw_local_irq_disable(void)
++static inline unsigned long arch_local_irq_disable(void)
+ {
+ 	unsigned long flags, zero;
+ 
+-	__asm__ __volatile__("li %1,0; lbz %0,%2(13); stb %1,%2(13)"
+-	: "=r" (flags), "=&r" (zero)
+-	: "i" (offsetof(struct paca_struct, soft_enabled))
+-	: "memory");
++	asm volatile(
++		"li %1,0; lbz %0,%2(13); stb %1,%2(13)"
++		: "=r" (flags), "=&r" (zero)
++		: "i" (offsetof(struct paca_struct, soft_enabled))
++		: "memory");
+ 
+ 	return flags;
+ }
+ 
+-extern void raw_local_irq_restore(unsigned long);
++extern void arch_local_irq_restore(unsigned long);
+ extern void iseries_handle_interrupts(void);
+ 
+-#define raw_local_irq_enable()		raw_local_irq_restore(1)
+-#define raw_local_save_flags(flags)	((flags) = local_get_flags())
+-#define raw_local_irq_save(flags)	((flags) = raw_local_irq_disable())
++static inline void arch_local_irq_enable(void)
++{
++	arch_local_irq_restore(1);
++}
++
++static inline unsigned long arch_local_irq_save(void)
++{
++	return arch_local_irq_disable();
++}
++
++static inline bool arch_irqs_disabled_flags(unsigned long flags)
++{
++	return flags == 0;
++}
+ 
+-#define raw_irqs_disabled()		(local_get_flags() == 0)
+-#define raw_irqs_disabled_flags(flags)	((flags) == 0)
++static inline bool arch_irqs_disabled(void)
++{
++	return arch_irqs_disabled_flags(arch_local_save_flags());
++}
+ 
+ #ifdef CONFIG_PPC_BOOK3E
+-#define __hard_irq_enable()	__asm__ __volatile__("wrteei 1": : :"memory");
+-#define __hard_irq_disable()	__asm__ __volatile__("wrteei 0": : :"memory");
++#define __hard_irq_enable()	asm volatile("wrteei 1" : : : "memory");
++#define __hard_irq_disable()	asm volatile("wrteei 0" : : : "memory");
+ #else
+ #define __hard_irq_enable()	__mtmsrd(mfmsr() | MSR_EE, 1)
+ #define __hard_irq_disable()	__mtmsrd(mfmsr() & ~MSR_EE, 1)
+@@ -64,64 +79,66 @@ extern void iseries_handle_interrupts(void);
+ 		get_paca()->hard_enabled = 0;	\
+ 	} while(0)
+ 
+-#else
++#else /* CONFIG_PPC64 */
+ 
+-#if defined(CONFIG_BOOKE)
+ #define SET_MSR_EE(x)	mtmsr(x)
+-#define raw_local_irq_restore(flags)	__asm__ __volatile__("wrtee %0" : : "r" (flags) : "memory")
++
++static inline unsigned long arch_local_save_flags(void)
++{
++	return mfmsr();
++}
++
++static inline void arch_local_irq_restore(unsigned long flags)
++{
++#if defined(CONFIG_BOOKE)
++	asm volatile("wrtee %0" : : "r" (flags) : "memory");
+ #else
+-#define SET_MSR_EE(x)	mtmsr(x)
+-#define raw_local_irq_restore(flags)	mtmsr(flags)
++	mtmsr(flags);
+ #endif
++}
+ 
+-static inline void raw_local_irq_disable(void)
++static inline unsigned long arch_local_irq_save(void)
+ {
++	unsigned long flags = arch_local_save_flags();
+ #ifdef CONFIG_BOOKE
+-	__asm__ __volatile__("wrteei 0": : :"memory");
++	asm volatile("wrteei 0" : : : "memory");
+ #else
+-	unsigned long msr;
+-
+-	msr = mfmsr();
+-	SET_MSR_EE(msr & ~MSR_EE);
++	SET_MSR_EE(flags & ~MSR_EE);
+ #endif
++	return flags;
+ }
+ 
+-static inline void raw_local_irq_enable(void)
++static inline void arch_local_irq_disable(void)
+ {
+ #ifdef CONFIG_BOOKE
+-	__asm__ __volatile__("wrteei 1": : :"memory");
++	asm volatile("wrteei 0" : : : "memory");
+ #else
+-	unsigned long msr;
+-
+-	msr = mfmsr();
+-	SET_MSR_EE(msr | MSR_EE);
++	arch_local_irq_save();
+ #endif
+ }
+ 
+-static inline void raw_local_irq_save_ptr(unsigned long *flags)
++static inline void arch_local_irq_enable(void)
+ {
+-	unsigned long msr;
+-	msr = mfmsr();
+-	*flags = msr;
+ #ifdef CONFIG_BOOKE
+-	__asm__ __volatile__("wrteei 0": : :"memory");
++	asm volatile("wrteei 1" : : : "memory");
+ #else
+-	SET_MSR_EE(msr & ~MSR_EE);
++	unsigned long msr = mfmsr();
++	SET_MSR_EE(msr | MSR_EE);
+ #endif
+ }
+ 
+-#define raw_local_save_flags(flags)	((flags) = mfmsr())
+-#define raw_local_irq_save(flags)	raw_local_irq_save_ptr(&flags)
+-#define raw_irqs_disabled()		((mfmsr() & MSR_EE) == 0)
+-#define raw_irqs_disabled_flags(flags)	(((flags) & MSR_EE) == 0)
+-
+-#define hard_irq_disable()		raw_local_irq_disable()
+-
+-static inline int irqs_disabled_flags(unsigned long flags)
++static inline bool arch_irqs_disabled_flags(unsigned long flags)
+ {
+ 	return (flags & MSR_EE) == 0;
+ }
+ 
++static inline bool arch_irqs_disabled(void)
++{
++	return arch_irqs_disabled_flags(arch_local_save_flags());
++}
++
++#define hard_irq_disable()		arch_local_irq_disable()
++
+ #endif /* CONFIG_PPC64 */
+ 
+ /*
+
+commit 0fe1ac48bef018bed896307cd12f6ca9b5e704ab
+Author: Paul Mackerras <paulus@samba.org>
+Date:   Tue Apr 13 20:46:04 2010 +0000
+
+    powerpc/perf_event: Fix oops due to perf_event_do_pending call
+    
+    Anton Blanchard found that large POWER systems would occasionally
+    crash in the exception exit path when profiling with perf_events.
+    The symptom was that an interrupt would occur late in the exit path
+    when the MSR[RI] (recoverable interrupt) bit was clear.  Interrupts
+    should be hard-disabled at this point but they were enabled.  Because
+    the interrupt was not recoverable the system panicked.
+    
+    The reason is that the exception exit path was calling
+    perf_event_do_pending after hard-disabling interrupts, and
+    perf_event_do_pending will re-enable interrupts.
+    
+    The simplest and cleanest fix for this is to use the same mechanism
+    that 32-bit powerpc does, namely to cause a self-IPI by setting the
+    decrementer to 1.  This means we can remove the tests in the exception
+    exit path and raw_local_irq_restore.
+    
+    This also makes sure that the call to perf_event_do_pending from
+    timer_interrupt() happens within irq_enter/irq_exit.  (Note that
+    calling perf_event_do_pending from timer_interrupt does not mean that
+    there is a possible 1/HZ latency; setting the decrementer to 1 ensures
+    that the timer interrupt will happen immediately, i.e. within one
+    timebase tick, which is a few nanoseconds or 10s of nanoseconds.)
+    
+    Signed-off-by: Paul Mackerras <paulus@samba.org>
+    Cc: stable@kernel.org
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+index 9f4c9d4f5803..bd100fcf40d0 100644
+--- a/arch/powerpc/include/asm/hw_irq.h
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -130,43 +130,5 @@ static inline int irqs_disabled_flags(unsigned long flags)
+  */
+ struct irq_chip;
+ 
+-#ifdef CONFIG_PERF_EVENTS
+-
+-#ifdef CONFIG_PPC64
+-static inline unsigned long test_perf_event_pending(void)
+-{
+-	unsigned long x;
+-
+-	asm volatile("lbz %0,%1(13)"
+-		: "=r" (x)
+-		: "i" (offsetof(struct paca_struct, perf_event_pending)));
+-	return x;
+-}
+-
+-static inline void set_perf_event_pending(void)
+-{
+-	asm volatile("stb %0,%1(13)" : :
+-		"r" (1),
+-		"i" (offsetof(struct paca_struct, perf_event_pending)));
+-}
+-
+-static inline void clear_perf_event_pending(void)
+-{
+-	asm volatile("stb %0,%1(13)" : :
+-		"r" (0),
+-		"i" (offsetof(struct paca_struct, perf_event_pending)));
+-}
+-#endif /* CONFIG_PPC64 */
+-
+-#else  /* CONFIG_PERF_EVENTS */
+-
+-static inline unsigned long test_perf_event_pending(void)
+-{
+-	return 0;
+-}
+-
+-static inline void clear_perf_event_pending(void) {}
+-#endif /* CONFIG_PERF_EVENTS */
+-
+ #endif	/* __KERNEL__ */
+ #endif	/* _ASM_POWERPC_HW_IRQ_H */
+
+commit 0682d6c1044e8a54aafdc6282d44c0c436da208f
+Author: Michael Neuling <mikey@neuling.org>
+Date:   Wed Oct 21 20:15:43 2009 +0000
+
+    powerpc: Fix potential compile error irqs_disabled_flags
+    
+    irqs_disabled_flags is #defined in linux/irqflags.h when
+    CONFIG_TRACE_IRQFLAGS_SUPPORT is enabled.  64 and 32 bit always have
+    CONFIG_TRACE_IRQFLAGS_SUPPORT enabled so just remove
+    irqs_disabled_flags.
+    
+    This fixes the case when someone needs to include both linux/irqflags.h
+    and asm/hw_irq.h.
+    
+    Signed-off-by: Michael Neuling <mikey@neuling.org>
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+index abbc2aaaced5..9f4c9d4f5803 100644
+--- a/arch/powerpc/include/asm/hw_irq.h
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -64,11 +64,6 @@ extern void iseries_handle_interrupts(void);
+ 		get_paca()->hard_enabled = 0;	\
+ 	} while(0)
+ 
+-static inline int irqs_disabled_flags(unsigned long flags)
+-{
+-	return flags == 0;
+-}
+-
+ #else
+ 
+ #if defined(CONFIG_BOOKE)
+
+commit cdd6c482c9ff9c55475ee7392ec8f672eddb7be6
+Author: Ingo Molnar <mingo@elte.hu>
+Date:   Mon Sep 21 12:02:48 2009 +0200
+
+    perf: Do the big rename: Performance Counters -> Performance Events
+    
+    Bye-bye Performance Counters, welcome Performance Events!
+    
+    In the past few months the perfcounters subsystem has grown out its
+    initial role of counting hardware events, and has become (and is
+    becoming) a much broader generic event enumeration, reporting, logging,
+    monitoring, analysis facility.
+    
+    Naming its core object 'perf_counter' and naming the subsystem
+    'perfcounters' has become more and more of a misnomer. With pending
+    code like hw-breakpoints support the 'counter' name is less and
+    less appropriate.
+    
+    All in one, we've decided to rename the subsystem to 'performance
+    events' and to propagate this rename through all fields, variables
+    and API names. (in an ABI compatible fashion)
+    
+    The word 'event' is also a bit shorter than 'counter' - which makes
+    it slightly more convenient to write/handle as well.
+    
+    Thanks goes to Stephane Eranian who first observed this misnomer and
+    suggested a rename.
+    
+    User-space tooling and ABI compatibility is not affected - this patch
+    should be function-invariant. (Also, defconfigs were not touched to
+    keep the size down.)
+    
+    This patch has been generated via the following script:
+    
+      FILES=$(find * -type f | grep -vE 'oprofile|[^K]config')
+    
+      sed -i \
+        -e 's/PERF_EVENT_/PERF_RECORD_/g' \
+        -e 's/PERF_COUNTER/PERF_EVENT/g' \
+        -e 's/perf_counter/perf_event/g' \
+        -e 's/nb_counters/nb_events/g' \
+        -e 's/swcounter/swevent/g' \
+        -e 's/tpcounter_event/tp_event/g' \
+        $FILES
+    
+      for N in $(find . -name perf_counter.[ch]); do
+        M=$(echo $N | sed 's/perf_counter/perf_event/g')
+        mv $N $M
+      done
+    
+      FILES=$(find . -name perf_event.*)
+    
+      sed -i \
+        -e 's/COUNTER_MASK/REG_MASK/g' \
+        -e 's/COUNTER/EVENT/g' \
+        -e 's/\<event\>/event_id/g' \
+        -e 's/counter/event/g' \
+        -e 's/Counter/Event/g' \
+        $FILES
+    
+    ... to keep it as correct as possible. This script can also be
+    used by anyone who has pending perfcounters patches - it converts
+    a Linux kernel tree over to the new naming. We tried to time this
+    change to the point in time where the amount of pending patches
+    is the smallest: the end of the merge window.
+    
+    Namespace clashes were fixed up in a preparatory patch - and some
+    stylistic fallout will be fixed up in a subsequent patch.
+    
+    ( NOTE: 'counters' are still the proper terminology when we deal
+      with hardware registers - and these sed scripts are a bit
+      over-eager in renaming them. I've undone some of that, but
+      in case there's something left where 'counter' would be
+      better than 'event' we can undo that on an individual basis
+      instead of touching an otherwise nicely automated patch. )
+    
+    Suggested-by: Stephane Eranian <eranian@google.com>
+    Acked-by: Peter Zijlstra <a.p.zijlstra@chello.nl>
+    Acked-by: Paul Mackerras <paulus@samba.org>
+    Reviewed-by: Arjan van de Ven <arjan@linux.intel.com>
+    Cc: Mike Galbraith <efault@gmx.de>
+    Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+    Cc: Frederic Weisbecker <fweisbec@gmail.com>
+    Cc: Steven Rostedt <rostedt@goodmis.org>
+    Cc: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+    Cc: David Howells <dhowells@redhat.com>
+    Cc: Kyle McMartin <kyle@mcmartin.ca>
+    Cc: Martin Schwidefsky <schwidefsky@de.ibm.com>
+    Cc: "David S. Miller" <davem@davemloft.net>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: "H. Peter Anvin" <hpa@zytor.com>
+    Cc: <linux-arch@vger.kernel.org>
+    LKML-Reference: <new-submission>
+    Signed-off-by: Ingo Molnar <mingo@elte.hu>
+
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+index e73d554538dd..abbc2aaaced5 100644
+--- a/arch/powerpc/include/asm/hw_irq.h
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -135,43 +135,43 @@ static inline int irqs_disabled_flags(unsigned long flags)
+  */
+ struct irq_chip;
+ 
+-#ifdef CONFIG_PERF_COUNTERS
++#ifdef CONFIG_PERF_EVENTS
+ 
+ #ifdef CONFIG_PPC64
+-static inline unsigned long test_perf_counter_pending(void)
++static inline unsigned long test_perf_event_pending(void)
+ {
+ 	unsigned long x;
+ 
+ 	asm volatile("lbz %0,%1(13)"
+ 		: "=r" (x)
+-		: "i" (offsetof(struct paca_struct, perf_counter_pending)));
++		: "i" (offsetof(struct paca_struct, perf_event_pending)));
+ 	return x;
+ }
+ 
+-static inline void set_perf_counter_pending(void)
++static inline void set_perf_event_pending(void)
+ {
+ 	asm volatile("stb %0,%1(13)" : :
+ 		"r" (1),
+-		"i" (offsetof(struct paca_struct, perf_counter_pending)));
++		"i" (offsetof(struct paca_struct, perf_event_pending)));
+ }
+ 
+-static inline void clear_perf_counter_pending(void)
++static inline void clear_perf_event_pending(void)
+ {
+ 	asm volatile("stb %0,%1(13)" : :
+ 		"r" (0),
+-		"i" (offsetof(struct paca_struct, perf_counter_pending)));
++		"i" (offsetof(struct paca_struct, perf_event_pending)));
+ }
+ #endif /* CONFIG_PPC64 */
+ 
+-#else  /* CONFIG_PERF_COUNTERS */
++#else  /* CONFIG_PERF_EVENTS */
+ 
+-static inline unsigned long test_perf_counter_pending(void)
++static inline unsigned long test_perf_event_pending(void)
+ {
+ 	return 0;
+ }
+ 
+-static inline void clear_perf_counter_pending(void) {}
+-#endif /* CONFIG_PERF_COUNTERS */
++static inline void clear_perf_event_pending(void) {}
++#endif /* CONFIG_PERF_EVENTS */
+ 
+ #endif	/* __KERNEL__ */
+ #endif	/* _ASM_POWERPC_HW_IRQ_H */
+
+commit 2d27cfd3286966c04d4192a9db5a6c7ea60eebf1
+Author: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+Date:   Thu Jul 23 23:15:59 2009 +0000
+
+    powerpc: Remaining 64-bit Book3E support
+    
+    This contains all the bits that didn't fit in previous patches :-) This
+    includes the actual exception handlers assembly, the changes to the
+    kernel entry, other misc bits and wiring it all up in Kconfig.
+    
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+index 8b505eaaa38a..e73d554538dd 100644
+--- a/arch/powerpc/include/asm/hw_irq.h
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -49,8 +49,13 @@ extern void iseries_handle_interrupts(void);
+ #define raw_irqs_disabled()		(local_get_flags() == 0)
+ #define raw_irqs_disabled_flags(flags)	((flags) == 0)
+ 
++#ifdef CONFIG_PPC_BOOK3E
++#define __hard_irq_enable()	__asm__ __volatile__("wrteei 1": : :"memory");
++#define __hard_irq_disable()	__asm__ __volatile__("wrteei 0": : :"memory");
++#else
+ #define __hard_irq_enable()	__mtmsrd(mfmsr() | MSR_EE, 1)
+ #define __hard_irq_disable()	__mtmsrd(mfmsr() & ~MSR_EE, 1)
++#endif
+ 
+ #define  hard_irq_disable()			\
+ 	do {					\
+
+commit 5d38902c483881645ba16058cffaa478b81e5cfa
+Author: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+Date:   Wed Jun 17 17:43:59 2009 +0000
+
+    powerpc: Add irqtrace support for 32-bit powerpc
+    
+    Based on initial work from: Dale Farnsworth <dale@farnsworth.org>
+    
+    Add the low level irq tracing hooks for 32-bit powerpc needed
+    to enable full lockdep functionality.
+    
+    The approach taken to deal with the code in entry_32.S is that
+    we don't trace all the transitions of MSR:EE when we just turn
+    it off to peek at TI_FLAGS without races. Only when we are
+    calling into C code or returning from exceptions with a state
+    that have changed from what lockdep thinks.
+    
+    There's a little bugger though: If we take an exception that
+    keeps interrupts enabled (such as an alignment exception) while
+    interrupts are enabled, we will call trace_hardirqs_on() on the
+    way back spurriously. Not a big deal, but to get rid of it would
+    require remembering in pt_regs that the exception was one of the
+    type that kept interrupts enabled which we don't know at this
+    stage. (Well, we could test all cases for regs->trap but that
+    sucks too much).
+    
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+    Tested-by: Kumar Gala <galak@kernel.crashing.org>
+
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+index 867ab8ed69b3..8b505eaaa38a 100644
+--- a/arch/powerpc/include/asm/hw_irq.h
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -68,13 +68,13 @@ static inline int irqs_disabled_flags(unsigned long flags)
+ 
+ #if defined(CONFIG_BOOKE)
+ #define SET_MSR_EE(x)	mtmsr(x)
+-#define local_irq_restore(flags)	__asm__ __volatile__("wrtee %0" : : "r" (flags) : "memory")
++#define raw_local_irq_restore(flags)	__asm__ __volatile__("wrtee %0" : : "r" (flags) : "memory")
+ #else
+ #define SET_MSR_EE(x)	mtmsr(x)
+-#define local_irq_restore(flags)	mtmsr(flags)
++#define raw_local_irq_restore(flags)	mtmsr(flags)
+ #endif
+ 
+-static inline void local_irq_disable(void)
++static inline void raw_local_irq_disable(void)
+ {
+ #ifdef CONFIG_BOOKE
+ 	__asm__ __volatile__("wrteei 0": : :"memory");
+@@ -86,7 +86,7 @@ static inline void local_irq_disable(void)
+ #endif
+ }
+ 
+-static inline void local_irq_enable(void)
++static inline void raw_local_irq_enable(void)
+ {
+ #ifdef CONFIG_BOOKE
+ 	__asm__ __volatile__("wrteei 1": : :"memory");
+@@ -98,7 +98,7 @@ static inline void local_irq_enable(void)
+ #endif
+ }
+ 
+-static inline void local_irq_save_ptr(unsigned long *flags)
++static inline void raw_local_irq_save_ptr(unsigned long *flags)
+ {
+ 	unsigned long msr;
+ 	msr = mfmsr();
+@@ -110,12 +110,12 @@ static inline void local_irq_save_ptr(unsigned long *flags)
+ #endif
+ }
+ 
+-#define local_save_flags(flags)	((flags) = mfmsr())
+-#define local_irq_save(flags)	local_irq_save_ptr(&flags)
+-#define irqs_disabled()		((mfmsr() & MSR_EE) == 0)
++#define raw_local_save_flags(flags)	((flags) = mfmsr())
++#define raw_local_irq_save(flags)	raw_local_irq_save_ptr(&flags)
++#define raw_irqs_disabled()		((mfmsr() & MSR_EE) == 0)
++#define raw_irqs_disabled_flags(flags)	(((flags) & MSR_EE) == 0)
+ 
+-#define hard_irq_enable()	local_irq_enable()
+-#define hard_irq_disable()	local_irq_disable()
++#define hard_irq_disable()		raw_local_irq_disable()
+ 
+ static inline int irqs_disabled_flags(unsigned long flags)
+ {
+
+commit 105988c015943e77092a6568bc5fb7e386df6ccd
+Author: Paul Mackerras <paulus@samba.org>
+Date:   Wed Jun 17 21:50:04 2009 +1000
+
+    perf_counter: powerpc: Enable use of software counters on 32-bit powerpc
+    
+    This enables the perf_counter subsystem on 32-bit powerpc.  Since we
+    don't have any support for hardware counters on 32-bit powerpc yet,
+    only software counters can be used.
+    
+    Besides selecting HAVE_PERF_COUNTERS for 32-bit powerpc as well as
+    64-bit, the main thing this does is add an implementation of
+    set_perf_counter_pending().  This needs to arrange for
+    perf_counter_do_pending() to be called when interrupts are enabled.
+    Rather than add code to local_irq_restore as 64-bit does, the 32-bit
+    set_perf_counter_pending() generates an interrupt by setting the
+    decrementer to 1 so that a decrementer interrupt will become pending
+    in 1 or 2 timebase ticks (if a decrementer interrupt isn't already
+    pending).  When interrupts are enabled, timer_interrupt() will be
+    called, and some new code in there calls perf_counter_do_pending().
+    We use a per-cpu array of flags to indicate whether we need to call
+    perf_counter_do_pending() or not.
+    
+    This introduces a couple of new Kconfig symbols: PPC_HAVE_PMU_SUPPORT,
+    which is selected by processor families for which we have hardware PMU
+    support (currently only PPC64), and PPC_PERF_CTRS, which enables the
+    powerpc-specific perf_counter back-end.
+    
+    Signed-off-by: Paul Mackerras <paulus@samba.org>
+    Cc: Peter Zijlstra <a.p.zijlstra@chello.nl>
+    Cc: linuxppc-dev@ozlabs.org
+    Cc: benh@kernel.crashing.org
+    LKML-Reference: <19000.55404.103840.393470@cargo.ozlabs.ibm.com>
+    Signed-off-by: Ingo Molnar <mingo@elte.hu>
+
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+index 10a642df014e..867ab8ed69b3 100644
+--- a/arch/powerpc/include/asm/hw_irq.h
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -131,6 +131,8 @@ static inline int irqs_disabled_flags(unsigned long flags)
+ struct irq_chip;
+ 
+ #ifdef CONFIG_PERF_COUNTERS
++
++#ifdef CONFIG_PPC64
+ static inline unsigned long test_perf_counter_pending(void)
+ {
+ 	unsigned long x;
+@@ -154,8 +156,9 @@ static inline void clear_perf_counter_pending(void)
+ 		"r" (0),
+ 		"i" (offsetof(struct paca_struct, perf_counter_pending)));
+ }
++#endif /* CONFIG_PPC64 */
+ 
+-#else
++#else  /* CONFIG_PERF_COUNTERS */
+ 
+ static inline unsigned long test_perf_counter_pending(void)
+ {
+
+commit a3d06cc6aa3e765dc2bf98626f87272dcf641dca
+Merge: 0990b1c65729 65795efbd380
+Author: Ingo Molnar <mingo@elte.hu>
+Date:   Wed Jun 17 13:06:17 2009 +0200
+
+    Merge branch 'linus' into perfcounters/core
+    
+    Conflicts:
+            arch/x86/include/asm/kmap_types.h
+            include/linux/mm.h
+    
+            include/asm-generic/kmap_types.h
+    
+    Merge reason: We crossed changes with kmap_types.h cleanups in mainline.
+    
+    Signed-off-by: Ingo Molnar <mingo@elte.hu>
+
+commit 9974458e2f9a11dbd2f4bd14fab5a79af4907b41
+Author: Paul Mackerras <paulus@samba.org>
+Date:   Mon Jun 15 21:45:16 2009 +1000
+
+    perf_counter: Make set_perf_counter_pending() declaration common
+    
+    At present, every architecture that supports perf_counters has to
+    declare set_perf_counter_pending() in its arch-specific headers.
+    This consolidates the declarations into a single declaration in one
+    common place, include/linux/perf_counter.h.  On powerpc, we continue
+    to provide a static inline definition of set_perf_counter_pending()
+    in the powerpc hw_irq.h.
+    
+    Also, this removes from the x86 perf_counter.h the unused null
+    definitions of {test,clear}_perf_counter_pending.
+    
+    Reported-by: Mike Frysinger <vapier.adi@gmail.com>
+    Signed-off-by: Paul Mackerras <paulus@samba.org>
+    Cc: Peter Zijlstra <a.p.zijlstra@chello.nl>
+    Cc: benh@kernel.crashing.org
+    LKML-Reference: <18998.13388.920691.523227@cargo.ozlabs.ibm.com>
+    Signed-off-by: Ingo Molnar <mingo@elte.hu>
+
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+index 53512374e1c9..1974cf191b03 100644
+--- a/arch/powerpc/include/asm/hw_irq.h
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -163,7 +163,6 @@ static inline unsigned long test_perf_counter_pending(void)
+ 	return 0;
+ }
+ 
+-static inline void set_perf_counter_pending(void) {}
+ static inline void clear_perf_counter_pending(void) {}
+ #endif /* CONFIG_PERF_COUNTERS */
+ 
+
+commit 4c75f84f2c781beb230031234ed961d28771a764
+Author: Paul Mackerras <paulus@samba.org>
+Date:   Fri Jun 12 02:00:50 2009 +0000
+
+    powerpc: Add compiler memory barrier to mtmsr macro
+    
+    On 32-bit non-Book E, local_irq_restore() turns into just mtmsr(),
+    which doesn't currently have a compiler memory barrier.  This means
+    that accesses to memory inside a local_irq_save/restore section,
+    or a spin_lock_irqsave/spin_unlock_irqrestore section on UP, can
+    be reordered by the compiler to occur outside that section.
+    
+    To fix this, this adds a compiler memory barrier to mtmsr for both
+    32-bit and 64-bit.  Having a compiler memory barrier in mtmsr makes
+    sense because it will almost always be changing something about the
+    context in which memory accesses are done, so in general we don't want
+    memory accesses getting moved from one side of an mtmsr to the other.
+    
+    With the barrier in mtmsr(), some of the explicit barriers in
+    hw_irq.h are now redundant, so this removes them.
+    
+    Signed-off-by: Paul Mackerras <paulus@samba.org>
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+index 53512374e1c9..b7f8f4a87cc0 100644
+--- a/arch/powerpc/include/asm/hw_irq.h
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -80,7 +80,7 @@ static inline void local_irq_disable(void)
+ 	__asm__ __volatile__("wrteei 0": : :"memory");
+ #else
+ 	unsigned long msr;
+-	__asm__ __volatile__("": : :"memory");
++
+ 	msr = mfmsr();
+ 	SET_MSR_EE(msr & ~MSR_EE);
+ #endif
+@@ -92,7 +92,7 @@ static inline void local_irq_enable(void)
+ 	__asm__ __volatile__("wrteei 1": : :"memory");
+ #else
+ 	unsigned long msr;
+-	__asm__ __volatile__("": : :"memory");
++
+ 	msr = mfmsr();
+ 	SET_MSR_EE(msr | MSR_EE);
+ #endif
+@@ -108,7 +108,6 @@ static inline void local_irq_save_ptr(unsigned long *flags)
+ #else
+ 	SET_MSR_EE(msr & ~MSR_EE);
+ #endif
+-	__asm__ __volatile__("": : :"memory");
+ }
+ 
+ #define local_save_flags(flags)	((flags) = mfmsr())
+
+commit e14112d1bd5e193166b54be19119cf6440470560
+Author: Stephen Rothwell <sfr@canb.auug.org.au>
+Date:   Fri Jun 12 10:14:22 2009 +1000
+
+    perfcounters: remove powerpc definitions of perf_counter_do_pending
+    
+    Commit 925d519ab82b6dd7aca9420d809ee83819c08db2 ("perf_counter:
+    unify and fix delayed counter wakeup") added global definitions.
+    
+    Signed-off-by: Stephen Rothwell <sfr@canb.auug.org.au>
+    Acked-by: Paul Mackerras <paulus@samba.org>
+    Acked-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+index 20a44d0c9fdd..53512374e1c9 100644
+--- a/arch/powerpc/include/asm/hw_irq.h
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -156,8 +156,6 @@ static inline void clear_perf_counter_pending(void)
+ 		"i" (offsetof(struct paca_struct, perf_counter_pending)));
+ }
+ 
+-extern void perf_counter_do_pending(void);
+-
+ #else
+ 
+ static inline unsigned long test_perf_counter_pending(void)
+@@ -167,7 +165,6 @@ static inline unsigned long test_perf_counter_pending(void)
+ 
+ static inline void set_perf_counter_pending(void) {}
+ static inline void clear_perf_counter_pending(void) {}
+-static inline void perf_counter_do_pending(void) {}
+ #endif /* CONFIG_PERF_COUNTERS */
+ 
+ #endif	/* __KERNEL__ */
+
+commit 925d519ab82b6dd7aca9420d809ee83819c08db2
+Author: Peter Zijlstra <a.p.zijlstra@chello.nl>
+Date:   Mon Mar 30 19:07:02 2009 +0200
+
+    perf_counter: unify and fix delayed counter wakeup
+    
+    While going over the wakeup code I noticed delayed wakeups only work
+    for hardware counters but basically all software counters rely on
+    them.
+    
+    This patch unifies and generalizes the delayed wakeup to fix this
+    issue.
+    
+    Since we're dealing with NMI context bits here, use a cmpxchg() based
+    single link list implementation to track counters that have pending
+    wakeups.
+    
+    [ This should really be generic code for delayed wakeups, but since we
+      cannot use cmpxchg()/xchg() in generic code, I've let it live in the
+      perf_counter code. -- Eric Dumazet could use it to aggregate the
+      network wakeups. ]
+    
+    Furthermore, the x86 method of using TIF flags was flawed in that its
+    quite possible to end up setting the bit on the idle task, loosing the
+    wakeup.
+    
+    The powerpc method uses per-cpu storage and does appear to be
+    sufficient.
+    
+    Signed-off-by: Peter Zijlstra <a.p.zijlstra@chello.nl>
+    Acked-by: Paul Mackerras <paulus@samba.org>
+    Orig-LKML-Reference: <20090330171023.153932974@chello.nl>
+    Signed-off-by: Ingo Molnar <mingo@elte.hu>
+
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+index cb32d571c9c7..20a44d0c9fdd 100644
+--- a/arch/powerpc/include/asm/hw_irq.h
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -132,7 +132,7 @@ static inline int irqs_disabled_flags(unsigned long flags)
+ struct irq_chip;
+ 
+ #ifdef CONFIG_PERF_COUNTERS
+-static inline unsigned long get_perf_counter_pending(void)
++static inline unsigned long test_perf_counter_pending(void)
+ {
+ 	unsigned long x;
+ 
+@@ -160,7 +160,7 @@ extern void perf_counter_do_pending(void);
+ 
+ #else
+ 
+-static inline unsigned long get_perf_counter_pending(void)
++static inline unsigned long test_perf_counter_pending(void)
+ {
+ 	return 0;
+ }
+
+commit b6c5a71da1477d261bc36254fe1f20d32b57598d
+Author: Paul Mackerras <paulus@samba.org>
+Date:   Mon Mar 16 21:00:00 2009 +1100
+
+    perf_counter: abstract wakeup flag setting in core to fix powerpc build
+    
+    Impact: build fix for powerpc
+    
+    Commit bd753921015e7905 ("perf_counter: software counter event
+    infrastructure") introduced a use of TIF_PERF_COUNTERS into the core
+    perfcounter code.  This breaks the build on powerpc because we use
+    a flag in a per-cpu area to signal wakeups on powerpc rather than
+    a thread_info flag, because the thread_info flags have to be
+    manipulated with atomic operations and are thus slower than per-cpu
+    flags.
+    
+    This fixes the by changing the core to use an abstracted
+    set_perf_counter_pending() function, which is defined on x86 to set
+    the TIF_PERF_COUNTERS flag and on powerpc to set the per-cpu flag
+    (paca->perf_counter_pending).  It changes the previous powerpc
+    definition of set_perf_counter_pending to not take an argument and
+    adds a clear_perf_counter_pending, so as to simplify the definition
+    on x86.
+    
+    On x86, set_perf_counter_pending() is defined as a macro.  Defining
+    it as a static inline in arch/x86/include/asm/perf_counters.h causes
+    compile failures because <asm/perf_counters.h> gets included early in
+    <linux/sched.h>, and the definitions of set_tsk_thread_flag etc. are
+    therefore not available in <asm/perf_counters.h>.  (On powerpc this
+    problem is avoided by defining set_perf_counter_pending etc. in
+    <asm/hw_irq.h>.)
+    
+    Signed-off-by: Paul Mackerras <paulus@samba.org>
+
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+index b43076ff92c9..cb32d571c9c7 100644
+--- a/arch/powerpc/include/asm/hw_irq.h
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -142,10 +142,17 @@ static inline unsigned long get_perf_counter_pending(void)
+ 	return x;
+ }
+ 
+-static inline void set_perf_counter_pending(int x)
++static inline void set_perf_counter_pending(void)
+ {
+ 	asm volatile("stb %0,%1(13)" : :
+-		"r" (x),
++		"r" (1),
++		"i" (offsetof(struct paca_struct, perf_counter_pending)));
++}
++
++static inline void clear_perf_counter_pending(void)
++{
++	asm volatile("stb %0,%1(13)" : :
++		"r" (0),
+ 		"i" (offsetof(struct paca_struct, perf_counter_pending)));
+ }
+ 
+@@ -158,7 +165,8 @@ static inline unsigned long get_perf_counter_pending(void)
+ 	return 0;
+ }
+ 
+-static inline void set_perf_counter_pending(int x) {}
++static inline void set_perf_counter_pending(void) {}
++static inline void clear_perf_counter_pending(void) {}
+ static inline void perf_counter_do_pending(void) {}
+ #endif /* CONFIG_PERF_COUNTERS */
+ 
+
+commit f541ae326fa120fa5c57433e4d9a133df212ce41
+Merge: e255357764f9 0221c81b1b8e
+Author: Ingo Molnar <mingo@elte.hu>
+Date:   Mon Apr 6 09:02:57 2009 +0200
+
+    Merge branch 'linus' into perfcounters/core-v2
+    
+    Merge reason: we have gathered quite a few conflicts, need to merge upstream
+    
+    Conflicts:
+            arch/powerpc/kernel/Makefile
+            arch/x86/ia32/ia32entry.S
+            arch/x86/include/asm/hardirq.h
+            arch/x86/include/asm/unistd_32.h
+            arch/x86/include/asm/unistd_64.h
+            arch/x86/kernel/cpu/common.c
+            arch/x86/kernel/irq.c
+            arch/x86/kernel/syscall_table_32.S
+            arch/x86/mm/iomap_32.c
+            include/linux/sched.h
+            kernel/Makefile
+    
+    Signed-off-by: Ingo Molnar <mingo@elte.hu>
+
+commit 353bca5ed4e0705ed4a1ac7b82491b223c3b55ba
+Author: Thomas Gleixner <tglx@linutronix.de>
+Date:   Tue Mar 10 14:46:30 2009 +0000
+
+    powerpc/irq: Convert obsolete hw_interrupt_type to struct irq_chip
+    
+    Impact: cleanup
+    
+    Convert the last remaining users to struct irq_chip.
+    
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    CC: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+    CC: linuxppc-dev@ozlabs.org
+    Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+index f75a5fc64d2e..b7e034b0a6dd 100644
+--- a/arch/powerpc/include/asm/hw_irq.h
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -129,7 +129,7 @@ static inline int irqs_disabled_flags(unsigned long flags)
+  * interrupt-retrigger: should we handle this via lost interrupts and IPIs
+  * or should we not care like we do now ? --BenH.
+  */
+-struct hw_interrupt_type;
++struct irq_chip;
+ 
+ #endif	/* __KERNEL__ */
+ #endif	/* _ASM_POWERPC_HW_IRQ_H */
+
+commit 93a6d3ce6962044fe9badf528fed46b455d58292
+Author: Paul Mackerras <paulus@samba.org>
+Date:   Fri Jan 9 16:52:19 2009 +1100
+
+    powerpc: Provide a way to defer perf counter work until interrupts are enabled
+    
+    Because 64-bit powerpc uses lazy (soft) interrupt disabling, it is
+    possible for a performance monitor exception to come in when the
+    kernel thinks interrupts are disabled (i.e. when they are
+    soft-disabled but hard-enabled).  In such a situation the performance
+    monitor exception handler might have some processing to do (such as
+    process wakeups) which can't be done in what is effectively an NMI
+    handler.
+    
+    This provides a way to defer that work until interrupts get enabled,
+    either in raw_local_irq_restore() or by returning from an interrupt
+    handler to code that had interrupts enabled.  We have a per-processor
+    flag that indicates that there is work pending to do when interrupts
+    subsequently get re-enabled.  This flag is checked in the interrupt
+    return path and in raw_local_irq_restore(), and if it is set,
+    perf_counter_do_pending() is called to do the pending work.
+    
+    Signed-off-by: Paul Mackerras <paulus@samba.org>
+
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+index f75a5fc64d2e..e10f151c3db6 100644
+--- a/arch/powerpc/include/asm/hw_irq.h
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -131,5 +131,36 @@ static inline int irqs_disabled_flags(unsigned long flags)
+  */
+ struct hw_interrupt_type;
+ 
++#ifdef CONFIG_PERF_COUNTERS
++static inline unsigned long get_perf_counter_pending(void)
++{
++	unsigned long x;
++
++	asm volatile("lbz %0,%1(13)"
++		: "=r" (x)
++		: "i" (offsetof(struct paca_struct, perf_counter_pending)));
++	return x;
++}
++
++static inline void set_perf_counter_pending(int x)
++{
++	asm volatile("stb %0,%1(13)" : :
++		"r" (x),
++		"i" (offsetof(struct paca_struct, perf_counter_pending)));
++}
++
++extern void perf_counter_do_pending(void);
++
++#else
++
++static inline unsigned long get_perf_counter_pending(void)
++{
++	return 0;
++}
++
++static inline void set_perf_counter_pending(int x) {}
++static inline void perf_counter_do_pending(void) {}
++#endif /* CONFIG_PERF_COUNTERS */
++
+ #endif	/* __KERNEL__ */
+ #endif	/* _ASM_POWERPC_HW_IRQ_H */
+
+commit b8b572e1015f81b4e748417be2629dfe51ab99f9
+Author: Stephen Rothwell <sfr@canb.auug.org.au>
+Date:   Fri Aug 1 15:20:30 2008 +1000
+
+    powerpc: Move include files to arch/powerpc/include/asm
+    
+    from include/asm-powerpc.  This is the result of a
+    
+    mkdir arch/powerpc/include/asm
+    git mv include/asm-powerpc/* arch/powerpc/include/asm
+    
+    Followed by a few documentation/comment fixups and a couple of places
+    where <asm-powepc/...> was being used explicitly.  Of the latter only
+    one was outside the arch code and it is a driver only built for powerpc.
+    
+    Signed-off-by: Stephen Rothwell <sfr@canb.auug.org.au>
+    Signed-off-by: Paul Mackerras <paulus@samba.org>
+
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+new file mode 100644
+index 000000000000..f75a5fc64d2e
+--- /dev/null
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -0,0 +1,135 @@
++/*
++ * Copyright (C) 1999 Cort Dougan <cort@cs.nmt.edu>
++ */
++#ifndef _ASM_POWERPC_HW_IRQ_H
++#define _ASM_POWERPC_HW_IRQ_H
++
++#ifdef __KERNEL__
++
++#include <linux/errno.h>
++#include <linux/compiler.h>
++#include <asm/ptrace.h>
++#include <asm/processor.h>
++
++extern void timer_interrupt(struct pt_regs *);
++
++#ifdef CONFIG_PPC64
++#include <asm/paca.h>
++
++static inline unsigned long local_get_flags(void)
++{
++	unsigned long flags;
++
++	__asm__ __volatile__("lbz %0,%1(13)"
++	: "=r" (flags)
++	: "i" (offsetof(struct paca_struct, soft_enabled)));
++
++	return flags;
++}
++
++static inline unsigned long raw_local_irq_disable(void)
++{
++	unsigned long flags, zero;
++
++	__asm__ __volatile__("li %1,0; lbz %0,%2(13); stb %1,%2(13)"
++	: "=r" (flags), "=&r" (zero)
++	: "i" (offsetof(struct paca_struct, soft_enabled))
++	: "memory");
++
++	return flags;
++}
++
++extern void raw_local_irq_restore(unsigned long);
++extern void iseries_handle_interrupts(void);
++
++#define raw_local_irq_enable()		raw_local_irq_restore(1)
++#define raw_local_save_flags(flags)	((flags) = local_get_flags())
++#define raw_local_irq_save(flags)	((flags) = raw_local_irq_disable())
++
++#define raw_irqs_disabled()		(local_get_flags() == 0)
++#define raw_irqs_disabled_flags(flags)	((flags) == 0)
++
++#define __hard_irq_enable()	__mtmsrd(mfmsr() | MSR_EE, 1)
++#define __hard_irq_disable()	__mtmsrd(mfmsr() & ~MSR_EE, 1)
++
++#define  hard_irq_disable()			\
++	do {					\
++		__hard_irq_disable();		\
++		get_paca()->soft_enabled = 0;	\
++		get_paca()->hard_enabled = 0;	\
++	} while(0)
++
++static inline int irqs_disabled_flags(unsigned long flags)
++{
++	return flags == 0;
++}
++
++#else
++
++#if defined(CONFIG_BOOKE)
++#define SET_MSR_EE(x)	mtmsr(x)
++#define local_irq_restore(flags)	__asm__ __volatile__("wrtee %0" : : "r" (flags) : "memory")
++#else
++#define SET_MSR_EE(x)	mtmsr(x)
++#define local_irq_restore(flags)	mtmsr(flags)
++#endif
++
++static inline void local_irq_disable(void)
++{
++#ifdef CONFIG_BOOKE
++	__asm__ __volatile__("wrteei 0": : :"memory");
++#else
++	unsigned long msr;
++	__asm__ __volatile__("": : :"memory");
++	msr = mfmsr();
++	SET_MSR_EE(msr & ~MSR_EE);
++#endif
++}
++
++static inline void local_irq_enable(void)
++{
++#ifdef CONFIG_BOOKE
++	__asm__ __volatile__("wrteei 1": : :"memory");
++#else
++	unsigned long msr;
++	__asm__ __volatile__("": : :"memory");
++	msr = mfmsr();
++	SET_MSR_EE(msr | MSR_EE);
++#endif
++}
++
++static inline void local_irq_save_ptr(unsigned long *flags)
++{
++	unsigned long msr;
++	msr = mfmsr();
++	*flags = msr;
++#ifdef CONFIG_BOOKE
++	__asm__ __volatile__("wrteei 0": : :"memory");
++#else
++	SET_MSR_EE(msr & ~MSR_EE);
++#endif
++	__asm__ __volatile__("": : :"memory");
++}
++
++#define local_save_flags(flags)	((flags) = mfmsr())
++#define local_irq_save(flags)	local_irq_save_ptr(&flags)
++#define irqs_disabled()		((mfmsr() & MSR_EE) == 0)
++
++#define hard_irq_enable()	local_irq_enable()
++#define hard_irq_disable()	local_irq_disable()
++
++static inline int irqs_disabled_flags(unsigned long flags)
++{
++	return (flags & MSR_EE) == 0;
++}
++
++#endif /* CONFIG_PPC64 */
++
++/*
++ * interrupt-retrigger: should we handle this via lost interrupts and IPIs
++ * or should we not care like we do now ? --BenH.
++ */
++struct hw_interrupt_type;
++
++#endif	/* __KERNEL__ */
++#endif	/* _ASM_POWERPC_HW_IRQ_H */

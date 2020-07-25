@@ -1,0 +1,256 @@
+commit fc1b6d6de2208774efd2a20bf0daddb02d18b1e0
+Author: Tuong Lien <tuong.t.lien@dektech.com.au>
+Date:   Fri Nov 8 12:05:11 2019 +0700
+
+    tipc: introduce TIPC encryption & authentication
+    
+    This commit offers an option to encrypt and authenticate all messaging,
+    including the neighbor discovery messages. The currently most advanced
+    algorithm supported is the AEAD AES-GCM (like IPSec or TLS). All
+    encryption/decryption is done at the bearer layer, just before leaving
+    or after entering TIPC.
+    
+    Supported features:
+    - Encryption & authentication of all TIPC messages (header + data);
+    - Two symmetric-key modes: Cluster and Per-node;
+    - Automatic key switching;
+    - Key-expired revoking (sequence number wrapped);
+    - Lock-free encryption/decryption (RCU);
+    - Asynchronous crypto, Intel AES-NI supported;
+    - Multiple cipher transforms;
+    - Logs & statistics;
+    
+    Two key modes:
+    - Cluster key mode: One single key is used for both TX & RX in all
+    nodes in the cluster.
+    - Per-node key mode: Each nodes in the cluster has one specific TX key.
+    For RX, a node requires its peers' TX key to be able to decrypt the
+    messages from those peers.
+    
+    Key setting from user-space is performed via netlink by a user program
+    (e.g. the iproute2 'tipc' tool).
+    
+    Internal key state machine:
+    
+                                     Attach    Align(RX)
+                                         +-+   +-+
+                                         | V   | V
+            +---------+      Attach     +---------+
+            |  IDLE   |---------------->| PENDING |(user = 0)
+            +---------+                 +---------+
+               A   A                   Switch|  A
+               |   |                         |  |
+               |   | Free(switch/revoked)    |  |
+         (Free)|   +----------------------+  |  |Timeout
+               |              (TX)        |  |  |(RX)
+               |                          |  |  |
+               |                          |  v  |
+            +---------+      Switch     +---------+
+            | PASSIVE |<----------------| ACTIVE  |
+            +---------+       (RX)      +---------+
+            (user = 1)                  (user >= 1)
+    
+    The number of TFMs is 10 by default and can be changed via the procfs
+    'net/tipc/max_tfms'. At this moment, as for simplicity, this file is
+    also used to print the crypto statistics at runtime:
+    
+    echo 0xfff1 > /proc/sys/net/tipc/max_tfms
+    
+    The patch defines a new TIPC version (v7) for the encryption message (-
+    backward compatibility as well). The message is basically encapsulated
+    as follows:
+    
+       +----------------------------------------------------------+
+       | TIPCv7 encryption  | Original TIPCv2    | Authentication |
+       | header             | packet (encrypted) | Tag            |
+       +----------------------------------------------------------+
+    
+    The throughput is about ~40% for small messages (compared with non-
+    encryption) and ~9% for large messages. With the support from hardware
+    crypto i.e. the Intel AES-NI CPU instructions, the throughput increases
+    upto ~85% for small messages and ~55% for large messages.
+    
+    By default, the new feature is inactive (i.e. no encryption) until user
+    sets a key for TIPC. There is however also a new option - "TIPC_CRYPTO"
+    in the kernel configuration to enable/disable the new code when needed.
+    
+    MAINTAINERS | add two new files 'crypto.h' & 'crypto.c' in tipc
+    
+    Acked-by: Ying Xue <ying.xue@windreiver.com>
+    Acked-by: Jon Maloy <jon.maloy@ericsson.com>
+    Signed-off-by: Tuong Lien <tuong.t.lien@dektech.com.au>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/tipc/crypto.h b/net/tipc/crypto.h
+new file mode 100644
+index 000000000000..c3de769f49e8
+--- /dev/null
++++ b/net/tipc/crypto.h
+@@ -0,0 +1,167 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/**
++ * net/tipc/crypto.h: Include file for TIPC crypto
++ *
++ * Copyright (c) 2019, Ericsson AB
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions are met:
++ *
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ * 3. Neither the names of the copyright holders nor the names of its
++ *    contributors may be used to endorse or promote products derived from
++ *    this software without specific prior written permission.
++ *
++ * Alternatively, this software may be distributed under the terms of the
++ * GNU General Public License ("GPL") version 2 as published by the Free
++ * Software Foundation.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
++ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
++ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
++ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
++ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
++ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
++ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
++ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++ * POSSIBILITY OF SUCH DAMAGE.
++ */
++#ifdef CONFIG_TIPC_CRYPTO
++#ifndef _TIPC_CRYPTO_H
++#define _TIPC_CRYPTO_H
++
++#include "core.h"
++#include "node.h"
++#include "msg.h"
++#include "bearer.h"
++
++#define TIPC_EVERSION			7
++
++/* AEAD aes(gcm) */
++#define TIPC_AES_GCM_KEY_SIZE_128	16
++#define TIPC_AES_GCM_KEY_SIZE_192	24
++#define TIPC_AES_GCM_KEY_SIZE_256	32
++
++#define TIPC_AES_GCM_SALT_SIZE		4
++#define TIPC_AES_GCM_IV_SIZE		12
++#define TIPC_AES_GCM_TAG_SIZE		16
++
++/**
++ * TIPC crypto modes:
++ * - CLUSTER_KEY:
++ *	One single key is used for both TX & RX in all nodes in the cluster.
++ * - PER_NODE_KEY:
++ *	Each nodes in the cluster has one TX key, for RX a node needs to know
++ *	its peers' TX key for the decryption of messages from those nodes.
++ */
++enum {
++	CLUSTER_KEY = 1,
++	PER_NODE_KEY = (1 << 1),
++};
++
++extern int sysctl_tipc_max_tfms __read_mostly;
++
++/**
++ * TIPC encryption message format:
++ *
++ *     3 3 2 2 2 2 2 2 2 2 2 2 1 1 1 1 1 1 1 1 1 1 0 0 0 0 0 0 0 0 0 0
++ *     1 0 9 8 7 6 5 4|3 2 1 0 9 8 7 6|5 4 3 2 1 0 9 8|7 6 5 4 3 2 1 0
++ *    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++ * w0:|Ver=7| User  |D|TX |RX |K|                 Rsvd                |
++ *    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++ * w1:|                             Seqno                             |
++ * w2:|                           (8 octets)                          |
++ *    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++ * w3:\                            Prevnode                           \
++ *    /                        (4 or 16 octets)                       /
++ *    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++ *    \                                                               \
++ *    /       Encrypted complete TIPC V2 header and user data         /
++ *    \                                                               \
++ *    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++ *    |                                                               |
++ *    |                             AuthTag                           |
++ *    |                           (16 octets)                         |
++ *    |                                                               |
++ *    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++ *
++ * Word0:
++ *	Ver	: = 7 i.e. TIPC encryption message version
++ *	User	: = 7 (for LINK_PROTOCOL); = 13 (for LINK_CONFIG) or = 0
++ *	D	: The destined bit i.e. the message's destination node is
++ *	          "known" or not at the message encryption
++ *	TX	: TX key used for the message encryption
++ *	RX	: Currently RX active key corresponding to the destination
++ *	          node's TX key (when the "D" bit is set)
++ *	K	: Keep-alive bit (for RPS, LINK_PROTOCOL/STATE_MSG only)
++ *	Rsvd	: Reserved bit, field
++ * Word1-2:
++ *	Seqno	: The 64-bit sequence number of the encrypted message, also
++ *		  part of the nonce used for the message encryption/decryption
++ * Word3-:
++ *	Prevnode: The source node address, or ID in case LINK_CONFIG only
++ *	AuthTag	: The authentication tag for the message integrity checking
++ *		  generated by the message encryption
++ */
++struct tipc_ehdr {
++	union {
++		struct {
++#if defined(__LITTLE_ENDIAN_BITFIELD)
++			__u8	destined:1,
++				user:4,
++				version:3;
++			__u8	reserved_1:3,
++				keepalive:1,
++				rx_key_active:2,
++				tx_key:2;
++#elif defined(__BIG_ENDIAN_BITFIELD)
++			__u8	version:3,
++				user:4,
++				destined:1;
++			__u8	tx_key:2,
++				rx_key_active:2,
++				keepalive:1,
++				reserved_1:3;
++#else
++#error  "Please fix <asm/byteorder.h>"
++#endif
++			__be16	reserved_2;
++		} __packed;
++		__be32 w0;
++	};
++	__be64 seqno;
++	union {
++		__be32 addr;
++		__u8 id[NODE_ID_LEN]; /* For a LINK_CONFIG message only! */
++	};
++#define EHDR_SIZE	(offsetof(struct tipc_ehdr, addr) + sizeof(__be32))
++#define EHDR_CFG_SIZE	(sizeof(struct tipc_ehdr))
++#define EHDR_MIN_SIZE	(EHDR_SIZE)
++#define EHDR_MAX_SIZE	(EHDR_CFG_SIZE)
++#define EMSG_OVERHEAD	(EHDR_SIZE + TIPC_AES_GCM_TAG_SIZE)
++} __packed;
++
++int tipc_crypto_start(struct tipc_crypto **crypto, struct net *net,
++		      struct tipc_node *node);
++void tipc_crypto_stop(struct tipc_crypto **crypto);
++void tipc_crypto_timeout(struct tipc_crypto *rx);
++int tipc_crypto_xmit(struct net *net, struct sk_buff **skb,
++		     struct tipc_bearer *b, struct tipc_media_addr *dst,
++		     struct tipc_node *__dnode);
++int tipc_crypto_rcv(struct net *net, struct tipc_crypto *rx,
++		    struct sk_buff **skb, struct tipc_bearer *b);
++int tipc_crypto_key_init(struct tipc_crypto *c, struct tipc_aead_key *ukey,
++			 u8 mode);
++void tipc_crypto_key_flush(struct tipc_crypto *c);
++int tipc_aead_key_validate(struct tipc_aead_key *ukey);
++bool tipc_ehdr_validate(struct sk_buff *skb);
++
++#endif /* _TIPC_CRYPTO_H */
++#endif

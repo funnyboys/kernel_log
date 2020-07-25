@@ -1,0 +1,2611 @@
+commit b0841eefd9693827afb9888235e26ddd098f9cef
+Author: Al Viro <viro@zeniv.linux.org.uk>
+Date:   Sat Aug 31 09:43:43 2019 +0200
+
+    configfs: provide exclusion between IO and removals
+    
+    Make sure that attribute methods are not called after the item
+    has been removed from the tree.  To do so, we
+            * at the point of no return in removals, grab ->frag_sem
+    exclusive and mark the fragment dead.
+            * call the methods of attributes with ->frag_sem taken
+    shared and only after having verified that the fragment is still
+    alive.
+    
+            The main benefit is for method instances - they are
+    guaranteed that the objects they are accessing *and* all ancestors
+    are still there.  Another win is that we don't need to bother
+    with extra refcount on config_item when opening a file -
+    the item will be alive for as long as it stays in the tree, and
+    we won't touch it/attributes/any associated data after it's
+    been removed from the tree.
+    
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+
+diff --git a/fs/configfs/file.c b/fs/configfs/file.c
+index 9d5e888df60b..fb65b706cc0d 100644
+--- a/fs/configfs/file.c
++++ b/fs/configfs/file.c
+@@ -48,22 +48,32 @@ struct configfs_buffer {
+ 	};
+ };
+ 
++static inline struct configfs_fragment *to_frag(struct file *file)
++{
++	struct configfs_dirent *sd = file->f_path.dentry->d_fsdata;
++
++	return sd->s_frag;
++}
+ 
+-static int fill_read_buffer(struct configfs_buffer * buffer)
++static int fill_read_buffer(struct file *file, struct configfs_buffer *buffer)
+ {
+-	ssize_t count;
++	struct configfs_fragment *frag = to_frag(file);
++	ssize_t count = -ENOENT;
+ 
+ 	if (!buffer->page)
+ 		buffer->page = (char *) get_zeroed_page(GFP_KERNEL);
+ 	if (!buffer->page)
+ 		return -ENOMEM;
+ 
+-	count = buffer->attr->show(buffer->item, buffer->page);
++	down_read(&frag->frag_sem);
++	if (!frag->frag_dead)
++		count = buffer->attr->show(buffer->item, buffer->page);
++	up_read(&frag->frag_sem);
++
+ 	if (count < 0)
+ 		return count;
+ 	if (WARN_ON_ONCE(count > (ssize_t)SIMPLE_ATTR_SIZE))
+ 		return -EIO;
+-
+ 	buffer->needs_read_fill = 0;
+ 	buffer->count = count;
+ 	return 0;
+@@ -96,7 +106,7 @@ configfs_read_file(struct file *file, char __user *buf, size_t count, loff_t *pp
+ 
+ 	mutex_lock(&buffer->mutex);
+ 	if (buffer->needs_read_fill) {
+-		retval = fill_read_buffer(buffer);
++		retval = fill_read_buffer(file, buffer);
+ 		if (retval)
+ 			goto out;
+ 	}
+@@ -133,6 +143,7 @@ static ssize_t
+ configfs_read_bin_file(struct file *file, char __user *buf,
+ 		       size_t count, loff_t *ppos)
+ {
++	struct configfs_fragment *frag = to_frag(file);
+ 	struct configfs_buffer *buffer = file->private_data;
+ 	ssize_t retval = 0;
+ 	ssize_t len = min_t(size_t, count, PAGE_SIZE);
+@@ -148,7 +159,12 @@ configfs_read_bin_file(struct file *file, char __user *buf,
+ 
+ 	if (buffer->needs_read_fill) {
+ 		/* perform first read with buf == NULL to get extent */
+-		len = buffer->bin_attr->read(buffer->item, NULL, 0);
++		down_read(&frag->frag_sem);
++		if (!frag->frag_dead)
++			len = buffer->bin_attr->read(buffer->item, NULL, 0);
++		else
++			len = -ENOENT;
++		up_read(&frag->frag_sem);
+ 		if (len <= 0) {
+ 			retval = len;
+ 			goto out;
+@@ -168,8 +184,13 @@ configfs_read_bin_file(struct file *file, char __user *buf,
+ 		buffer->bin_buffer_size = len;
+ 
+ 		/* perform second read to fill buffer */
+-		len = buffer->bin_attr->read(buffer->item,
+-					     buffer->bin_buffer, len);
++		down_read(&frag->frag_sem);
++		if (!frag->frag_dead)
++			len = buffer->bin_attr->read(buffer->item,
++						     buffer->bin_buffer, len);
++		else
++			len = -ENOENT;
++		up_read(&frag->frag_sem);
+ 		if (len < 0) {
+ 			retval = len;
+ 			vfree(buffer->bin_buffer);
+@@ -220,9 +241,16 @@ fill_write_buffer(struct configfs_buffer * buffer, const char __user * buf, size
+ }
+ 
+ static int
+-flush_write_buffer(struct configfs_buffer *buffer, size_t count)
++flush_write_buffer(struct file *file, struct configfs_buffer *buffer, size_t count)
+ {
+-	return buffer->attr->store(buffer->item, buffer->page, count);
++	struct configfs_fragment *frag = to_frag(file);
++	int res = -ENOENT;
++
++	down_read(&frag->frag_sem);
++	if (!frag->frag_dead)
++		res = buffer->attr->store(buffer->item, buffer->page, count);
++	up_read(&frag->frag_sem);
++	return res;
+ }
+ 
+ 
+@@ -252,7 +280,7 @@ configfs_write_file(struct file *file, const char __user *buf, size_t count, lof
+ 	mutex_lock(&buffer->mutex);
+ 	len = fill_write_buffer(buffer, buf, count);
+ 	if (len > 0)
+-		len = flush_write_buffer(buffer, len);
++		len = flush_write_buffer(file, buffer, len);
+ 	if (len > 0)
+ 		*ppos += len;
+ 	mutex_unlock(&buffer->mutex);
+@@ -328,6 +356,7 @@ configfs_write_bin_file(struct file *file, const char __user *buf,
+ static int __configfs_open_file(struct inode *inode, struct file *file, int type)
+ {
+ 	struct dentry *dentry = file->f_path.dentry;
++	struct configfs_fragment *frag = to_frag(file);
+ 	struct configfs_attribute *attr;
+ 	struct configfs_buffer *buffer;
+ 	int error;
+@@ -337,8 +366,13 @@ static int __configfs_open_file(struct inode *inode, struct file *file, int type
+ 	if (!buffer)
+ 		goto out;
+ 
++	error = -ENOENT;
++	down_read(&frag->frag_sem);
++	if (unlikely(frag->frag_dead))
++		goto out_free_buffer;
++
+ 	error = -EINVAL;
+-	buffer->item = configfs_get_config_item(dentry->d_parent);
++	buffer->item = to_item(dentry->d_parent);
+ 	if (!buffer->item)
+ 		goto out_free_buffer;
+ 
+@@ -396,6 +430,7 @@ static int __configfs_open_file(struct inode *inode, struct file *file, int type
+ 	buffer->read_in_progress = false;
+ 	buffer->write_in_progress = false;
+ 	file->private_data = buffer;
++	up_read(&frag->frag_sem);
+ 	return 0;
+ 
+ out_put_module:
+@@ -403,6 +438,7 @@ static int __configfs_open_file(struct inode *inode, struct file *file, int type
+ out_put_item:
+ 	config_item_put(buffer->item);
+ out_free_buffer:
++	up_read(&frag->frag_sem);
+ 	kfree(buffer);
+ out:
+ 	return error;
+@@ -412,8 +448,6 @@ static int configfs_release(struct inode *inode, struct file *filp)
+ {
+ 	struct configfs_buffer *buffer = filp->private_data;
+ 
+-	if (buffer->item)
+-		config_item_put(buffer->item);
+ 	module_put(buffer->owner);
+ 	if (buffer->page)
+ 		free_page((unsigned long)buffer->page);
+@@ -439,12 +473,17 @@ static int configfs_release_bin_file(struct inode *inode, struct file *file)
+ 	buffer->read_in_progress = false;
+ 
+ 	if (buffer->write_in_progress) {
++		struct configfs_fragment *frag = to_frag(file);
+ 		buffer->write_in_progress = false;
+ 
+-		/* result of ->release() is ignored */
+-		buffer->bin_attr->write(buffer->item, buffer->bin_buffer,
+-				buffer->bin_buffer_size);
+-
++		down_read(&frag->frag_sem);
++		if (!frag->frag_dead) {
++			/* result of ->release() is ignored */
++			buffer->bin_attr->write(buffer->item,
++					buffer->bin_buffer,
++					buffer->bin_buffer_size);
++		}
++		up_read(&frag->frag_sem);
+ 		/* vfree on NULL is safe */
+ 		vfree(buffer->bin_buffer);
+ 		buffer->bin_buffer = NULL;
+
+commit 47320fbe11a6059ae502c9c16b668022fdb4cf76
+Author: Al Viro <viro@zeniv.linux.org.uk>
+Date:   Sun Aug 25 19:56:13 2019 -0400
+
+    configfs: new object reprsenting tree fragments
+    
+    Refcounted, hangs of configfs_dirent, created by operations that add
+    fragments to configfs tree (mkdir and configfs_register_{subsystem,group}).
+    Will be used in the next commit to provide exclusion between fragment
+    removal and ->show/->store calls.
+    
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+
+diff --git a/fs/configfs/file.c b/fs/configfs/file.c
+index eee6281a7b35..9d5e888df60b 100644
+--- a/fs/configfs/file.c
++++ b/fs/configfs/file.c
+@@ -488,7 +488,7 @@ int configfs_create_file(struct config_item * item, const struct configfs_attrib
+ 
+ 	inode_lock_nested(d_inode(dir), I_MUTEX_NORMAL);
+ 	error = configfs_make_dirent(parent_sd, NULL, (void *) attr, mode,
+-				     CONFIGFS_ITEM_ATTR);
++				     CONFIGFS_ITEM_ATTR, parent_sd->s_frag);
+ 	inode_unlock(d_inode(dir));
+ 
+ 	return error;
+@@ -510,7 +510,7 @@ int configfs_create_bin_file(struct config_item *item,
+ 
+ 	inode_lock_nested(dir->d_inode, I_MUTEX_NORMAL);
+ 	error = configfs_make_dirent(parent_sd, NULL, (void *) bin_attr, mode,
+-				     CONFIGFS_ITEM_BIN_ATTR);
++				     CONFIGFS_ITEM_BIN_ATTR, parent_sd->s_frag);
+ 	inode_unlock(dir->d_inode);
+ 
+ 	return error;
+
+commit ff4dd081977da56566a848f071aed8fa92d604a1
+Author: Al Viro <viro@zeniv.linux.org.uk>
+Date:   Fri Aug 30 11:30:03 2019 -0400
+
+    configfs: stash the data we need into configfs_buffer at open time
+    
+    simplifies the ->read()/->write()/->release() instances nicely
+    
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+
+diff --git a/fs/configfs/file.c b/fs/configfs/file.c
+index 61e4db4390a1..eee6281a7b35 100644
+--- a/fs/configfs/file.c
++++ b/fs/configfs/file.c
+@@ -39,24 +39,18 @@ struct configfs_buffer {
+ 	bool			write_in_progress;
+ 	char			*bin_buffer;
+ 	int			bin_buffer_size;
++	int			cb_max_size;
++	struct config_item	*item;
++	struct module		*owner;
++	union {
++		struct configfs_attribute	*attr;
++		struct configfs_bin_attribute	*bin_attr;
++	};
+ };
+ 
+ 
+-/**
+- *	fill_read_buffer - allocate and fill buffer from item.
+- *	@dentry:	dentry pointer.
+- *	@buffer:	data buffer for file.
+- *
+- *	Allocate @buffer->page, if it hasn't been already, then call the
+- *	config_item's show() method to fill the buffer with this attribute's
+- *	data.
+- *	This is called only once, on the file's first read.
+- */
+-static int fill_read_buffer(struct dentry * dentry, struct configfs_buffer * buffer)
++static int fill_read_buffer(struct configfs_buffer * buffer)
+ {
+-	struct configfs_attribute * attr = to_attr(dentry);
+-	struct config_item * item = to_item(dentry->d_parent);
+-	int ret = 0;
+ 	ssize_t count;
+ 
+ 	if (!buffer->page)
+@@ -64,15 +58,15 @@ static int fill_read_buffer(struct dentry * dentry, struct configfs_buffer * buf
+ 	if (!buffer->page)
+ 		return -ENOMEM;
+ 
+-	count = attr->show(item, buffer->page);
++	count = buffer->attr->show(buffer->item, buffer->page);
++	if (count < 0)
++		return count;
++	if (WARN_ON_ONCE(count > (ssize_t)SIMPLE_ATTR_SIZE))
++		return -EIO;
+ 
+-	BUG_ON(count > (ssize_t)SIMPLE_ATTR_SIZE);
+-	if (count >= 0) {
+-		buffer->needs_read_fill = 0;
+-		buffer->count = count;
+-	} else
+-		ret = count;
+-	return ret;
++	buffer->needs_read_fill = 0;
++	buffer->count = count;
++	return 0;
+ }
+ 
+ /**
+@@ -97,12 +91,13 @@ static int fill_read_buffer(struct dentry * dentry, struct configfs_buffer * buf
+ static ssize_t
+ configfs_read_file(struct file *file, char __user *buf, size_t count, loff_t *ppos)
+ {
+-	struct configfs_buffer * buffer = file->private_data;
++	struct configfs_buffer *buffer = file->private_data;
+ 	ssize_t retval = 0;
+ 
+ 	mutex_lock(&buffer->mutex);
+ 	if (buffer->needs_read_fill) {
+-		if ((retval = fill_read_buffer(file->f_path.dentry,buffer)))
++		retval = fill_read_buffer(buffer);
++		if (retval)
+ 			goto out;
+ 	}
+ 	pr_debug("%s: count = %zd, ppos = %lld, buf = %s\n",
+@@ -139,9 +134,6 @@ configfs_read_bin_file(struct file *file, char __user *buf,
+ 		       size_t count, loff_t *ppos)
+ {
+ 	struct configfs_buffer *buffer = file->private_data;
+-	struct dentry *dentry = file->f_path.dentry;
+-	struct config_item *item = to_item(dentry->d_parent);
+-	struct configfs_bin_attribute *bin_attr = to_bin_attr(dentry);
+ 	ssize_t retval = 0;
+ 	ssize_t len = min_t(size_t, count, PAGE_SIZE);
+ 
+@@ -156,14 +148,14 @@ configfs_read_bin_file(struct file *file, char __user *buf,
+ 
+ 	if (buffer->needs_read_fill) {
+ 		/* perform first read with buf == NULL to get extent */
+-		len = bin_attr->read(item, NULL, 0);
++		len = buffer->bin_attr->read(buffer->item, NULL, 0);
+ 		if (len <= 0) {
+ 			retval = len;
+ 			goto out;
+ 		}
+ 
+ 		/* do not exceed the maximum value */
+-		if (bin_attr->cb_max_size && len > bin_attr->cb_max_size) {
++		if (buffer->cb_max_size && len > buffer->cb_max_size) {
+ 			retval = -EFBIG;
+ 			goto out;
+ 		}
+@@ -176,7 +168,8 @@ configfs_read_bin_file(struct file *file, char __user *buf,
+ 		buffer->bin_buffer_size = len;
+ 
+ 		/* perform second read to fill buffer */
+-		len = bin_attr->read(item, buffer->bin_buffer, len);
++		len = buffer->bin_attr->read(buffer->item,
++					     buffer->bin_buffer, len);
+ 		if (len < 0) {
+ 			retval = len;
+ 			vfree(buffer->bin_buffer);
+@@ -226,25 +219,10 @@ fill_write_buffer(struct configfs_buffer * buffer, const char __user * buf, size
+ 	return error ? -EFAULT : count;
+ }
+ 
+-
+-/**
+- *	flush_write_buffer - push buffer to config_item.
+- *	@dentry:	dentry to the attribute
+- *	@buffer:	data buffer for file.
+- *	@count:		number of bytes
+- *
+- *	Get the correct pointers for the config_item and the attribute we're
+- *	dealing with, then call the store() method for the attribute,
+- *	passing the buffer that we acquired in fill_write_buffer().
+- */
+-
+ static int
+-flush_write_buffer(struct dentry * dentry, struct configfs_buffer * buffer, size_t count)
++flush_write_buffer(struct configfs_buffer *buffer, size_t count)
+ {
+-	struct configfs_attribute * attr = to_attr(dentry);
+-	struct config_item * item = to_item(dentry->d_parent);
+-
+-	return attr->store(item, buffer->page, count);
++	return buffer->attr->store(buffer->item, buffer->page, count);
+ }
+ 
+ 
+@@ -268,13 +246,13 @@ flush_write_buffer(struct dentry * dentry, struct configfs_buffer * buffer, size
+ static ssize_t
+ configfs_write_file(struct file *file, const char __user *buf, size_t count, loff_t *ppos)
+ {
+-	struct configfs_buffer * buffer = file->private_data;
++	struct configfs_buffer *buffer = file->private_data;
+ 	ssize_t len;
+ 
+ 	mutex_lock(&buffer->mutex);
+ 	len = fill_write_buffer(buffer, buf, count);
+ 	if (len > 0)
+-		len = flush_write_buffer(file->f_path.dentry, buffer, len);
++		len = flush_write_buffer(buffer, len);
+ 	if (len > 0)
+ 		*ppos += len;
+ 	mutex_unlock(&buffer->mutex);
+@@ -299,8 +277,6 @@ configfs_write_bin_file(struct file *file, const char __user *buf,
+ 			size_t count, loff_t *ppos)
+ {
+ 	struct configfs_buffer *buffer = file->private_data;
+-	struct dentry *dentry = file->f_path.dentry;
+-	struct configfs_bin_attribute *bin_attr = to_bin_attr(dentry);
+ 	void *tbuf = NULL;
+ 	ssize_t len;
+ 
+@@ -316,8 +292,8 @@ configfs_write_bin_file(struct file *file, const char __user *buf,
+ 	/* buffer grows? */
+ 	if (*ppos + count > buffer->bin_buffer_size) {
+ 
+-		if (bin_attr->cb_max_size &&
+-			*ppos + count > bin_attr->cb_max_size) {
++		if (buffer->cb_max_size &&
++			*ppos + count > buffer->cb_max_size) {
+ 			len = -EFBIG;
+ 			goto out;
+ 		}
+@@ -349,31 +325,45 @@ configfs_write_bin_file(struct file *file, const char __user *buf,
+ 	return len;
+ }
+ 
+-static int check_perm(struct inode * inode, struct file * file, int type)
++static int __configfs_open_file(struct inode *inode, struct file *file, int type)
+ {
+-	struct config_item *item = configfs_get_config_item(file->f_path.dentry->d_parent);
+-	struct configfs_attribute * attr = to_attr(file->f_path.dentry);
+-	struct configfs_bin_attribute *bin_attr = NULL;
+-	struct configfs_buffer * buffer;
+-	struct configfs_item_operations * ops = NULL;
+-	int error = 0;
++	struct dentry *dentry = file->f_path.dentry;
++	struct configfs_attribute *attr;
++	struct configfs_buffer *buffer;
++	int error;
+ 
+-	if (!item || !attr)
+-		goto Einval;
++	error = -ENOMEM;
++	buffer = kzalloc(sizeof(struct configfs_buffer), GFP_KERNEL);
++	if (!buffer)
++		goto out;
+ 
+-	if (type & CONFIGFS_ITEM_BIN_ATTR)
+-		bin_attr = to_bin_attr(file->f_path.dentry);
++	error = -EINVAL;
++	buffer->item = configfs_get_config_item(dentry->d_parent);
++	if (!buffer->item)
++		goto out_free_buffer;
++
++	attr = to_attr(dentry);
++	if (!attr)
++		goto out_put_item;
++
++	if (type & CONFIGFS_ITEM_BIN_ATTR) {
++		buffer->bin_attr = to_bin_attr(dentry);
++		buffer->cb_max_size = buffer->bin_attr->cb_max_size;
++	} else {
++		buffer->attr = attr;
++	}
+ 
++	buffer->owner = attr->ca_owner;
+ 	/* Grab the module reference for this attribute if we have one */
+-	if (!try_module_get(attr->ca_owner)) {
+-		error = -ENODEV;
+-		goto Done;
+-	}
++	error = -ENODEV;
++	if (!try_module_get(buffer->owner))
++		goto out_put_item;
+ 
+-	if (item->ci_type)
+-		ops = item->ci_type->ct_item_ops;
+-	else
+-		goto Eaccess;
++	error = -EACCES;
++	if (!buffer->item->ci_type)
++		goto out_put_module;
++
++	buffer->ops = buffer->item->ci_type->ct_item_ops;
+ 
+ 	/* File needs write support.
+ 	 * The inode's perms must say it's ok,
+@@ -381,13 +371,11 @@ static int check_perm(struct inode * inode, struct file * file, int type)
+ 	 */
+ 	if (file->f_mode & FMODE_WRITE) {
+ 		if (!(inode->i_mode & S_IWUGO))
+-			goto Eaccess;
+-
++			goto out_put_module;
+ 		if ((type & CONFIGFS_ITEM_ATTR) && !attr->store)
+-			goto Eaccess;
+-
+-		if ((type & CONFIGFS_ITEM_BIN_ATTR) && !bin_attr->write)
+-			goto Eaccess;
++			goto out_put_module;
++		if ((type & CONFIGFS_ITEM_BIN_ATTR) && !buffer->bin_attr->write)
++			goto out_put_module;
+ 	}
+ 
+ 	/* File needs read support.
+@@ -396,90 +384,65 @@ static int check_perm(struct inode * inode, struct file * file, int type)
+ 	 */
+ 	if (file->f_mode & FMODE_READ) {
+ 		if (!(inode->i_mode & S_IRUGO))
+-			goto Eaccess;
+-
++			goto out_put_module;
+ 		if ((type & CONFIGFS_ITEM_ATTR) && !attr->show)
+-			goto Eaccess;
+-
+-		if ((type & CONFIGFS_ITEM_BIN_ATTR) && !bin_attr->read)
+-			goto Eaccess;
++			goto out_put_module;
++		if ((type & CONFIGFS_ITEM_BIN_ATTR) && !buffer->bin_attr->read)
++			goto out_put_module;
+ 	}
+ 
+-	/* No error? Great, allocate a buffer for the file, and store it
+-	 * it in file->private_data for easy access.
+-	 */
+-	buffer = kzalloc(sizeof(struct configfs_buffer),GFP_KERNEL);
+-	if (!buffer) {
+-		error = -ENOMEM;
+-		goto Enomem;
+-	}
+ 	mutex_init(&buffer->mutex);
+ 	buffer->needs_read_fill = 1;
+ 	buffer->read_in_progress = false;
+ 	buffer->write_in_progress = false;
+-	buffer->ops = ops;
+ 	file->private_data = buffer;
+-	goto Done;
++	return 0;
+ 
+- Einval:
+-	error = -EINVAL;
+-	goto Done;
+- Eaccess:
+-	error = -EACCES;
+- Enomem:
+-	module_put(attr->ca_owner);
+- Done:
+-	if (error && item)
+-		config_item_put(item);
++out_put_module:
++	module_put(buffer->owner);
++out_put_item:
++	config_item_put(buffer->item);
++out_free_buffer:
++	kfree(buffer);
++out:
+ 	return error;
+ }
+ 
+ static int configfs_release(struct inode *inode, struct file *filp)
+ {
+-	struct config_item * item = to_item(filp->f_path.dentry->d_parent);
+-	struct configfs_attribute * attr = to_attr(filp->f_path.dentry);
+-	struct module * owner = attr->ca_owner;
+-	struct configfs_buffer * buffer = filp->private_data;
+-
+-	if (item)
+-		config_item_put(item);
+-	/* After this point, attr should not be accessed. */
+-	module_put(owner);
+-
+-	if (buffer) {
+-		if (buffer->page)
+-			free_page((unsigned long)buffer->page);
+-		mutex_destroy(&buffer->mutex);
+-		kfree(buffer);
+-	}
++	struct configfs_buffer *buffer = filp->private_data;
++
++	if (buffer->item)
++		config_item_put(buffer->item);
++	module_put(buffer->owner);
++	if (buffer->page)
++		free_page((unsigned long)buffer->page);
++	mutex_destroy(&buffer->mutex);
++	kfree(buffer);
+ 	return 0;
+ }
+ 
+ static int configfs_open_file(struct inode *inode, struct file *filp)
+ {
+-	return check_perm(inode, filp, CONFIGFS_ITEM_ATTR);
++	return __configfs_open_file(inode, filp, CONFIGFS_ITEM_ATTR);
+ }
+ 
+ static int configfs_open_bin_file(struct inode *inode, struct file *filp)
+ {
+-	return check_perm(inode, filp, CONFIGFS_ITEM_BIN_ATTR);
++	return __configfs_open_file(inode, filp, CONFIGFS_ITEM_BIN_ATTR);
+ }
+ 
+-static int configfs_release_bin_file(struct inode *inode, struct file *filp)
++static int configfs_release_bin_file(struct inode *inode, struct file *file)
+ {
+-	struct configfs_buffer *buffer = filp->private_data;
+-	struct dentry *dentry = filp->f_path.dentry;
+-	struct config_item *item = to_item(dentry->d_parent);
+-	struct configfs_bin_attribute *bin_attr = to_bin_attr(dentry);
+-	ssize_t len = 0;
+-	int ret;
++	struct configfs_buffer *buffer = file->private_data;
+ 
+ 	buffer->read_in_progress = false;
+ 
+ 	if (buffer->write_in_progress) {
+ 		buffer->write_in_progress = false;
+ 
+-		len = bin_attr->write(item, buffer->bin_buffer,
++		/* result of ->release() is ignored */
++		buffer->bin_attr->write(buffer->item, buffer->bin_buffer,
+ 				buffer->bin_buffer_size);
+ 
+ 		/* vfree on NULL is safe */
+@@ -489,10 +452,8 @@ static int configfs_release_bin_file(struct inode *inode, struct file *filp)
+ 		buffer->needs_read_fill = 1;
+ 	}
+ 
+-	ret = configfs_release(inode, filp);
+-	if (len < 0)
+-		return len;
+-	return ret;
++	configfs_release(inode, file);
++	return 0;
+ }
+ 
+ 
+
+commit 328970de0e39d596e0ef44080e7642224b29ecde
+Author: Thomas Gleixner <tglx@linutronix.de>
+Date:   Fri May 24 12:04:05 2019 +0200
+
+    treewide: Replace GPLv2 boilerplate/reference with SPDX - rule 145
+    
+    Based on 1 normalized pattern(s):
+    
+      this program is free software you can redistribute it and or modify
+      it under the terms of the gnu general public license as published by
+      the free software foundation either version 2 of the license or at
+      your option any later version this program is distributed in the
+      hope that it will be useful but without any warranty without even
+      the implied warranty of merchantability or fitness for a particular
+      purpose see the gnu general public license for more details you
+      should have received a copy of the gnu general public license along
+      with this program if not write to the free software foundation inc
+      59 temple place suite 330 boston ma 021110 1307 usa
+    
+    extracted by the scancode license scanner the SPDX license identifier
+    
+      GPL-2.0-or-later
+    
+    has been chosen to replace the boilerplate/reference in 84 file(s).
+    
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Reviewed-by: Richard Fontana <rfontana@redhat.com>
+    Reviewed-by: Allison Randal <allison@lohutok.net>
+    Reviewed-by: Kate Stewart <kstewart@linuxfoundation.org>
+    Cc: linux-spdx@vger.kernel.org
+    Link: https://lkml.kernel.org/r/20190524100844.756442981@linutronix.de
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/fs/configfs/file.c b/fs/configfs/file.c
+index 62580dba3552..61e4db4390a1 100644
+--- a/fs/configfs/file.c
++++ b/fs/configfs/file.c
+@@ -1,23 +1,9 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
+ /* -*- mode: c; c-basic-offset: 8; -*-
+  * vim: noexpandtab sw=8 ts=8 sts=0:
+  *
+  * file.c - operations for regular (text) files.
+  *
+- * This program is free software; you can redistribute it and/or
+- * modify it under the terms of the GNU General Public
+- * License as published by the Free Software Foundation; either
+- * version 2 of the License, or (at your option) any later version.
+- *
+- * This program is distributed in the hope that it will be useful,
+- * but WITHOUT ANY WARRANTY; without even the implied warranty of
+- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+- * General Public License for more details.
+- *
+- * You should have received a copy of the GNU General Public
+- * License along with this program; if not, write to the
+- * Free Software Foundation, Inc., 59 Temple Place - Suite 330,
+- * Boston, MA 021110-1307, USA.
+- *
+  * Based on sysfs:
+  * 	sysfs is Copyright (C) 2001, 2002, 2003 Patrick Mochel
+  *
+
+commit 3f6928c347707a65cee10a9f54b85ad5fb078b3f
+Author: Thomas Meyer <thomas@m3y3r.de>
+Date:   Sat Oct 7 16:02:21 2017 +0200
+
+    configfs: Fix bool initialization/comparison
+    
+    Bool initializations should use true and false. Bool tests don't need
+    comparisons.
+    
+    Signed-off-by: Thomas Meyer <thomas@m3y3r.de>
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+
+diff --git a/fs/configfs/file.c b/fs/configfs/file.c
+index 39da1103d341..62580dba3552 100644
+--- a/fs/configfs/file.c
++++ b/fs/configfs/file.c
+@@ -166,7 +166,7 @@ configfs_read_bin_file(struct file *file, char __user *buf,
+ 		retval = -ETXTBSY;
+ 		goto out;
+ 	}
+-	buffer->read_in_progress = 1;
++	buffer->read_in_progress = true;
+ 
+ 	if (buffer->needs_read_fill) {
+ 		/* perform first read with buf == NULL to get extent */
+@@ -325,7 +325,7 @@ configfs_write_bin_file(struct file *file, const char __user *buf,
+ 		len = -ETXTBSY;
+ 		goto out;
+ 	}
+-	buffer->write_in_progress = 1;
++	buffer->write_in_progress = true;
+ 
+ 	/* buffer grows? */
+ 	if (*ppos + count > buffer->bin_buffer_size) {
+@@ -429,8 +429,8 @@ static int check_perm(struct inode * inode, struct file * file, int type)
+ 	}
+ 	mutex_init(&buffer->mutex);
+ 	buffer->needs_read_fill = 1;
+-	buffer->read_in_progress = 0;
+-	buffer->write_in_progress = 0;
++	buffer->read_in_progress = false;
++	buffer->write_in_progress = false;
+ 	buffer->ops = ops;
+ 	file->private_data = buffer;
+ 	goto Done;
+@@ -488,10 +488,10 @@ static int configfs_release_bin_file(struct inode *inode, struct file *filp)
+ 	ssize_t len = 0;
+ 	int ret;
+ 
+-	buffer->read_in_progress = 0;
++	buffer->read_in_progress = false;
+ 
+ 	if (buffer->write_in_progress) {
+-		buffer->write_in_progress = 0;
++		buffer->write_in_progress = false;
+ 
+ 		len = bin_attr->write(item, buffer->bin_buffer,
+ 				buffer->bin_buffer_size);
+
+commit 7c0f6ba682b9c7632072ffbedf8d328c8f3c42ba
+Author: Linus Torvalds <torvalds@linux-foundation.org>
+Date:   Sat Dec 24 11:46:01 2016 -0800
+
+    Replace <asm/uaccess.h> with <linux/uaccess.h> globally
+    
+    This was entirely automated, using the script by Al:
+    
+      PATT='^[[:blank:]]*#[[:blank:]]*include[[:blank:]]*<asm/uaccess.h>'
+      sed -i -e "s!$PATT!#include <linux/uaccess.h>!" \
+            $(git grep -l "$PATT"|grep -v ^include/linux/uaccess.h)
+    
+    to do the replacement at the end of the merge window.
+    
+    Requested-by: Al Viro <viro@zeniv.linux.org.uk>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/fs/configfs/file.c b/fs/configfs/file.c
+index 2c6312db8516..39da1103d341 100644
+--- a/fs/configfs/file.c
++++ b/fs/configfs/file.c
+@@ -29,7 +29,7 @@
+ #include <linux/slab.h>
+ #include <linux/mutex.h>
+ #include <linux/vmalloc.h>
+-#include <asm/uaccess.h>
++#include <linux/uaccess.h>
+ 
+ #include <linux/configfs.h>
+ #include "configfs_internal.h"
+
+commit 42857cf512cb34c2c8cb50f1e766689d979d64e0
+Author: Phil Turnbull <phil.turnbull@oracle.com>
+Date:   Thu Sep 15 12:20:12 2016 -0400
+
+    configfs: Return -EFBIG from configfs_write_bin_file.
+    
+    The check for writing more than cb_max_size bytes does not 'goto out' so
+    it is a no-op which allows users to vmalloc an arbitrary amount.
+    
+    Fixes: 03607ace807b ("configfs: implement binary attributes")
+    Cc: stable@kernel.org
+    Signed-off-by: Phil Turnbull <phil.turnbull@oracle.com>
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+
+diff --git a/fs/configfs/file.c b/fs/configfs/file.c
+index c30cf49b69d2..2c6312db8516 100644
+--- a/fs/configfs/file.c
++++ b/fs/configfs/file.c
+@@ -333,6 +333,7 @@ configfs_write_bin_file(struct file *file, const char __user *buf,
+ 		if (bin_attr->cb_max_size &&
+ 			*ppos + count > bin_attr->cb_max_size) {
+ 			len = -EFBIG;
++			goto out;
+ 		}
+ 
+ 		tbuf = vmalloc(*ppos + count);
+
+commit 3dc3afadeb0403fd967b97ee282ab9053d36da2b
+Author: Tal Shorer <tal.shorer@gmail.com>
+Date:   Fri Jul 1 12:28:57 2016 +0300
+
+    configfs: don't set buffer_needs_fill to zero if show() returns error
+    
+    A confgifs attribute's show() callback is called once the first time
+    the user attempts to read from it. If it returns an error, that
+    error is returned to the user. However, the open file's
+    buffer_needs_fill is still set to zero and consecutive read() calls
+    will find an empty buffer that doesn't need filling and return 0 to
+    the user. This could give the user the wrong impression that the
+    attribute was read successfully.
+    
+    Fix this by not setting buffer_needs_fill if show() returns an error,
+    making consecutive read() calls call show() again and either get an
+    error again or get data.
+    
+    Signed-off-by: Tal Shorer <tal.shorer@gmail.com>
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+
+diff --git a/fs/configfs/file.c b/fs/configfs/file.c
+index bbc1252a59f5..c30cf49b69d2 100644
+--- a/fs/configfs/file.c
++++ b/fs/configfs/file.c
+@@ -80,11 +80,11 @@ static int fill_read_buffer(struct dentry * dentry, struct configfs_buffer * buf
+ 
+ 	count = attr->show(item, buffer->page);
+ 
+-	buffer->needs_read_fill = 0;
+ 	BUG_ON(count > (ssize_t)SIMPLE_ATTR_SIZE);
+-	if (count >= 0)
++	if (count >= 0) {
++		buffer->needs_read_fill = 0;
+ 		buffer->count = count;
+-	else
++	} else
+ 		ret = count;
+ 	return ret;
+ }
+
+commit f8608985f851c917b3884b692d8e326b0210d34e
+Author: Marek Vasut <marex@denx.de>
+Date:   Wed May 18 16:16:51 2016 +0200
+
+    configfs: Remove ppos increment in configfs_write_bin_file
+    
+    The simple_write_to_buffer() already increments the @ppos on success,
+    see fs/libfs.c simple_write_to_buffer() comment:
+    
+    "
+    On success, the number of bytes written is returned and the offset @ppos
+    advanced by this number, or negative value is returned on error.
+    "
+    
+    If the configfs_write_bin_file() is invoked with @count smaller than the
+    total length of the written binary file, it will be invoked multiple times.
+    Since configfs_write_bin_file() increments @ppos on success, after calling
+    simple_write_to_buffer(), the @ppos is incremented twice.
+    
+    Subsequent invocation of configfs_write_bin_file() will result in the next
+    piece of data being written to the offset twice as long as the length of
+    the previous write, thus creating buffer with "holes" in it.
+    
+    The simple testcase using DTO follows:
+      $ mkdir /sys/kernel/config/device-tree/overlays/1
+      $ dd bs=1 if=foo.dtbo of=/sys/kernel/config/device-tree/overlays/1/dtbo
+    Without this patch, the testcase will result in twice as big buffer in the
+    kernel, which is then passed to the cfs_overlay_item_dtbo_write() .
+    
+    Signed-off-by: Marek Vasut <marex@denx.de>
+    Cc: Geert Uytterhoeven <geert+renesas@glider.be>
+    Cc: Christoph Hellwig <hch@lst.de>
+    Cc: Pantelis Antoniou <pantelis.antoniou@konsulko.com>
+
+diff --git a/fs/configfs/file.c b/fs/configfs/file.c
+index 33b7ee34eda5..bbc1252a59f5 100644
+--- a/fs/configfs/file.c
++++ b/fs/configfs/file.c
+@@ -357,8 +357,6 @@ configfs_write_bin_file(struct file *file, const char __user *buf,
+ 
+ 	len = simple_write_to_buffer(buffer->bin_buffer,
+ 			buffer->bin_buffer_size, ppos, buf, count);
+-	if (len > 0)
+-		*ppos += len;
+ out:
+ 	mutex_unlock(&buffer->mutex);
+ 	return len;
+
+commit 5955102c9984fa081b2d570cfac75c97eecf8f3b
+Author: Al Viro <viro@zeniv.linux.org.uk>
+Date:   Fri Jan 22 15:40:57 2016 -0500
+
+    wrappers for ->i_mutex access
+    
+    parallel to mutex_{lock,unlock,trylock,is_locked,lock_nested},
+    inode_foo(inode) being mutex_foo(&inode->i_mutex).
+    
+    Please, use those for access to ->i_mutex; over the coming cycle
+    ->i_mutex will become rwsem, with ->lookup() done with it held
+    only shared.
+    
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/fs/configfs/file.c b/fs/configfs/file.c
+index 3687187c8ea5..33b7ee34eda5 100644
+--- a/fs/configfs/file.c
++++ b/fs/configfs/file.c
+@@ -540,10 +540,10 @@ int configfs_create_file(struct config_item * item, const struct configfs_attrib
+ 	umode_t mode = (attr->ca_mode & S_IALLUGO) | S_IFREG;
+ 	int error = 0;
+ 
+-	mutex_lock_nested(&d_inode(dir)->i_mutex, I_MUTEX_NORMAL);
++	inode_lock_nested(d_inode(dir), I_MUTEX_NORMAL);
+ 	error = configfs_make_dirent(parent_sd, NULL, (void *) attr, mode,
+ 				     CONFIGFS_ITEM_ATTR);
+-	mutex_unlock(&d_inode(dir)->i_mutex);
++	inode_unlock(d_inode(dir));
+ 
+ 	return error;
+ }
+@@ -562,10 +562,10 @@ int configfs_create_bin_file(struct config_item *item,
+ 	umode_t mode = (bin_attr->cb_attr.ca_mode & S_IALLUGO) | S_IFREG;
+ 	int error = 0;
+ 
+-	mutex_lock_nested(&dir->d_inode->i_mutex, I_MUTEX_NORMAL);
++	inode_lock_nested(dir->d_inode, I_MUTEX_NORMAL);
+ 	error = configfs_make_dirent(parent_sd, NULL, (void *) bin_attr, mode,
+ 				     CONFIGFS_ITEM_BIN_ATTR);
+-	mutex_unlock(&dir->d_inode->i_mutex);
++	inode_unlock(dir->d_inode);
+ 
+ 	return error;
+ }
+
+commit 03607ace807b414eab46323c794b6fb8fcc2d48c
+Author: Pantelis Antoniou <pantelis.antoniou@konsulko.com>
+Date:   Thu Oct 22 23:30:04 2015 +0300
+
+    configfs: implement binary attributes
+    
+    ConfigFS lacked binary attributes up until now. This patch
+    introduces support for binary attributes in a somewhat similar
+    manner of sysfs binary attributes albeit with changes that
+    fit the configfs usage model.
+    
+    Problems that configfs binary attributes fix are everything that
+    requires a binary blob as part of the configuration of a resource,
+    such as bitstream loading for FPGAs, DTBs for dynamically created
+    devices etc.
+    
+    Look at Documentation/filesystems/configfs/configfs.txt for internals
+    and howto use them.
+    
+    This patch is against linux-next as of today that contains
+    Christoph's configfs rework.
+    
+    Signed-off-by: Pantelis Antoniou <pantelis.antoniou@konsulko.com>
+    [hch: folded a fix from Geert Uytterhoeven <geert+renesas@glider.be>]
+    [hch: a few tiny updates based on review feedback]
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+
+diff --git a/fs/configfs/file.c b/fs/configfs/file.c
+index d39099ea7df7..3687187c8ea5 100644
+--- a/fs/configfs/file.c
++++ b/fs/configfs/file.c
+@@ -28,6 +28,7 @@
+ #include <linux/module.h>
+ #include <linux/slab.h>
+ #include <linux/mutex.h>
++#include <linux/vmalloc.h>
+ #include <asm/uaccess.h>
+ 
+ #include <linux/configfs.h>
+@@ -48,6 +49,10 @@ struct configfs_buffer {
+ 	struct configfs_item_operations	* ops;
+ 	struct mutex		mutex;
+ 	int			needs_read_fill;
++	bool			read_in_progress;
++	bool			write_in_progress;
++	char			*bin_buffer;
++	int			bin_buffer_size;
+ };
+ 
+ 
+@@ -123,6 +128,87 @@ configfs_read_file(struct file *file, char __user *buf, size_t count, loff_t *pp
+ 	return retval;
+ }
+ 
++/**
++ *	configfs_read_bin_file - read a binary attribute.
++ *	@file:	file pointer.
++ *	@buf:	buffer to fill.
++ *	@count:	number of bytes to read.
++ *	@ppos:	starting offset in file.
++ *
++ *	Userspace wants to read a binary attribute file. The attribute
++ *	descriptor is in the file's ->d_fsdata. The target item is in the
++ *	directory's ->d_fsdata.
++ *
++ *	We check whether we need to refill the buffer. If so we will
++ *	call the attributes' attr->read() twice. The first time we
++ *	will pass a NULL as a buffer pointer, which the attributes' method
++ *	will use to return the size of the buffer required. If no error
++ *	occurs we will allocate the buffer using vmalloc and call
++ *	attr->read() again passing that buffer as an argument.
++ *	Then we just copy to user-space using simple_read_from_buffer.
++ */
++
++static ssize_t
++configfs_read_bin_file(struct file *file, char __user *buf,
++		       size_t count, loff_t *ppos)
++{
++	struct configfs_buffer *buffer = file->private_data;
++	struct dentry *dentry = file->f_path.dentry;
++	struct config_item *item = to_item(dentry->d_parent);
++	struct configfs_bin_attribute *bin_attr = to_bin_attr(dentry);
++	ssize_t retval = 0;
++	ssize_t len = min_t(size_t, count, PAGE_SIZE);
++
++	mutex_lock(&buffer->mutex);
++
++	/* we don't support switching read/write modes */
++	if (buffer->write_in_progress) {
++		retval = -ETXTBSY;
++		goto out;
++	}
++	buffer->read_in_progress = 1;
++
++	if (buffer->needs_read_fill) {
++		/* perform first read with buf == NULL to get extent */
++		len = bin_attr->read(item, NULL, 0);
++		if (len <= 0) {
++			retval = len;
++			goto out;
++		}
++
++		/* do not exceed the maximum value */
++		if (bin_attr->cb_max_size && len > bin_attr->cb_max_size) {
++			retval = -EFBIG;
++			goto out;
++		}
++
++		buffer->bin_buffer = vmalloc(len);
++		if (buffer->bin_buffer == NULL) {
++			retval = -ENOMEM;
++			goto out;
++		}
++		buffer->bin_buffer_size = len;
++
++		/* perform second read to fill buffer */
++		len = bin_attr->read(item, buffer->bin_buffer, len);
++		if (len < 0) {
++			retval = len;
++			vfree(buffer->bin_buffer);
++			buffer->bin_buffer_size = 0;
++			buffer->bin_buffer = NULL;
++			goto out;
++		}
++
++		buffer->needs_read_fill = 0;
++	}
++
++	retval = simple_read_from_buffer(buf, count, ppos, buffer->bin_buffer,
++					buffer->bin_buffer_size);
++out:
++	mutex_unlock(&buffer->mutex);
++	return retval;
++}
++
+ 
+ /**
+  *	fill_write_buffer - copy buffer from userspace.
+@@ -209,10 +295,80 @@ configfs_write_file(struct file *file, const char __user *buf, size_t count, lof
+ 	return len;
+ }
+ 
+-static int check_perm(struct inode * inode, struct file * file)
++/**
++ *	configfs_write_bin_file - write a binary attribute.
++ *	@file:	file pointer
++ *	@buf:	data to write
++ *	@count:	number of bytes
++ *	@ppos:	starting offset
++ *
++ *	Writing to a binary attribute file is similar to a normal read.
++ *	We buffer the consecutive writes (binary attribute files do not
++ *	support lseek) in a continuously growing buffer, but we don't
++ *	commit until the close of the file.
++ */
++
++static ssize_t
++configfs_write_bin_file(struct file *file, const char __user *buf,
++			size_t count, loff_t *ppos)
++{
++	struct configfs_buffer *buffer = file->private_data;
++	struct dentry *dentry = file->f_path.dentry;
++	struct configfs_bin_attribute *bin_attr = to_bin_attr(dentry);
++	void *tbuf = NULL;
++	ssize_t len;
++
++	mutex_lock(&buffer->mutex);
++
++	/* we don't support switching read/write modes */
++	if (buffer->read_in_progress) {
++		len = -ETXTBSY;
++		goto out;
++	}
++	buffer->write_in_progress = 1;
++
++	/* buffer grows? */
++	if (*ppos + count > buffer->bin_buffer_size) {
++
++		if (bin_attr->cb_max_size &&
++			*ppos + count > bin_attr->cb_max_size) {
++			len = -EFBIG;
++		}
++
++		tbuf = vmalloc(*ppos + count);
++		if (tbuf == NULL) {
++			len = -ENOMEM;
++			goto out;
++		}
++
++		/* copy old contents */
++		if (buffer->bin_buffer) {
++			memcpy(tbuf, buffer->bin_buffer,
++				buffer->bin_buffer_size);
++			vfree(buffer->bin_buffer);
++		}
++
++		/* clear the new area */
++		memset(tbuf + buffer->bin_buffer_size, 0,
++			*ppos + count - buffer->bin_buffer_size);
++		buffer->bin_buffer = tbuf;
++		buffer->bin_buffer_size = *ppos + count;
++	}
++
++	len = simple_write_to_buffer(buffer->bin_buffer,
++			buffer->bin_buffer_size, ppos, buf, count);
++	if (len > 0)
++		*ppos += len;
++out:
++	mutex_unlock(&buffer->mutex);
++	return len;
++}
++
++static int check_perm(struct inode * inode, struct file * file, int type)
+ {
+ 	struct config_item *item = configfs_get_config_item(file->f_path.dentry->d_parent);
+ 	struct configfs_attribute * attr = to_attr(file->f_path.dentry);
++	struct configfs_bin_attribute *bin_attr = NULL;
+ 	struct configfs_buffer * buffer;
+ 	struct configfs_item_operations * ops = NULL;
+ 	int error = 0;
+@@ -220,6 +376,9 @@ static int check_perm(struct inode * inode, struct file * file)
+ 	if (!item || !attr)
+ 		goto Einval;
+ 
++	if (type & CONFIGFS_ITEM_BIN_ATTR)
++		bin_attr = to_bin_attr(file->f_path.dentry);
++
+ 	/* Grab the module reference for this attribute if we have one */
+ 	if (!try_module_get(attr->ca_owner)) {
+ 		error = -ENODEV;
+@@ -236,9 +395,14 @@ static int check_perm(struct inode * inode, struct file * file)
+ 	 * and we must have a store method.
+ 	 */
+ 	if (file->f_mode & FMODE_WRITE) {
+-		if (!(inode->i_mode & S_IWUGO) || !attr->store)
++		if (!(inode->i_mode & S_IWUGO))
++			goto Eaccess;
++
++		if ((type & CONFIGFS_ITEM_ATTR) && !attr->store)
+ 			goto Eaccess;
+ 
++		if ((type & CONFIGFS_ITEM_BIN_ATTR) && !bin_attr->write)
++			goto Eaccess;
+ 	}
+ 
+ 	/* File needs read support.
+@@ -246,7 +410,13 @@ static int check_perm(struct inode * inode, struct file * file)
+ 	 * must be a show method for it.
+ 	 */
+ 	if (file->f_mode & FMODE_READ) {
+-		if (!(inode->i_mode & S_IRUGO) || !attr->show)
++		if (!(inode->i_mode & S_IRUGO))
++			goto Eaccess;
++
++		if ((type & CONFIGFS_ITEM_ATTR) && !attr->show)
++			goto Eaccess;
++
++		if ((type & CONFIGFS_ITEM_BIN_ATTR) && !bin_attr->read)
+ 			goto Eaccess;
+ 	}
+ 
+@@ -260,6 +430,8 @@ static int check_perm(struct inode * inode, struct file * file)
+ 	}
+ 	mutex_init(&buffer->mutex);
+ 	buffer->needs_read_fill = 1;
++	buffer->read_in_progress = 0;
++	buffer->write_in_progress = 0;
+ 	buffer->ops = ops;
+ 	file->private_data = buffer;
+ 	goto Done;
+@@ -277,12 +449,7 @@ static int check_perm(struct inode * inode, struct file * file)
+ 	return error;
+ }
+ 
+-static int configfs_open_file(struct inode * inode, struct file * filp)
+-{
+-	return check_perm(inode,filp);
+-}
+-
+-static int configfs_release(struct inode * inode, struct file * filp)
++static int configfs_release(struct inode *inode, struct file *filp)
+ {
+ 	struct config_item * item = to_item(filp->f_path.dentry->d_parent);
+ 	struct configfs_attribute * attr = to_attr(filp->f_path.dentry);
+@@ -303,6 +470,47 @@ static int configfs_release(struct inode * inode, struct file * filp)
+ 	return 0;
+ }
+ 
++static int configfs_open_file(struct inode *inode, struct file *filp)
++{
++	return check_perm(inode, filp, CONFIGFS_ITEM_ATTR);
++}
++
++static int configfs_open_bin_file(struct inode *inode, struct file *filp)
++{
++	return check_perm(inode, filp, CONFIGFS_ITEM_BIN_ATTR);
++}
++
++static int configfs_release_bin_file(struct inode *inode, struct file *filp)
++{
++	struct configfs_buffer *buffer = filp->private_data;
++	struct dentry *dentry = filp->f_path.dentry;
++	struct config_item *item = to_item(dentry->d_parent);
++	struct configfs_bin_attribute *bin_attr = to_bin_attr(dentry);
++	ssize_t len = 0;
++	int ret;
++
++	buffer->read_in_progress = 0;
++
++	if (buffer->write_in_progress) {
++		buffer->write_in_progress = 0;
++
++		len = bin_attr->write(item, buffer->bin_buffer,
++				buffer->bin_buffer_size);
++
++		/* vfree on NULL is safe */
++		vfree(buffer->bin_buffer);
++		buffer->bin_buffer = NULL;
++		buffer->bin_buffer_size = 0;
++		buffer->needs_read_fill = 1;
++	}
++
++	ret = configfs_release(inode, filp);
++	if (len < 0)
++		return len;
++	return ret;
++}
++
++
+ const struct file_operations configfs_file_operations = {
+ 	.read		= configfs_read_file,
+ 	.write		= configfs_write_file,
+@@ -311,6 +519,14 @@ const struct file_operations configfs_file_operations = {
+ 	.release	= configfs_release,
+ };
+ 
++const struct file_operations configfs_bin_file_operations = {
++	.read		= configfs_read_bin_file,
++	.write		= configfs_write_bin_file,
++	.llseek		= NULL,		/* bin file is not seekable */
++	.open		= configfs_open_bin_file,
++	.release	= configfs_release_bin_file,
++};
++
+ /**
+  *	configfs_create_file - create an attribute file for an item.
+  *	@item:	item we're creating for.
+@@ -332,3 +548,24 @@ int configfs_create_file(struct config_item * item, const struct configfs_attrib
+ 	return error;
+ }
+ 
++/**
++ *	configfs_create_bin_file - create a binary attribute file for an item.
++ *	@item:	item we're creating for.
++ *	@attr:	atrribute descriptor.
++ */
++
++int configfs_create_bin_file(struct config_item *item,
++		const struct configfs_bin_attribute *bin_attr)
++{
++	struct dentry *dir = item->ci_dentry;
++	struct configfs_dirent *parent_sd = dir->d_fsdata;
++	umode_t mode = (bin_attr->cb_attr.ca_mode & S_IALLUGO) | S_IFREG;
++	int error = 0;
++
++	mutex_lock_nested(&dir->d_inode->i_mutex, I_MUTEX_NORMAL);
++	error = configfs_make_dirent(parent_sd, NULL, (void *) bin_attr, mode,
++				     CONFIGFS_ITEM_BIN_ATTR);
++	mutex_unlock(&dir->d_inode->i_mutex);
++
++	return error;
++}
+
+commit 517982229f78b2aebf00a8a337e84e8eeea70b8e
+Author: Christoph Hellwig <hch@lst.de>
+Date:   Sat Oct 3 15:32:59 2015 +0200
+
+    configfs: remove old API
+    
+    Remove the old show_attribute and store_attribute methods and update
+    the documentation.  Also replace the two C samples with a single new
+    one in the proper samples directory where people expect to find it.
+    
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+
+diff --git a/fs/configfs/file.c b/fs/configfs/file.c
+index 106ca589e90a..d39099ea7df7 100644
+--- a/fs/configfs/file.c
++++ b/fs/configfs/file.c
+@@ -65,7 +65,6 @@ static int fill_read_buffer(struct dentry * dentry, struct configfs_buffer * buf
+ {
+ 	struct configfs_attribute * attr = to_attr(dentry);
+ 	struct config_item * item = to_item(dentry->d_parent);
+-	struct configfs_item_operations * ops = buffer->ops;
+ 	int ret = 0;
+ 	ssize_t count;
+ 
+@@ -74,10 +73,7 @@ static int fill_read_buffer(struct dentry * dentry, struct configfs_buffer * buf
+ 	if (!buffer->page)
+ 		return -ENOMEM;
+ 
+-	if (ops->show_attribute)
+-		count = ops->show_attribute(item, attr, buffer->page);
+-	else
+-		count = attr->show(item, buffer->page);
++	count = attr->show(item, buffer->page);
+ 
+ 	buffer->needs_read_fill = 0;
+ 	BUG_ON(count > (ssize_t)SIMPLE_ATTR_SIZE);
+@@ -175,10 +171,7 @@ flush_write_buffer(struct dentry * dentry, struct configfs_buffer * buffer, size
+ {
+ 	struct configfs_attribute * attr = to_attr(dentry);
+ 	struct config_item * item = to_item(dentry->d_parent);
+-	struct configfs_item_operations * ops = buffer->ops;
+ 
+-	if (ops->store_attribute)
+-		return ops->store_attribute(item, attr, buffer->page, count);
+ 	return attr->store(item, buffer->page, count);
+ }
+ 
+@@ -243,8 +236,7 @@ static int check_perm(struct inode * inode, struct file * file)
+ 	 * and we must have a store method.
+ 	 */
+ 	if (file->f_mode & FMODE_WRITE) {
+-		if (!(inode->i_mode & S_IWUGO) ||
+-		    (!ops->store_attribute && !attr->store))
++		if (!(inode->i_mode & S_IWUGO) || !attr->store)
+ 			goto Eaccess;
+ 
+ 	}
+@@ -254,8 +246,7 @@ static int check_perm(struct inode * inode, struct file * file)
+ 	 * must be a show method for it.
+ 	 */
+ 	if (file->f_mode & FMODE_READ) {
+-		if (!(inode->i_mode & S_IRUGO) ||
+-		    (!ops->show_attribute && !attr->show))
++		if (!(inode->i_mode & S_IRUGO) || !attr->show)
+ 			goto Eaccess;
+ 	}
+ 
+
+commit 870823e629ea194e6cf8e82a9694ac62cad49512
+Author: Christoph Hellwig <hch@lst.de>
+Date:   Sat Oct 3 15:32:37 2015 +0200
+
+    configfs: add show and store methods to struct configfs_attribute
+    
+    Add methods to struct configfs_attribute to directly show and store
+    attributes without adding boilerplate code to every user.  In addition
+    to the methods this also adds 3 helper macros to define read/write,
+    read-only and write-only attributes with a single line of code.
+    
+    Signed-off-by: Christoph Hellwig <hch@lst.de>
+    Reviewed-by: Nicholas Bellinger <nab@linux-iscsi.org>
+    Acked-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+    Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+
+diff --git a/fs/configfs/file.c b/fs/configfs/file.c
+index 403269ffcdf3..106ca589e90a 100644
+--- a/fs/configfs/file.c
++++ b/fs/configfs/file.c
+@@ -74,7 +74,11 @@ static int fill_read_buffer(struct dentry * dentry, struct configfs_buffer * buf
+ 	if (!buffer->page)
+ 		return -ENOMEM;
+ 
+-	count = ops->show_attribute(item,attr,buffer->page);
++	if (ops->show_attribute)
++		count = ops->show_attribute(item, attr, buffer->page);
++	else
++		count = attr->show(item, buffer->page);
++
+ 	buffer->needs_read_fill = 0;
+ 	BUG_ON(count > (ssize_t)SIMPLE_ATTR_SIZE);
+ 	if (count >= 0)
+@@ -173,7 +177,9 @@ flush_write_buffer(struct dentry * dentry, struct configfs_buffer * buffer, size
+ 	struct config_item * item = to_item(dentry->d_parent);
+ 	struct configfs_item_operations * ops = buffer->ops;
+ 
+-	return ops->store_attribute(item,attr,buffer->page,count);
++	if (ops->store_attribute)
++		return ops->store_attribute(item, attr, buffer->page, count);
++	return attr->store(item, buffer->page, count);
+ }
+ 
+ 
+@@ -237,8 +243,8 @@ static int check_perm(struct inode * inode, struct file * file)
+ 	 * and we must have a store method.
+ 	 */
+ 	if (file->f_mode & FMODE_WRITE) {
+-
+-		if (!(inode->i_mode & S_IWUGO) || !ops->store_attribute)
++		if (!(inode->i_mode & S_IWUGO) ||
++		    (!ops->store_attribute && !attr->store))
+ 			goto Eaccess;
+ 
+ 	}
+@@ -248,7 +254,8 @@ static int check_perm(struct inode * inode, struct file * file)
+ 	 * must be a show method for it.
+ 	 */
+ 	if (file->f_mode & FMODE_READ) {
+-		if (!(inode->i_mode & S_IRUGO) || !ops->show_attribute)
++		if (!(inode->i_mode & S_IRUGO) ||
++		    (!ops->show_attribute && !attr->show))
+ 			goto Eaccess;
+ 	}
+ 
+
+commit 2b0143b5c986be1ce8408b3aadc4709e0a94429d
+Author: David Howells <dhowells@redhat.com>
+Date:   Tue Mar 17 22:25:59 2015 +0000
+
+    VFS: normal filesystems (and lustre): d_inode() annotations
+    
+    that's the bulk of filesystem drivers dealing with inodes of their own
+    
+    Signed-off-by: David Howells <dhowells@redhat.com>
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/fs/configfs/file.c b/fs/configfs/file.c
+index 56d2cdc9ae0a..403269ffcdf3 100644
+--- a/fs/configfs/file.c
++++ b/fs/configfs/file.c
+@@ -326,10 +326,10 @@ int configfs_create_file(struct config_item * item, const struct configfs_attrib
+ 	umode_t mode = (attr->ca_mode & S_IALLUGO) | S_IFREG;
+ 	int error = 0;
+ 
+-	mutex_lock_nested(&dir->d_inode->i_mutex, I_MUTEX_NORMAL);
++	mutex_lock_nested(&d_inode(dir)->i_mutex, I_MUTEX_NORMAL);
+ 	error = configfs_make_dirent(parent_sd, NULL, (void *) attr, mode,
+ 				     CONFIGFS_ITEM_ATTR);
+-	mutex_unlock(&dir->d_inode->i_mutex);
++	mutex_unlock(&d_inode(dir)->i_mutex);
+ 
+ 	return error;
+ }
+
+commit 28444a2bde8d1695447eb51362b46cf1e49b9c21
+Author: Al Viro <viro@zeniv.linux.org.uk>
+Date:   Thu Jan 29 00:27:57 2015 -0500
+
+    configfs_add_file: fold into its sole caller
+    
+    Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+
+diff --git a/fs/configfs/file.c b/fs/configfs/file.c
+index 1d1c41f1014d..56d2cdc9ae0a 100644
+--- a/fs/configfs/file.c
++++ b/fs/configfs/file.c
+@@ -313,21 +313,6 @@ const struct file_operations configfs_file_operations = {
+ 	.release	= configfs_release,
+ };
+ 
+-
+-int configfs_add_file(struct dentry * dir, const struct configfs_attribute * attr, int type)
+-{
+-	struct configfs_dirent * parent_sd = dir->d_fsdata;
+-	umode_t mode = (attr->ca_mode & S_IALLUGO) | S_IFREG;
+-	int error = 0;
+-
+-	mutex_lock_nested(&dir->d_inode->i_mutex, I_MUTEX_NORMAL);
+-	error = configfs_make_dirent(parent_sd, NULL, (void *) attr, mode, type);
+-	mutex_unlock(&dir->d_inode->i_mutex);
+-
+-	return error;
+-}
+-
+-
+ /**
+  *	configfs_create_file - create an attribute file for an item.
+  *	@item:	item we're creating for.
+@@ -336,9 +321,16 @@ int configfs_add_file(struct dentry * dir, const struct configfs_attribute * att
+ 
+ int configfs_create_file(struct config_item * item, const struct configfs_attribute * attr)
+ {
+-	BUG_ON(!item || !item->ci_dentry || !attr);
++	struct dentry *dir = item->ci_dentry;
++	struct configfs_dirent *parent_sd = dir->d_fsdata;
++	umode_t mode = (attr->ca_mode & S_IALLUGO) | S_IFREG;
++	int error = 0;
+ 
+-	return configfs_add_file(item->ci_dentry, attr,
+-				 CONFIGFS_ITEM_ATTR);
++	mutex_lock_nested(&dir->d_inode->i_mutex, I_MUTEX_NORMAL);
++	error = configfs_make_dirent(parent_sd, NULL, (void *) attr, mode,
++				     CONFIGFS_ITEM_ATTR);
++	mutex_unlock(&dir->d_inode->i_mutex);
++
++	return error;
+ }
+ 
+
+commit 7121064b214bbc97007ec4d0e70aaeffef1b55f7
+Author: Dan Carpenter <dan.carpenter@oracle.com>
+Date:   Wed Jul 3 15:00:45 2013 -0700
+
+    configfs: use capped length for ->store_attribute()
+    
+    The difference between "count" and "len" is that "len" is capped at
+    4095.  Changing it like this makes it match how sysfs_write_file() is
+    implemented.
+    
+    This is a static analysis patch.  I haven't found any store_attribute()
+    functions where this change makes a difference.
+    
+    Signed-off-by: Dan Carpenter <dan.carpenter@oracle.com>
+    Acked-by: Joel Becker <jlbec@evilplan.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/fs/configfs/file.c b/fs/configfs/file.c
+index 2b6cb23dd14e..1d1c41f1014d 100644
+--- a/fs/configfs/file.c
++++ b/fs/configfs/file.c
+@@ -203,7 +203,7 @@ configfs_write_file(struct file *file, const char __user *buf, size_t count, lof
+ 	mutex_lock(&buffer->mutex);
+ 	len = fill_write_buffer(buffer, buf, count);
+ 	if (len > 0)
+-		len = flush_write_buffer(file->f_path.dentry, buffer, count);
++		len = flush_write_buffer(file->f_path.dentry, buffer, len);
+ 	if (len > 0)
+ 		*ppos += len;
+ 	mutex_unlock(&buffer->mutex);
+
+commit 8e24eea728068bbeb6a3c500b848f883a20bf225
+Author: Harvey Harrison <harvey.harrison@gmail.com>
+Date:   Wed Apr 30 00:55:09 2008 -0700
+
+    fs: replace remaining __FUNCTION__ occurrences
+    
+    __FUNCTION__ is gcc-specific, use __func__
+    
+    Signed-off-by: Harvey Harrison <harvey.harrison@gmail.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/fs/configfs/file.c b/fs/configfs/file.c
+index 397cb503a180..2b6cb23dd14e 100644
+--- a/fs/configfs/file.c
++++ b/fs/configfs/file.c
+@@ -115,7 +115,7 @@ configfs_read_file(struct file *file, char __user *buf, size_t count, loff_t *pp
+ 			goto out;
+ 	}
+ 	pr_debug("%s: count = %zd, ppos = %lld, buf = %s\n",
+-		 __FUNCTION__, count, *ppos, buffer->page);
++		 __func__, count, *ppos, buffer->page);
+ 	retval = simple_read_from_buffer(buf, count, ppos, buffer->page,
+ 					 buffer->count);
+ out:
+
+commit 116ba5d5ea1a5789a8c14b1087014007cada363b
+Author: Joonwoo Park <joonwpark81@gmail.com>
+Date:   Wed Dec 26 12:09:57 2007 +0900
+
+    configfs: file.c fix possible recursive locking
+    
+    configfs_register_subsystem() with default_groups triggers recursive locking.
+    it seems that mutex_lock_nested is needed.
+    
+    =============================================
+    [ INFO: possible recursive locking detected ]
+    2.6.24-rc6 #145
+    ---------------------------------------------
+    swapper/1 is trying to acquire lock:
+     (&sb->s_type->i_mutex_key#3){--..}, at: [<c40c9a9e>] configfs_add_file+0x2e/0x70
+    
+    but task is already holding lock:
+     (&sb->s_type->i_mutex_key#3){--..}, at: [<c40ca985>] configfs_register_subsystem+0x55/0x130
+    
+    other info that might help us debug this:
+    1 lock held by swapper/1:
+     #0:  (&sb->s_type->i_mutex_key#3){--..}, at: [<c40ca985>] configfs_register_subsystem+0x55/0x130
+    
+    stack backtrace:
+    Pid: 1, comm: swapper Not tainted 2.6.24-rc6 #145
+     [<c40053ba>] show_trace_log_lvl+0x1a/0x30
+     [<c4005e82>] show_trace+0x12/0x20
+     [<c400687e>] dump_stack+0x6e/0x80
+     [<c404ec72>] __lock_acquire+0xe62/0x1120
+     [<c404efb2>] lock_acquire+0x82/0xa0
+     [<c43fda88>] mutex_lock_nested+0x98/0x2e0
+     [<c40c9a9e>] configfs_add_file+0x2e/0x70
+     [<c40c9b0c>] configfs_create_file+0x2c/0x40
+     [<c40ca639>] configfs_attach_item+0x139/0x220
+     [<c40ca734>] configfs_attach_group+0x14/0x140
+     [<c40ca7e9>] configfs_attach_group+0xc9/0x140
+     [<c40ca9f6>] configfs_register_subsystem+0xc6/0x130
+     [<c45c8186>] init_netconsole+0x2b6/0x300
+     [<c45a75f2>] kernel_init+0x142/0x320
+     [<c4004fb3>] kernel_thread_helper+0x7/0x14
+     =======================
+    
+    Signed-off-by: Joonwoo Park <joonwpark81@gmail.com>
+    Signed-off-by: Joel Becker <joel.becker@oracle.com>
+    Signed-off-by: Mark Fasheh <mark.fasheh@oracle.com>
+
+diff --git a/fs/configfs/file.c b/fs/configfs/file.c
+index a3658f9a082c..397cb503a180 100644
+--- a/fs/configfs/file.c
++++ b/fs/configfs/file.c
+@@ -320,7 +320,7 @@ int configfs_add_file(struct dentry * dir, const struct configfs_attribute * att
+ 	umode_t mode = (attr->ca_mode & S_IALLUGO) | S_IFREG;
+ 	int error = 0;
+ 
+-	mutex_lock(&dir->d_inode->i_mutex);
++	mutex_lock_nested(&dir->d_inode->i_mutex, I_MUTEX_NORMAL);
+ 	error = configfs_make_dirent(parent_sd, NULL, (void *) attr, mode, type);
+ 	mutex_unlock(&dir->d_inode->i_mutex);
+ 
+
+commit 6d748924b753d63a57dad130fdf11f64c27ff54b
+Author: Johannes Berg <johannes@sipsolutions.net>
+Date:   Fri Jun 22 11:20:00 2007 +0200
+
+    [PATCH] configsfs buffer: use mutex
+    
+    Seems copied from sysfs, but I don't see a reason here nor there to use
+    a semaphore instead of a mutex. Convert.
+    
+    Signed-off-by: Johannes Berg <johannes@sipsolutions.net>
+    Signed-off-by: Joel Becker <joel.becker@oracle.com>
+    Signed-off-by: Mark Fasheh <mark.fasheh@oracle.com>
+
+diff --git a/fs/configfs/file.c b/fs/configfs/file.c
+index 0f4b65e85245..a3658f9a082c 100644
+--- a/fs/configfs/file.c
++++ b/fs/configfs/file.c
+@@ -27,8 +27,8 @@
+ #include <linux/fs.h>
+ #include <linux/module.h>
+ #include <linux/slab.h>
++#include <linux/mutex.h>
+ #include <asm/uaccess.h>
+-#include <asm/semaphore.h>
+ 
+ #include <linux/configfs.h>
+ #include "configfs_internal.h"
+@@ -46,7 +46,7 @@ struct configfs_buffer {
+ 	loff_t			pos;
+ 	char			* page;
+ 	struct configfs_item_operations	* ops;
+-	struct semaphore	sem;
++	struct mutex		mutex;
+ 	int			needs_read_fill;
+ };
+ 
+@@ -109,7 +109,7 @@ configfs_read_file(struct file *file, char __user *buf, size_t count, loff_t *pp
+ 	struct configfs_buffer * buffer = file->private_data;
+ 	ssize_t retval = 0;
+ 
+-	down(&buffer->sem);
++	mutex_lock(&buffer->mutex);
+ 	if (buffer->needs_read_fill) {
+ 		if ((retval = fill_read_buffer(file->f_path.dentry,buffer)))
+ 			goto out;
+@@ -119,7 +119,7 @@ configfs_read_file(struct file *file, char __user *buf, size_t count, loff_t *pp
+ 	retval = simple_read_from_buffer(buf, count, ppos, buffer->page,
+ 					 buffer->count);
+ out:
+-	up(&buffer->sem);
++	mutex_unlock(&buffer->mutex);
+ 	return retval;
+ }
+ 
+@@ -200,13 +200,13 @@ configfs_write_file(struct file *file, const char __user *buf, size_t count, lof
+ 	struct configfs_buffer * buffer = file->private_data;
+ 	ssize_t len;
+ 
+-	down(&buffer->sem);
++	mutex_lock(&buffer->mutex);
+ 	len = fill_write_buffer(buffer, buf, count);
+ 	if (len > 0)
+ 		len = flush_write_buffer(file->f_path.dentry, buffer, count);
+ 	if (len > 0)
+ 		*ppos += len;
+-	up(&buffer->sem);
++	mutex_unlock(&buffer->mutex);
+ 	return len;
+ }
+ 
+@@ -260,7 +260,7 @@ static int check_perm(struct inode * inode, struct file * file)
+ 		error = -ENOMEM;
+ 		goto Enomem;
+ 	}
+-	init_MUTEX(&buffer->sem);
++	mutex_init(&buffer->mutex);
+ 	buffer->needs_read_fill = 1;
+ 	buffer->ops = ops;
+ 	file->private_data = buffer;
+@@ -299,6 +299,7 @@ static int configfs_release(struct inode * inode, struct file * filp)
+ 	if (buffer) {
+ 		if (buffer->page)
+ 			free_page((unsigned long)buffer->page);
++		mutex_destroy(&buffer->mutex);
+ 		kfree(buffer);
+ 	}
+ 	return 0;
+
+commit b23cdde4c6240d70bb3d2e3c4046b60d6f6c8451
+Author: Joel Becker <joel.becker@oracle.com>
+Date:   Fri Jun 22 13:07:02 2007 -0700
+
+    configfs: consistent attribute size
+    
+    The attribute store/show code currently limits attributes at PAGE_SIZE.
+    This code comes from sysfs, where it still works that way.
+    
+    However, PAGE_SIZE is not constant.  A 16k attribute string works on
+    ia64 but not on x86.  Really a subsystem shouldn't allow different
+    attribute sizes based on platform.
+    
+    As such, limit all simple attributes to 4k.  This works on all
+    platforms, and is consistent with all current code.
+    
+    Signed-off-by: Joel Becker <joel.becker@oracle.com>
+    Signed-off-by: Mark Fasheh <mark.fasheh@oracle.com>
+
+diff --git a/fs/configfs/file.c b/fs/configfs/file.c
+index 3527c7c6def8..0f4b65e85245 100644
+--- a/fs/configfs/file.c
++++ b/fs/configfs/file.c
+@@ -33,6 +33,13 @@
+ #include <linux/configfs.h>
+ #include "configfs_internal.h"
+ 
++/*
++ * A simple attribute can only be 4096 characters.  Why 4k?  Because the
++ * original code limited it to PAGE_SIZE.  That's a bad idea, though,
++ * because an attribute of 16k on ia64 won't work on x86.  So we limit to
++ * 4k, our minimum common page size.
++ */
++#define SIMPLE_ATTR_SIZE 4096
+ 
+ struct configfs_buffer {
+ 	size_t			count;
+@@ -69,7 +76,7 @@ static int fill_read_buffer(struct dentry * dentry, struct configfs_buffer * buf
+ 
+ 	count = ops->show_attribute(item,attr,buffer->page);
+ 	buffer->needs_read_fill = 0;
+-	BUG_ON(count > (ssize_t)PAGE_SIZE);
++	BUG_ON(count > (ssize_t)SIMPLE_ATTR_SIZE);
+ 	if (count >= 0)
+ 		buffer->count = count;
+ 	else
+@@ -137,8 +144,8 @@ fill_write_buffer(struct configfs_buffer * buffer, const char __user * buf, size
+ 	if (!buffer->page)
+ 		return -ENOMEM;
+ 
+-	if (count >= PAGE_SIZE)
+-		count = PAGE_SIZE - 1;
++	if (count >= SIMPLE_ATTR_SIZE)
++		count = SIMPLE_ATTR_SIZE - 1;
+ 	error = copy_from_user(buffer->page,buf,count);
+ 	buffer->needs_read_fill = 1;
+ 	/* if buf is assumed to contain a string, terminate it by \0,
+
+commit 92f4c701aad794de9e4cf7341d0a486aed027c46
+Author: Akinobu Mita <akinobu.mita@gmail.com>
+Date:   Wed May 9 02:33:32 2007 -0700
+
+    use simple_read_from_buffer() in fs/
+    
+    Cleanup using simple_read_from_buffer() in binfmt_misc, configfs, and sysfs.
+    
+    Cc: Greg Kroah-Hartman <gregkh@suse.de>
+    Cc: Joel Becker <joel.becker@oracle.com>
+    Signed-off-by: Akinobu Mita <akinobu.mita@gmail.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/fs/configfs/file.c b/fs/configfs/file.c
+index d98be5e01328..3527c7c6def8 100644
+--- a/fs/configfs/file.c
++++ b/fs/configfs/file.c
+@@ -77,36 +77,6 @@ static int fill_read_buffer(struct dentry * dentry, struct configfs_buffer * buf
+ 	return ret;
+ }
+ 
+-
+-/**
+- *	flush_read_buffer - push buffer to userspace.
+- *	@buffer:	data buffer for file.
+- *	@userbuf:	user-passed buffer.
+- *	@count:		number of bytes requested.
+- *	@ppos:		file position.
+- *
+- *	Copy the buffer we filled in fill_read_buffer() to userspace.
+- *	This is done at the reader's leisure, copying and advancing
+- *	the amount they specify each time.
+- *	This may be called continuously until the buffer is empty.
+- */
+-static int flush_read_buffer(struct configfs_buffer * buffer, char __user * buf,
+-			     size_t count, loff_t * ppos)
+-{
+-	int error;
+-
+-	if (*ppos > buffer->count)
+-		return 0;
+-
+-	if (count > (buffer->count - *ppos))
+-		count = buffer->count - *ppos;
+-
+-	error = copy_to_user(buf,buffer->page + *ppos,count);
+-	if (!error)
+-		*ppos += count;
+-	return error ? -EFAULT : count;
+-}
+-
+ /**
+  *	configfs_read_file - read an attribute.
+  *	@file:	file pointer.
+@@ -139,7 +109,8 @@ configfs_read_file(struct file *file, char __user *buf, size_t count, loff_t *pp
+ 	}
+ 	pr_debug("%s: count = %zd, ppos = %lld, buf = %s\n",
+ 		 __FUNCTION__, count, *ppos, buffer->page);
+-	retval = flush_read_buffer(buffer,buf,count,ppos);
++	retval = simple_read_from_buffer(buf, count, ppos, buffer->page,
++					 buffer->count);
+ out:
+ 	up(&buffer->sem);
+ 	return retval;
+
+commit ff05d1c4643dd4260eb699396043d7e8009c0de4
+Author: Joel Becker <joel.becker@oracle.com>
+Date:   Tue Jan 23 17:00:45 2007 -0800
+
+    configfs: Zero terminate data in configfs attribute writes.
+    
+    Attributes in configfs are text files.  As such, most handlers expect to be
+    able to call functions like simple_strtoul() without checking the bounds
+    of the buffer.  Change the call to zero terminate the buffer before calling
+    the client's ->store() method.  This does reduce the attribute size from
+    PAGE_SIZE to PAGE_SIZE-1.
+    
+    Also, change get_zeroed_page() to alloc_page(), as we are handling the
+    termination.
+    
+    Signed-off-by: Joel Becker <joel.becker@oracle.com>
+    Signed-off-by: Mark Fasheh <mark.fasheh@oracle.com>
+
+diff --git a/fs/configfs/file.c b/fs/configfs/file.c
+index 2a7cb086e80c..d98be5e01328 100644
+--- a/fs/configfs/file.c
++++ b/fs/configfs/file.c
+@@ -162,14 +162,17 @@ fill_write_buffer(struct configfs_buffer * buffer, const char __user * buf, size
+ 	int error;
+ 
+ 	if (!buffer->page)
+-		buffer->page = (char *)get_zeroed_page(GFP_KERNEL);
++		buffer->page = (char *)__get_free_pages(GFP_KERNEL, 0);
+ 	if (!buffer->page)
+ 		return -ENOMEM;
+ 
+-	if (count > PAGE_SIZE)
+-		count = PAGE_SIZE;
++	if (count >= PAGE_SIZE)
++		count = PAGE_SIZE - 1;
+ 	error = copy_from_user(buffer->page,buf,count);
+ 	buffer->needs_read_fill = 1;
++	/* if buf is assumed to contain a string, terminate it by \0,
++	 * so e.g. sscanf() can scan the string easily */
++	buffer->page[count] = 0;
+ 	return error ? -EFAULT : count;
+ }
+ 
+
+commit 867fa491a2722cee6964a30dfda86e0e02dcb400
+Author: Josef "Jeff" Sipek <jsipek@cs.sunysb.edu>
+Date:   Fri Dec 8 02:36:47 2006 -0800
+
+    [PATCH] configfs: change uses of f_{dentry, vfsmnt} to use f_path
+    
+    Change all the uses of f_{dentry,vfsmnt} to f_path.{dentry,mnt} in the
+    configfs filesystem.
+    
+    Signed-off-by: Josef "Jeff" Sipek <jsipek@cs.sunysb.edu>
+    Signed-off-by: Andrew Morton <akpm@osdl.org>
+    Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+
+diff --git a/fs/configfs/file.c b/fs/configfs/file.c
+index cf33fac68c84..2a7cb086e80c 100644
+--- a/fs/configfs/file.c
++++ b/fs/configfs/file.c
+@@ -134,7 +134,7 @@ configfs_read_file(struct file *file, char __user *buf, size_t count, loff_t *pp
+ 
+ 	down(&buffer->sem);
+ 	if (buffer->needs_read_fill) {
+-		if ((retval = fill_read_buffer(file->f_dentry,buffer)))
++		if ((retval = fill_read_buffer(file->f_path.dentry,buffer)))
+ 			goto out;
+ 	}
+ 	pr_debug("%s: count = %zd, ppos = %lld, buf = %s\n",
+@@ -222,7 +222,7 @@ configfs_write_file(struct file *file, const char __user *buf, size_t count, lof
+ 	down(&buffer->sem);
+ 	len = fill_write_buffer(buffer, buf, count);
+ 	if (len > 0)
+-		len = flush_write_buffer(file->f_dentry, buffer, count);
++		len = flush_write_buffer(file->f_path.dentry, buffer, count);
+ 	if (len > 0)
+ 		*ppos += len;
+ 	up(&buffer->sem);
+@@ -231,8 +231,8 @@ configfs_write_file(struct file *file, const char __user *buf, size_t count, lof
+ 
+ static int check_perm(struct inode * inode, struct file * file)
+ {
+-	struct config_item *item = configfs_get_config_item(file->f_dentry->d_parent);
+-	struct configfs_attribute * attr = to_attr(file->f_dentry);
++	struct config_item *item = configfs_get_config_item(file->f_path.dentry->d_parent);
++	struct configfs_attribute * attr = to_attr(file->f_path.dentry);
+ 	struct configfs_buffer * buffer;
+ 	struct configfs_item_operations * ops = NULL;
+ 	int error = 0;
+@@ -305,8 +305,8 @@ static int configfs_open_file(struct inode * inode, struct file * filp)
+ 
+ static int configfs_release(struct inode * inode, struct file * filp)
+ {
+-	struct config_item * item = to_item(filp->f_dentry->d_parent);
+-	struct configfs_attribute * attr = to_attr(filp->f_dentry);
++	struct config_item * item = to_item(filp->f_path.dentry->d_parent);
++	struct configfs_attribute * attr = to_attr(filp->f_path.dentry);
+ 	struct module * owner = attr->ca_owner;
+ 	struct configfs_buffer * buffer = filp->private_data;
+ 
+
+commit 559c9ac391c046710bdeee5581dc5d9dda794881
+Author: Chandra Seetharaman <sekharan@us.ibm.com>
+Date:   Tue Oct 10 15:15:55 2006 -0700
+
+    configfs: handle kzalloc() failure in check_perm()
+    
+    check_perm() does not drop the reference to the module when kzalloc()
+    failure occurs.
+    
+    Signed-Off-By: Chandra Seetharaman <sekharan@us.ibm.com>
+    Signed-off-by: Joel Becker <joel.becker@oracle.com>
+    Signed-off-by: Mark Fasheh <mark.fasheh@oracle.com>
+
+diff --git a/fs/configfs/file.c b/fs/configfs/file.c
+index e6d5754a715e..cf33fac68c84 100644
+--- a/fs/configfs/file.c
++++ b/fs/configfs/file.c
+@@ -275,13 +275,14 @@ static int check_perm(struct inode * inode, struct file * file)
+ 	 * it in file->private_data for easy access.
+ 	 */
+ 	buffer = kzalloc(sizeof(struct configfs_buffer),GFP_KERNEL);
+-	if (buffer) {
+-		init_MUTEX(&buffer->sem);
+-		buffer->needs_read_fill = 1;
+-		buffer->ops = ops;
+-		file->private_data = buffer;
+-	} else
++	if (!buffer) {
+ 		error = -ENOMEM;
++		goto Enomem;
++	}
++	init_MUTEX(&buffer->sem);
++	buffer->needs_read_fill = 1;
++	buffer->ops = ops;
++	file->private_data = buffer;
+ 	goto Done;
+ 
+  Einval:
+@@ -289,6 +290,7 @@ static int check_perm(struct inode * inode, struct file * file)
+ 	goto Done;
+  Eaccess:
+ 	error = -EACCES;
++ Enomem:
+ 	module_put(attr->ca_owner);
+  Done:
+ 	if (error && item)
+
+commit 4779efca147475a708e84d902e096bbd20e613b7
+Author: Zach Brown <zach.brown@oracle.com>
+Date:   Tue Oct 3 01:16:05 2006 -0700
+
+    [PATCH] pr_debug: configfs: use size_t length modifier in pr_debug format argument
+    
+    configfs: use size_t length modifier in pr_debug format argument
+    
+    Signed-off-by: Zach Brown <zach.brown@oracle.com>
+    Acked-by: Joel Becker <joel.becker@oracle.com>
+    Signed-off-by: Andrew Morton <akpm@osdl.org>
+    Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+
+diff --git a/fs/configfs/file.c b/fs/configfs/file.c
+index 85105e50f7db..e6d5754a715e 100644
+--- a/fs/configfs/file.c
++++ b/fs/configfs/file.c
+@@ -137,8 +137,8 @@ configfs_read_file(struct file *file, char __user *buf, size_t count, loff_t *pp
+ 		if ((retval = fill_read_buffer(file->f_dentry,buffer)))
+ 			goto out;
+ 	}
+-	pr_debug("%s: count = %d, ppos = %lld, buf = %s\n",
+-		 __FUNCTION__,count,*ppos,buffer->page);
++	pr_debug("%s: count = %zd, ppos = %lld, buf = %s\n",
++		 __FUNCTION__, count, *ppos, buffer->page);
+ 	retval = flush_read_buffer(buffer,buf,count,ppos);
+ out:
+ 	up(&buffer->sem);
+
+commit f8314dc60ccba7e41f425048c4160dc7f63377d5
+Author: Panagiotis Issaris <takis@issaris.org>
+Date:   Wed Sep 27 01:49:37 2006 -0700
+
+    [PATCH] fs: Conversions from kmalloc+memset to k(z|c)alloc
+    
+    Conversions from kmalloc+memset to kzalloc.
+    
+    Signed-off-by: Panagiotis Issaris <takis@issaris.org>
+    Jffs2-bit-acked-by: David Woodhouse <dwmw2@infradead.org>
+    Signed-off-by: Andrew Morton <akpm@osdl.org>
+    Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+
+diff --git a/fs/configfs/file.c b/fs/configfs/file.c
+index f499803743e0..85105e50f7db 100644
+--- a/fs/configfs/file.c
++++ b/fs/configfs/file.c
+@@ -274,9 +274,8 @@ static int check_perm(struct inode * inode, struct file * file)
+ 	/* No error? Great, allocate a buffer for the file, and store it
+ 	 * it in file->private_data for easy access.
+ 	 */
+-	buffer = kmalloc(sizeof(struct configfs_buffer),GFP_KERNEL);
++	buffer = kzalloc(sizeof(struct configfs_buffer),GFP_KERNEL);
+ 	if (buffer) {
+-		memset(buffer,0,sizeof(struct configfs_buffer));
+ 		init_MUTEX(&buffer->sem);
+ 		buffer->needs_read_fill = 1;
+ 		buffer->ops = ops;
+
+commit 4b6f5d20b04dcbc3d888555522b90ba6d36c4106
+Author: Arjan van de Ven <arjan@infradead.org>
+Date:   Tue Mar 28 01:56:42 2006 -0800
+
+    [PATCH] Make most file operations structs in fs/ const
+    
+    This is a conversion to make the various file_operations structs in fs/
+    const.  Basically a regexp job, with a few manual fixups
+    
+    The goal is both to increase correctness (harder to accidentally write to
+    shared datastructures) and reducing the false sharing of cachelines with
+    things that get dirty in .data (while .rodata is nicely read only and thus
+    cache clean)
+    
+    Signed-off-by: Arjan van de Ven <arjan@infradead.org>
+    Signed-off-by: Andrew Morton <akpm@osdl.org>
+    Signed-off-by: Linus Torvalds <torvalds@osdl.org>
+
+diff --git a/fs/configfs/file.c b/fs/configfs/file.c
+index 3921920d8716..f499803743e0 100644
+--- a/fs/configfs/file.c
++++ b/fs/configfs/file.c
+@@ -322,7 +322,7 @@ static int configfs_release(struct inode * inode, struct file * filp)
+ 	return 0;
+ }
+ 
+-struct file_operations configfs_file_operations = {
++const struct file_operations configfs_file_operations = {
+ 	.read		= configfs_read_file,
+ 	.write		= configfs_write_file,
+ 	.llseek		= generic_file_llseek,
+
+commit 3d0f89bb169482d26d5aa4e82e763077e7e9bc4d
+Author: Joel Becker <joel.becker@oracle.com>
+Date:   Wed Jan 25 13:31:07 2006 -0800
+
+    configfs: Add permission and ownership to configfs objects.
+    
+    configfs always made item and attribute ownership root.root and
+    permissions based on a umask of 022.  Add ->setattr() to allow
+    chown(2)/chmod(2), and persist the changes for the lifetime of the
+    items and attributes.
+    
+    Signed-off-by: Joel Becker <joel.becker@oracle.com>
+    Signed-off-by: Mark Fasheh <mark.fasheh@oracle.com>
+
+diff --git a/fs/configfs/file.c b/fs/configfs/file.c
+index c26cd61f13af..3921920d8716 100644
+--- a/fs/configfs/file.c
++++ b/fs/configfs/file.c
+@@ -26,7 +26,6 @@
+ 
+ #include <linux/fs.h>
+ #include <linux/module.h>
+-#include <linux/dnotify.h>
+ #include <linux/slab.h>
+ #include <asm/uaccess.h>
+ #include <asm/semaphore.h>
+@@ -150,7 +149,7 @@ configfs_read_file(struct file *file, char __user *buf, size_t count, loff_t *pp
+ /**
+  *	fill_write_buffer - copy buffer from userspace.
+  *	@buffer:	data buffer for file.
+- *	@userbuf:	data from user.
++ *	@buf:		data from user.
+  *	@count:		number of bytes in @userbuf.
+  *
+  *	Allocate @buffer->page if it hasn't been already, then
+@@ -177,8 +176,9 @@ fill_write_buffer(struct configfs_buffer * buffer, const char __user * buf, size
+ 
+ /**
+  *	flush_write_buffer - push buffer to config_item.
+- *	@file:		file pointer.
++ *	@dentry:	dentry to the attribute
+  *	@buffer:	data buffer for file.
++ *	@count:		number of bytes
+  *
+  *	Get the correct pointers for the config_item and the attribute we're
+  *	dealing with, then call the store() method for the attribute,
+@@ -217,15 +217,16 @@ static ssize_t
+ configfs_write_file(struct file *file, const char __user *buf, size_t count, loff_t *ppos)
+ {
+ 	struct configfs_buffer * buffer = file->private_data;
++	ssize_t len;
+ 
+ 	down(&buffer->sem);
+-	count = fill_write_buffer(buffer,buf,count);
+-	if (count > 0)
+-		count = flush_write_buffer(file->f_dentry,buffer,count);
+-	if (count > 0)
+-		*ppos += count;
++	len = fill_write_buffer(buffer, buf, count);
++	if (len > 0)
++		len = flush_write_buffer(file->f_dentry, buffer, count);
++	if (len > 0)
++		*ppos += len;
+ 	up(&buffer->sem);
+-	return count;
++	return len;
+ }
+ 
+ static int check_perm(struct inode * inode, struct file * file)
+
+commit 1b1dcc1b57a49136f118a0f16367256ff9994a69
+Author: Jes Sorensen <jes@sgi.com>
+Date:   Mon Jan 9 15:59:24 2006 -0800
+
+    [PATCH] mutex subsystem, semaphore to mutex: VFS, ->i_sem
+    
+    This patch converts the inode semaphore to a mutex. I have tested it on
+    XFS and compiled as much as one can consider on an ia64. Anyway your
+    luck with it might be different.
+    
+    Modified-by: Ingo Molnar <mingo@elte.hu>
+    
+    (finished the conversion)
+    
+    Signed-off-by: Jes Sorensen <jes@sgi.com>
+    Signed-off-by: Ingo Molnar <mingo@elte.hu>
+
+diff --git a/fs/configfs/file.c b/fs/configfs/file.c
+index af1ffc9a15c0..c26cd61f13af 100644
+--- a/fs/configfs/file.c
++++ b/fs/configfs/file.c
+@@ -336,9 +336,9 @@ int configfs_add_file(struct dentry * dir, const struct configfs_attribute * att
+ 	umode_t mode = (attr->ca_mode & S_IALLUGO) | S_IFREG;
+ 	int error = 0;
+ 
+-	down(&dir->d_inode->i_sem);
++	mutex_lock(&dir->d_inode->i_mutex);
+ 	error = configfs_make_dirent(parent_sd, NULL, (void *) attr, mode, type);
+-	up(&dir->d_inode->i_sem);
++	mutex_unlock(&dir->d_inode->i_mutex);
+ 
+ 	return error;
+ }
+
+commit 7063fbf2261194f72ee75afca67b3b38b554b5fa
+Author: Joel Becker <joel.becker@oracle.com>
+Date:   Thu Dec 15 14:29:43 2005 -0800
+
+    [PATCH] configfs: User-driven configuration filesystem
+    
+    Configfs, a file system for userspace-driven kernel object configuration.
+    The OCFS2 stack makes extensive use of this for propagation of cluster
+    configuration information into kernel.
+    
+    Signed-off-by: Joel Becker <joel.becker@oracle.com>
+
+diff --git a/fs/configfs/file.c b/fs/configfs/file.c
+new file mode 100644
+index 000000000000..af1ffc9a15c0
+--- /dev/null
++++ b/fs/configfs/file.c
+@@ -0,0 +1,360 @@
++/* -*- mode: c; c-basic-offset: 8; -*-
++ * vim: noexpandtab sw=8 ts=8 sts=0:
++ *
++ * file.c - operations for regular (text) files.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public
++ * License as published by the Free Software Foundation; either
++ * version 2 of the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public
++ * License along with this program; if not, write to the
++ * Free Software Foundation, Inc., 59 Temple Place - Suite 330,
++ * Boston, MA 021110-1307, USA.
++ *
++ * Based on sysfs:
++ * 	sysfs is Copyright (C) 2001, 2002, 2003 Patrick Mochel
++ *
++ * configfs Copyright (C) 2005 Oracle.  All rights reserved.
++ */
++
++#include <linux/fs.h>
++#include <linux/module.h>
++#include <linux/dnotify.h>
++#include <linux/slab.h>
++#include <asm/uaccess.h>
++#include <asm/semaphore.h>
++
++#include <linux/configfs.h>
++#include "configfs_internal.h"
++
++
++struct configfs_buffer {
++	size_t			count;
++	loff_t			pos;
++	char			* page;
++	struct configfs_item_operations	* ops;
++	struct semaphore	sem;
++	int			needs_read_fill;
++};
++
++
++/**
++ *	fill_read_buffer - allocate and fill buffer from item.
++ *	@dentry:	dentry pointer.
++ *	@buffer:	data buffer for file.
++ *
++ *	Allocate @buffer->page, if it hasn't been already, then call the
++ *	config_item's show() method to fill the buffer with this attribute's
++ *	data.
++ *	This is called only once, on the file's first read.
++ */
++static int fill_read_buffer(struct dentry * dentry, struct configfs_buffer * buffer)
++{
++	struct configfs_attribute * attr = to_attr(dentry);
++	struct config_item * item = to_item(dentry->d_parent);
++	struct configfs_item_operations * ops = buffer->ops;
++	int ret = 0;
++	ssize_t count;
++
++	if (!buffer->page)
++		buffer->page = (char *) get_zeroed_page(GFP_KERNEL);
++	if (!buffer->page)
++		return -ENOMEM;
++
++	count = ops->show_attribute(item,attr,buffer->page);
++	buffer->needs_read_fill = 0;
++	BUG_ON(count > (ssize_t)PAGE_SIZE);
++	if (count >= 0)
++		buffer->count = count;
++	else
++		ret = count;
++	return ret;
++}
++
++
++/**
++ *	flush_read_buffer - push buffer to userspace.
++ *	@buffer:	data buffer for file.
++ *	@userbuf:	user-passed buffer.
++ *	@count:		number of bytes requested.
++ *	@ppos:		file position.
++ *
++ *	Copy the buffer we filled in fill_read_buffer() to userspace.
++ *	This is done at the reader's leisure, copying and advancing
++ *	the amount they specify each time.
++ *	This may be called continuously until the buffer is empty.
++ */
++static int flush_read_buffer(struct configfs_buffer * buffer, char __user * buf,
++			     size_t count, loff_t * ppos)
++{
++	int error;
++
++	if (*ppos > buffer->count)
++		return 0;
++
++	if (count > (buffer->count - *ppos))
++		count = buffer->count - *ppos;
++
++	error = copy_to_user(buf,buffer->page + *ppos,count);
++	if (!error)
++		*ppos += count;
++	return error ? -EFAULT : count;
++}
++
++/**
++ *	configfs_read_file - read an attribute.
++ *	@file:	file pointer.
++ *	@buf:	buffer to fill.
++ *	@count:	number of bytes to read.
++ *	@ppos:	starting offset in file.
++ *
++ *	Userspace wants to read an attribute file. The attribute descriptor
++ *	is in the file's ->d_fsdata. The target item is in the directory's
++ *	->d_fsdata.
++ *
++ *	We call fill_read_buffer() to allocate and fill the buffer from the
++ *	item's show() method exactly once (if the read is happening from
++ *	the beginning of the file). That should fill the entire buffer with
++ *	all the data the item has to offer for that attribute.
++ *	We then call flush_read_buffer() to copy the buffer to userspace
++ *	in the increments specified.
++ */
++
++static ssize_t
++configfs_read_file(struct file *file, char __user *buf, size_t count, loff_t *ppos)
++{
++	struct configfs_buffer * buffer = file->private_data;
++	ssize_t retval = 0;
++
++	down(&buffer->sem);
++	if (buffer->needs_read_fill) {
++		if ((retval = fill_read_buffer(file->f_dentry,buffer)))
++			goto out;
++	}
++	pr_debug("%s: count = %d, ppos = %lld, buf = %s\n",
++		 __FUNCTION__,count,*ppos,buffer->page);
++	retval = flush_read_buffer(buffer,buf,count,ppos);
++out:
++	up(&buffer->sem);
++	return retval;
++}
++
++
++/**
++ *	fill_write_buffer - copy buffer from userspace.
++ *	@buffer:	data buffer for file.
++ *	@userbuf:	data from user.
++ *	@count:		number of bytes in @userbuf.
++ *
++ *	Allocate @buffer->page if it hasn't been already, then
++ *	copy the user-supplied buffer into it.
++ */
++
++static int
++fill_write_buffer(struct configfs_buffer * buffer, const char __user * buf, size_t count)
++{
++	int error;
++
++	if (!buffer->page)
++		buffer->page = (char *)get_zeroed_page(GFP_KERNEL);
++	if (!buffer->page)
++		return -ENOMEM;
++
++	if (count > PAGE_SIZE)
++		count = PAGE_SIZE;
++	error = copy_from_user(buffer->page,buf,count);
++	buffer->needs_read_fill = 1;
++	return error ? -EFAULT : count;
++}
++
++
++/**
++ *	flush_write_buffer - push buffer to config_item.
++ *	@file:		file pointer.
++ *	@buffer:	data buffer for file.
++ *
++ *	Get the correct pointers for the config_item and the attribute we're
++ *	dealing with, then call the store() method for the attribute,
++ *	passing the buffer that we acquired in fill_write_buffer().
++ */
++
++static int
++flush_write_buffer(struct dentry * dentry, struct configfs_buffer * buffer, size_t count)
++{
++	struct configfs_attribute * attr = to_attr(dentry);
++	struct config_item * item = to_item(dentry->d_parent);
++	struct configfs_item_operations * ops = buffer->ops;
++
++	return ops->store_attribute(item,attr,buffer->page,count);
++}
++
++
++/**
++ *	configfs_write_file - write an attribute.
++ *	@file:	file pointer
++ *	@buf:	data to write
++ *	@count:	number of bytes
++ *	@ppos:	starting offset
++ *
++ *	Similar to configfs_read_file(), though working in the opposite direction.
++ *	We allocate and fill the data from the user in fill_write_buffer(),
++ *	then push it to the config_item in flush_write_buffer().
++ *	There is no easy way for us to know if userspace is only doing a partial
++ *	write, so we don't support them. We expect the entire buffer to come
++ *	on the first write.
++ *	Hint: if you're writing a value, first read the file, modify only the
++ *	the value you're changing, then write entire buffer back.
++ */
++
++static ssize_t
++configfs_write_file(struct file *file, const char __user *buf, size_t count, loff_t *ppos)
++{
++	struct configfs_buffer * buffer = file->private_data;
++
++	down(&buffer->sem);
++	count = fill_write_buffer(buffer,buf,count);
++	if (count > 0)
++		count = flush_write_buffer(file->f_dentry,buffer,count);
++	if (count > 0)
++		*ppos += count;
++	up(&buffer->sem);
++	return count;
++}
++
++static int check_perm(struct inode * inode, struct file * file)
++{
++	struct config_item *item = configfs_get_config_item(file->f_dentry->d_parent);
++	struct configfs_attribute * attr = to_attr(file->f_dentry);
++	struct configfs_buffer * buffer;
++	struct configfs_item_operations * ops = NULL;
++	int error = 0;
++
++	if (!item || !attr)
++		goto Einval;
++
++	/* Grab the module reference for this attribute if we have one */
++	if (!try_module_get(attr->ca_owner)) {
++		error = -ENODEV;
++		goto Done;
++	}
++
++	if (item->ci_type)
++		ops = item->ci_type->ct_item_ops;
++	else
++		goto Eaccess;
++
++	/* File needs write support.
++	 * The inode's perms must say it's ok,
++	 * and we must have a store method.
++	 */
++	if (file->f_mode & FMODE_WRITE) {
++
++		if (!(inode->i_mode & S_IWUGO) || !ops->store_attribute)
++			goto Eaccess;
++
++	}
++
++	/* File needs read support.
++	 * The inode's perms must say it's ok, and we there
++	 * must be a show method for it.
++	 */
++	if (file->f_mode & FMODE_READ) {
++		if (!(inode->i_mode & S_IRUGO) || !ops->show_attribute)
++			goto Eaccess;
++	}
++
++	/* No error? Great, allocate a buffer for the file, and store it
++	 * it in file->private_data for easy access.
++	 */
++	buffer = kmalloc(sizeof(struct configfs_buffer),GFP_KERNEL);
++	if (buffer) {
++		memset(buffer,0,sizeof(struct configfs_buffer));
++		init_MUTEX(&buffer->sem);
++		buffer->needs_read_fill = 1;
++		buffer->ops = ops;
++		file->private_data = buffer;
++	} else
++		error = -ENOMEM;
++	goto Done;
++
++ Einval:
++	error = -EINVAL;
++	goto Done;
++ Eaccess:
++	error = -EACCES;
++	module_put(attr->ca_owner);
++ Done:
++	if (error && item)
++		config_item_put(item);
++	return error;
++}
++
++static int configfs_open_file(struct inode * inode, struct file * filp)
++{
++	return check_perm(inode,filp);
++}
++
++static int configfs_release(struct inode * inode, struct file * filp)
++{
++	struct config_item * item = to_item(filp->f_dentry->d_parent);
++	struct configfs_attribute * attr = to_attr(filp->f_dentry);
++	struct module * owner = attr->ca_owner;
++	struct configfs_buffer * buffer = filp->private_data;
++
++	if (item)
++		config_item_put(item);
++	/* After this point, attr should not be accessed. */
++	module_put(owner);
++
++	if (buffer) {
++		if (buffer->page)
++			free_page((unsigned long)buffer->page);
++		kfree(buffer);
++	}
++	return 0;
++}
++
++struct file_operations configfs_file_operations = {
++	.read		= configfs_read_file,
++	.write		= configfs_write_file,
++	.llseek		= generic_file_llseek,
++	.open		= configfs_open_file,
++	.release	= configfs_release,
++};
++
++
++int configfs_add_file(struct dentry * dir, const struct configfs_attribute * attr, int type)
++{
++	struct configfs_dirent * parent_sd = dir->d_fsdata;
++	umode_t mode = (attr->ca_mode & S_IALLUGO) | S_IFREG;
++	int error = 0;
++
++	down(&dir->d_inode->i_sem);
++	error = configfs_make_dirent(parent_sd, NULL, (void *) attr, mode, type);
++	up(&dir->d_inode->i_sem);
++
++	return error;
++}
++
++
++/**
++ *	configfs_create_file - create an attribute file for an item.
++ *	@item:	item we're creating for.
++ *	@attr:	atrribute descriptor.
++ */
++
++int configfs_create_file(struct config_item * item, const struct configfs_attribute * attr)
++{
++	BUG_ON(!item || !item->ci_dentry || !attr);
++
++	return configfs_add_file(item->ci_dentry, attr,
++				 CONFIGFS_ITEM_ATTR);
++}
++

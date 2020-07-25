@@ -1,0 +1,2991 @@
+commit ad88b7a6aa3e6ac94589fc1aaf7c99fe9211cff2
+Author: Florian Westphal <fw@strlen.de>
+Date:   Tue Oct 22 18:56:42 2019 +0200
+
+    netfilter: ecache: don't look for ecache extension on dying/unconfirmed conntracks
+    
+    syzbot reported following splat:
+    BUG: KASAN: use-after-free in __nf_ct_ext_exist
+    include/net/netfilter/nf_conntrack_extend.h:53 [inline]
+    BUG: KASAN: use-after-free in nf_ct_deliver_cached_events+0x5c3/0x6d0
+    net/netfilter/nf_conntrack_ecache.c:205
+    nf_conntrack_confirm include/net/netfilter/nf_conntrack_core.h:65 [inline]
+    nf_confirm+0x3d8/0x4d0 net/netfilter/nf_conntrack_proto.c:154
+    [..]
+    
+    While there is no reproducer yet, the syzbot report contains one
+    interesting bit of information:
+    
+    Freed by task 27585:
+    [..]
+     kfree+0x10a/0x2c0 mm/slab.c:3757
+     nf_ct_ext_destroy+0x2ab/0x2e0 net/netfilter/nf_conntrack_extend.c:38
+     nf_conntrack_free+0x8f/0xe0 net/netfilter/nf_conntrack_core.c:1418
+     destroy_conntrack+0x1a2/0x270 net/netfilter/nf_conntrack_core.c:626
+     nf_conntrack_put include/linux/netfilter/nf_conntrack_common.h:31 [inline]
+     nf_ct_resolve_clash net/netfilter/nf_conntrack_core.c:915 [inline]
+     ^^^^^^^^^^^^^^^^^^^
+     __nf_conntrack_confirm+0x21ca/0x2830 net/netfilter/nf_conntrack_core.c:1038
+     nf_conntrack_confirm include/net/netfilter/nf_conntrack_core.h:63 [inline]
+     nf_confirm+0x3e7/0x4d0 net/netfilter/nf_conntrack_proto.c:154
+    
+    This is whats happening:
+    
+    1. a conntrack entry is about to be confirmed (added to hash table).
+    2. a clash with existing entry is detected.
+    3. nf_ct_resolve_clash() puts skb->nfct (the "losing" entry).
+    4. this entry now has a refcount of 0 and is freed to SLAB_TYPESAFE_BY_RCU
+       kmem cache.
+    
+    skb->nfct has been replaced by the one found in the hash.
+    Problem is that nf_conntrack_confirm() uses the old ct:
+    
+    static inline int nf_conntrack_confirm(struct sk_buff *skb)
+    {
+     struct nf_conn *ct = (struct nf_conn *)skb_nfct(skb);
+     int ret = NF_ACCEPT;
+    
+      if (ct) {
+        if (!nf_ct_is_confirmed(ct))
+           ret = __nf_conntrack_confirm(skb);
+        if (likely(ret == NF_ACCEPT))
+            nf_ct_deliver_cached_events(ct); /* This ct has refcount 0! */
+      }
+      return ret;
+    }
+    
+    As of "netfilter: conntrack: free extension area immediately", we can't
+    access conntrack extensions in this case.
+    
+    To fix this, make sure we check the dying bit presence before attempting
+    to get the eache extension.
+    
+    Reported-by: syzbot+c7aabc9fe93e7f3637ba@syzkaller.appspotmail.com
+    Fixes: 2ad9d7747c10d1 ("netfilter: conntrack: free extension area immediately")
+    Signed-off-by: Florian Westphal <fw@strlen.de>
+    Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+
+diff --git a/net/netfilter/nf_conntrack_ecache.c b/net/netfilter/nf_conntrack_ecache.c
+index 0d83c159671c..7956c9f19899 100644
+--- a/net/netfilter/nf_conntrack_ecache.c
++++ b/net/netfilter/nf_conntrack_ecache.c
+@@ -202,15 +202,15 @@ void nf_ct_deliver_cached_events(struct nf_conn *ct)
+ 	if (notify == NULL)
+ 		goto out_unlock;
+ 
++	if (!nf_ct_is_confirmed(ct) || nf_ct_is_dying(ct))
++		goto out_unlock;
++
+ 	e = nf_ct_ecache_find(ct);
+ 	if (e == NULL)
+ 		goto out_unlock;
+ 
+ 	events = xchg(&e->cache, 0);
+ 
+-	if (!nf_ct_is_confirmed(ct) || nf_ct_is_dying(ct))
+-		goto out_unlock;
+-
+ 	/* We make a copy of the missed event cache without taking
+ 	 * the lock, thus we may send missed events twice. However,
+ 	 * this does not harm and it happens very rarely. */
+
+commit 63f55acf7b479250b7b0293333c3d94e05cb3f6f
+Author: Florian Westphal <fw@strlen.de>
+Date:   Sun Oct 13 20:19:45 2019 +0200
+
+    netfilter: ecache: document extension area access rules
+    
+    Once ct->ext gets free'd via kfree() rather than kfree_rcu we can't
+    access the extension area anymore without owning the conntrack.
+    
+    This is a special case:
+    
+    The worker is walking the pcpu dying list while holding dying list lock:
+    Neither ct nor ct->ext can be free'd until after the walk has completed.
+    
+    Signed-off-by: Florian Westphal <fw@strlen.de>
+    Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+
+diff --git a/net/netfilter/nf_conntrack_ecache.c b/net/netfilter/nf_conntrack_ecache.c
+index 6fba74b5aaf7..0d83c159671c 100644
+--- a/net/netfilter/nf_conntrack_ecache.c
++++ b/net/netfilter/nf_conntrack_ecache.c
+@@ -30,6 +30,7 @@
+ static DEFINE_MUTEX(nf_ct_ecache_mutex);
+ 
+ #define ECACHE_RETRY_WAIT (HZ/10)
++#define ECACHE_STACK_ALLOC (256 / sizeof(void *))
+ 
+ enum retry_state {
+ 	STATE_CONGESTED,
+@@ -39,11 +40,11 @@ enum retry_state {
+ 
+ static enum retry_state ecache_work_evict_list(struct ct_pcpu *pcpu)
+ {
+-	struct nf_conn *refs[16];
++	struct nf_conn *refs[ECACHE_STACK_ALLOC];
++	enum retry_state ret = STATE_DONE;
+ 	struct nf_conntrack_tuple_hash *h;
+ 	struct hlist_nulls_node *n;
+ 	unsigned int evicted = 0;
+-	enum retry_state ret = STATE_DONE;
+ 
+ 	spin_lock(&pcpu->lock);
+ 
+@@ -54,10 +55,22 @@ static enum retry_state ecache_work_evict_list(struct ct_pcpu *pcpu)
+ 		if (!nf_ct_is_confirmed(ct))
+ 			continue;
+ 
++		/* This ecache access is safe because the ct is on the
++		 * pcpu dying list and we hold the spinlock -- the entry
++		 * cannot be free'd until after the lock is released.
++		 *
++		 * This is true even if ct has a refcount of 0: the
++		 * cpu that is about to free the entry must remove it
++		 * from the dying list and needs the lock to do so.
++		 */
+ 		e = nf_ct_ecache_find(ct);
+ 		if (!e || e->state != NFCT_ECACHE_DESTROY_FAIL)
+ 			continue;
+ 
++		/* ct is in NFCT_ECACHE_DESTROY_FAIL state, this means
++		 * the worker owns this entry: the ct will remain valid
++		 * until the worker puts its ct reference.
++		 */
+ 		if (nf_conntrack_event(IPCT_DESTROY, ct)) {
+ 			ret = STATE_CONGESTED;
+ 			break;
+
+commit 40d102cde0a2aabb5e542ab1ab1aa4aaa1fd4372
+Author: Jeremy Sowden <jeremy@azazel.net>
+Date:   Fri Sep 13 09:13:05 2019 +0100
+
+    netfilter: update include directives.
+    
+    Include some headers in files which require them, and remove others
+    which are not required.
+    
+    Signed-off-by: Jeremy Sowden <jeremy@azazel.net>
+    Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+
+diff --git a/net/netfilter/nf_conntrack_ecache.c b/net/netfilter/nf_conntrack_ecache.c
+index 5e2812ee2149..6fba74b5aaf7 100644
+--- a/net/netfilter/nf_conntrack_ecache.c
++++ b/net/netfilter/nf_conntrack_ecache.c
+@@ -24,6 +24,7 @@
+ 
+ #include <net/netfilter/nf_conntrack.h>
+ #include <net/netfilter/nf_conntrack_core.h>
++#include <net/netfilter/nf_conntrack_ecache.h>
+ #include <net/netfilter/nf_conntrack_extend.h>
+ 
+ static DEFINE_MUTEX(nf_ct_ecache_mutex);
+
+commit d2912cb15bdda8ba4a5dd73396ad62641af2f520
+Author: Thomas Gleixner <tglx@linutronix.de>
+Date:   Tue Jun 4 10:11:33 2019 +0200
+
+    treewide: Replace GPLv2 boilerplate/reference with SPDX - rule 500
+    
+    Based on 2 normalized pattern(s):
+    
+      this program is free software you can redistribute it and or modify
+      it under the terms of the gnu general public license version 2 as
+      published by the free software foundation
+    
+      this program is free software you can redistribute it and or modify
+      it under the terms of the gnu general public license version 2 as
+      published by the free software foundation #
+    
+    extracted by the scancode license scanner the SPDX license identifier
+    
+      GPL-2.0-only
+    
+    has been chosen to replace the boilerplate/reference in 4122 file(s).
+    
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Reviewed-by: Enrico Weigelt <info@metux.net>
+    Reviewed-by: Kate Stewart <kstewart@linuxfoundation.org>
+    Reviewed-by: Allison Randal <allison@lohutok.net>
+    Cc: linux-spdx@vger.kernel.org
+    Link: https://lkml.kernel.org/r/20190604081206.933168790@linutronix.de
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/net/netfilter/nf_conntrack_ecache.c b/net/netfilter/nf_conntrack_ecache.c
+index 3d042f8ff183..5e2812ee2149 100644
+--- a/net/netfilter/nf_conntrack_ecache.c
++++ b/net/netfilter/nf_conntrack_ecache.c
+@@ -1,3 +1,4 @@
++// SPDX-License-Identifier: GPL-2.0-only
+ /* Event cache for netfilter. */
+ 
+ /*
+@@ -5,10 +6,6 @@
+  * (C) 2005 Patrick McHardy <kaber@trash.net>
+  * (C) 2005-2006 Netfilter Core Team <coreteam@netfilter.org>
+  * (C) 2005 USAGI/WIDE Project <http://www.linux-ipv6.org>
+- *
+- * This program is free software; you can redistribute it and/or modify
+- * it under the terms of the GNU General Public License version 2 as
+- * published by the Free Software Foundation.
+  */
+ 
+ #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+
+commit fc3893fd5cfc3c654ae4b9c8d7ee39ea70e4bdc6
+Author: Florian Westphal <fw@strlen.de>
+Date:   Tue Dec 18 23:04:49 2018 +0100
+
+    netfilter: conntrack: remove empty pernet fini stubs
+    
+    after moving sysctl handling into single place, the init functions
+    can't fail anymore and some of the fini functions are empty.
+    
+    Remove them and change return type to void.
+    This also simplifies error unwinding in conntrack module init path.
+    
+    Signed-off-by: Florian Westphal <fw@strlen.de>
+    Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+
+diff --git a/net/netfilter/nf_conntrack_ecache.c b/net/netfilter/nf_conntrack_ecache.c
+index 75118b75aa50..3d042f8ff183 100644
+--- a/net/netfilter/nf_conntrack_ecache.c
++++ b/net/netfilter/nf_conntrack_ecache.c
+@@ -342,11 +342,10 @@ static const struct nf_ct_ext_type event_extend = {
+ 	.id	= NF_CT_EXT_ECACHE,
+ };
+ 
+-int nf_conntrack_ecache_pernet_init(struct net *net)
++void nf_conntrack_ecache_pernet_init(struct net *net)
+ {
+ 	net->ct.sysctl_events = nf_ct_events;
+ 	INIT_DELAYED_WORK(&net->ct.ecache_dwork, ecache_work);
+-	return 0;
+ }
+ 
+ void nf_conntrack_ecache_pernet_fini(struct net *net)
+
+commit cb2833ed0044f910877b810077bc6da2ac5f09a2
+Author: Florian Westphal <fw@strlen.de>
+Date:   Tue Dec 18 23:04:48 2018 +0100
+
+    netfilter: conntrack: merge ecache and timestamp sysctl tables with main one
+    
+    Similar to previous change, this time for eache and timestamp.
+    Unlike helper and acct, these can be disabled at build time, so they
+    need ifdef guards.
+    
+    Next patch will remove a few (now obsolete) functions.
+    
+    Signed-off-by: Florian Westphal <fw@strlen.de>
+    Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+
+diff --git a/net/netfilter/nf_conntrack_ecache.c b/net/netfilter/nf_conntrack_ecache.c
+index c11822a7d2bf..75118b75aa50 100644
+--- a/net/netfilter/nf_conntrack_ecache.c
++++ b/net/netfilter/nf_conntrack_ecache.c
+@@ -336,85 +336,22 @@ EXPORT_SYMBOL_GPL(nf_ct_expect_unregister_notifier);
+ #define NF_CT_EVENTS_DEFAULT 1
+ static int nf_ct_events __read_mostly = NF_CT_EVENTS_DEFAULT;
+ 
+-#ifdef CONFIG_SYSCTL
+-static struct ctl_table event_sysctl_table[] = {
+-	{
+-		.procname	= "nf_conntrack_events",
+-		.data		= &init_net.ct.sysctl_events,
+-		.maxlen		= sizeof(unsigned int),
+-		.mode		= 0644,
+-		.proc_handler	= proc_dointvec,
+-	},
+-	{}
+-};
+-#endif /* CONFIG_SYSCTL */
+-
+ static const struct nf_ct_ext_type event_extend = {
+ 	.len	= sizeof(struct nf_conntrack_ecache),
+ 	.align	= __alignof__(struct nf_conntrack_ecache),
+ 	.id	= NF_CT_EXT_ECACHE,
+ };
+ 
+-#ifdef CONFIG_SYSCTL
+-static int nf_conntrack_event_init_sysctl(struct net *net)
+-{
+-	struct ctl_table *table;
+-
+-	table = kmemdup(event_sysctl_table, sizeof(event_sysctl_table),
+-			GFP_KERNEL);
+-	if (!table)
+-		goto out;
+-
+-	table[0].data = &net->ct.sysctl_events;
+-
+-	/* Don't export sysctls to unprivileged users */
+-	if (net->user_ns != &init_user_ns)
+-		table[0].procname = NULL;
+-
+-	net->ct.event_sysctl_header =
+-		register_net_sysctl(net, "net/netfilter", table);
+-	if (!net->ct.event_sysctl_header) {
+-		pr_err("can't register to sysctl\n");
+-		goto out_register;
+-	}
+-	return 0;
+-
+-out_register:
+-	kfree(table);
+-out:
+-	return -ENOMEM;
+-}
+-
+-static void nf_conntrack_event_fini_sysctl(struct net *net)
+-{
+-	struct ctl_table *table;
+-
+-	table = net->ct.event_sysctl_header->ctl_table_arg;
+-	unregister_net_sysctl_table(net->ct.event_sysctl_header);
+-	kfree(table);
+-}
+-#else
+-static int nf_conntrack_event_init_sysctl(struct net *net)
+-{
+-	return 0;
+-}
+-
+-static void nf_conntrack_event_fini_sysctl(struct net *net)
+-{
+-}
+-#endif /* CONFIG_SYSCTL */
+-
+ int nf_conntrack_ecache_pernet_init(struct net *net)
+ {
+ 	net->ct.sysctl_events = nf_ct_events;
+ 	INIT_DELAYED_WORK(&net->ct.ecache_dwork, ecache_work);
+-	return nf_conntrack_event_init_sysctl(net);
++	return 0;
+ }
+ 
+ void nf_conntrack_ecache_pernet_fini(struct net *net)
+ {
+ 	cancel_delayed_work_sync(&net->ct.ecache_dwork);
+-	nf_conntrack_event_fini_sysctl(net);
+ }
+ 
+ int nf_conntrack_ecache_init(void)
+
+commit 5191d70f83fd1878c40029cffe69f6a2bf65fa0e
+Author: Arushi Singhal <arushisinghal19971997@gmail.com>
+Date:   Mon Mar 12 18:36:29 2018 +0530
+
+    netfilter: Replace printk() with pr_*() and define pr_fmt()
+    
+    Using pr_<loglevel>() is more concise than printk(KERN_<LOGLEVEL>).
+    This patch:
+    * Replace printks having a log level with the appropriate
+    pr_*() macros.
+    * Define pr_fmt() to include relevant name.
+    * Remove redundant prefixes from pr_*() calls.
+    * Indent the code where possible.
+    * Remove the useless output messages.
+    * Remove periods from messages.
+    
+    Signed-off-by: Arushi Singhal <arushisinghal19971997@gmail.com>
+    Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+
+diff --git a/net/netfilter/nf_conntrack_ecache.c b/net/netfilter/nf_conntrack_ecache.c
+index caac41ad9483..c11822a7d2bf 100644
+--- a/net/netfilter/nf_conntrack_ecache.c
++++ b/net/netfilter/nf_conntrack_ecache.c
+@@ -11,6 +11,8 @@
+  * published by the Free Software Foundation.
+  */
+ 
++#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++
+ #include <linux/types.h>
+ #include <linux/netfilter.h>
+ #include <linux/skbuff.h>
+@@ -372,7 +374,7 @@ static int nf_conntrack_event_init_sysctl(struct net *net)
+ 	net->ct.event_sysctl_header =
+ 		register_net_sysctl(net, "net/netfilter", table);
+ 	if (!net->ct.event_sysctl_header) {
+-		printk(KERN_ERR "nf_ct_event: can't register to sysctl.\n");
++		pr_err("can't register to sysctl\n");
+ 		goto out_register;
+ 	}
+ 	return 0;
+@@ -419,7 +421,7 @@ int nf_conntrack_ecache_init(void)
+ {
+ 	int ret = nf_ct_extend_register(&event_extend);
+ 	if (ret < 0)
+-		pr_err("nf_ct_event: Unable to register event extension.\n");
++		pr_err("Unable to register event extension\n");
+ 
+ 	BUILD_BUG_ON(__IPCT_MAX >= 16);	/* ctmask, missed use u16 */
+ 
+
+commit 23f671a1b56a4493075ab7263c78c526ac12a592
+Author: Florian Westphal <fw@strlen.de>
+Date:   Thu Apr 20 09:54:23 2017 +0200
+
+    netfilter: conntrack: mark extension structs as const
+    
+    Signed-off-by: Florian Westphal <fw@strlen.de>
+    Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+
+diff --git a/net/netfilter/nf_conntrack_ecache.c b/net/netfilter/nf_conntrack_ecache.c
+index 515212948125..caac41ad9483 100644
+--- a/net/netfilter/nf_conntrack_ecache.c
++++ b/net/netfilter/nf_conntrack_ecache.c
+@@ -347,7 +347,7 @@ static struct ctl_table event_sysctl_table[] = {
+ };
+ #endif /* CONFIG_SYSCTL */
+ 
+-static struct nf_ct_ext_type event_extend __read_mostly = {
++static const struct nf_ct_ext_type event_extend = {
+ 	.len	= sizeof(struct nf_conntrack_ecache),
+ 	.align	= __alignof__(struct nf_conntrack_ecache),
+ 	.id	= NF_CT_EXT_ECACHE,
+
+commit 01026edef9062b7d26ace74a5b4a5a33a2399501
+Author: Florian Westphal <fw@strlen.de>
+Date:   Tue Apr 18 17:27:32 2017 +0200
+
+    nefilter: eache: reduce struct size from 32 to 24 byte
+    
+    Only "cache" needs to use ulong (its used with set_bit()), missed can use
+    u16.  Also add build-time assertion to ensure event bits fit.
+    
+    Signed-off-by: Florian Westphal <fw@strlen.de>
+    Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+
+diff --git a/net/netfilter/nf_conntrack_ecache.c b/net/netfilter/nf_conntrack_ecache.c
+index 6161e92d2980..515212948125 100644
+--- a/net/netfilter/nf_conntrack_ecache.c
++++ b/net/netfilter/nf_conntrack_ecache.c
+@@ -420,6 +420,9 @@ int nf_conntrack_ecache_init(void)
+ 	int ret = nf_ct_extend_register(&event_extend);
+ 	if (ret < 0)
+ 		pr_err("nf_ct_event: Unable to register event extension.\n");
++
++	BUILD_BUG_ON(__IPCT_MAX >= 16);	/* ctmask, missed use u16 */
++
+ 	return ret;
+ }
+ 
+
+commit 6e354a5e565110c3a0eb7da3788340d4809a42b6
+Author: Gao Feng <fgao@ikuai8.com>
+Date:   Thu Apr 13 09:35:49 2017 +0800
+
+    netfilter: ecache: Refine the nf_ct_deliver_cached_events
+    
+    1. Remove single !events condition check to deliver the missed event
+    even though there is no new event happened.
+    
+    Consider this case:
+    1) nf_ct_deliver_cached_events is invoked at the first time, the
+    event is failed to deliver, then the missed is set.
+    2) nf_ct_deliver_cached_events is invoked again, but there is no
+    any new event happened.
+    The missed event is lost really.
+    
+    It would try to send the missed event again after remove this check.
+    And it is ok if there is no missed event because the latter check
+    !((events | missed) & e->ctmask) could avoid it.
+    
+    2. Correct the return value check of notify->fcn.
+    When send the event successfully, it returns 0, not postive value.
+    
+    Signed-off-by: Gao Feng <fgao@ikuai8.com>
+    Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+
+diff --git a/net/netfilter/nf_conntrack_ecache.c b/net/netfilter/nf_conntrack_ecache.c
+index 22fc32143e9c..6161e92d2980 100644
+--- a/net/netfilter/nf_conntrack_ecache.c
++++ b/net/netfilter/nf_conntrack_ecache.c
+@@ -195,7 +195,7 @@ void nf_ct_deliver_cached_events(struct nf_conn *ct)
+ 
+ 	events = xchg(&e->cache, 0);
+ 
+-	if (!nf_ct_is_confirmed(ct) || nf_ct_is_dying(ct) || !events)
++	if (!nf_ct_is_confirmed(ct) || nf_ct_is_dying(ct))
+ 		goto out_unlock;
+ 
+ 	/* We make a copy of the missed event cache without taking
+@@ -212,7 +212,7 @@ void nf_ct_deliver_cached_events(struct nf_conn *ct)
+ 
+ 	ret = notify->fcn(events | missed, &item);
+ 
+-	if (likely(ret >= 0 && !missed))
++	if (likely(ret == 0 && !missed))
+ 		goto out_unlock;
+ 
+ 	spin_lock_bh(&ct->lock);
+
+commit 3b7dabf029478bb80507a6c4500ca94132a2bc0b
+Author: Liping Zhang <zlpnobody@gmail.com>
+Date:   Sat Mar 25 08:53:12 2017 +0800
+
+    netfilter: invoke synchronize_rcu after set the _hook_ to NULL
+    
+    Otherwise, another CPU may access the invalid pointer. For example:
+        CPU0                CPU1
+         -              rcu_read_lock();
+         -              pfunc = _hook_;
+      _hook_ = NULL;          -
+      mod unload              -
+         -                 pfunc(); // invalid, panic
+         -             rcu_read_unlock();
+    
+    So we must call synchronize_rcu() to wait the rcu reader to finish.
+    
+    Also note, in nf_nat_snmp_basic_fini, synchronize_rcu() will be invoked
+    by later nf_conntrack_helper_unregister, but I'm inclined to add a
+    explicit synchronize_rcu after set the nf_nat_snmp_hook to NULL. Depend
+    on such obscure assumptions is not a good idea.
+    
+    Last, in nfnetlink_cttimeout, we use kfree_rcu to free the time object,
+    so in cttimeout_exit, invoking rcu_barrier() is not necessary at all,
+    remove it too.
+    
+    Signed-off-by: Liping Zhang <zlpnobody@gmail.com>
+    Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+
+diff --git a/net/netfilter/nf_conntrack_ecache.c b/net/netfilter/nf_conntrack_ecache.c
+index da9df2d56e66..22fc32143e9c 100644
+--- a/net/netfilter/nf_conntrack_ecache.c
++++ b/net/netfilter/nf_conntrack_ecache.c
+@@ -290,6 +290,7 @@ void nf_conntrack_unregister_notifier(struct net *net,
+ 	BUG_ON(notify != new);
+ 	RCU_INIT_POINTER(net->ct.nf_conntrack_event_cb, NULL);
+ 	mutex_unlock(&nf_ct_ecache_mutex);
++	/* synchronize_rcu() is called from ctnetlink_exit. */
+ }
+ EXPORT_SYMBOL_GPL(nf_conntrack_unregister_notifier);
+ 
+@@ -326,6 +327,7 @@ void nf_ct_expect_unregister_notifier(struct net *net,
+ 	BUG_ON(notify != new);
+ 	RCU_INIT_POINTER(net->ct.nf_expect_event_cb, NULL);
+ 	mutex_unlock(&nf_ct_ecache_mutex);
++	/* synchronize_rcu() is called from ctnetlink_exit. */
+ }
+ EXPORT_SYMBOL_GPL(nf_ct_expect_unregister_notifier);
+ 
+
+commit 616b14b46957b52dc7e1f3ec2210d3f9051b1178
+Author: Florian Westphal <fw@strlen.de>
+Date:   Thu Aug 25 15:33:30 2016 +0200
+
+    netfilter: don't rely on DYING bit to detect when destroy event was sent
+    
+    The reliable event delivery mode currently (ab)uses the DYING bit to
+    detect which entries on the dying list have to be skipped when
+    re-delivering events from the eache worker in reliable event mode.
+    
+    Currently when we delete the conntrack from main table we only set this
+    bit if we could also deliver the netlink destroy event to userspace.
+    
+    If we fail we move it to the dying list, the ecache worker will
+    reattempt event delivery for all confirmed conntracks on the dying list
+    that do not have the DYING bit set.
+    
+    Once timer is gone, we can no longer use if (del_timer()) to detect
+    when we 'stole' the reference count owned by the timer/hash entry, so
+    we need some other way to avoid racing with other cpu.
+    
+    Pablo suggested to add a marker in the ecache extension that skips
+    entries that have been unhashed from main table but are still waiting
+    for the last reference count to be dropped (e.g. because one skb waiting
+    on nfqueue verdict still holds a reference).
+    
+    We do this by adding a tristate.
+    If we fail to deliver the destroy event, make a note of this in the
+    eache extension.  The worker can then skip all entries that are in
+    a different state.  Either they never delivered a destroy event,
+    e.g. because the netlink backend was not loaded, or redelivery took
+    place already.
+    
+    Once the conntrack timer is removed we will now be able to replace
+    del_timer() test with test_and_set_bit(DYING, &ct->status) to avoid
+    racing with other cpu that tries to evict the same conntrack.
+    
+    Because DYING will then be set right before we report the destroy event
+    we can no longer skip event reporting when dying bit is set.
+    
+    Suggested-by: Pablo Neira Ayuso <pablo@netfilter.org>
+    Signed-off-by: Florian Westphal <fw@strlen.de>
+    Acked-by: Eric Dumazet <edumazet@google.com>
+    Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+
+diff --git a/net/netfilter/nf_conntrack_ecache.c b/net/netfilter/nf_conntrack_ecache.c
+index d28011b42845..da9df2d56e66 100644
+--- a/net/netfilter/nf_conntrack_ecache.c
++++ b/net/netfilter/nf_conntrack_ecache.c
+@@ -49,8 +49,13 @@ static enum retry_state ecache_work_evict_list(struct ct_pcpu *pcpu)
+ 
+ 	hlist_nulls_for_each_entry(h, n, &pcpu->dying, hnnode) {
+ 		struct nf_conn *ct = nf_ct_tuplehash_to_ctrack(h);
++		struct nf_conntrack_ecache *e;
+ 
+-		if (nf_ct_is_dying(ct))
++		if (!nf_ct_is_confirmed(ct))
++			continue;
++
++		e = nf_ct_ecache_find(ct);
++		if (!e || e->state != NFCT_ECACHE_DESTROY_FAIL)
+ 			continue;
+ 
+ 		if (nf_conntrack_event(IPCT_DESTROY, ct)) {
+@@ -58,8 +63,7 @@ static enum retry_state ecache_work_evict_list(struct ct_pcpu *pcpu)
+ 			break;
+ 		}
+ 
+-		/* we've got the event delivered, now it's dying */
+-		set_bit(IPS_DYING_BIT, &ct->status);
++		e->state = NFCT_ECACHE_DESTROY_SENT;
+ 		refs[evicted] = ct;
+ 
+ 		if (++evicted >= ARRAY_SIZE(refs)) {
+@@ -130,7 +134,7 @@ int nf_conntrack_eventmask_report(unsigned int eventmask, struct nf_conn *ct,
+ 	if (!e)
+ 		goto out_unlock;
+ 
+-	if (nf_ct_is_confirmed(ct) && !nf_ct_is_dying(ct)) {
++	if (nf_ct_is_confirmed(ct)) {
+ 		struct nf_ct_event item = {
+ 			.ct	= ct,
+ 			.portid	= e->portid ? e->portid : portid,
+@@ -150,11 +154,13 @@ int nf_conntrack_eventmask_report(unsigned int eventmask, struct nf_conn *ct,
+ 				 * triggered by a process, we store the PORTID
+ 				 * to include it in the retransmission.
+ 				 */
+-				if (eventmask & (1 << IPCT_DESTROY) &&
+-				    e->portid == 0 && portid != 0)
+-					e->portid = portid;
+-				else
++				if (eventmask & (1 << IPCT_DESTROY)) {
++					if (e->portid == 0 && portid != 0)
++						e->portid = portid;
++					e->state = NFCT_ECACHE_DESTROY_FAIL;
++				} else {
+ 					e->missed |= eventmask;
++				}
+ 			} else {
+ 				e->missed &= ~missed;
+ 			}
+
+commit ecdfb48cddfd1096343148113d5b1bd789033aa8
+Author: Florian Westphal <fw@strlen.de>
+Date:   Mon Apr 11 21:52:36 2016 +0200
+
+    netfilter: conntrack: move expectation event helper to ecache.c
+    
+    Not performance critical, it is only invoked when an expectation is
+    added/destroyed.
+    
+    While at it, kill unused nf_ct_expect_event() wrapper.
+    
+    Signed-off-by: Florian Westphal <fw@strlen.de>
+    Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+
+diff --git a/net/netfilter/nf_conntrack_ecache.c b/net/netfilter/nf_conntrack_ecache.c
+index a0ebab96a92f..d28011b42845 100644
+--- a/net/netfilter/nf_conntrack_ecache.c
++++ b/net/netfilter/nf_conntrack_ecache.c
+@@ -221,6 +221,36 @@ void nf_ct_deliver_cached_events(struct nf_conn *ct)
+ }
+ EXPORT_SYMBOL_GPL(nf_ct_deliver_cached_events);
+ 
++void nf_ct_expect_event_report(enum ip_conntrack_expect_events event,
++			       struct nf_conntrack_expect *exp,
++			       u32 portid, int report)
++
++{
++	struct net *net = nf_ct_exp_net(exp);
++	struct nf_exp_event_notifier *notify;
++	struct nf_conntrack_ecache *e;
++
++	rcu_read_lock();
++	notify = rcu_dereference(net->ct.nf_expect_event_cb);
++	if (!notify)
++		goto out_unlock;
++
++	e = nf_ct_ecache_find(exp->master);
++	if (!e)
++		goto out_unlock;
++
++	if (e->expmask & (1 << event)) {
++		struct nf_exp_event item = {
++			.exp	= exp,
++			.portid	= portid,
++			.report = report
++		};
++		notify->fcn(1 << event, &item);
++	}
++out_unlock:
++	rcu_read_unlock();
++}
++
+ int nf_conntrack_register_notifier(struct net *net,
+ 				   struct nf_ct_event_notifier *new)
+ {
+
+commit 3c435e2e414e82ec6c0e96a1dfc2be3ddc3c23b4
+Author: Florian Westphal <fw@strlen.de>
+Date:   Mon Apr 11 21:52:35 2016 +0200
+
+    netfilter: conntrack: de-inline nf_conntrack_eventmask_report
+    
+    Way too large; move it to nf_conntrack_ecache.c.
+    Reduces total object size by 1216 byte on my machine.
+    
+    Signed-off-by: Florian Westphal <fw@strlen.de>
+    Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+
+diff --git a/net/netfilter/nf_conntrack_ecache.c b/net/netfilter/nf_conntrack_ecache.c
+index 4e78c57b818f..a0ebab96a92f 100644
+--- a/net/netfilter/nf_conntrack_ecache.c
++++ b/net/netfilter/nf_conntrack_ecache.c
+@@ -113,6 +113,60 @@ static void ecache_work(struct work_struct *work)
+ 		schedule_delayed_work(&ctnet->ecache_dwork, delay);
+ }
+ 
++int nf_conntrack_eventmask_report(unsigned int eventmask, struct nf_conn *ct,
++				  u32 portid, int report)
++{
++	int ret = 0;
++	struct net *net = nf_ct_net(ct);
++	struct nf_ct_event_notifier *notify;
++	struct nf_conntrack_ecache *e;
++
++	rcu_read_lock();
++	notify = rcu_dereference(net->ct.nf_conntrack_event_cb);
++	if (!notify)
++		goto out_unlock;
++
++	e = nf_ct_ecache_find(ct);
++	if (!e)
++		goto out_unlock;
++
++	if (nf_ct_is_confirmed(ct) && !nf_ct_is_dying(ct)) {
++		struct nf_ct_event item = {
++			.ct	= ct,
++			.portid	= e->portid ? e->portid : portid,
++			.report = report
++		};
++		/* This is a resent of a destroy event? If so, skip missed */
++		unsigned long missed = e->portid ? 0 : e->missed;
++
++		if (!((eventmask | missed) & e->ctmask))
++			goto out_unlock;
++
++		ret = notify->fcn(eventmask | missed, &item);
++		if (unlikely(ret < 0 || missed)) {
++			spin_lock_bh(&ct->lock);
++			if (ret < 0) {
++				/* This is a destroy event that has been
++				 * triggered by a process, we store the PORTID
++				 * to include it in the retransmission.
++				 */
++				if (eventmask & (1 << IPCT_DESTROY) &&
++				    e->portid == 0 && portid != 0)
++					e->portid = portid;
++				else
++					e->missed |= eventmask;
++			} else {
++				e->missed &= ~missed;
++			}
++			spin_unlock_bh(&ct->lock);
++		}
++	}
++out_unlock:
++	rcu_read_unlock();
++	return ret;
++}
++EXPORT_SYMBOL_GPL(nf_conntrack_eventmask_report);
++
+ /* deliver cached events and clear cache entry - must be called with locally
+  * disabled softirqs */
+ void nf_ct_deliver_cached_events(struct nf_conn *ct)
+
+commit 9500507c61381ceda4edbefa7361a4d26f54eb17
+Author: Florian Westphal <fw@strlen.de>
+Date:   Tue Jun 10 23:12:56 2014 +0200
+
+    netfilter: conntrack: remove timer from ecache extension
+    
+    This brings the (per-conntrack) ecache extension back to 24 bytes in size
+    (was 152 byte on x86_64 with lockdep on).
+    
+    When event delivery fails, re-delivery is attempted via work queue.
+    
+    Redelivery is attempted at least every 0.1 seconds, but can happen
+    more frequently if userspace is not congested.
+    
+    The nf_ct_release_dying_list() function is removed.
+    With this patch, ownership of the to-be-redelivered conntracks
+    (on-dying-list-with-DYING-bit not yet set) is with the work queue,
+    which will release the references once event is out.
+    
+    Joint work with Pablo Neira Ayuso.
+    
+    Signed-off-by: Florian Westphal <fw@strlen.de>
+    Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+
+diff --git a/net/netfilter/nf_conntrack_ecache.c b/net/netfilter/nf_conntrack_ecache.c
+index 1df176146567..4e78c57b818f 100644
+--- a/net/netfilter/nf_conntrack_ecache.c
++++ b/net/netfilter/nf_conntrack_ecache.c
+@@ -29,6 +29,90 @@
+ 
+ static DEFINE_MUTEX(nf_ct_ecache_mutex);
+ 
++#define ECACHE_RETRY_WAIT (HZ/10)
++
++enum retry_state {
++	STATE_CONGESTED,
++	STATE_RESTART,
++	STATE_DONE,
++};
++
++static enum retry_state ecache_work_evict_list(struct ct_pcpu *pcpu)
++{
++	struct nf_conn *refs[16];
++	struct nf_conntrack_tuple_hash *h;
++	struct hlist_nulls_node *n;
++	unsigned int evicted = 0;
++	enum retry_state ret = STATE_DONE;
++
++	spin_lock(&pcpu->lock);
++
++	hlist_nulls_for_each_entry(h, n, &pcpu->dying, hnnode) {
++		struct nf_conn *ct = nf_ct_tuplehash_to_ctrack(h);
++
++		if (nf_ct_is_dying(ct))
++			continue;
++
++		if (nf_conntrack_event(IPCT_DESTROY, ct)) {
++			ret = STATE_CONGESTED;
++			break;
++		}
++
++		/* we've got the event delivered, now it's dying */
++		set_bit(IPS_DYING_BIT, &ct->status);
++		refs[evicted] = ct;
++
++		if (++evicted >= ARRAY_SIZE(refs)) {
++			ret = STATE_RESTART;
++			break;
++		}
++	}
++
++	spin_unlock(&pcpu->lock);
++
++	/* can't _put while holding lock */
++	while (evicted)
++		nf_ct_put(refs[--evicted]);
++
++	return ret;
++}
++
++static void ecache_work(struct work_struct *work)
++{
++	struct netns_ct *ctnet =
++		container_of(work, struct netns_ct, ecache_dwork.work);
++	int cpu, delay = -1;
++	struct ct_pcpu *pcpu;
++
++	local_bh_disable();
++
++	for_each_possible_cpu(cpu) {
++		enum retry_state ret;
++
++		pcpu = per_cpu_ptr(ctnet->pcpu_lists, cpu);
++
++		ret = ecache_work_evict_list(pcpu);
++
++		switch (ret) {
++		case STATE_CONGESTED:
++			delay = ECACHE_RETRY_WAIT;
++			goto out;
++		case STATE_RESTART:
++			delay = 0;
++			break;
++		case STATE_DONE:
++			break;
++		}
++	}
++
++ out:
++	local_bh_enable();
++
++	ctnet->ecache_dwork_pending = delay > 0;
++	if (delay >= 0)
++		schedule_delayed_work(&ctnet->ecache_dwork, delay);
++}
++
+ /* deliver cached events and clear cache entry - must be called with locally
+  * disabled softirqs */
+ void nf_ct_deliver_cached_events(struct nf_conn *ct)
+@@ -157,7 +241,6 @@ EXPORT_SYMBOL_GPL(nf_ct_expect_unregister_notifier);
+ 
+ #define NF_CT_EVENTS_DEFAULT 1
+ static int nf_ct_events __read_mostly = NF_CT_EVENTS_DEFAULT;
+-static int nf_ct_events_retry_timeout __read_mostly = 15*HZ;
+ 
+ #ifdef CONFIG_SYSCTL
+ static struct ctl_table event_sysctl_table[] = {
+@@ -168,13 +251,6 @@ static struct ctl_table event_sysctl_table[] = {
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_dointvec,
+ 	},
+-	{
+-		.procname	= "nf_conntrack_events_retry_timeout",
+-		.data		= &init_net.ct.sysctl_events_retry_timeout,
+-		.maxlen		= sizeof(unsigned int),
+-		.mode		= 0644,
+-		.proc_handler	= proc_dointvec_jiffies,
+-	},
+ 	{}
+ };
+ #endif /* CONFIG_SYSCTL */
+@@ -196,7 +272,6 @@ static int nf_conntrack_event_init_sysctl(struct net *net)
+ 		goto out;
+ 
+ 	table[0].data = &net->ct.sysctl_events;
+-	table[1].data = &net->ct.sysctl_events_retry_timeout;
+ 
+ 	/* Don't export sysctls to unprivileged users */
+ 	if (net->user_ns != &init_user_ns)
+@@ -238,12 +313,13 @@ static void nf_conntrack_event_fini_sysctl(struct net *net)
+ int nf_conntrack_ecache_pernet_init(struct net *net)
+ {
+ 	net->ct.sysctl_events = nf_ct_events;
+-	net->ct.sysctl_events_retry_timeout = nf_ct_events_retry_timeout;
++	INIT_DELAYED_WORK(&net->ct.ecache_dwork, ecache_work);
+ 	return nf_conntrack_event_init_sysctl(net);
+ }
+ 
+ void nf_conntrack_ecache_pernet_fini(struct net *net)
+ {
++	cancel_delayed_work_sync(&net->ct.ecache_dwork);
+ 	nf_conntrack_event_fini_sysctl(net);
+ }
+ 
+
+commit f229f6ce481ceb33a966311722b8ef0cb6c25de7
+Author: Patrick McHardy <kaber@trash.net>
+Date:   Sat Apr 6 15:24:29 2013 +0200
+
+    netfilter: add my copyright statements
+    
+    Add copyright statements to all netfilter files which have had significant
+    changes done by myself in the past.
+    
+    Some notes:
+    
+    - nf_conntrack_ecache.c was incorrectly attributed to Rusty and Netfilter
+      Core Team when it got split out of nf_conntrack_core.c. The copyrights
+      even state a date which lies six years before it was written. It was
+      written in 2005 by Harald and myself.
+    
+    - net/ipv{4,6}/netfilter.c, net/netfitler/nf_queue.c were missing copyright
+      statements. I've added the copyright statement from net/netfilter/core.c,
+      where this code originated
+    
+    - for nf_conntrack_proto_tcp.c I've also added Jozsef, since I didn't want
+      it to give the wrong impression
+    
+    Signed-off-by: Patrick McHardy <kaber@trash.net>
+    Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+
+diff --git a/net/netfilter/nf_conntrack_ecache.c b/net/netfilter/nf_conntrack_ecache.c
+index b5d2eb8bf0d5..1df176146567 100644
+--- a/net/netfilter/nf_conntrack_ecache.c
++++ b/net/netfilter/nf_conntrack_ecache.c
+@@ -1,8 +1,10 @@
+ /* Event cache for netfilter. */
+ 
+-/* (C) 1999-2001 Paul `Rusty' Russell
+- * (C) 2002-2006 Netfilter Core Team <coreteam@netfilter.org>
+- * (C) 2003,2004 USAGI/WIDE Project <http://www.linux-ipv6.org>
++/*
++ * (C) 2005 Harald Welte <laforge@gnumonks.org>
++ * (C) 2005 Patrick McHardy <kaber@trash.net>
++ * (C) 2005-2006 Netfilter Core Team <coreteam@netfilter.org>
++ * (C) 2005 USAGI/WIDE Project <http://www.linux-ipv6.org>
+  *
+  * This program is free software; you can redistribute it and/or modify
+  * it under the terms of the GNU General Public License version 2 as
+
+commit 3fe0f943d4f52f875f0fdf8dbe472c8a9b852891
+Author: Gao feng <gaofeng@cn.fujitsu.com>
+Date:   Mon Jan 21 22:10:28 2013 +0000
+
+    netfilter: nf_ct_ecache: move initialization out of pernet_operations
+    
+    Move the global initial codes to the module_init/exit context.
+    
+    Signed-off-by: Gao feng <gaofeng@cn.fujitsu.com>
+    Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+
+diff --git a/net/netfilter/nf_conntrack_ecache.c b/net/netfilter/nf_conntrack_ecache.c
+index faa978f1714b..b5d2eb8bf0d5 100644
+--- a/net/netfilter/nf_conntrack_ecache.c
++++ b/net/netfilter/nf_conntrack_ecache.c
+@@ -233,38 +233,27 @@ static void nf_conntrack_event_fini_sysctl(struct net *net)
+ }
+ #endif /* CONFIG_SYSCTL */
+ 
+-int nf_conntrack_ecache_init(struct net *net)
++int nf_conntrack_ecache_pernet_init(struct net *net)
+ {
+-	int ret;
+-
+ 	net->ct.sysctl_events = nf_ct_events;
+ 	net->ct.sysctl_events_retry_timeout = nf_ct_events_retry_timeout;
++	return nf_conntrack_event_init_sysctl(net);
++}
+ 
+-	if (net_eq(net, &init_net)) {
+-		ret = nf_ct_extend_register(&event_extend);
+-		if (ret < 0) {
+-			printk(KERN_ERR "nf_ct_event: Unable to register "
+-					"event extension.\n");
+-			goto out_extend_register;
+-		}
+-	}
++void nf_conntrack_ecache_pernet_fini(struct net *net)
++{
++	nf_conntrack_event_fini_sysctl(net);
++}
+ 
+-	ret = nf_conntrack_event_init_sysctl(net);
++int nf_conntrack_ecache_init(void)
++{
++	int ret = nf_ct_extend_register(&event_extend);
+ 	if (ret < 0)
+-		goto out_sysctl;
+-
+-	return 0;
+-
+-out_sysctl:
+-	if (net_eq(net, &init_net))
+-		nf_ct_extend_unregister(&event_extend);
+-out_extend_register:
++		pr_err("nf_ct_event: Unable to register event extension.\n");
+ 	return ret;
+ }
+ 
+-void nf_conntrack_ecache_fini(struct net *net)
++void nf_conntrack_ecache_fini(void)
+ {
+-	nf_conntrack_event_fini_sysctl(net);
+-	if (net_eq(net, &init_net))
+-		nf_ct_extend_unregister(&event_extend);
++	nf_ct_extend_unregister(&event_extend);
+ }
+
+commit 464dc801c76aa0db88e16e8f5f47c6879858b9b2
+Author: Eric W. Biederman <ebiederm@xmission.com>
+Date:   Fri Nov 16 03:02:59 2012 +0000
+
+    net: Don't export sysctls to unprivileged users
+    
+    In preparation for supporting the creation of network namespaces
+    by unprivileged users, modify all of the per net sysctl exports
+    and refuse to allow them to unprivileged users.
+    
+    This makes it safe for unprivileged users in general to access
+    per net sysctls, and allows sysctls to be exported to unprivileged
+    users on an individual basis as they are deemed safe.
+    
+    Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/netfilter/nf_conntrack_ecache.c b/net/netfilter/nf_conntrack_ecache.c
+index de9781b6464f..faa978f1714b 100644
+--- a/net/netfilter/nf_conntrack_ecache.c
++++ b/net/netfilter/nf_conntrack_ecache.c
+@@ -196,6 +196,10 @@ static int nf_conntrack_event_init_sysctl(struct net *net)
+ 	table[0].data = &net->ct.sysctl_events;
+ 	table[1].data = &net->ct.sysctl_events_retry_timeout;
+ 
++	/* Don't export sysctls to unprivileged users */
++	if (net->user_ns != &init_user_ns)
++		table[0].procname = NULL;
++
+ 	net->ct.event_sysctl_header =
+ 		register_net_sysctl(net, "net/netfilter", table);
+ 	if (!net->ct.event_sysctl_header) {
+
+commit 15e473046cb6e5d18a4d0057e61d76315230382b
+Author: Eric W. Biederman <ebiederm@xmission.com>
+Date:   Fri Sep 7 20:12:54 2012 +0000
+
+    netlink: Rename pid to portid to avoid confusion
+    
+    It is a frequent mistake to confuse the netlink port identifier with a
+    process identifier.  Try to reduce this confusion by renaming fields
+    that hold port identifiers portid instead of pid.
+    
+    I have carefully avoided changing the structures exported to
+    userspace to avoid changing the userspace API.
+    
+    I have successfully built an allyesconfig kernel with this change.
+    
+    Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+    Acked-by: Stephen Hemminger <shemminger@vyatta.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/netfilter/nf_conntrack_ecache.c b/net/netfilter/nf_conntrack_ecache.c
+index e7be79e640de..de9781b6464f 100644
+--- a/net/netfilter/nf_conntrack_ecache.c
++++ b/net/netfilter/nf_conntrack_ecache.c
+@@ -61,7 +61,7 @@ void nf_ct_deliver_cached_events(struct nf_conn *ct)
+ 		goto out_unlock;
+ 
+ 	item.ct = ct;
+-	item.pid = 0;
++	item.portid = 0;
+ 	item.report = 0;
+ 
+ 	ret = notify->fcn(events | missed, &item);
+
+commit 031d7709f21c778bcb1eed96d790e82b3bee96b5
+Author: Tony Zelenoff <antonz@parallels.com>
+Date:   Thu Mar 8 23:35:39 2012 +0000
+
+    netfilter: nf_ct_ecache: refactor notifier registration
+    
+    * ret variable initialization removed as useless
+    * similar code strings concatenated and functions code
+      flow became more plain
+    
+    Signed-off-by: Tony Zelenoff <antonz@parallels.com>
+    Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+
+diff --git a/net/netfilter/nf_conntrack_ecache.c b/net/netfilter/nf_conntrack_ecache.c
+index b924f3a49a8e..e7be79e640de 100644
+--- a/net/netfilter/nf_conntrack_ecache.c
++++ b/net/netfilter/nf_conntrack_ecache.c
+@@ -84,7 +84,7 @@ EXPORT_SYMBOL_GPL(nf_ct_deliver_cached_events);
+ int nf_conntrack_register_notifier(struct net *net,
+ 				   struct nf_ct_event_notifier *new)
+ {
+-	int ret = 0;
++	int ret;
+ 	struct nf_ct_event_notifier *notify;
+ 
+ 	mutex_lock(&nf_ct_ecache_mutex);
+@@ -95,8 +95,7 @@ int nf_conntrack_register_notifier(struct net *net,
+ 		goto out_unlock;
+ 	}
+ 	rcu_assign_pointer(net->ct.nf_conntrack_event_cb, new);
+-	mutex_unlock(&nf_ct_ecache_mutex);
+-	return ret;
++	ret = 0;
+ 
+ out_unlock:
+ 	mutex_unlock(&nf_ct_ecache_mutex);
+@@ -121,7 +120,7 @@ EXPORT_SYMBOL_GPL(nf_conntrack_unregister_notifier);
+ int nf_ct_expect_register_notifier(struct net *net,
+ 				   struct nf_exp_event_notifier *new)
+ {
+-	int ret = 0;
++	int ret;
+ 	struct nf_exp_event_notifier *notify;
+ 
+ 	mutex_lock(&nf_ct_ecache_mutex);
+@@ -132,8 +131,7 @@ int nf_ct_expect_register_notifier(struct net *net,
+ 		goto out_unlock;
+ 	}
+ 	rcu_assign_pointer(net->ct.nf_expect_event_cb, new);
+-	mutex_unlock(&nf_ct_ecache_mutex);
+-	return ret;
++	ret = 0;
+ 
+ out_unlock:
+ 	mutex_unlock(&nf_ct_ecache_mutex);
+
+commit ec8f23ce0f4005b74013d4d122e0d540397a93c9
+Author: Eric W. Biederman <ebiederm@xmission.com>
+Date:   Thu Apr 19 13:44:49 2012 +0000
+
+    net: Convert all sysctl registrations to register_net_sysctl
+    
+    This results in code with less boiler plate that is a bit easier
+    to read.
+    
+    Additionally stops us from using compatibility code in the sysctl
+    core, hastening the day when the compatibility code can be removed.
+    
+    Signed-off-by: Eric W. Biederman <ebiederm@xmission.com>
+    Acked-by: Pavel Emelyanov <xemul@parallels.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/netfilter/nf_conntrack_ecache.c b/net/netfilter/nf_conntrack_ecache.c
+index 5bd3047ddeec..b924f3a49a8e 100644
+--- a/net/netfilter/nf_conntrack_ecache.c
++++ b/net/netfilter/nf_conntrack_ecache.c
+@@ -199,8 +199,7 @@ static int nf_conntrack_event_init_sysctl(struct net *net)
+ 	table[1].data = &net->ct.sysctl_events_retry_timeout;
+ 
+ 	net->ct.event_sysctl_header =
+-		register_net_sysctl_table(net,
+-					  nf_net_netfilter_sysctl_path, table);
++		register_net_sysctl(net, "net/netfilter", table);
+ 	if (!net->ct.event_sysctl_header) {
+ 		printk(KERN_ERR "nf_ct_event: can't register to sysctl.\n");
+ 		goto out_register;
+
+commit 58020f77612747271ffa13e63cbff6ba12f49c2e
+Author: Tony Zelenoff <antonz@parallels.com>
+Date:   Wed Feb 22 10:48:01 2012 +0400
+
+    netfilter: nf_ct_ecache: refactor nf_ct_deliver_cached_events
+    
+    * identation lowered
+    * some CPU cycles saved at delayed item variable initialization
+    
+    Signed-off-by: Tony Zelenoff <antonz@parallels.com>
+    Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+
+diff --git a/net/netfilter/nf_conntrack_ecache.c b/net/netfilter/nf_conntrack_ecache.c
+index aa15977b1781..5bd3047ddeec 100644
+--- a/net/netfilter/nf_conntrack_ecache.c
++++ b/net/netfilter/nf_conntrack_ecache.c
+@@ -32,9 +32,11 @@ static DEFINE_MUTEX(nf_ct_ecache_mutex);
+ void nf_ct_deliver_cached_events(struct nf_conn *ct)
+ {
+ 	struct net *net = nf_ct_net(ct);
+-	unsigned long events;
++	unsigned long events, missed;
+ 	struct nf_ct_event_notifier *notify;
+ 	struct nf_conntrack_ecache *e;
++	struct nf_ct_event item;
++	int ret;
+ 
+ 	rcu_read_lock();
+ 	notify = rcu_dereference(net->ct.nf_conntrack_event_cb);
+@@ -47,31 +49,32 @@ void nf_ct_deliver_cached_events(struct nf_conn *ct)
+ 
+ 	events = xchg(&e->cache, 0);
+ 
+-	if (nf_ct_is_confirmed(ct) && !nf_ct_is_dying(ct) && events) {
+-		struct nf_ct_event item = {
+-			.ct	= ct,
+-			.pid	= 0,
+-			.report	= 0
+-		};
+-		int ret;
+-		/* We make a copy of the missed event cache without taking
+-		 * the lock, thus we may send missed events twice. However,
+-		 * this does not harm and it happens very rarely. */
+-		unsigned long missed = e->missed;
+-
+-		if (!((events | missed) & e->ctmask))
+-			goto out_unlock;
+-
+-		ret = notify->fcn(events | missed, &item);
+-		if (unlikely(ret < 0 || missed)) {
+-			spin_lock_bh(&ct->lock);
+-			if (ret < 0)
+-				e->missed |= events;
+-			else
+-				e->missed &= ~missed;
+-			spin_unlock_bh(&ct->lock);
+-		}
+-	}
++	if (!nf_ct_is_confirmed(ct) || nf_ct_is_dying(ct) || !events)
++		goto out_unlock;
++
++	/* We make a copy of the missed event cache without taking
++	 * the lock, thus we may send missed events twice. However,
++	 * this does not harm and it happens very rarely. */
++	missed = e->missed;
++
++	if (!((events | missed) & e->ctmask))
++		goto out_unlock;
++
++	item.ct = ct;
++	item.pid = 0;
++	item.report = 0;
++
++	ret = notify->fcn(events | missed, &item);
++
++	if (likely(ret >= 0 && !missed))
++		goto out_unlock;
++
++	spin_lock_bh(&ct->lock);
++	if (ret < 0)
++		e->missed |= events;
++	else
++		e->missed &= ~missed;
++	spin_unlock_bh(&ct->lock);
+ 
+ out_unlock:
+ 	rcu_read_unlock();
+
+commit 93326ae31222ddb8f4835e0461d3eb9959482ffd
+Author: Tony Zelenoff <antonz@parallels.com>
+Date:   Wed Feb 22 10:47:59 2012 +0400
+
+    netfilter: nf_ct_ecache: trailing whitespace removed
+    
+    Signed-off-by: Tony Zelenoff <antonz@parallels.com>
+    Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+
+diff --git a/net/netfilter/nf_conntrack_ecache.c b/net/netfilter/nf_conntrack_ecache.c
+index 14af6329bdda..aa15977b1781 100644
+--- a/net/netfilter/nf_conntrack_ecache.c
++++ b/net/netfilter/nf_conntrack_ecache.c
+@@ -70,7 +70,7 @@ void nf_ct_deliver_cached_events(struct nf_conn *ct)
+ 			else
+ 				e->missed &= ~missed;
+ 			spin_unlock_bh(&ct->lock);
+-		} 
++		}
+ 	}
+ 
+ out_unlock:
+
+commit cf778b00e96df6d64f8e21b8395d1f8a859ecdc7
+Author: Eric Dumazet <eric.dumazet@gmail.com>
+Date:   Thu Jan 12 04:41:32 2012 +0000
+
+    net: reintroduce missing rcu_assign_pointer() calls
+    
+    commit a9b3cd7f32 (rcu: convert uses of rcu_assign_pointer(x, NULL) to
+    RCU_INIT_POINTER) did a lot of incorrect changes, since it did a
+    complete conversion of rcu_assign_pointer(x, y) to RCU_INIT_POINTER(x,
+    y).
+    
+    We miss needed barriers, even on x86, when y is not NULL.
+    
+    Signed-off-by: Eric Dumazet <eric.dumazet@gmail.com>
+    CC: Stephen Hemminger <shemminger@vyatta.com>
+    CC: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/netfilter/nf_conntrack_ecache.c b/net/netfilter/nf_conntrack_ecache.c
+index b62c4148b921..14af6329bdda 100644
+--- a/net/netfilter/nf_conntrack_ecache.c
++++ b/net/netfilter/nf_conntrack_ecache.c
+@@ -91,7 +91,7 @@ int nf_conntrack_register_notifier(struct net *net,
+ 		ret = -EBUSY;
+ 		goto out_unlock;
+ 	}
+-	RCU_INIT_POINTER(net->ct.nf_conntrack_event_cb, new);
++	rcu_assign_pointer(net->ct.nf_conntrack_event_cb, new);
+ 	mutex_unlock(&nf_ct_ecache_mutex);
+ 	return ret;
+ 
+@@ -128,7 +128,7 @@ int nf_ct_expect_register_notifier(struct net *net,
+ 		ret = -EBUSY;
+ 		goto out_unlock;
+ 	}
+-	RCU_INIT_POINTER(net->ct.nf_expect_event_cb, new);
++	rcu_assign_pointer(net->ct.nf_expect_event_cb, new);
+ 	mutex_unlock(&nf_ct_ecache_mutex);
+ 	return ret;
+ 
+
+commit 70e9942f17a6193e9172a804e6569a8806633d6b
+Author: Pablo Neira Ayuso <pablo@netfilter.org>
+Date:   Tue Nov 22 00:16:51 2011 +0100
+
+    netfilter: nf_conntrack: make event callback registration per-netns
+    
+    This patch fixes an oops that can be triggered following this recipe:
+    
+    0) make sure nf_conntrack_netlink and nf_conntrack_ipv4 are loaded.
+    1) container is started.
+    2) connect to it via lxc-console.
+    3) generate some traffic with the container to create some conntrack
+       entries in its table.
+    4) stop the container: you hit one oops because the conntrack table
+       cleanup tries to report the destroy event to user-space but the
+       per-netns nfnetlink socket has already gone (as the nfnetlink
+       socket is per-netns but event callback registration is global).
+    
+    To fix this situation, we make the ctnl_notifier per-netns so the
+    callback is registered/unregistered if the container is
+    created/destroyed.
+    
+    Alex Bligh and Alexey Dobriyan originally proposed one small patch to
+    check if the nfnetlink socket is gone in nfnetlink_has_listeners,
+    but this is a very visited path for events, thus, it may reduce
+    performance and it looks a bit hackish to check for the nfnetlink
+    socket only to workaround this situation. As a result, I decided
+    to follow the bigger path choice, which seems to look nicer to me.
+    
+    Cc: Alexey Dobriyan <adobriyan@gmail.com>
+    Reported-by: Alex Bligh <alex@alex.org.uk>
+    Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+
+diff --git a/net/netfilter/nf_conntrack_ecache.c b/net/netfilter/nf_conntrack_ecache.c
+index 6b368be937c6..b62c4148b921 100644
+--- a/net/netfilter/nf_conntrack_ecache.c
++++ b/net/netfilter/nf_conntrack_ecache.c
+@@ -27,22 +27,17 @@
+ 
+ static DEFINE_MUTEX(nf_ct_ecache_mutex);
+ 
+-struct nf_ct_event_notifier __rcu *nf_conntrack_event_cb __read_mostly;
+-EXPORT_SYMBOL_GPL(nf_conntrack_event_cb);
+-
+-struct nf_exp_event_notifier __rcu *nf_expect_event_cb __read_mostly;
+-EXPORT_SYMBOL_GPL(nf_expect_event_cb);
+-
+ /* deliver cached events and clear cache entry - must be called with locally
+  * disabled softirqs */
+ void nf_ct_deliver_cached_events(struct nf_conn *ct)
+ {
++	struct net *net = nf_ct_net(ct);
+ 	unsigned long events;
+ 	struct nf_ct_event_notifier *notify;
+ 	struct nf_conntrack_ecache *e;
+ 
+ 	rcu_read_lock();
+-	notify = rcu_dereference(nf_conntrack_event_cb);
++	notify = rcu_dereference(net->ct.nf_conntrack_event_cb);
+ 	if (notify == NULL)
+ 		goto out_unlock;
+ 
+@@ -83,19 +78,20 @@ void nf_ct_deliver_cached_events(struct nf_conn *ct)
+ }
+ EXPORT_SYMBOL_GPL(nf_ct_deliver_cached_events);
+ 
+-int nf_conntrack_register_notifier(struct nf_ct_event_notifier *new)
++int nf_conntrack_register_notifier(struct net *net,
++				   struct nf_ct_event_notifier *new)
+ {
+ 	int ret = 0;
+ 	struct nf_ct_event_notifier *notify;
+ 
+ 	mutex_lock(&nf_ct_ecache_mutex);
+-	notify = rcu_dereference_protected(nf_conntrack_event_cb,
++	notify = rcu_dereference_protected(net->ct.nf_conntrack_event_cb,
+ 					   lockdep_is_held(&nf_ct_ecache_mutex));
+ 	if (notify != NULL) {
+ 		ret = -EBUSY;
+ 		goto out_unlock;
+ 	}
+-	RCU_INIT_POINTER(nf_conntrack_event_cb, new);
++	RCU_INIT_POINTER(net->ct.nf_conntrack_event_cb, new);
+ 	mutex_unlock(&nf_ct_ecache_mutex);
+ 	return ret;
+ 
+@@ -105,32 +101,34 @@ int nf_conntrack_register_notifier(struct nf_ct_event_notifier *new)
+ }
+ EXPORT_SYMBOL_GPL(nf_conntrack_register_notifier);
+ 
+-void nf_conntrack_unregister_notifier(struct nf_ct_event_notifier *new)
++void nf_conntrack_unregister_notifier(struct net *net,
++				      struct nf_ct_event_notifier *new)
+ {
+ 	struct nf_ct_event_notifier *notify;
+ 
+ 	mutex_lock(&nf_ct_ecache_mutex);
+-	notify = rcu_dereference_protected(nf_conntrack_event_cb,
++	notify = rcu_dereference_protected(net->ct.nf_conntrack_event_cb,
+ 					   lockdep_is_held(&nf_ct_ecache_mutex));
+ 	BUG_ON(notify != new);
+-	RCU_INIT_POINTER(nf_conntrack_event_cb, NULL);
++	RCU_INIT_POINTER(net->ct.nf_conntrack_event_cb, NULL);
+ 	mutex_unlock(&nf_ct_ecache_mutex);
+ }
+ EXPORT_SYMBOL_GPL(nf_conntrack_unregister_notifier);
+ 
+-int nf_ct_expect_register_notifier(struct nf_exp_event_notifier *new)
++int nf_ct_expect_register_notifier(struct net *net,
++				   struct nf_exp_event_notifier *new)
+ {
+ 	int ret = 0;
+ 	struct nf_exp_event_notifier *notify;
+ 
+ 	mutex_lock(&nf_ct_ecache_mutex);
+-	notify = rcu_dereference_protected(nf_expect_event_cb,
++	notify = rcu_dereference_protected(net->ct.nf_expect_event_cb,
+ 					   lockdep_is_held(&nf_ct_ecache_mutex));
+ 	if (notify != NULL) {
+ 		ret = -EBUSY;
+ 		goto out_unlock;
+ 	}
+-	RCU_INIT_POINTER(nf_expect_event_cb, new);
++	RCU_INIT_POINTER(net->ct.nf_expect_event_cb, new);
+ 	mutex_unlock(&nf_ct_ecache_mutex);
+ 	return ret;
+ 
+@@ -140,15 +138,16 @@ int nf_ct_expect_register_notifier(struct nf_exp_event_notifier *new)
+ }
+ EXPORT_SYMBOL_GPL(nf_ct_expect_register_notifier);
+ 
+-void nf_ct_expect_unregister_notifier(struct nf_exp_event_notifier *new)
++void nf_ct_expect_unregister_notifier(struct net *net,
++				      struct nf_exp_event_notifier *new)
+ {
+ 	struct nf_exp_event_notifier *notify;
+ 
+ 	mutex_lock(&nf_ct_ecache_mutex);
+-	notify = rcu_dereference_protected(nf_expect_event_cb,
++	notify = rcu_dereference_protected(net->ct.nf_expect_event_cb,
+ 					   lockdep_is_held(&nf_ct_ecache_mutex));
+ 	BUG_ON(notify != new);
+-	RCU_INIT_POINTER(nf_expect_event_cb, NULL);
++	RCU_INIT_POINTER(net->ct.nf_expect_event_cb, NULL);
+ 	mutex_unlock(&nf_ct_ecache_mutex);
+ }
+ EXPORT_SYMBOL_GPL(nf_ct_expect_unregister_notifier);
+
+commit bc3b2d7fb9b014d75ebb79ba371a763dbab5e8cf
+Author: Paul Gortmaker <paul.gortmaker@windriver.com>
+Date:   Fri Jul 15 11:47:34 2011 -0400
+
+    net: Add export.h for EXPORT_SYMBOL/THIS_MODULE to non-modules
+    
+    These files are non modular, but need to export symbols using
+    the macros now living in export.h -- call out the include so
+    that things won't break when we remove the implicit presence
+    of module.h from everywhere.
+    
+    Signed-off-by: Paul Gortmaker <paul.gortmaker@windriver.com>
+
+diff --git a/net/netfilter/nf_conntrack_ecache.c b/net/netfilter/nf_conntrack_ecache.c
+index 3add99439059..6b368be937c6 100644
+--- a/net/netfilter/nf_conntrack_ecache.c
++++ b/net/netfilter/nf_conntrack_ecache.c
+@@ -19,6 +19,7 @@
+ #include <linux/kernel.h>
+ #include <linux/netdevice.h>
+ #include <linux/slab.h>
++#include <linux/export.h>
+ 
+ #include <net/netfilter/nf_conntrack.h>
+ #include <net/netfilter/nf_conntrack_core.h>
+
+commit a9b3cd7f323b2e57593e7215362a7b02fc933e3a
+Author: Stephen Hemminger <shemminger@vyatta.com>
+Date:   Mon Aug 1 16:19:00 2011 +0000
+
+    rcu: convert uses of rcu_assign_pointer(x, NULL) to RCU_INIT_POINTER
+    
+    When assigning a NULL value to an RCU protected pointer, no barrier
+    is needed. The rcu_assign_pointer, used to handle that but will soon
+    change to not handle the special case.
+    
+    Convert all rcu_assign_pointer of NULL value.
+    
+    //smpl
+    @@ expression P; @@
+    
+    - rcu_assign_pointer(P, NULL)
+    + RCU_INIT_POINTER(P, NULL)
+    
+    // </smpl>
+    
+    Signed-off-by: Stephen Hemminger <shemminger@vyatta.com>
+    Acked-by: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/netfilter/nf_conntrack_ecache.c b/net/netfilter/nf_conntrack_ecache.c
+index 63a1b915a7e4..3add99439059 100644
+--- a/net/netfilter/nf_conntrack_ecache.c
++++ b/net/netfilter/nf_conntrack_ecache.c
+@@ -94,7 +94,7 @@ int nf_conntrack_register_notifier(struct nf_ct_event_notifier *new)
+ 		ret = -EBUSY;
+ 		goto out_unlock;
+ 	}
+-	rcu_assign_pointer(nf_conntrack_event_cb, new);
++	RCU_INIT_POINTER(nf_conntrack_event_cb, new);
+ 	mutex_unlock(&nf_ct_ecache_mutex);
+ 	return ret;
+ 
+@@ -112,7 +112,7 @@ void nf_conntrack_unregister_notifier(struct nf_ct_event_notifier *new)
+ 	notify = rcu_dereference_protected(nf_conntrack_event_cb,
+ 					   lockdep_is_held(&nf_ct_ecache_mutex));
+ 	BUG_ON(notify != new);
+-	rcu_assign_pointer(nf_conntrack_event_cb, NULL);
++	RCU_INIT_POINTER(nf_conntrack_event_cb, NULL);
+ 	mutex_unlock(&nf_ct_ecache_mutex);
+ }
+ EXPORT_SYMBOL_GPL(nf_conntrack_unregister_notifier);
+@@ -129,7 +129,7 @@ int nf_ct_expect_register_notifier(struct nf_exp_event_notifier *new)
+ 		ret = -EBUSY;
+ 		goto out_unlock;
+ 	}
+-	rcu_assign_pointer(nf_expect_event_cb, new);
++	RCU_INIT_POINTER(nf_expect_event_cb, new);
+ 	mutex_unlock(&nf_ct_ecache_mutex);
+ 	return ret;
+ 
+@@ -147,7 +147,7 @@ void nf_ct_expect_unregister_notifier(struct nf_exp_event_notifier *new)
+ 	notify = rcu_dereference_protected(nf_expect_event_cb,
+ 					   lockdep_is_held(&nf_ct_ecache_mutex));
+ 	BUG_ON(notify != new);
+-	rcu_assign_pointer(nf_expect_event_cb, NULL);
++	RCU_INIT_POINTER(nf_expect_event_cb, NULL);
+ 	mutex_unlock(&nf_ct_ecache_mutex);
+ }
+ EXPORT_SYMBOL_GPL(nf_ct_expect_unregister_notifier);
+
+commit 3db7e93d3308fb882884b9f024235d6fbf542034
+Author: Pablo Neira Ayuso <pablo@netfilter.org>
+Date:   Tue Feb 1 16:06:30 2011 +0100
+
+    netfilter: ecache: always set events bits, filter them later
+    
+    For the following rule:
+    
+    iptables -I PREROUTING -t raw -j CT --ctevents assured
+    
+    The event delivered looks like the following:
+    
+     [UPDATE] tcp      6 src=192.168.0.2 dst=192.168.1.2 sport=37041 dport=80 src=192.168.1.2 dst=192.168.1.100 sport=80 dport=37041 [ASSURED]
+    
+    Note that the TCP protocol state is not included. For that reason
+    the CT event filtering is not very useful for conntrackd.
+    
+    To resolve this issue, instead of conditionally setting the CT events
+    bits based on the ctmask, we always set them and perform the filtering
+    in the late stage, just before the delivery.
+    
+    Thus, the event delivered looks like the following:
+    
+     [UPDATE] tcp      6 432000 ESTABLISHED src=192.168.0.2 dst=192.168.1.2 sport=37041 dport=80 src=192.168.1.2 dst=192.168.1.100 sport=80 dport=37041 [ASSURED]
+    
+    Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+    Signed-off-by: Patrick McHardy <kaber@trash.net>
+
+diff --git a/net/netfilter/nf_conntrack_ecache.c b/net/netfilter/nf_conntrack_ecache.c
+index 5702de35e2bb..63a1b915a7e4 100644
+--- a/net/netfilter/nf_conntrack_ecache.c
++++ b/net/netfilter/nf_conntrack_ecache.c
+@@ -63,6 +63,9 @@ void nf_ct_deliver_cached_events(struct nf_conn *ct)
+ 		 * this does not harm and it happens very rarely. */
+ 		unsigned long missed = e->missed;
+ 
++		if (!((events | missed) & e->ctmask))
++			goto out_unlock;
++
+ 		ret = notify->fcn(events | missed, &item);
+ 		if (unlikely(ret < 0 || missed)) {
+ 			spin_lock_bh(&ct->lock);
+
+commit 0906a372f2aa0fec1e59bd12b896883b6e41307a
+Author: Arnd Bergmann <arnd@relay.de.ibm.com>
+Date:   Tue Mar 9 20:59:15 2010 +0100
+
+    net/netfilter: __rcu annotations
+    
+    Signed-off-by: Arnd Bergmann <arnd@arndb.de>
+    Signed-off-by: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+    Acked-by: Patrick McHardy <kaber@trash.net>
+    Cc: "David S. Miller" <davem@davemloft.net>
+    Cc: Eric Dumazet <eric.dumazet@gmail.com>
+    Reviewed-by: Josh Triplett <josh@joshtriplett.org>
+
+diff --git a/net/netfilter/nf_conntrack_ecache.c b/net/netfilter/nf_conntrack_ecache.c
+index cdcc7649476b..5702de35e2bb 100644
+--- a/net/netfilter/nf_conntrack_ecache.c
++++ b/net/netfilter/nf_conntrack_ecache.c
+@@ -26,10 +26,10 @@
+ 
+ static DEFINE_MUTEX(nf_ct_ecache_mutex);
+ 
+-struct nf_ct_event_notifier *nf_conntrack_event_cb __read_mostly;
++struct nf_ct_event_notifier __rcu *nf_conntrack_event_cb __read_mostly;
+ EXPORT_SYMBOL_GPL(nf_conntrack_event_cb);
+ 
+-struct nf_exp_event_notifier *nf_expect_event_cb __read_mostly;
++struct nf_exp_event_notifier __rcu *nf_expect_event_cb __read_mostly;
+ EXPORT_SYMBOL_GPL(nf_expect_event_cb);
+ 
+ /* deliver cached events and clear cache entry - must be called with locally
+
+commit b56f2d55c6c22b0c5774b3b22e336fb6cc5f4094
+Author: Patrick McHardy <kaber@trash.net>
+Date:   Mon May 10 18:47:57 2010 +0200
+
+    netfilter: use rcu_dereference_protected()
+    
+    Restore the rcu_dereference() calls in conntrack/expectation notifier
+    and logger registration/unregistration, but use the _protected variant,
+    which will be required by the upcoming __rcu annotations.
+    
+    Based on patch by Eric Dumazet <eric.dumazet@gmail.com>
+    
+    Signed-off-by: Patrick McHardy <kaber@trash.net>
+
+diff --git a/net/netfilter/nf_conntrack_ecache.c b/net/netfilter/nf_conntrack_ecache.c
+index a94ac3ad02cb..cdcc7649476b 100644
+--- a/net/netfilter/nf_conntrack_ecache.c
++++ b/net/netfilter/nf_conntrack_ecache.c
+@@ -82,9 +82,12 @@ EXPORT_SYMBOL_GPL(nf_ct_deliver_cached_events);
+ int nf_conntrack_register_notifier(struct nf_ct_event_notifier *new)
+ {
+ 	int ret = 0;
++	struct nf_ct_event_notifier *notify;
+ 
+ 	mutex_lock(&nf_ct_ecache_mutex);
+-	if (nf_conntrack_event_cb != NULL) {
++	notify = rcu_dereference_protected(nf_conntrack_event_cb,
++					   lockdep_is_held(&nf_ct_ecache_mutex));
++	if (notify != NULL) {
+ 		ret = -EBUSY;
+ 		goto out_unlock;
+ 	}
+@@ -100,8 +103,12 @@ EXPORT_SYMBOL_GPL(nf_conntrack_register_notifier);
+ 
+ void nf_conntrack_unregister_notifier(struct nf_ct_event_notifier *new)
+ {
++	struct nf_ct_event_notifier *notify;
++
+ 	mutex_lock(&nf_ct_ecache_mutex);
+-	BUG_ON(nf_conntrack_event_cb != new);
++	notify = rcu_dereference_protected(nf_conntrack_event_cb,
++					   lockdep_is_held(&nf_ct_ecache_mutex));
++	BUG_ON(notify != new);
+ 	rcu_assign_pointer(nf_conntrack_event_cb, NULL);
+ 	mutex_unlock(&nf_ct_ecache_mutex);
+ }
+@@ -110,9 +117,12 @@ EXPORT_SYMBOL_GPL(nf_conntrack_unregister_notifier);
+ int nf_ct_expect_register_notifier(struct nf_exp_event_notifier *new)
+ {
+ 	int ret = 0;
++	struct nf_exp_event_notifier *notify;
+ 
+ 	mutex_lock(&nf_ct_ecache_mutex);
+-	if (nf_expect_event_cb != NULL) {
++	notify = rcu_dereference_protected(nf_expect_event_cb,
++					   lockdep_is_held(&nf_ct_ecache_mutex));
++	if (notify != NULL) {
+ 		ret = -EBUSY;
+ 		goto out_unlock;
+ 	}
+@@ -128,8 +138,12 @@ EXPORT_SYMBOL_GPL(nf_ct_expect_register_notifier);
+ 
+ void nf_ct_expect_unregister_notifier(struct nf_exp_event_notifier *new)
+ {
++	struct nf_exp_event_notifier *notify;
++
+ 	mutex_lock(&nf_ct_ecache_mutex);
+-	BUG_ON(nf_expect_event_cb != new);
++	notify = rcu_dereference_protected(nf_expect_event_cb,
++					   lockdep_is_held(&nf_ct_ecache_mutex));
++	BUG_ON(notify != new);
+ 	rcu_assign_pointer(nf_expect_event_cb, NULL);
+ 	mutex_unlock(&nf_ct_ecache_mutex);
+ }
+
+commit 62910554656cdcd6b6f84a5154c4155aae4ca231
+Merge: 22265a5c3c10 ab9304717f76
+Author: Patrick McHardy <kaber@trash.net>
+Date:   Tue Apr 20 16:02:01 2010 +0200
+
+    Merge branch 'master' of /repos/git/net-next-2.6
+    
+    Conflicts:
+            Documentation/feature-removal-schedule.txt
+            net/ipv6/netfilter/ip6t_REJECT.c
+            net/netfilter/xt_limit.c
+    
+    Signed-off-by: Patrick McHardy <kaber@trash.net>
+
+commit ed86308f6179d8fa6151c2d0f652aad0091548e2
+Author: Patrick McHardy <kaber@trash.net>
+Date:   Fri Apr 9 16:42:15 2010 +0200
+
+    netfilter: remove invalid rcu_dereference() calls
+    
+    The CONFIG_PROVE_RCU option discovered a few invalid uses of
+    rcu_dereference() in netfilter. In all these cases, the code code
+    intends to check whether a pointer is already assigned when
+    performing registration or whether the assigned pointer matches
+    when performing unregistration. The entire registration/
+    unregistration is protected by a mutex, so we don't need the
+    rcu_dereference() calls.
+    
+    Reported-by: Valdis Kletnieks <Valdis.Kletnieks@vt.edu>
+    Tested-by: Valdis Kletnieks <Valdis.Kletnieks@vt.edu>
+    Signed-off-by: Patrick McHardy <kaber@trash.net>
+
+diff --git a/net/netfilter/nf_conntrack_ecache.c b/net/netfilter/nf_conntrack_ecache.c
+index d5a9bcd7d61b..849614af2322 100644
+--- a/net/netfilter/nf_conntrack_ecache.c
++++ b/net/netfilter/nf_conntrack_ecache.c
+@@ -81,11 +81,9 @@ EXPORT_SYMBOL_GPL(nf_ct_deliver_cached_events);
+ int nf_conntrack_register_notifier(struct nf_ct_event_notifier *new)
+ {
+ 	int ret = 0;
+-	struct nf_ct_event_notifier *notify;
+ 
+ 	mutex_lock(&nf_ct_ecache_mutex);
+-	notify = rcu_dereference(nf_conntrack_event_cb);
+-	if (notify != NULL) {
++	if (nf_conntrack_event_cb != NULL) {
+ 		ret = -EBUSY;
+ 		goto out_unlock;
+ 	}
+@@ -101,11 +99,8 @@ EXPORT_SYMBOL_GPL(nf_conntrack_register_notifier);
+ 
+ void nf_conntrack_unregister_notifier(struct nf_ct_event_notifier *new)
+ {
+-	struct nf_ct_event_notifier *notify;
+-
+ 	mutex_lock(&nf_ct_ecache_mutex);
+-	notify = rcu_dereference(nf_conntrack_event_cb);
+-	BUG_ON(notify != new);
++	BUG_ON(nf_conntrack_event_cb != new);
+ 	rcu_assign_pointer(nf_conntrack_event_cb, NULL);
+ 	mutex_unlock(&nf_ct_ecache_mutex);
+ }
+@@ -114,11 +109,9 @@ EXPORT_SYMBOL_GPL(nf_conntrack_unregister_notifier);
+ int nf_ct_expect_register_notifier(struct nf_exp_event_notifier *new)
+ {
+ 	int ret = 0;
+-	struct nf_exp_event_notifier *notify;
+ 
+ 	mutex_lock(&nf_ct_ecache_mutex);
+-	notify = rcu_dereference(nf_expect_event_cb);
+-	if (notify != NULL) {
++	if (nf_expect_event_cb != NULL) {
+ 		ret = -EBUSY;
+ 		goto out_unlock;
+ 	}
+@@ -134,11 +127,8 @@ EXPORT_SYMBOL_GPL(nf_ct_expect_register_notifier);
+ 
+ void nf_ct_expect_unregister_notifier(struct nf_exp_event_notifier *new)
+ {
+-	struct nf_exp_event_notifier *notify;
+-
+ 	mutex_lock(&nf_ct_ecache_mutex);
+-	notify = rcu_dereference(nf_expect_event_cb);
+-	BUG_ON(notify != new);
++	BUG_ON(nf_expect_event_cb != new);
+ 	rcu_assign_pointer(nf_expect_event_cb, NULL);
+ 	mutex_unlock(&nf_ct_ecache_mutex);
+ }
+
+commit 5a0e3ad6af8660be21ca98a971cd00f331318c05
+Author: Tejun Heo <tj@kernel.org>
+Date:   Wed Mar 24 17:04:11 2010 +0900
+
+    include cleanup: Update gfp.h and slab.h includes to prepare for breaking implicit slab.h inclusion from percpu.h
+    
+    percpu.h is included by sched.h and module.h and thus ends up being
+    included when building most .c files.  percpu.h includes slab.h which
+    in turn includes gfp.h making everything defined by the two files
+    universally available and complicating inclusion dependencies.
+    
+    percpu.h -> slab.h dependency is about to be removed.  Prepare for
+    this change by updating users of gfp and slab facilities include those
+    headers directly instead of assuming availability.  As this conversion
+    needs to touch large number of source files, the following script is
+    used as the basis of conversion.
+    
+      http://userweb.kernel.org/~tj/misc/slabh-sweep.py
+    
+    The script does the followings.
+    
+    * Scan files for gfp and slab usages and update includes such that
+      only the necessary includes are there.  ie. if only gfp is used,
+      gfp.h, if slab is used, slab.h.
+    
+    * When the script inserts a new include, it looks at the include
+      blocks and try to put the new include such that its order conforms
+      to its surrounding.  It's put in the include block which contains
+      core kernel includes, in the same order that the rest are ordered -
+      alphabetical, Christmas tree, rev-Xmas-tree or at the end if there
+      doesn't seem to be any matching order.
+    
+    * If the script can't find a place to put a new include (mostly
+      because the file doesn't have fitting include block), it prints out
+      an error message indicating which .h file needs to be added to the
+      file.
+    
+    The conversion was done in the following steps.
+    
+    1. The initial automatic conversion of all .c files updated slightly
+       over 4000 files, deleting around 700 includes and adding ~480 gfp.h
+       and ~3000 slab.h inclusions.  The script emitted errors for ~400
+       files.
+    
+    2. Each error was manually checked.  Some didn't need the inclusion,
+       some needed manual addition while adding it to implementation .h or
+       embedding .c file was more appropriate for others.  This step added
+       inclusions to around 150 files.
+    
+    3. The script was run again and the output was compared to the edits
+       from #2 to make sure no file was left behind.
+    
+    4. Several build tests were done and a couple of problems were fixed.
+       e.g. lib/decompress_*.c used malloc/free() wrappers around slab
+       APIs requiring slab.h to be added manually.
+    
+    5. The script was run on all .h files but without automatically
+       editing them as sprinkling gfp.h and slab.h inclusions around .h
+       files could easily lead to inclusion dependency hell.  Most gfp.h
+       inclusion directives were ignored as stuff from gfp.h was usually
+       wildly available and often used in preprocessor macros.  Each
+       slab.h inclusion directive was examined and added manually as
+       necessary.
+    
+    6. percpu.h was updated not to include slab.h.
+    
+    7. Build test were done on the following configurations and failures
+       were fixed.  CONFIG_GCOV_KERNEL was turned off for all tests (as my
+       distributed build env didn't work with gcov compiles) and a few
+       more options had to be turned off depending on archs to make things
+       build (like ipr on powerpc/64 which failed due to missing writeq).
+    
+       * x86 and x86_64 UP and SMP allmodconfig and a custom test config.
+       * powerpc and powerpc64 SMP allmodconfig
+       * sparc and sparc64 SMP allmodconfig
+       * ia64 SMP allmodconfig
+       * s390 SMP allmodconfig
+       * alpha SMP allmodconfig
+       * um on x86_64 SMP allmodconfig
+    
+    8. percpu.h modifications were reverted so that it could be applied as
+       a separate patch and serve as bisection point.
+    
+    Given the fact that I had only a couple of failures from tests on step
+    6, I'm fairly confident about the coverage of this conversion patch.
+    If there is a breakage, it's likely to be something in one of the arch
+    headers which should be easily discoverable easily on most builds of
+    the specific arch.
+    
+    Signed-off-by: Tejun Heo <tj@kernel.org>
+    Guess-its-ok-by: Christoph Lameter <cl@linux-foundation.org>
+    Cc: Ingo Molnar <mingo@redhat.com>
+    Cc: Lee Schermerhorn <Lee.Schermerhorn@hp.com>
+
+diff --git a/net/netfilter/nf_conntrack_ecache.c b/net/netfilter/nf_conntrack_ecache.c
+index d5a9bcd7d61b..f516961a83b4 100644
+--- a/net/netfilter/nf_conntrack_ecache.c
++++ b/net/netfilter/nf_conntrack_ecache.c
+@@ -18,6 +18,7 @@
+ #include <linux/percpu.h>
+ #include <linux/kernel.h>
+ #include <linux/netdevice.h>
++#include <linux/slab.h>
+ 
+ #include <net/netfilter/nf_conntrack.h>
+ #include <net/netfilter/nf_conntrack_core.h>
+
+commit f8572d8f2a2ba75408b97dc24ef47c83671795d7
+Author: Eric W. Biederman <ebiederm@xmission.com>
+Date:   Thu Nov 5 13:32:03 2009 -0800
+
+    sysctl net: Remove unused binary sysctl code
+    
+    Now that sys_sysctl is a compatiblity wrapper around /proc/sys
+    all sysctl strategy routines, and all ctl_name and strategy
+    entries in the sysctl tables are unused, and can be
+    revmoed.
+    
+    In addition neigh_sysctl_register has been modified to no longer
+    take a strategy argument and it's callers have been modified not
+    to pass one.
+    
+    Cc: "David Miller" <davem@davemloft.net>
+    Cc: Hideaki YOSHIFUJI <yoshfuji@linux-ipv6.org>
+    Cc: netdev@vger.kernel.org
+    Signed-off-by: Eric W. Biederman <ebiederm@xmission.com>
+
+diff --git a/net/netfilter/nf_conntrack_ecache.c b/net/netfilter/nf_conntrack_ecache.c
+index aee560b4768d..d5a9bcd7d61b 100644
+--- a/net/netfilter/nf_conntrack_ecache.c
++++ b/net/netfilter/nf_conntrack_ecache.c
+@@ -151,7 +151,6 @@ static int nf_ct_events_retry_timeout __read_mostly = 15*HZ;
+ #ifdef CONFIG_SYSCTL
+ static struct ctl_table event_sysctl_table[] = {
+ 	{
+-		.ctl_name	= CTL_UNNUMBERED,
+ 		.procname	= "nf_conntrack_events",
+ 		.data		= &init_net.ct.sysctl_events,
+ 		.maxlen		= sizeof(unsigned int),
+@@ -159,7 +158,6 @@ static struct ctl_table event_sysctl_table[] = {
+ 		.proc_handler	= proc_dointvec,
+ 	},
+ 	{
+-		.ctl_name	= CTL_UNNUMBERED,
+ 		.procname	= "nf_conntrack_events_retry_timeout",
+ 		.data		= &init_net.ct.sysctl_events_retry_timeout,
+ 		.maxlen		= sizeof(unsigned int),
+
+commit dd7669a92c6066b2b31bae7e04cd787092920883
+Author: Pablo Neira Ayuso <pablo@netfilter.org>
+Date:   Sat Jun 13 12:30:52 2009 +0200
+
+    netfilter: conntrack: optional reliable conntrack event delivery
+    
+    This patch improves ctnetlink event reliability if one broadcast
+    listener has set the NETLINK_BROADCAST_ERROR socket option.
+    
+    The logic is the following: if an event delivery fails, we keep
+    the undelivered events in the missed event cache. Once the next
+    packet arrives, we add the new events (if any) to the missed
+    events in the cache and we try a new delivery, and so on. Thus,
+    if ctnetlink fails to deliver an event, we try to deliver them
+    once we see a new packet. Therefore, we may lose state
+    transitions but the userspace process gets in sync at some point.
+    
+    At worst case, if no events were delivered to userspace, we make
+    sure that destroy events are successfully delivered. Basically,
+    if ctnetlink fails to deliver the destroy event, we remove the
+    conntrack entry from the hashes and we insert them in the dying
+    list, which contains inactive entries. Then, the conntrack timer
+    is added with an extra grace timeout of random32() % 15 seconds
+    to trigger the event again (this grace timeout is tunable via
+    /proc). The use of a limited random timeout value allows
+    distributing the "destroy" resends, thus, avoiding accumulating
+    lots "destroy" events at the same time. Event delivery may
+    re-order but we can identify them by means of the tuple plus
+    the conntrack ID.
+    
+    The maximum number of conntrack entries (active or inactive) is
+    still handled by nf_conntrack_max. Thus, we may start dropping
+    packets at some point if we accumulate a lot of inactive conntrack
+    entries that did not successfully report the destroy event to
+    userspace.
+    
+    During my stress tests consisting of setting a very small buffer
+    of 2048 bytes for conntrackd and the NETLINK_BROADCAST_ERROR socket
+    flag, and generating lots of very small connections, I noticed
+    very few destroy entries on the fly waiting to be resend.
+    
+    A simple way to test this patch consist of creating a lot of
+    entries, set a very small Netlink buffer in conntrackd (+ a patch
+    which is not in the git tree to set the BROADCAST_ERROR flag)
+    and invoke `conntrack -F'.
+    
+    For expectations, no changes are introduced in this patch.
+    Currently, event delivery is only done for new expectations (no
+    events from expectation expiration, removal and confirmation).
+    In that case, they need a per-expectation event cache to implement
+    the same idea that is exposed in this patch.
+    
+    This patch can be useful to provide reliable flow-accouting. We
+    still have to add a new conntrack extension to store the creation
+    and destroy time.
+    
+    Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+    Signed-off-by: Patrick McHardy <kaber@trash.net>
+
+diff --git a/net/netfilter/nf_conntrack_ecache.c b/net/netfilter/nf_conntrack_ecache.c
+index 683281b78047..aee560b4768d 100644
+--- a/net/netfilter/nf_conntrack_ecache.c
++++ b/net/netfilter/nf_conntrack_ecache.c
+@@ -56,8 +56,21 @@ void nf_ct_deliver_cached_events(struct nf_conn *ct)
+ 			.pid	= 0,
+ 			.report	= 0
+ 		};
+-
+-		notify->fcn(events, &item);
++		int ret;
++		/* We make a copy of the missed event cache without taking
++		 * the lock, thus we may send missed events twice. However,
++		 * this does not harm and it happens very rarely. */
++		unsigned long missed = e->missed;
++
++		ret = notify->fcn(events | missed, &item);
++		if (unlikely(ret < 0 || missed)) {
++			spin_lock_bh(&ct->lock);
++			if (ret < 0)
++				e->missed |= events;
++			else
++				e->missed &= ~missed;
++			spin_unlock_bh(&ct->lock);
++		} 
+ 	}
+ 
+ out_unlock:
+@@ -133,6 +146,7 @@ EXPORT_SYMBOL_GPL(nf_ct_expect_unregister_notifier);
+ 
+ #define NF_CT_EVENTS_DEFAULT 1
+ static int nf_ct_events __read_mostly = NF_CT_EVENTS_DEFAULT;
++static int nf_ct_events_retry_timeout __read_mostly = 15*HZ;
+ 
+ #ifdef CONFIG_SYSCTL
+ static struct ctl_table event_sysctl_table[] = {
+@@ -144,6 +158,14 @@ static struct ctl_table event_sysctl_table[] = {
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_dointvec,
+ 	},
++	{
++		.ctl_name	= CTL_UNNUMBERED,
++		.procname	= "nf_conntrack_events_retry_timeout",
++		.data		= &init_net.ct.sysctl_events_retry_timeout,
++		.maxlen		= sizeof(unsigned int),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec_jiffies,
++	},
+ 	{}
+ };
+ #endif /* CONFIG_SYSCTL */
+@@ -165,6 +187,7 @@ static int nf_conntrack_event_init_sysctl(struct net *net)
+ 		goto out;
+ 
+ 	table[0].data = &net->ct.sysctl_events;
++	table[1].data = &net->ct.sysctl_events_retry_timeout;
+ 
+ 	net->ct.event_sysctl_header =
+ 		register_net_sysctl_table(net,
+@@ -205,6 +228,7 @@ int nf_conntrack_ecache_init(struct net *net)
+ 	int ret;
+ 
+ 	net->ct.sysctl_events = nf_ct_events;
++	net->ct.sysctl_events_retry_timeout = nf_ct_events_retry_timeout;
+ 
+ 	if (net_eq(net, &init_net)) {
+ 		ret = nf_ct_extend_register(&event_extend);
+
+commit a0891aa6a635f658f29bb061a00d6d3486941519
+Author: Pablo Neira Ayuso <pablo@netfilter.org>
+Date:   Sat Jun 13 12:26:29 2009 +0200
+
+    netfilter: conntrack: move event caching to conntrack extension infrastructure
+    
+    This patch reworks the per-cpu event caching to use the conntrack
+    extension infrastructure.
+    
+    The main drawback is that we consume more memory per conntrack
+    if event delivery is enabled. This patch is required by the
+    reliable event delivery that follows to this patch.
+    
+    BTW, this patch allows you to enable/disable event delivery via
+    /proc/sys/net/netfilter/nf_conntrack_events in runtime, although
+    you can still disable event caching as compilation option.
+    
+    Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+    Signed-off-by: Patrick McHardy <kaber@trash.net>
+
+diff --git a/net/netfilter/nf_conntrack_ecache.c b/net/netfilter/nf_conntrack_ecache.c
+index 5516b3e64b43..683281b78047 100644
+--- a/net/netfilter/nf_conntrack_ecache.c
++++ b/net/netfilter/nf_conntrack_ecache.c
+@@ -21,6 +21,7 @@
+ 
+ #include <net/netfilter/nf_conntrack.h>
+ #include <net/netfilter/nf_conntrack_core.h>
++#include <net/netfilter/nf_conntrack_extend.h>
+ 
+ static DEFINE_MUTEX(nf_ct_ecache_mutex);
+ 
+@@ -32,94 +33,38 @@ EXPORT_SYMBOL_GPL(nf_expect_event_cb);
+ 
+ /* deliver cached events and clear cache entry - must be called with locally
+  * disabled softirqs */
+-static inline void
+-__nf_ct_deliver_cached_events(struct nf_conntrack_ecache *ecache)
++void nf_ct_deliver_cached_events(struct nf_conn *ct)
+ {
++	unsigned long events;
+ 	struct nf_ct_event_notifier *notify;
++	struct nf_conntrack_ecache *e;
+ 
+ 	rcu_read_lock();
+ 	notify = rcu_dereference(nf_conntrack_event_cb);
+ 	if (notify == NULL)
+ 		goto out_unlock;
+ 
+-	if (nf_ct_is_confirmed(ecache->ct) && !nf_ct_is_dying(ecache->ct)
+-	    && ecache->events) {
++	e = nf_ct_ecache_find(ct);
++	if (e == NULL)
++		goto out_unlock;
++
++	events = xchg(&e->cache, 0);
++
++	if (nf_ct_is_confirmed(ct) && !nf_ct_is_dying(ct) && events) {
+ 		struct nf_ct_event item = {
+-			.ct 	= ecache->ct,
++			.ct	= ct,
+ 			.pid	= 0,
+ 			.report	= 0
+ 		};
+ 
+-		notify->fcn(ecache->events, &item);
++		notify->fcn(events, &item);
+ 	}
+ 
+-	ecache->events = 0;
+-	nf_ct_put(ecache->ct);
+-	ecache->ct = NULL;
+-
+ out_unlock:
+ 	rcu_read_unlock();
+ }
+-
+-/* Deliver all cached events for a particular conntrack. This is called
+- * by code prior to async packet handling for freeing the skb */
+-void nf_ct_deliver_cached_events(const struct nf_conn *ct)
+-{
+-	struct net *net = nf_ct_net(ct);
+-	struct nf_conntrack_ecache *ecache;
+-
+-	local_bh_disable();
+-	ecache = per_cpu_ptr(net->ct.ecache, raw_smp_processor_id());
+-	if (ecache->ct == ct)
+-		__nf_ct_deliver_cached_events(ecache);
+-	local_bh_enable();
+-}
+ EXPORT_SYMBOL_GPL(nf_ct_deliver_cached_events);
+ 
+-/* Deliver cached events for old pending events, if current conntrack != old */
+-void __nf_ct_event_cache_init(struct nf_conn *ct)
+-{
+-	struct net *net = nf_ct_net(ct);
+-	struct nf_conntrack_ecache *ecache;
+-
+-	/* take care of delivering potentially old events */
+-	ecache = per_cpu_ptr(net->ct.ecache, raw_smp_processor_id());
+-	BUG_ON(ecache->ct == ct);
+-	if (ecache->ct)
+-		__nf_ct_deliver_cached_events(ecache);
+-	/* initialize for this conntrack/packet */
+-	ecache->ct = ct;
+-	nf_conntrack_get(&ct->ct_general);
+-}
+-EXPORT_SYMBOL_GPL(__nf_ct_event_cache_init);
+-
+-/* flush the event cache - touches other CPU's data and must not be called
+- * while packets are still passing through the code */
+-void nf_ct_event_cache_flush(struct net *net)
+-{
+-	struct nf_conntrack_ecache *ecache;
+-	int cpu;
+-
+-	for_each_possible_cpu(cpu) {
+-		ecache = per_cpu_ptr(net->ct.ecache, cpu);
+-		if (ecache->ct)
+-			nf_ct_put(ecache->ct);
+-	}
+-}
+-
+-int nf_conntrack_ecache_init(struct net *net)
+-{
+-	net->ct.ecache = alloc_percpu(struct nf_conntrack_ecache);
+-	if (!net->ct.ecache)
+-		return -ENOMEM;
+-	return 0;
+-}
+-
+-void nf_conntrack_ecache_fini(struct net *net)
+-{
+-	free_percpu(net->ct.ecache);
+-}
+-
+ int nf_conntrack_register_notifier(struct nf_ct_event_notifier *new)
+ {
+ 	int ret = 0;
+@@ -185,3 +130,107 @@ void nf_ct_expect_unregister_notifier(struct nf_exp_event_notifier *new)
+ 	mutex_unlock(&nf_ct_ecache_mutex);
+ }
+ EXPORT_SYMBOL_GPL(nf_ct_expect_unregister_notifier);
++
++#define NF_CT_EVENTS_DEFAULT 1
++static int nf_ct_events __read_mostly = NF_CT_EVENTS_DEFAULT;
++
++#ifdef CONFIG_SYSCTL
++static struct ctl_table event_sysctl_table[] = {
++	{
++		.ctl_name	= CTL_UNNUMBERED,
++		.procname	= "nf_conntrack_events",
++		.data		= &init_net.ct.sysctl_events,
++		.maxlen		= sizeof(unsigned int),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec,
++	},
++	{}
++};
++#endif /* CONFIG_SYSCTL */
++
++static struct nf_ct_ext_type event_extend __read_mostly = {
++	.len	= sizeof(struct nf_conntrack_ecache),
++	.align	= __alignof__(struct nf_conntrack_ecache),
++	.id	= NF_CT_EXT_ECACHE,
++};
++
++#ifdef CONFIG_SYSCTL
++static int nf_conntrack_event_init_sysctl(struct net *net)
++{
++	struct ctl_table *table;
++
++	table = kmemdup(event_sysctl_table, sizeof(event_sysctl_table),
++			GFP_KERNEL);
++	if (!table)
++		goto out;
++
++	table[0].data = &net->ct.sysctl_events;
++
++	net->ct.event_sysctl_header =
++		register_net_sysctl_table(net,
++					  nf_net_netfilter_sysctl_path, table);
++	if (!net->ct.event_sysctl_header) {
++		printk(KERN_ERR "nf_ct_event: can't register to sysctl.\n");
++		goto out_register;
++	}
++	return 0;
++
++out_register:
++	kfree(table);
++out:
++	return -ENOMEM;
++}
++
++static void nf_conntrack_event_fini_sysctl(struct net *net)
++{
++	struct ctl_table *table;
++
++	table = net->ct.event_sysctl_header->ctl_table_arg;
++	unregister_net_sysctl_table(net->ct.event_sysctl_header);
++	kfree(table);
++}
++#else
++static int nf_conntrack_event_init_sysctl(struct net *net)
++{
++	return 0;
++}
++
++static void nf_conntrack_event_fini_sysctl(struct net *net)
++{
++}
++#endif /* CONFIG_SYSCTL */
++
++int nf_conntrack_ecache_init(struct net *net)
++{
++	int ret;
++
++	net->ct.sysctl_events = nf_ct_events;
++
++	if (net_eq(net, &init_net)) {
++		ret = nf_ct_extend_register(&event_extend);
++		if (ret < 0) {
++			printk(KERN_ERR "nf_ct_event: Unable to register "
++					"event extension.\n");
++			goto out_extend_register;
++		}
++	}
++
++	ret = nf_conntrack_event_init_sysctl(net);
++	if (ret < 0)
++		goto out_sysctl;
++
++	return 0;
++
++out_sysctl:
++	if (net_eq(net, &init_net))
++		nf_ct_extend_unregister(&event_extend);
++out_extend_register:
++	return ret;
++}
++
++void nf_conntrack_ecache_fini(struct net *net)
++{
++	nf_conntrack_event_fini_sysctl(net);
++	if (net_eq(net, &init_net))
++		nf_ct_extend_unregister(&event_extend);
++}
+
+commit e34d5c1a4f9919a81b4ea4591d7383245f35cb8e
+Author: Pablo Neira Ayuso <pablo@netfilter.org>
+Date:   Wed Jun 3 10:32:06 2009 +0200
+
+    netfilter: conntrack: replace notify chain by function pointer
+    
+    This patch removes the notify chain infrastructure and replace it
+    by a simple function pointer. This issue has been mentioned in the
+    mailing list several times: the use of the notify chain adds
+    too much overhead for something that is only used by ctnetlink.
+    
+    This patch also changes nfnetlink_send(). It seems that gfp_any()
+    returns GFP_KERNEL for user-context request, like those via
+    ctnetlink, inside the RCU read-side section which is not valid.
+    Using GFP_KERNEL is also evil since netlink may schedule(),
+    this leads to "scheduling while atomic" bug reports.
+    
+    Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+
+diff --git a/net/netfilter/nf_conntrack_ecache.c b/net/netfilter/nf_conntrack_ecache.c
+index dee4190209cc..5516b3e64b43 100644
+--- a/net/netfilter/nf_conntrack_ecache.c
++++ b/net/netfilter/nf_conntrack_ecache.c
+@@ -16,24 +16,32 @@
+ #include <linux/stddef.h>
+ #include <linux/err.h>
+ #include <linux/percpu.h>
+-#include <linux/notifier.h>
+ #include <linux/kernel.h>
+ #include <linux/netdevice.h>
+ 
+ #include <net/netfilter/nf_conntrack.h>
+ #include <net/netfilter/nf_conntrack_core.h>
+ 
+-ATOMIC_NOTIFIER_HEAD(nf_conntrack_chain);
+-EXPORT_SYMBOL_GPL(nf_conntrack_chain);
++static DEFINE_MUTEX(nf_ct_ecache_mutex);
+ 
+-ATOMIC_NOTIFIER_HEAD(nf_ct_expect_chain);
+-EXPORT_SYMBOL_GPL(nf_ct_expect_chain);
++struct nf_ct_event_notifier *nf_conntrack_event_cb __read_mostly;
++EXPORT_SYMBOL_GPL(nf_conntrack_event_cb);
++
++struct nf_exp_event_notifier *nf_expect_event_cb __read_mostly;
++EXPORT_SYMBOL_GPL(nf_expect_event_cb);
+ 
+ /* deliver cached events and clear cache entry - must be called with locally
+  * disabled softirqs */
+ static inline void
+ __nf_ct_deliver_cached_events(struct nf_conntrack_ecache *ecache)
+ {
++	struct nf_ct_event_notifier *notify;
++
++	rcu_read_lock();
++	notify = rcu_dereference(nf_conntrack_event_cb);
++	if (notify == NULL)
++		goto out_unlock;
++
+ 	if (nf_ct_is_confirmed(ecache->ct) && !nf_ct_is_dying(ecache->ct)
+ 	    && ecache->events) {
+ 		struct nf_ct_event item = {
+@@ -42,14 +50,15 @@ __nf_ct_deliver_cached_events(struct nf_conntrack_ecache *ecache)
+ 			.report	= 0
+ 		};
+ 
+-		atomic_notifier_call_chain(&nf_conntrack_chain,
+-					   ecache->events,
+-					   &item);
++		notify->fcn(ecache->events, &item);
+ 	}
+ 
+ 	ecache->events = 0;
+ 	nf_ct_put(ecache->ct);
+ 	ecache->ct = NULL;
++
++out_unlock:
++	rcu_read_unlock();
+ }
+ 
+ /* Deliver all cached events for a particular conntrack. This is called
+@@ -111,26 +120,68 @@ void nf_conntrack_ecache_fini(struct net *net)
+ 	free_percpu(net->ct.ecache);
+ }
+ 
+-int nf_conntrack_register_notifier(struct notifier_block *nb)
++int nf_conntrack_register_notifier(struct nf_ct_event_notifier *new)
+ {
+-	return atomic_notifier_chain_register(&nf_conntrack_chain, nb);
++	int ret = 0;
++	struct nf_ct_event_notifier *notify;
++
++	mutex_lock(&nf_ct_ecache_mutex);
++	notify = rcu_dereference(nf_conntrack_event_cb);
++	if (notify != NULL) {
++		ret = -EBUSY;
++		goto out_unlock;
++	}
++	rcu_assign_pointer(nf_conntrack_event_cb, new);
++	mutex_unlock(&nf_ct_ecache_mutex);
++	return ret;
++
++out_unlock:
++	mutex_unlock(&nf_ct_ecache_mutex);
++	return ret;
+ }
+ EXPORT_SYMBOL_GPL(nf_conntrack_register_notifier);
+ 
+-int nf_conntrack_unregister_notifier(struct notifier_block *nb)
++void nf_conntrack_unregister_notifier(struct nf_ct_event_notifier *new)
+ {
+-	return atomic_notifier_chain_unregister(&nf_conntrack_chain, nb);
++	struct nf_ct_event_notifier *notify;
++
++	mutex_lock(&nf_ct_ecache_mutex);
++	notify = rcu_dereference(nf_conntrack_event_cb);
++	BUG_ON(notify != new);
++	rcu_assign_pointer(nf_conntrack_event_cb, NULL);
++	mutex_unlock(&nf_ct_ecache_mutex);
+ }
+ EXPORT_SYMBOL_GPL(nf_conntrack_unregister_notifier);
+ 
+-int nf_ct_expect_register_notifier(struct notifier_block *nb)
++int nf_ct_expect_register_notifier(struct nf_exp_event_notifier *new)
+ {
+-	return atomic_notifier_chain_register(&nf_ct_expect_chain, nb);
++	int ret = 0;
++	struct nf_exp_event_notifier *notify;
++
++	mutex_lock(&nf_ct_ecache_mutex);
++	notify = rcu_dereference(nf_expect_event_cb);
++	if (notify != NULL) {
++		ret = -EBUSY;
++		goto out_unlock;
++	}
++	rcu_assign_pointer(nf_expect_event_cb, new);
++	mutex_unlock(&nf_ct_ecache_mutex);
++	return ret;
++
++out_unlock:
++	mutex_unlock(&nf_ct_ecache_mutex);
++	return ret;
+ }
+ EXPORT_SYMBOL_GPL(nf_ct_expect_register_notifier);
+ 
+-int nf_ct_expect_unregister_notifier(struct notifier_block *nb)
++void nf_ct_expect_unregister_notifier(struct nf_exp_event_notifier *new)
+ {
+-	return atomic_notifier_chain_unregister(&nf_ct_expect_chain, nb);
++	struct nf_exp_event_notifier *notify;
++
++	mutex_lock(&nf_ct_ecache_mutex);
++	notify = rcu_dereference(nf_expect_event_cb);
++	BUG_ON(notify != new);
++	rcu_assign_pointer(nf_expect_event_cb, NULL);
++	mutex_unlock(&nf_ct_ecache_mutex);
+ }
+ EXPORT_SYMBOL_GPL(nf_ct_expect_unregister_notifier);
+
+commit 19abb7b090a6bce88d4e9b2914a0367f4f684432
+Author: Pablo Neira Ayuso <pablo@netfilter.org>
+Date:   Tue Nov 18 11:56:20 2008 +0100
+
+    netfilter: ctnetlink: deliver events for conntracks changed from userspace
+    
+    As for now, the creation and update of conntracks via ctnetlink do not
+    propagate an event to userspace. This can result in inconsistent situations
+    if several userspace processes modify the connection tracking table by means
+    of ctnetlink at the same time. Specifically, using the conntrack command
+    line tool and conntrackd at the same time can trigger unconsistencies.
+    
+    This patch also modifies the event cache infrastructure to pass the
+    process PID and the ECHO flag to nfnetlink_send() to report back
+    to userspace if the process that triggered the change needs so.
+    Based on a suggestion from Patrick McHardy.
+    
+    Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+    Signed-off-by: Patrick McHardy <kaber@trash.net>
+
+diff --git a/net/netfilter/nf_conntrack_ecache.c b/net/netfilter/nf_conntrack_ecache.c
+index a5f5e2e65d13..dee4190209cc 100644
+--- a/net/netfilter/nf_conntrack_ecache.c
++++ b/net/netfilter/nf_conntrack_ecache.c
+@@ -35,9 +35,17 @@ static inline void
+ __nf_ct_deliver_cached_events(struct nf_conntrack_ecache *ecache)
+ {
+ 	if (nf_ct_is_confirmed(ecache->ct) && !nf_ct_is_dying(ecache->ct)
+-	    && ecache->events)
+-		atomic_notifier_call_chain(&nf_conntrack_chain, ecache->events,
+-				    ecache->ct);
++	    && ecache->events) {
++		struct nf_ct_event item = {
++			.ct 	= ecache->ct,
++			.pid	= 0,
++			.report	= 0
++		};
++
++		atomic_notifier_call_chain(&nf_conntrack_chain,
++					   ecache->events,
++					   &item);
++	}
+ 
+ 	ecache->events = 0;
+ 	nf_ct_put(ecache->ct);
+
+commit 6058fa6bb96a5b6145cba10c5171f09c2783ca69
+Author: Alexey Dobriyan <adobriyan@gmail.com>
+Date:   Wed Oct 8 11:35:07 2008 +0200
+
+    netfilter: netns nf_conntrack: per-netns event cache
+    
+    Heh, last minute proof-reading of this patch made me think,
+    that this is actually unneeded, simply because "ct" pointers will be
+    different for different conntracks in different netns, just like they
+    are different in one netns.
+    
+    Not so sure anymore.
+    
+    [Patrick: pointers will be different, flushing can only be done while
+     inactive though and thus it needs to be per netns]
+    
+    Signed-off-by: Alexey Dobriyan <adobriyan@gmail.com>
+    Signed-off-by: Patrick McHardy <kaber@trash.net>
+
+diff --git a/net/netfilter/nf_conntrack_ecache.c b/net/netfilter/nf_conntrack_ecache.c
+index 83c41ac3505b..a5f5e2e65d13 100644
+--- a/net/netfilter/nf_conntrack_ecache.c
++++ b/net/netfilter/nf_conntrack_ecache.c
+@@ -29,9 +29,6 @@ EXPORT_SYMBOL_GPL(nf_conntrack_chain);
+ ATOMIC_NOTIFIER_HEAD(nf_ct_expect_chain);
+ EXPORT_SYMBOL_GPL(nf_ct_expect_chain);
+ 
+-DEFINE_PER_CPU(struct nf_conntrack_ecache, nf_conntrack_ecache);
+-EXPORT_PER_CPU_SYMBOL_GPL(nf_conntrack_ecache);
+-
+ /* deliver cached events and clear cache entry - must be called with locally
+  * disabled softirqs */
+ static inline void
+@@ -51,10 +48,11 @@ __nf_ct_deliver_cached_events(struct nf_conntrack_ecache *ecache)
+  * by code prior to async packet handling for freeing the skb */
+ void nf_ct_deliver_cached_events(const struct nf_conn *ct)
+ {
++	struct net *net = nf_ct_net(ct);
+ 	struct nf_conntrack_ecache *ecache;
+ 
+ 	local_bh_disable();
+-	ecache = &__get_cpu_var(nf_conntrack_ecache);
++	ecache = per_cpu_ptr(net->ct.ecache, raw_smp_processor_id());
+ 	if (ecache->ct == ct)
+ 		__nf_ct_deliver_cached_events(ecache);
+ 	local_bh_enable();
+@@ -64,10 +62,11 @@ EXPORT_SYMBOL_GPL(nf_ct_deliver_cached_events);
+ /* Deliver cached events for old pending events, if current conntrack != old */
+ void __nf_ct_event_cache_init(struct nf_conn *ct)
+ {
++	struct net *net = nf_ct_net(ct);
+ 	struct nf_conntrack_ecache *ecache;
+ 
+ 	/* take care of delivering potentially old events */
+-	ecache = &__get_cpu_var(nf_conntrack_ecache);
++	ecache = per_cpu_ptr(net->ct.ecache, raw_smp_processor_id());
+ 	BUG_ON(ecache->ct == ct);
+ 	if (ecache->ct)
+ 		__nf_ct_deliver_cached_events(ecache);
+@@ -79,18 +78,31 @@ EXPORT_SYMBOL_GPL(__nf_ct_event_cache_init);
+ 
+ /* flush the event cache - touches other CPU's data and must not be called
+  * while packets are still passing through the code */
+-void nf_ct_event_cache_flush(void)
++void nf_ct_event_cache_flush(struct net *net)
+ {
+ 	struct nf_conntrack_ecache *ecache;
+ 	int cpu;
+ 
+ 	for_each_possible_cpu(cpu) {
+-		ecache = &per_cpu(nf_conntrack_ecache, cpu);
++		ecache = per_cpu_ptr(net->ct.ecache, cpu);
+ 		if (ecache->ct)
+ 			nf_ct_put(ecache->ct);
+ 	}
+ }
+ 
++int nf_conntrack_ecache_init(struct net *net)
++{
++	net->ct.ecache = alloc_percpu(struct nf_conntrack_ecache);
++	if (!net->ct.ecache)
++		return -ENOMEM;
++	return 0;
++}
++
++void nf_conntrack_ecache_fini(struct net *net)
++{
++	free_percpu(net->ct.ecache);
++}
++
+ int nf_conntrack_register_notifier(struct notifier_block *nb)
+ {
+ 	return atomic_notifier_chain_register(&nf_conntrack_chain, nb);
+
+commit 6823645d608541c2c69e8a99454936e058c294e0
+Author: Patrick McHardy <kaber@trash.net>
+Date:   Sat Jul 7 22:30:49 2007 -0700
+
+    [NETFILTER]: nf_conntrack_expect: function naming unification
+    
+    Currently there is a wild mix of nf_conntrack_expect_, nf_ct_exp_,
+    expect_, exp_, ...
+    
+    Consistently use nf_ct_ as prefix for exported functions.
+    
+    Signed-off-by: Patrick McHardy <kaber@trash.net>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/netfilter/nf_conntrack_ecache.c b/net/netfilter/nf_conntrack_ecache.c
+index 6bd421df2dbc..83c41ac3505b 100644
+--- a/net/netfilter/nf_conntrack_ecache.c
++++ b/net/netfilter/nf_conntrack_ecache.c
+@@ -26,8 +26,8 @@
+ ATOMIC_NOTIFIER_HEAD(nf_conntrack_chain);
+ EXPORT_SYMBOL_GPL(nf_conntrack_chain);
+ 
+-ATOMIC_NOTIFIER_HEAD(nf_conntrack_expect_chain);
+-EXPORT_SYMBOL_GPL(nf_conntrack_expect_chain);
++ATOMIC_NOTIFIER_HEAD(nf_ct_expect_chain);
++EXPORT_SYMBOL_GPL(nf_ct_expect_chain);
+ 
+ DEFINE_PER_CPU(struct nf_conntrack_ecache, nf_conntrack_ecache);
+ EXPORT_PER_CPU_SYMBOL_GPL(nf_conntrack_ecache);
+@@ -103,14 +103,14 @@ int nf_conntrack_unregister_notifier(struct notifier_block *nb)
+ }
+ EXPORT_SYMBOL_GPL(nf_conntrack_unregister_notifier);
+ 
+-int nf_conntrack_expect_register_notifier(struct notifier_block *nb)
++int nf_ct_expect_register_notifier(struct notifier_block *nb)
+ {
+-	return atomic_notifier_chain_register(&nf_conntrack_expect_chain, nb);
++	return atomic_notifier_chain_register(&nf_ct_expect_chain, nb);
+ }
+-EXPORT_SYMBOL_GPL(nf_conntrack_expect_register_notifier);
++EXPORT_SYMBOL_GPL(nf_ct_expect_register_notifier);
+ 
+-int nf_conntrack_expect_unregister_notifier(struct notifier_block *nb)
++int nf_ct_expect_unregister_notifier(struct notifier_block *nb)
+ {
+-	return atomic_notifier_chain_unregister(&nf_conntrack_expect_chain, nb);
++	return atomic_notifier_chain_unregister(&nf_ct_expect_chain, nb);
+ }
+-EXPORT_SYMBOL_GPL(nf_conntrack_expect_unregister_notifier);
++EXPORT_SYMBOL_GPL(nf_ct_expect_unregister_notifier);
+
+commit 010c7d6f867e98c86723f420d485583464fbab45
+Author: Patrick McHardy <kaber@trash.net>
+Date:   Wed Mar 14 16:40:10 2007 -0700
+
+    [NETFILTER]: nf_conntrack: uninline notifier registration functions
+    
+    Signed-off-by: Patrick McHardy <kaber@trash.net>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/netfilter/nf_conntrack_ecache.c b/net/netfilter/nf_conntrack_ecache.c
+index 1a223e0c0856..6bd421df2dbc 100644
+--- a/net/netfilter/nf_conntrack_ecache.c
++++ b/net/netfilter/nf_conntrack_ecache.c
+@@ -91,3 +91,26 @@ void nf_ct_event_cache_flush(void)
+ 	}
+ }
+ 
++int nf_conntrack_register_notifier(struct notifier_block *nb)
++{
++	return atomic_notifier_chain_register(&nf_conntrack_chain, nb);
++}
++EXPORT_SYMBOL_GPL(nf_conntrack_register_notifier);
++
++int nf_conntrack_unregister_notifier(struct notifier_block *nb)
++{
++	return atomic_notifier_chain_unregister(&nf_conntrack_chain, nb);
++}
++EXPORT_SYMBOL_GPL(nf_conntrack_unregister_notifier);
++
++int nf_conntrack_expect_register_notifier(struct notifier_block *nb)
++{
++	return atomic_notifier_chain_register(&nf_conntrack_expect_chain, nb);
++}
++EXPORT_SYMBOL_GPL(nf_conntrack_expect_register_notifier);
++
++int nf_conntrack_expect_unregister_notifier(struct notifier_block *nb)
++{
++	return atomic_notifier_chain_unregister(&nf_conntrack_expect_chain, nb);
++}
++EXPORT_SYMBOL_GPL(nf_conntrack_expect_unregister_notifier);
+
+commit 1863f0965e716cc61d3c23cf106d41aa070f706f
+Author: Yasuyuki Kozakai <yasuyuki.kozakai@toshiba.co.jp>
+Date:   Sat Dec 2 22:12:54 2006 -0800
+
+    [NETFILTER]: nf_conntrack: fix header inclusions for helpers
+    
+    Signed-off-by: Yasuyuki Kozakai <yasuyuki.kozakai@toshiba.co.jp>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/netfilter/nf_conntrack_ecache.c b/net/netfilter/nf_conntrack_ecache.c
+index d051694774c7..1a223e0c0856 100644
+--- a/net/netfilter/nf_conntrack_ecache.c
++++ b/net/netfilter/nf_conntrack_ecache.c
+@@ -21,10 +21,6 @@
+ #include <linux/netdevice.h>
+ 
+ #include <net/netfilter/nf_conntrack.h>
+-#include <net/netfilter/nf_conntrack_l3proto.h>
+-#include <net/netfilter/nf_conntrack_l4proto.h>
+-#include <net/netfilter/nf_conntrack_expect.h>
+-#include <net/netfilter/nf_conntrack_helper.h>
+ #include <net/netfilter/nf_conntrack_core.h>
+ 
+ ATOMIC_NOTIFIER_HEAD(nf_conntrack_chain);
+
+commit 13b1833910205289172cdc655cb9bc61188f77e9
+Author: Patrick McHardy <kaber@trash.net>
+Date:   Sat Dec 2 22:11:25 2006 -0800
+
+    [NETFILTER]: nf_conntrack: EXPORT_SYMBOL cleanup
+    
+    - move EXPORT_SYMBOL next to exported symbol
+    - use EXPORT_SYMBOL_GPL since this is what the original code used
+    
+    Signed-off-by: Patrick McHardy <kaber@trash.net>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/netfilter/nf_conntrack_ecache.c b/net/netfilter/nf_conntrack_ecache.c
+index 5152efd511d0..d051694774c7 100644
+--- a/net/netfilter/nf_conntrack_ecache.c
++++ b/net/netfilter/nf_conntrack_ecache.c
+@@ -28,9 +28,13 @@
+ #include <net/netfilter/nf_conntrack_core.h>
+ 
+ ATOMIC_NOTIFIER_HEAD(nf_conntrack_chain);
++EXPORT_SYMBOL_GPL(nf_conntrack_chain);
++
+ ATOMIC_NOTIFIER_HEAD(nf_conntrack_expect_chain);
++EXPORT_SYMBOL_GPL(nf_conntrack_expect_chain);
+ 
+ DEFINE_PER_CPU(struct nf_conntrack_ecache, nf_conntrack_ecache);
++EXPORT_PER_CPU_SYMBOL_GPL(nf_conntrack_ecache);
+ 
+ /* deliver cached events and clear cache entry - must be called with locally
+  * disabled softirqs */
+@@ -59,6 +63,7 @@ void nf_ct_deliver_cached_events(const struct nf_conn *ct)
+ 		__nf_ct_deliver_cached_events(ecache);
+ 	local_bh_enable();
+ }
++EXPORT_SYMBOL_GPL(nf_ct_deliver_cached_events);
+ 
+ /* Deliver cached events for old pending events, if current conntrack != old */
+ void __nf_ct_event_cache_init(struct nf_conn *ct)
+@@ -74,6 +79,7 @@ void __nf_ct_event_cache_init(struct nf_conn *ct)
+ 	ecache->ct = ct;
+ 	nf_conntrack_get(&ct->ct_general);
+ }
++EXPORT_SYMBOL_GPL(__nf_ct_event_cache_init);
+ 
+ /* flush the event cache - touches other CPU's data and must not be called
+  * while packets are still passing through the code */
+
+commit 605dcad6c85226e6d43387917b329d65b95cef39
+Author: Martin Josefsson <gandalf@wlug.westbo.se>
+Date:   Wed Nov 29 02:35:06 2006 +0100
+
+    [NETFILTER]: nf_conntrack: rename struct nf_conntrack_protocol
+    
+    Rename 'struct nf_conntrack_protocol' to 'struct nf_conntrack_l4proto' in
+    order to help distinguish it from 'struct nf_conntrack_l3proto'. It gets
+    rather confusing with 'nf_conntrack_protocol'.
+    
+    Signed-off-by: Martin Josefsson <gandalf@wlug.westbo.se>
+    Signed-off-by: Patrick McHardy <kaber@trash.net>
+
+diff --git a/net/netfilter/nf_conntrack_ecache.c b/net/netfilter/nf_conntrack_ecache.c
+index 35763e96fddb..5152efd511d0 100644
+--- a/net/netfilter/nf_conntrack_ecache.c
++++ b/net/netfilter/nf_conntrack_ecache.c
+@@ -22,7 +22,7 @@
+ 
+ #include <net/netfilter/nf_conntrack.h>
+ #include <net/netfilter/nf_conntrack_l3proto.h>
+-#include <net/netfilter/nf_conntrack_protocol.h>
++#include <net/netfilter/nf_conntrack_l4proto.h>
+ #include <net/netfilter/nf_conntrack_expect.h>
+ #include <net/netfilter/nf_conntrack_helper.h>
+ #include <net/netfilter/nf_conntrack_core.h>
+
+commit f61801218a58381f498ae5c38ae3eae0bc73e976
+Author: Martin Josefsson <gandalf@wlug.westbo.se>
+Date:   Wed Nov 29 02:35:01 2006 +0100
+
+    [NETFILTER]: nf_conntrack: split out the event cache
+    
+    This patch splits out the event cache into its own file
+    nf_conntrack_ecache.c
+    
+    Signed-off-by: Martin Josefsson <gandalf@wlug.westbo.se>
+    Signed-off-by: Patrick McHardy <kaber@trash.net>
+
+diff --git a/net/netfilter/nf_conntrack_ecache.c b/net/netfilter/nf_conntrack_ecache.c
+new file mode 100644
+index 000000000000..35763e96fddb
+--- /dev/null
++++ b/net/netfilter/nf_conntrack_ecache.c
+@@ -0,0 +1,91 @@
++/* Event cache for netfilter. */
++
++/* (C) 1999-2001 Paul `Rusty' Russell
++ * (C) 2002-2006 Netfilter Core Team <coreteam@netfilter.org>
++ * (C) 2003,2004 USAGI/WIDE Project <http://www.linux-ipv6.org>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#include <linux/types.h>
++#include <linux/netfilter.h>
++#include <linux/skbuff.h>
++#include <linux/vmalloc.h>
++#include <linux/stddef.h>
++#include <linux/err.h>
++#include <linux/percpu.h>
++#include <linux/notifier.h>
++#include <linux/kernel.h>
++#include <linux/netdevice.h>
++
++#include <net/netfilter/nf_conntrack.h>
++#include <net/netfilter/nf_conntrack_l3proto.h>
++#include <net/netfilter/nf_conntrack_protocol.h>
++#include <net/netfilter/nf_conntrack_expect.h>
++#include <net/netfilter/nf_conntrack_helper.h>
++#include <net/netfilter/nf_conntrack_core.h>
++
++ATOMIC_NOTIFIER_HEAD(nf_conntrack_chain);
++ATOMIC_NOTIFIER_HEAD(nf_conntrack_expect_chain);
++
++DEFINE_PER_CPU(struct nf_conntrack_ecache, nf_conntrack_ecache);
++
++/* deliver cached events and clear cache entry - must be called with locally
++ * disabled softirqs */
++static inline void
++__nf_ct_deliver_cached_events(struct nf_conntrack_ecache *ecache)
++{
++	if (nf_ct_is_confirmed(ecache->ct) && !nf_ct_is_dying(ecache->ct)
++	    && ecache->events)
++		atomic_notifier_call_chain(&nf_conntrack_chain, ecache->events,
++				    ecache->ct);
++
++	ecache->events = 0;
++	nf_ct_put(ecache->ct);
++	ecache->ct = NULL;
++}
++
++/* Deliver all cached events for a particular conntrack. This is called
++ * by code prior to async packet handling for freeing the skb */
++void nf_ct_deliver_cached_events(const struct nf_conn *ct)
++{
++	struct nf_conntrack_ecache *ecache;
++
++	local_bh_disable();
++	ecache = &__get_cpu_var(nf_conntrack_ecache);
++	if (ecache->ct == ct)
++		__nf_ct_deliver_cached_events(ecache);
++	local_bh_enable();
++}
++
++/* Deliver cached events for old pending events, if current conntrack != old */
++void __nf_ct_event_cache_init(struct nf_conn *ct)
++{
++	struct nf_conntrack_ecache *ecache;
++
++	/* take care of delivering potentially old events */
++	ecache = &__get_cpu_var(nf_conntrack_ecache);
++	BUG_ON(ecache->ct == ct);
++	if (ecache->ct)
++		__nf_ct_deliver_cached_events(ecache);
++	/* initialize for this conntrack/packet */
++	ecache->ct = ct;
++	nf_conntrack_get(&ct->ct_general);
++}
++
++/* flush the event cache - touches other CPU's data and must not be called
++ * while packets are still passing through the code */
++void nf_ct_event_cache_flush(void)
++{
++	struct nf_conntrack_ecache *ecache;
++	int cpu;
++
++	for_each_possible_cpu(cpu) {
++		ecache = &per_cpu(nf_conntrack_ecache, cpu);
++		if (ecache->ct)
++			nf_ct_put(ecache->ct);
++	}
++}
++

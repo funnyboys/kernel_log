@@ -1,0 +1,599 @@
+commit 3f50f132d8400e129fc9eb68b5020167ef80a244
+Author: John Fastabend <john.fastabend@gmail.com>
+Date:   Mon Mar 30 14:36:39 2020 -0700
+
+    bpf: Verifier, do explicit ALU32 bounds tracking
+    
+    It is not possible for the current verifier to track ALU32 and JMP ops
+    correctly. This can result in the verifier aborting with errors even though
+    the program should be verifiable. BPF codes that hit this can work around
+    it by changin int variables to 64-bit types, marking variables volatile,
+    etc. But this is all very ugly so it would be better to avoid these tricks.
+    
+    But, the main reason to address this now is do_refine_retval_range() was
+    assuming return values could not be negative. Once we fixed this code that
+    was previously working will no longer work. See do_refine_retval_range()
+    patch for details. And we don't want to suddenly cause programs that used
+    to work to fail.
+    
+    The simplest example code snippet that illustrates the problem is likely
+    this,
+    
+     53: w8 = w0                    // r8 <- [0, S32_MAX],
+                                    // w8 <- [-S32_MIN, X]
+     54: w8 <s 0                    // r8 <- [0, U32_MAX]
+                                    // w8 <- [0, X]
+    
+    The expected 64-bit and 32-bit bounds after each line are shown on the
+    right. The current issue is without the w* bounds we are forced to use
+    the worst case bound of [0, U32_MAX]. To resolve this type of case,
+    jmp32 creating divergent 32-bit bounds from 64-bit bounds, we add explicit
+    32-bit register bounds s32_{min|max}_value and u32_{min|max}_value. Then
+    from branch_taken logic creating new bounds we can track 32-bit bounds
+    explicitly.
+    
+    The next case we observed is ALU ops after the jmp32,
+    
+     53: w8 = w0                    // r8 <- [0, S32_MAX],
+                                    // w8 <- [-S32_MIN, X]
+     54: w8 <s 0                    // r8 <- [0, U32_MAX]
+                                    // w8 <- [0, X]
+     55: w8 += 1                    // r8 <- [0, U32_MAX+1]
+                                    // w8 <- [0, X+1]
+    
+    In order to keep the bounds accurate at this point we also need to track
+    ALU32 ops. To do this we add explicit ALU32 logic for each of the ALU
+    ops, mov, add, sub, etc.
+    
+    Finally there is a question of how and when to merge bounds. The cases
+    enumerate here,
+    
+    1. MOV ALU32   - zext 32-bit -> 64-bit
+    2. MOV ALU64   - copy 64-bit -> 32-bit
+    3. op  ALU32   - zext 32-bit -> 64-bit
+    4. op  ALU64   - n/a
+    5. jmp ALU32   - 64-bit: var32_off | upper_32_bits(var64_off)
+    6. jmp ALU64   - 32-bit: (>> (<< var64_off))
+    
+    Details for each case,
+    
+    For "MOV ALU32" BPF arch zero extends so we simply copy the bounds
+    from 32-bit into 64-bit ensuring we truncate var_off and 64-bit
+    bounds correctly. See zext_32_to_64.
+    
+    For "MOV ALU64" copy all bounds including 32-bit into new register. If
+    the src register had 32-bit bounds the dst register will as well.
+    
+    For "op ALU32" zero extend 32-bit into 64-bit the same as move,
+    see zext_32_to_64.
+    
+    For "op ALU64" calculate both 32-bit and 64-bit bounds no merging
+    is done here. Except we have a special case. When RSH or ARSH is
+    done we can't simply ignore shifting bits from 64-bit reg into the
+    32-bit subreg. So currently just push bounds from 64-bit into 32-bit.
+    This will be correct in the sense that they will represent a valid
+    state of the register. However we could lose some accuracy if an
+    ARSH is following a jmp32 operation. We can handle this special
+    case in a follow up series.
+    
+    For "jmp ALU32" mark 64-bit reg unknown and recalculate 64-bit bounds
+    from tnum by setting var_off to ((<<(>>var_off)) | var32_off). We
+    special case if 64-bit bounds has zero'd upper 32bits at which point
+    we can simply copy 32-bit bounds into 64-bit register. This catches
+    a common compiler trick where upper 32-bits are zeroed and then
+    32-bit ops are used followed by a 64-bit compare or 64-bit op on
+    a pointer. See __reg_combine_64_into_32().
+    
+    For "jmp ALU64" cast the bounds of the 64bit to their 32-bit
+    counterpart. For example s32_min_value = (s32)reg->smin_value. For
+    tnum use only the lower 32bits via, (>>(<<var_off)). See
+    __reg_combine_64_into_32().
+    
+    Signed-off-by: John Fastabend <john.fastabend@gmail.com>
+    Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+    Link: https://lore.kernel.org/bpf/158560419880.10843.11448220440809118343.stgit@john-Precision-5820-Tower
+
+diff --git a/kernel/bpf/tnum.c b/kernel/bpf/tnum.c
+index d4f335a9a899..ceac5281bd31 100644
+--- a/kernel/bpf/tnum.c
++++ b/kernel/bpf/tnum.c
+@@ -194,3 +194,18 @@ int tnum_sbin(char *str, size_t size, struct tnum a)
+ 	str[min(size - 1, (size_t)64)] = 0;
+ 	return 64;
+ }
++
++struct tnum tnum_subreg(struct tnum a)
++{
++	return tnum_cast(a, 4);
++}
++
++struct tnum tnum_clear_subreg(struct tnum a)
++{
++	return tnum_lshift(tnum_rshift(a, 32), 32);
++}
++
++struct tnum tnum_const_subreg(struct tnum a, u32 value)
++{
++	return tnum_or(tnum_clear_subreg(a), tnum_const(value));
++}
+
+commit 0af2ffc93a4b50948f9dad2786b7f1bd253bf0b9
+Author: Daniel Borkmann <daniel@iogearbox.net>
+Date:   Wed Jan 15 21:47:33 2020 +0100
+
+    bpf: Fix incorrect verifier simulation of ARSH under ALU32
+    
+    Anatoly has been fuzzing with kBdysch harness and reported a hang in one
+    of the outcomes:
+    
+      0: R1=ctx(id=0,off=0,imm=0) R10=fp0
+      0: (85) call bpf_get_socket_cookie#46
+      1: R0_w=invP(id=0) R10=fp0
+      1: (57) r0 &= 808464432
+      2: R0_w=invP(id=0,umax_value=808464432,var_off=(0x0; 0x30303030)) R10=fp0
+      2: (14) w0 -= 810299440
+      3: R0_w=invP(id=0,umax_value=4294967295,var_off=(0xcf800000; 0x3077fff0)) R10=fp0
+      3: (c4) w0 s>>= 1
+      4: R0_w=invP(id=0,umin_value=1740636160,umax_value=2147221496,var_off=(0x67c00000; 0x183bfff8)) R10=fp0
+      4: (76) if w0 s>= 0x30303030 goto pc+216
+      221: R0_w=invP(id=0,umin_value=1740636160,umax_value=2147221496,var_off=(0x67c00000; 0x183bfff8)) R10=fp0
+      221: (95) exit
+      processed 6 insns (limit 1000000) [...]
+    
+    Taking a closer look, the program was xlated as follows:
+    
+      # ./bpftool p d x i 12
+      0: (85) call bpf_get_socket_cookie#7800896
+      1: (bf) r6 = r0
+      2: (57) r6 &= 808464432
+      3: (14) w6 -= 810299440
+      4: (c4) w6 s>>= 1
+      5: (76) if w6 s>= 0x30303030 goto pc+216
+      6: (05) goto pc-1
+      7: (05) goto pc-1
+      8: (05) goto pc-1
+      [...]
+      220: (05) goto pc-1
+      221: (05) goto pc-1
+      222: (95) exit
+    
+    Meaning, the visible effect is very similar to f54c7898ed1c ("bpf: Fix
+    precision tracking for unbounded scalars"), that is, the fall-through
+    branch in the instruction 5 is considered to be never taken given the
+    conclusion from the min/max bounds tracking in w6, and therefore the
+    dead-code sanitation rewrites it as goto pc-1. However, real-life input
+    disagrees with verification analysis since a soft-lockup was observed.
+    
+    The bug sits in the analysis of the ARSH. The definition is that we shift
+    the target register value right by K bits through shifting in copies of
+    its sign bit. In adjust_scalar_min_max_vals(), we do first coerce the
+    register into 32 bit mode, same happens after simulating the operation.
+    However, for the case of simulating the actual ARSH, we don't take the
+    mode into account and act as if it's always 64 bit, but location of sign
+    bit is different:
+    
+      dst_reg->smin_value >>= umin_val;
+      dst_reg->smax_value >>= umin_val;
+      dst_reg->var_off = tnum_arshift(dst_reg->var_off, umin_val);
+    
+    Consider an unknown R0 where bpf_get_socket_cookie() (or others) would
+    for example return 0xffff. With the above ARSH simulation, we'd see the
+    following results:
+    
+      [...]
+      1: R1=ctx(id=0,off=0,imm=0) R2_w=invP65535 R10=fp0
+      1: (85) call bpf_get_socket_cookie#46
+      2: R0_w=invP(id=0) R10=fp0
+      2: (57) r0 &= 808464432
+        -> R0_runtime = 0x3030
+      3: R0_w=invP(id=0,umax_value=808464432,var_off=(0x0; 0x30303030)) R10=fp0
+      3: (14) w0 -= 810299440
+        -> R0_runtime = 0xcfb40000
+      4: R0_w=invP(id=0,umax_value=4294967295,var_off=(0xcf800000; 0x3077fff0)) R10=fp0
+                                  (0xffffffff)
+      4: (c4) w0 s>>= 1
+        -> R0_runtime = 0xe7da0000
+      5: R0_w=invP(id=0,umin_value=1740636160,umax_value=2147221496,var_off=(0x67c00000; 0x183bfff8)) R10=fp0
+                                  (0x67c00000)           (0x7ffbfff8)
+      [...]
+    
+    In insn 3, we have a runtime value of 0xcfb40000, which is '1100 1111 1011
+    0100 0000 0000 0000 0000', the result after the shift has 0xe7da0000 that
+    is '1110 0111 1101 1010 0000 0000 0000 0000', where the sign bit is correctly
+    retained in 32 bit mode. In insn4, the umax was 0xffffffff, and changed into
+    0x7ffbfff8 after the shift, that is, '0111 1111 1111 1011 1111 1111 1111 1000'
+    and means here that the simulation didn't retain the sign bit. With above
+    logic, the updates happen on the 64 bit min/max bounds and given we coerced
+    the register, the sign bits of the bounds are cleared as well, meaning, we
+    need to force the simulation into s32 space for 32 bit alu mode.
+    
+    Verification after the fix below. We're first analyzing the fall-through branch
+    on 32 bit signed >= test eventually leading to rejection of the program in this
+    specific case:
+    
+      0: R1=ctx(id=0,off=0,imm=0) R10=fp0
+      0: (b7) r2 = 808464432
+      1: R1=ctx(id=0,off=0,imm=0) R2_w=invP808464432 R10=fp0
+      1: (85) call bpf_get_socket_cookie#46
+      2: R0_w=invP(id=0) R10=fp0
+      2: (bf) r6 = r0
+      3: R0_w=invP(id=0) R6_w=invP(id=0) R10=fp0
+      3: (57) r6 &= 808464432
+      4: R0_w=invP(id=0) R6_w=invP(id=0,umax_value=808464432,var_off=(0x0; 0x30303030)) R10=fp0
+      4: (14) w6 -= 810299440
+      5: R0_w=invP(id=0) R6_w=invP(id=0,umax_value=4294967295,var_off=(0xcf800000; 0x3077fff0)) R10=fp0
+      5: (c4) w6 s>>= 1
+      6: R0_w=invP(id=0) R6_w=invP(id=0,umin_value=3888119808,umax_value=4294705144,var_off=(0xe7c00000; 0x183bfff8)) R10=fp0
+                                                  (0x67c00000)          (0xfffbfff8)
+      6: (76) if w6 s>= 0x30303030 goto pc+216
+      7: R0_w=invP(id=0) R6_w=invP(id=0,umin_value=3888119808,umax_value=4294705144,var_off=(0xe7c00000; 0x183bfff8)) R10=fp0
+      7: (30) r0 = *(u8 *)skb[808464432]
+      BPF_LD_[ABS|IND] uses reserved fields
+      processed 8 insns (limit 1000000) [...]
+    
+    Fixes: 9cbe1f5a32dc ("bpf/verifier: improve register value range tracking with ARSH")
+    Reported-by: Anatoly Trosinenko <anatoly.trosinenko@gmail.com>
+    Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+    Acked-by: Yonghong Song <yhs@fb.com>
+    Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+    Link: https://lore.kernel.org/bpf/20200115204733.16648-1-daniel@iogearbox.net
+
+diff --git a/kernel/bpf/tnum.c b/kernel/bpf/tnum.c
+index ca52b9642943..d4f335a9a899 100644
+--- a/kernel/bpf/tnum.c
++++ b/kernel/bpf/tnum.c
+@@ -44,14 +44,19 @@ struct tnum tnum_rshift(struct tnum a, u8 shift)
+ 	return TNUM(a.value >> shift, a.mask >> shift);
+ }
+ 
+-struct tnum tnum_arshift(struct tnum a, u8 min_shift)
++struct tnum tnum_arshift(struct tnum a, u8 min_shift, u8 insn_bitness)
+ {
+ 	/* if a.value is negative, arithmetic shifting by minimum shift
+ 	 * will have larger negative offset compared to more shifting.
+ 	 * If a.value is nonnegative, arithmetic shifting by minimum shift
+ 	 * will have larger positive offset compare to more shifting.
+ 	 */
+-	return TNUM((s64)a.value >> min_shift, (s64)a.mask >> min_shift);
++	if (insn_bitness == 32)
++		return TNUM((u32)(((s32)a.value) >> min_shift),
++			    (u32)(((s32)a.mask)  >> min_shift));
++	else
++		return TNUM((s64)a.value >> min_shift,
++			    (s64)a.mask  >> min_shift);
+ }
+ 
+ struct tnum tnum_add(struct tnum a, struct tnum b)
+
+commit 457c89965399115e5cd8bf38f9c597293405703d
+Author: Thomas Gleixner <tglx@linutronix.de>
+Date:   Sun May 19 13:08:55 2019 +0100
+
+    treewide: Add SPDX license identifier for missed files
+    
+    Add SPDX license identifiers to all files which:
+    
+     - Have no license information of any form
+    
+     - Have EXPORT_.*_SYMBOL_GPL inside which was used in the
+       initial scan/conversion to ignore the file
+    
+    These files fall under the project license, GPL v2 only. The resulting SPDX
+    license identifier is:
+    
+      GPL-2.0-only
+    
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/kernel/bpf/tnum.c b/kernel/bpf/tnum.c
+index 938d41211be7..ca52b9642943 100644
+--- a/kernel/bpf/tnum.c
++++ b/kernel/bpf/tnum.c
+@@ -1,3 +1,4 @@
++// SPDX-License-Identifier: GPL-2.0-only
+ /* tnum: tracked (or tristate) numbers
+  *
+  * A tnum tracks knowledge about the bits of a value.  Each bit can be either
+
+commit 9cbe1f5a32dcd6d0508326f7d9098e5bc380a4fe
+Author: Yonghong Song <yhs@fb.com>
+Date:   Sat Apr 28 22:28:11 2018 -0700
+
+    bpf/verifier: improve register value range tracking with ARSH
+    
+    When helpers like bpf_get_stack returns an int value
+    and later on used for arithmetic computation, the LSH and ARSH
+    operations are often required to get proper sign extension into
+    64-bit. For example, without this patch:
+        54: R0=inv(id=0,umax_value=800)
+        54: (bf) r8 = r0
+        55: R0=inv(id=0,umax_value=800) R8_w=inv(id=0,umax_value=800)
+        55: (67) r8 <<= 32
+        56: R8_w=inv(id=0,umax_value=3435973836800,var_off=(0x0; 0x3ff00000000))
+        56: (c7) r8 s>>= 32
+        57: R8=inv(id=0)
+    With this patch:
+        54: R0=inv(id=0,umax_value=800)
+        54: (bf) r8 = r0
+        55: R0=inv(id=0,umax_value=800) R8_w=inv(id=0,umax_value=800)
+        55: (67) r8 <<= 32
+        56: R8_w=inv(id=0,umax_value=3435973836800,var_off=(0x0; 0x3ff00000000))
+        56: (c7) r8 s>>= 32
+        57: R8=inv(id=0, umax_value=800,var_off=(0x0; 0x3ff))
+    With better range of "R8", later on when "R8" is added to other register,
+    e.g., a map pointer or scalar-value register, the better register
+    range can be derived and verifier failure may be avoided.
+    
+    In our later example,
+        ......
+        usize = bpf_get_stack(ctx, raw_data, max_len, BPF_F_USER_STACK);
+        if (usize < 0)
+            return 0;
+        ksize = bpf_get_stack(ctx, raw_data + usize, max_len - usize, 0);
+        ......
+    Without improving ARSH value range tracking, the register representing
+    "max_len - usize" will have smin_value equal to S64_MIN and will be
+    rejected by verifier.
+    
+    Acked-by: Alexei Starovoitov <ast@kernel.org>
+    Signed-off-by: Yonghong Song <yhs@fb.com>
+    Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+
+diff --git a/kernel/bpf/tnum.c b/kernel/bpf/tnum.c
+index 1f4bf68c12db..938d41211be7 100644
+--- a/kernel/bpf/tnum.c
++++ b/kernel/bpf/tnum.c
+@@ -43,6 +43,16 @@ struct tnum tnum_rshift(struct tnum a, u8 shift)
+ 	return TNUM(a.value >> shift, a.mask >> shift);
+ }
+ 
++struct tnum tnum_arshift(struct tnum a, u8 min_shift)
++{
++	/* if a.value is negative, arithmetic shifting by minimum shift
++	 * will have larger negative offset compared to more shifting.
++	 * If a.value is nonnegative, arithmetic shifting by minimum shift
++	 * will have larger positive offset compare to more shifting.
++	 */
++	return TNUM((s64)a.value >> min_shift, (s64)a.mask >> min_shift);
++}
++
+ struct tnum tnum_add(struct tnum a, struct tnum b)
+ {
+ 	u64 sm, sv, sigma, chi, mu;
+
+commit b03c9f9fdc37dab81ea04d5dacdc5995d4c224c2
+Author: Edward Cree <ecree@solarflare.com>
+Date:   Mon Aug 7 15:26:36 2017 +0100
+
+    bpf/verifier: track signed and unsigned min/max values
+    
+    Allows us to, sometimes, combine information from a signed check of one
+     bound and an unsigned check of the other.
+    We now track the full range of possible values, rather than restricting
+     ourselves to [0, 1<<30) and considering anything beyond that as
+     unknown.  While this is probably not necessary, it makes the code more
+     straightforward and symmetrical between signed and unsigned bounds.
+    
+    Signed-off-by: Edward Cree <ecree@solarflare.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/kernel/bpf/tnum.c b/kernel/bpf/tnum.c
+index 92eeeb1974a2..1f4bf68c12db 100644
+--- a/kernel/bpf/tnum.c
++++ b/kernel/bpf/tnum.c
+@@ -17,6 +17,22 @@ struct tnum tnum_const(u64 value)
+ 	return TNUM(value, 0);
+ }
+ 
++struct tnum tnum_range(u64 min, u64 max)
++{
++	u64 chi = min ^ max, delta;
++	u8 bits = fls64(chi);
++
++	/* special case, needed because 1ULL << 64 is undefined */
++	if (bits > 63)
++		return tnum_unknown;
++	/* e.g. if chi = 4, bits = 3, delta = (1<<3) - 1 = 7.
++	 * if chi = 0, bits = 0, delta = (1<<0) - 1 = 0, so we return
++	 *  constant min (since min == max).
++	 */
++	delta = (1ULL << bits) - 1;
++	return TNUM(min & ~delta, delta);
++}
++
+ struct tnum tnum_lshift(struct tnum a, u8 shift)
+ {
+ 	return TNUM(a.value << shift, a.mask << shift);
+
+commit f1174f77b50c94eecaa658fdc56fa69b421de4b8
+Author: Edward Cree <ecree@solarflare.com>
+Date:   Mon Aug 7 15:26:19 2017 +0100
+
+    bpf/verifier: rework value tracking
+    
+    Unifies adjusted and unadjusted register value types (e.g. FRAME_POINTER is
+     now just a PTR_TO_STACK with zero offset).
+    Tracks value alignment by means of tracking known & unknown bits.  This
+     also replaces the 'reg->imm' (leading zero bits) calculations for (what
+     were) UNKNOWN_VALUEs.
+    If pointer leaks are allowed, and adjust_ptr_min_max_vals returns -EACCES,
+     treat the pointer as an unknown scalar and try again, because we might be
+     able to conclude something about the result (e.g. pointer & 0x40 is either
+     0 or 0x40).
+    Verifier hooks in the netronome/nfp driver were changed to match the new
+     data structures.
+    
+    Signed-off-by: Edward Cree <ecree@solarflare.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/kernel/bpf/tnum.c b/kernel/bpf/tnum.c
+new file mode 100644
+index 000000000000..92eeeb1974a2
+--- /dev/null
++++ b/kernel/bpf/tnum.c
+@@ -0,0 +1,164 @@
++/* tnum: tracked (or tristate) numbers
++ *
++ * A tnum tracks knowledge about the bits of a value.  Each bit can be either
++ * known (0 or 1), or unknown (x).  Arithmetic operations on tnums will
++ * propagate the unknown bits such that the tnum result represents all the
++ * possible results for possible values of the operands.
++ */
++#include <linux/kernel.h>
++#include <linux/tnum.h>
++
++#define TNUM(_v, _m)	(struct tnum){.value = _v, .mask = _m}
++/* A completely unknown value */
++const struct tnum tnum_unknown = { .value = 0, .mask = -1 };
++
++struct tnum tnum_const(u64 value)
++{
++	return TNUM(value, 0);
++}
++
++struct tnum tnum_lshift(struct tnum a, u8 shift)
++{
++	return TNUM(a.value << shift, a.mask << shift);
++}
++
++struct tnum tnum_rshift(struct tnum a, u8 shift)
++{
++	return TNUM(a.value >> shift, a.mask >> shift);
++}
++
++struct tnum tnum_add(struct tnum a, struct tnum b)
++{
++	u64 sm, sv, sigma, chi, mu;
++
++	sm = a.mask + b.mask;
++	sv = a.value + b.value;
++	sigma = sm + sv;
++	chi = sigma ^ sv;
++	mu = chi | a.mask | b.mask;
++	return TNUM(sv & ~mu, mu);
++}
++
++struct tnum tnum_sub(struct tnum a, struct tnum b)
++{
++	u64 dv, alpha, beta, chi, mu;
++
++	dv = a.value - b.value;
++	alpha = dv + a.mask;
++	beta = dv - b.mask;
++	chi = alpha ^ beta;
++	mu = chi | a.mask | b.mask;
++	return TNUM(dv & ~mu, mu);
++}
++
++struct tnum tnum_and(struct tnum a, struct tnum b)
++{
++	u64 alpha, beta, v;
++
++	alpha = a.value | a.mask;
++	beta = b.value | b.mask;
++	v = a.value & b.value;
++	return TNUM(v, alpha & beta & ~v);
++}
++
++struct tnum tnum_or(struct tnum a, struct tnum b)
++{
++	u64 v, mu;
++
++	v = a.value | b.value;
++	mu = a.mask | b.mask;
++	return TNUM(v, mu & ~v);
++}
++
++struct tnum tnum_xor(struct tnum a, struct tnum b)
++{
++	u64 v, mu;
++
++	v = a.value ^ b.value;
++	mu = a.mask | b.mask;
++	return TNUM(v & ~mu, mu);
++}
++
++/* half-multiply add: acc += (unknown * mask * value).
++ * An intermediate step in the multiply algorithm.
++ */
++static struct tnum hma(struct tnum acc, u64 value, u64 mask)
++{
++	while (mask) {
++		if (mask & 1)
++			acc = tnum_add(acc, TNUM(0, value));
++		mask >>= 1;
++		value <<= 1;
++	}
++	return acc;
++}
++
++struct tnum tnum_mul(struct tnum a, struct tnum b)
++{
++	struct tnum acc;
++	u64 pi;
++
++	pi = a.value * b.value;
++	acc = hma(TNUM(pi, 0), a.mask, b.mask | b.value);
++	return hma(acc, b.mask, a.value);
++}
++
++/* Note that if a and b disagree - i.e. one has a 'known 1' where the other has
++ * a 'known 0' - this will return a 'known 1' for that bit.
++ */
++struct tnum tnum_intersect(struct tnum a, struct tnum b)
++{
++	u64 v, mu;
++
++	v = a.value | b.value;
++	mu = a.mask & b.mask;
++	return TNUM(v & ~mu, mu);
++}
++
++struct tnum tnum_cast(struct tnum a, u8 size)
++{
++	a.value &= (1ULL << (size * 8)) - 1;
++	a.mask &= (1ULL << (size * 8)) - 1;
++	return a;
++}
++
++bool tnum_is_aligned(struct tnum a, u64 size)
++{
++	if (!size)
++		return true;
++	return !((a.value | a.mask) & (size - 1));
++}
++
++bool tnum_in(struct tnum a, struct tnum b)
++{
++	if (b.mask & ~a.mask)
++		return false;
++	b.value &= ~a.mask;
++	return a.value == b.value;
++}
++
++int tnum_strn(char *str, size_t size, struct tnum a)
++{
++	return snprintf(str, size, "(%#llx; %#llx)", a.value, a.mask);
++}
++EXPORT_SYMBOL_GPL(tnum_strn);
++
++int tnum_sbin(char *str, size_t size, struct tnum a)
++{
++	size_t n;
++
++	for (n = 64; n; n--) {
++		if (n < size) {
++			if (a.mask & 1)
++				str[n - 1] = 'x';
++			else if (a.value & 1)
++				str[n - 1] = '1';
++			else
++				str[n - 1] = '0';
++		}
++		a.mask >>= 1;
++		a.value >>= 1;
++	}
++	str[min(size - 1, (size_t)64)] = 0;
++	return 64;
++}

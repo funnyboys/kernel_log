@@ -1,0 +1,4753 @@
+commit 55e00fb66fd5048f4a3ee357018fd26fc527abca
+Author: Yu-cheng Yu <yu-cheng.yu@intel.com>
+Date:   Tue May 12 07:54:44 2020 -0700
+
+    x86/fpu/xstate: Restore supervisor states for signal return
+    
+    The signal return fast path directly restores user states from the user
+    buffer. Once that succeeds, restore supervisor states (but only when
+    they are not yet restored).
+    
+    For the slow path, save supervisor states to preserve them across context
+    switches, and restore after the user states are restored.
+    
+    The previous version has the overhead of an XSAVES in both the fast and the
+    slow paths.  It is addressed as the following:
+    
+    - In the fast path, only do an XRSTORS.
+    - In the slow path, do a supervisor-state-only XSAVES, and relocate the
+      buffer contents.
+    
+    Some thoughts in the implementation:
+    
+    - In the slow path, can any supervisor state become stale between
+      save/restore?
+    
+      Answer: set_thread_flag(TIF_NEED_FPU_LOAD) protects the xstate buffer.
+    
+    - In the slow path, can any code reference a stale supervisor state
+      register between save/restore?
+    
+      Answer: In the current lazy-restore scheme, any reference to xstate
+      registers needs fpregs_lock()/fpregs_unlock() and __fpregs_load_activate().
+    
+    - Are there other options?
+    
+      One other option is eagerly restoring all supervisor states.
+    
+      Currently, CET user-mode states and ENQCMD's PASID do not need to be
+      eagerly restored.  The upcoming CET kernel-mode states (24 bytes) need
+      to be eagerly restored.  To me, eagerly restoring all supervisor states
+      adds more overhead then benefit at this point.
+    
+    Signed-off-by: Yu-cheng Yu <yu-cheng.yu@intel.com>
+    Signed-off-by: Borislav Petkov <bp@suse.de>
+    Reviewed-by: Dave Hansen <dave.hansen@linux.intel.com>
+    Link: https://lkml.kernel.org/r/20200512145444.15483-11-yu-cheng.yu@intel.com
+
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+index 6184fe70a9e1..9393a445d73c 100644
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -347,6 +347,23 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 		ret = copy_user_to_fpregs_zeroing(buf_fx, user_xfeatures, fx_only);
+ 		pagefault_enable();
+ 		if (!ret) {
++
++			/*
++			 * Restore supervisor states: previous context switch
++			 * etc has done XSAVES and saved the supervisor states
++			 * in the kernel buffer from which they can be restored
++			 * now.
++			 *
++			 * We cannot do a single XRSTORS here - which would
++			 * be nice - because the rest of the FPU registers are
++			 * being restored from a user buffer directly. The
++			 * single XRSTORS happens below, when the user buffer
++			 * has been copied to the kernel one.
++			 */
++			if (test_thread_flag(TIF_NEED_FPU_LOAD) &&
++			    xfeatures_mask_supervisor())
++				copy_kernel_to_xregs(&fpu->state.xsave,
++						     xfeatures_mask_supervisor());
+ 			fpregs_mark_activate();
+ 			fpregs_unlock();
+ 			return 0;
+@@ -364,14 +381,25 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 	}
+ 
+ 	/*
+-	 * The current state of the FPU registers does not matter. By setting
+-	 * TIF_NEED_FPU_LOAD unconditionally it is ensured that the our xstate
+-	 * is not modified on context switch and that the xstate is considered
++	 * By setting TIF_NEED_FPU_LOAD it is ensured that our xstate is
++	 * not modified on context switch and that the xstate is considered
+ 	 * to be loaded again on return to userland (overriding last_cpu avoids
+ 	 * the optimisation).
+ 	 */
+-	set_thread_flag(TIF_NEED_FPU_LOAD);
++	fpregs_lock();
++
++	if (!test_thread_flag(TIF_NEED_FPU_LOAD)) {
++
++		/*
++		 * Supervisor states are not modified by user space input.  Save
++		 * current supervisor states first and invalidate the FPU regs.
++		 */
++		if (xfeatures_mask_supervisor())
++			copy_supervisor_to_kernel(&fpu->state.xsave);
++		set_thread_flag(TIF_NEED_FPU_LOAD);
++	}
+ 	__fpu_invalidate_fpregs_state(fpu);
++	fpregs_unlock();
+ 
+ 	if (use_xsave() && !fx_only) {
+ 		u64 init_bv = xfeatures_mask_user() & ~user_xfeatures;
+@@ -393,7 +421,13 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 		fpregs_lock();
+ 		if (unlikely(init_bv))
+ 			copy_kernel_to_xregs(&init_fpstate.xsave, init_bv);
+-		ret = copy_kernel_to_xregs_err(&fpu->state.xsave, user_xfeatures);
++
++		/*
++		 * Restore previously saved supervisor xstates along with
++		 * copied-in user xstates.
++		 */
++		ret = copy_kernel_to_xregs_err(&fpu->state.xsave,
++					       user_xfeatures | xfeatures_mask_supervisor());
+ 
+ 	} else if (use_fxsr()) {
+ 		ret = __copy_from_user(&fpu->state.fxsave, buf_fx, state_size);
+
+commit 98265c17efa9f2279c59262cd27679aca12e0bb8
+Author: Yu-cheng Yu <yu-cheng.yu@intel.com>
+Date:   Tue May 12 07:54:43 2020 -0700
+
+    x86/fpu/xstate: Preserve supervisor states for the slow path in __fpu__restore_sig()
+    
+    The signal return code is responsible for taking an XSAVE buffer
+    present in user memory and loading it into the hardware registers. This
+    operation only affects user XSAVE state and never affects supervisor
+    state.
+    
+    The fast path through this code simply points XRSTOR directly at the
+    user buffer. However, since user memory is not guaranteed to be always
+    mapped, this XRSTOR can fail. If it fails, the signal return code falls
+    back to a slow path which can tolerate page faults.
+    
+    That slow path copies the xfeatures one by one out of the user buffer
+    into the task's fpu state area. However, by being in a context where it
+    can handle page faults, the code can also schedule.
+    
+    The lazy-fpu-load code would think it has an up-to-date fpstate and
+    would fail to save the supervisor state when scheduling the task out.
+    When scheduling back in, it would likely restore stale supervisor state.
+    
+    To fix that, preserve supervisor state before the slow path.  Modify
+    copy_user_to_fpregs_zeroing() so that if it fails, fpregs are not zeroed,
+    and there is no need for fpregs_deactivate() and supervisor states are
+    preserved.
+    
+    Move set_thread_flag(TIF_NEED_FPU_LOAD) to the slow path.  Without doing
+    this, the fast path also needs supervisor states to be saved first.
+    
+    Signed-off-by: Yu-cheng Yu <yu-cheng.yu@intel.com>
+    Signed-off-by: Borislav Petkov <bp@suse.de>
+    Link: https://lkml.kernel.org/r/20200512145444.15483-10-yu-cheng.yu@intel.com
+
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+index 77e5c2e34ee6..6184fe70a9e1 100644
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -262,19 +262,23 @@ sanitize_restored_user_xstate(union fpregs_state *state,
+ static int copy_user_to_fpregs_zeroing(void __user *buf, u64 xbv, int fx_only)
+ {
+ 	u64 init_bv;
++	int r;
+ 
+ 	if (use_xsave()) {
+ 		if (fx_only) {
+ 			init_bv = xfeatures_mask_user() & ~XFEATURE_MASK_FPSSE;
+ 
+-			copy_kernel_to_xregs(&init_fpstate.xsave, init_bv);
+-			return copy_user_to_fxregs(buf);
++			r = copy_user_to_fxregs(buf);
++			if (!r)
++				copy_kernel_to_xregs(&init_fpstate.xsave, init_bv);
++			return r;
+ 		} else {
+ 			init_bv = xfeatures_mask_user() & ~xbv;
+ 
+-			if (unlikely(init_bv))
++			r = copy_user_to_xregs(buf, xbv);
++			if (!r && unlikely(init_bv))
+ 				copy_kernel_to_xregs(&init_fpstate.xsave, init_bv);
+-			return copy_user_to_xregs(buf, xbv);
++			return r;
+ 		}
+ 	} else if (use_fxsr()) {
+ 		return copy_user_to_fxregs(buf);
+@@ -327,28 +331,10 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 		}
+ 	}
+ 
+-	/*
+-	 * The current state of the FPU registers does not matter. By setting
+-	 * TIF_NEED_FPU_LOAD unconditionally it is ensured that the our xstate
+-	 * is not modified on context switch and that the xstate is considered
+-	 * to be loaded again on return to userland (overriding last_cpu avoids
+-	 * the optimisation).
+-	 */
+-	set_thread_flag(TIF_NEED_FPU_LOAD);
+-	__fpu_invalidate_fpregs_state(fpu);
+-
+ 	if ((unsigned long)buf_fx % 64)
+ 		fx_only = 1;
+-	/*
+-	 * For 32-bit frames with fxstate, copy the fxstate so it can be
+-	 * reconstructed later.
+-	 */
+-	if (ia32_fxstate) {
+-		ret = __copy_from_user(&env, buf, sizeof(env));
+-		if (ret)
+-			goto err_out;
+-		envp = &env;
+-	} else {
++
++	if (!ia32_fxstate) {
+ 		/*
+ 		 * Attempt to restore the FPU registers directly from user
+ 		 * memory. For that to succeed, the user access cannot cause
+@@ -365,10 +351,27 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 			fpregs_unlock();
+ 			return 0;
+ 		}
+-		fpregs_deactivate(fpu);
+ 		fpregs_unlock();
++	} else {
++		/*
++		 * For 32-bit frames with fxstate, copy the fxstate so it can
++		 * be reconstructed later.
++		 */
++		ret = __copy_from_user(&env, buf, sizeof(env));
++		if (ret)
++			goto err_out;
++		envp = &env;
+ 	}
+ 
++	/*
++	 * The current state of the FPU registers does not matter. By setting
++	 * TIF_NEED_FPU_LOAD unconditionally it is ensured that the our xstate
++	 * is not modified on context switch and that the xstate is considered
++	 * to be loaded again on return to userland (overriding last_cpu avoids
++	 * the optimisation).
++	 */
++	set_thread_flag(TIF_NEED_FPU_LOAD);
++	__fpu_invalidate_fpregs_state(fpu);
+ 
+ 	if (use_xsave() && !fx_only) {
+ 		u64 init_bv = xfeatures_mask_user() & ~user_xfeatures;
+
+commit 5d6b6a6f9b5ce7ac42273efd75d61ec63b463c18
+Author: Yu-cheng Yu <yu-cheng.yu@intel.com>
+Date:   Tue May 12 07:54:40 2020 -0700
+
+    x86/fpu/xstate: Update sanitize_restored_xstate() for supervisor xstates
+    
+    The function sanitize_restored_xstate() sanitizes user xstates of an XSAVE
+    buffer by clearing bits not in the input 'xfeatures' from the buffer's
+    header->xfeatures, effectively resetting those features back to the init
+    state.
+    
+    When supervisor xstates are introduced, it is necessary to make sure only
+    user xstates are sanitized.  Ensure supervisor bits in header->xfeatures
+    stay set and supervisor states are not modified.
+    
+    To make names clear, also:
+    
+    - Rename the function to sanitize_restored_user_xstate().
+    - Rename input parameter 'xfeatures' to 'user_xfeatures'.
+    - In __fpu__restore_sig(), rename 'xfeatures' to 'user_xfeatures'.
+    
+    Signed-off-by: Yu-cheng Yu <yu-cheng.yu@intel.com>
+    Signed-off-by: Borislav Petkov <bp@suse.de>
+    Reviewed-by: Dave Hansen <dave.hansen@linux.intel.com>
+    Link: https://lkml.kernel.org/r/20200512145444.15483-7-yu-cheng.yu@intel.com
+
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+index cd6eafba12da..77e5c2e34ee6 100644
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -211,9 +211,9 @@ int copy_fpstate_to_sigframe(void __user *buf, void __user *buf_fx, int size)
+ }
+ 
+ static inline void
+-sanitize_restored_xstate(union fpregs_state *state,
+-			 struct user_i387_ia32_struct *ia32_env,
+-			 u64 xfeatures, int fx_only)
++sanitize_restored_user_xstate(union fpregs_state *state,
++			      struct user_i387_ia32_struct *ia32_env,
++			      u64 user_xfeatures, int fx_only)
+ {
+ 	struct xregs_state *xsave = &state->xsave;
+ 	struct xstate_header *header = &xsave->header;
+@@ -226,13 +226,22 @@ sanitize_restored_xstate(union fpregs_state *state,
+ 		 */
+ 
+ 		/*
+-		 * Init the state that is not present in the memory
+-		 * layout and not enabled by the OS.
++		 * 'user_xfeatures' might have bits clear which are
++		 * set in header->xfeatures. This represents features that
++		 * were in init state prior to a signal delivery, and need
++		 * to be reset back to the init state.  Clear any user
++		 * feature bits which are set in the kernel buffer to get
++		 * them back to the init state.
++		 *
++		 * Supervisor state is unchanged by input from userspace.
++		 * Ensure supervisor state bits stay set and supervisor
++		 * state is not modified.
+ 		 */
+ 		if (fx_only)
+ 			header->xfeatures = XFEATURE_MASK_FPSSE;
+ 		else
+-			header->xfeatures &= xfeatures;
++			header->xfeatures &= user_xfeatures |
++					     xfeatures_mask_supervisor();
+ 	}
+ 
+ 	if (use_fxsr()) {
+@@ -281,7 +290,7 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 	struct task_struct *tsk = current;
+ 	struct fpu *fpu = &tsk->thread.fpu;
+ 	struct user_i387_ia32_struct env;
+-	u64 xfeatures = 0;
++	u64 user_xfeatures = 0;
+ 	int fx_only = 0;
+ 	int ret = 0;
+ 
+@@ -314,7 +323,7 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 			trace_x86_fpu_xstate_check_failed(fpu);
+ 		} else {
+ 			state_size = fx_sw_user.xstate_size;
+-			xfeatures = fx_sw_user.xfeatures;
++			user_xfeatures = fx_sw_user.xfeatures;
+ 		}
+ 	}
+ 
+@@ -349,7 +358,7 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 		 */
+ 		fpregs_lock();
+ 		pagefault_disable();
+-		ret = copy_user_to_fpregs_zeroing(buf_fx, xfeatures, fx_only);
++		ret = copy_user_to_fpregs_zeroing(buf_fx, user_xfeatures, fx_only);
+ 		pagefault_enable();
+ 		if (!ret) {
+ 			fpregs_mark_activate();
+@@ -362,7 +371,7 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 
+ 
+ 	if (use_xsave() && !fx_only) {
+-		u64 init_bv = xfeatures_mask_user() & ~xfeatures;
++		u64 init_bv = xfeatures_mask_user() & ~user_xfeatures;
+ 
+ 		if (using_compacted_format()) {
+ 			ret = copy_user_to_xstate(&fpu->state.xsave, buf_fx);
+@@ -375,12 +384,13 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 		if (ret)
+ 			goto err_out;
+ 
+-		sanitize_restored_xstate(&fpu->state, envp, xfeatures, fx_only);
++		sanitize_restored_user_xstate(&fpu->state, envp, user_xfeatures,
++					      fx_only);
+ 
+ 		fpregs_lock();
+ 		if (unlikely(init_bv))
+ 			copy_kernel_to_xregs(&init_fpstate.xsave, init_bv);
+-		ret = copy_kernel_to_xregs_err(&fpu->state.xsave, xfeatures);
++		ret = copy_kernel_to_xregs_err(&fpu->state.xsave, user_xfeatures);
+ 
+ 	} else if (use_fxsr()) {
+ 		ret = __copy_from_user(&fpu->state.fxsave, buf_fx, state_size);
+@@ -389,7 +399,8 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 			goto err_out;
+ 		}
+ 
+-		sanitize_restored_xstate(&fpu->state, envp, xfeatures, fx_only);
++		sanitize_restored_user_xstate(&fpu->state, envp, user_xfeatures,
++					      fx_only);
+ 
+ 		fpregs_lock();
+ 		if (use_xsave()) {
+
+commit b860eb8dce5906b14e3a7f3c771e0b3d6ef61b94
+Author: Fenghua Yu <fenghua.yu@intel.com>
+Date:   Tue May 12 07:54:39 2020 -0700
+
+    x86/fpu/xstate: Define new functions for clearing fpregs and xstates
+    
+    Currently, fpu__clear() clears all fpregs and xstates.  Once XSAVES
+    supervisor states are introduced, supervisor settings (e.g. CET xstates)
+    must remain active for signals; It is necessary to have separate functions:
+    
+    - Create fpu__clear_user_states(): clear only user settings for signals;
+    - Create fpu__clear_all(): clear both user and supervisor settings in
+       flush_thread().
+    
+    Also modify copy_init_fpstate_to_fpregs() to take a mask from above two
+    functions.
+    
+    Remove obvious side-comment in fpu__clear(), while at it.
+    
+     [ bp: Make the second argument of fpu__clear() bool after requesting it
+       a bunch of times during review.
+      - Add a comment about copy_init_fpstate_to_fpregs() locking needs. ]
+    
+    Co-developed-by: Yu-cheng Yu <yu-cheng.yu@intel.com>
+    Signed-off-by: Fenghua Yu <fenghua.yu@intel.com>
+    Signed-off-by: Yu-cheng Yu <yu-cheng.yu@intel.com>
+    Signed-off-by: Borislav Petkov <bp@suse.de>
+    Reviewed-by: Dave Hansen <dave.hansen@linux.intel.com>
+    Reviewed-by: Tony Luck <tony.luck@intel.com>
+    Link: https://lkml.kernel.org/r/20200512145444.15483-6-yu-cheng.yu@intel.com
+
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+index 3df0cfae535f..cd6eafba12da 100644
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -289,7 +289,7 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 			 IS_ENABLED(CONFIG_IA32_EMULATION));
+ 
+ 	if (!buf) {
+-		fpu__clear(fpu);
++		fpu__clear_user_states(fpu);
+ 		return 0;
+ 	}
+ 
+@@ -416,7 +416,7 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 
+ err_out:
+ 	if (ret)
+-		fpu__clear(fpu);
++		fpu__clear_user_states(fpu);
+ 	return ret;
+ }
+ 
+
+commit 524bb73bc15c56f5587e33c817e103a259b019d2
+Author: Yu-cheng Yu <yu-cheng.yu@intel.com>
+Date:   Tue May 12 07:54:37 2020 -0700
+
+    x86/fpu/xstate: Separate user and supervisor xfeatures mask
+    
+    Before the introduction of XSAVES supervisor states, 'xfeatures_mask' is
+    used at various places to determine XSAVE buffer components and XCR0 bits.
+    It contains only user xstates.  To support supervisor xstates, it is
+    necessary to separate user and supervisor xstates:
+    
+    - First, change 'xfeatures_mask' to 'xfeatures_mask_all', which represents
+      the full set of bits that should ever be set in a kernel XSAVE buffer.
+    - Introduce xfeatures_mask_supervisor() and xfeatures_mask_user() to
+      extract relevant xfeatures from xfeatures_mask_all.
+    
+    Co-developed-by: Fenghua Yu <fenghua.yu@intel.com>
+    Signed-off-by: Fenghua Yu <fenghua.yu@intel.com>
+    Signed-off-by: Yu-cheng Yu <yu-cheng.yu@intel.com>
+    Signed-off-by: Borislav Petkov <bp@suse.de>
+    Reviewed-by: Dave Hansen <dave.hansen@linux.intel.com>
+    Reviewed-by: Tony Luck <tony.luck@intel.com>
+    Link: https://lkml.kernel.org/r/20200512145444.15483-4-yu-cheng.yu@intel.com
+
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+index 585e3651b98f..3df0cfae535f 100644
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -252,13 +252,17 @@ sanitize_restored_xstate(union fpregs_state *state,
+  */
+ static int copy_user_to_fpregs_zeroing(void __user *buf, u64 xbv, int fx_only)
+ {
++	u64 init_bv;
++
+ 	if (use_xsave()) {
+ 		if (fx_only) {
+-			u64 init_bv = xfeatures_mask & ~XFEATURE_MASK_FPSSE;
++			init_bv = xfeatures_mask_user() & ~XFEATURE_MASK_FPSSE;
++
+ 			copy_kernel_to_xregs(&init_fpstate.xsave, init_bv);
+ 			return copy_user_to_fxregs(buf);
+ 		} else {
+-			u64 init_bv = xfeatures_mask & ~xbv;
++			init_bv = xfeatures_mask_user() & ~xbv;
++
+ 			if (unlikely(init_bv))
+ 				copy_kernel_to_xregs(&init_fpstate.xsave, init_bv);
+ 			return copy_user_to_xregs(buf, xbv);
+@@ -358,7 +362,7 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 
+ 
+ 	if (use_xsave() && !fx_only) {
+-		u64 init_bv = xfeatures_mask & ~xfeatures;
++		u64 init_bv = xfeatures_mask_user() & ~xfeatures;
+ 
+ 		if (using_compacted_format()) {
+ 			ret = copy_user_to_xstate(&fpu->state.xsave, buf_fx);
+@@ -389,7 +393,9 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 
+ 		fpregs_lock();
+ 		if (use_xsave()) {
+-			u64 init_bv = xfeatures_mask & ~XFEATURE_MASK_FPSSE;
++			u64 init_bv;
++
++			init_bv = xfeatures_mask_user() & ~XFEATURE_MASK_FPSSE;
+ 			copy_kernel_to_xregs(&init_fpstate.xsave, init_bv);
+ 		}
+ 
+@@ -465,7 +471,7 @@ void fpu__init_prepare_fx_sw_frame(void)
+ 
+ 	fx_sw_reserved.magic1 = FP_XSTATE_MAGIC1;
+ 	fx_sw_reserved.extended_size = size;
+-	fx_sw_reserved.xfeatures = xfeatures_mask;
++	fx_sw_reserved.xfeatures = xfeatures_mask_user();
+ 	fx_sw_reserved.xstate_size = fpu_user_xstate_size;
+ 
+ 	if (IS_ENABLED(CONFIG_IA32_EMULATION) ||
+
+commit 5274e6c172c47241534e970df26a522497086624
+Author: Fenghua Yu <fenghua.yu@intel.com>
+Date:   Tue May 12 07:54:35 2020 -0700
+
+    x86/fpu/xstate: Rename validate_xstate_header() to validate_user_xstate_header()
+    
+    The function validate_xstate_header() validates an xstate header coming
+    from userspace (PTRACE or sigreturn). To make it clear, rename it to
+    validate_user_xstate_header().
+    
+    Suggested-by: Dave Hansen <dave.hansen@intel.com>
+    Signed-off-by: Fenghua Yu <fenghua.yu@intel.com>
+    Signed-off-by: Yu-cheng Yu <yu-cheng.yu@intel.com>
+    Signed-off-by: Borislav Petkov <bp@suse.de>
+    Reviewed-by: Dave Hansen <dave.hansen@linux.intel.com>
+    Reviewed-by: Tony Luck <tony.luck@intel.com>
+    Reviewed-by: Borislav Petkov <bp@suse.de>
+    Link: https://lkml.kernel.org/r/20200512145444.15483-2-yu-cheng.yu@intel.com
+
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+index 400a05e1c1c5..585e3651b98f 100644
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -366,7 +366,7 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 			ret = __copy_from_user(&fpu->state.xsave, buf_fx, state_size);
+ 
+ 			if (!ret && state_size > offsetof(struct xregs_state, header))
+-				ret = validate_xstate_header(&fpu->state.xsave.header);
++				ret = validate_user_xstate_header(&fpu->state.xsave.header);
+ 		}
+ 		if (ret)
+ 			goto err_out;
+
+commit bbc55341b9c67645d1a5471506370caf7dd4a203
+Author: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Date:   Fri Dec 20 20:59:06 2019 +0100
+
+    x86/fpu: Deactivate FPU state after failure during state load
+    
+    In __fpu__restore_sig(), fpu_fpregs_owner_ctx needs to be reset if the
+    FPU state was not fully restored. Otherwise the following may happen (on
+    the same CPU):
+    
+      Task A                     Task B               fpu_fpregs_owner_ctx
+      *active*                                        A.fpu
+      __fpu__restore_sig()
+                                 ctx switch           load B.fpu
+                                 *active*             B.fpu
+      fpregs_lock()
+      copy_user_to_fpregs_zeroing()
+        copy_kernel_to_xregs() *modify*
+        copy_user_to_xregs() *fails*
+      fpregs_unlock()
+                                ctx switch            skip loading B.fpu,
+                                *active*              B.fpu
+    
+    In the success case, fpu_fpregs_owner_ctx is set to the current task.
+    
+    In the failure case, the FPU state might have been modified by loading
+    the init state.
+    
+    In this case, fpu_fpregs_owner_ctx needs to be reset in order to ensure
+    that the FPU state of the following task is loaded from saved state (and
+    not skipped because it was the previous state).
+    
+    Reset fpu_fpregs_owner_ctx after a failure during restore occurred, to
+    ensure that the FPU state for the next task is always loaded.
+    
+    The problem was debugged-by Yu-cheng Yu <yu-cheng.yu@intel.com>.
+    
+     [ bp: Massage commit message. ]
+    
+    Fixes: 5f409e20b7945 ("x86/fpu: Defer FPU state load until return to userspace")
+    Reported-by: Yu-cheng Yu <yu-cheng.yu@intel.com>
+    Signed-off-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+    Signed-off-by: Borislav Petkov <bp@suse.de>
+    Cc: Andy Lutomirski <luto@kernel.org>
+    Cc: Dave Hansen <dave.hansen@linux.intel.com>
+    Cc: Fenghua Yu <fenghua.yu@intel.com>
+    Cc: "H. Peter Anvin" <hpa@zytor.com>
+    Cc: Ingo Molnar <mingo@redhat.com>
+    Cc: Jann Horn <jannh@google.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: "Ravi V. Shankar" <ravi.v.shankar@intel.com>
+    Cc: Rik van Riel <riel@surriel.com>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Tony Luck <tony.luck@intel.com>
+    Cc: x86-ml <x86@kernel.org>
+    Link: https://lkml.kernel.org/r/20191220195906.plk6kpmsrikvbcfn@linutronix.de
+
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+index 0071b794ed19..400a05e1c1c5 100644
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -352,6 +352,7 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 			fpregs_unlock();
+ 			return 0;
+ 		}
++		fpregs_deactivate(fpu);
+ 		fpregs_unlock();
+ 	}
+ 
+@@ -403,6 +404,8 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 	}
+ 	if (!ret)
+ 		fpregs_mark_activate();
++	else
++		fpregs_deactivate(fpu);
+ 	fpregs_unlock();
+ 
+ err_out:
+
+commit aab8445c4e1cceeb3f739352041ec1c2586bc923
+Author: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Date:   Fri Jun 7 16:29:16 2019 +0200
+
+    x86/fpu: Update kernel's FPU state before using for the fsave header
+    
+    In commit
+    
+      39388e80f9b0c ("x86/fpu: Don't save fxregs for ia32 frames in copy_fpstate_to_sigframe()")
+    
+    I removed the statement
+    
+    |       if (ia32_fxstate)
+    |               copy_fxregs_to_kernel(fpu);
+    
+    and argued that it was wrongly merged because the content was already
+    saved in kernel's state.
+    
+    This was wrong: It is required to write it back because it is only
+    saved on the user-stack and save_fsave_header() reads it from task's
+    FPU-state. I missed that part…
+    
+    Save x87 FPU state unless thread's FPU registers are already up to date.
+    
+    Fixes: 39388e80f9b0c ("x86/fpu: Don't save fxregs for ia32 frames in copy_fpstate_to_sigframe()")
+    Reported-by: Eric Biggers <ebiggers@kernel.org>
+    Signed-off-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+    Signed-off-by: Borislav Petkov <bp@suse.de>
+    Tested-by: Eric Biggers <ebiggers@kernel.org>
+    Cc: Andy Lutomirski <luto@kernel.org>
+    Cc: Dave Hansen <dave.hansen@intel.com>
+    Cc: "H. Peter Anvin" <hpa@zytor.com>
+    Cc: Hugh Dickins <hughd@google.com>
+    Cc: Ingo Molnar <mingo@redhat.com>
+    Cc: Jann Horn <jannh@google.com>
+    Cc: "Jason A. Donenfeld" <Jason@zx2c4.com>
+    Cc: kvm ML <kvm@vger.kernel.org>
+    Cc: Paolo Bonzini <pbonzini@redhat.com>
+    Cc: Radim Krčmář <rkrcmar@redhat.com>
+    Cc: Rik van Riel <riel@surriel.com>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: x86-ml <x86@kernel.org>
+    Link: https://lkml.kernel.org/r/20190607142915.y52mfmgk5lvhll7n@linutronix.de
+
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+index 060d6188b453..0071b794ed19 100644
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -62,6 +62,11 @@ static inline int save_fsave_header(struct task_struct *tsk, void __user *buf)
+ 		struct user_i387_ia32_struct env;
+ 		struct _fpstate_32 __user *fp = buf;
+ 
++		fpregs_lock();
++		if (!test_thread_flag(TIF_NEED_FPU_LOAD))
++			copy_fxregs_to_kernel(&tsk->thread.fpu);
++		fpregs_unlock();
++
+ 		convert_from_fxsr(&env, tsk);
+ 
+ 		if (__copy_to_user(buf, &env, sizeof(env)) ||
+
+commit b81ff1013eb8eef2934ca7e8cf53d553c1029e84
+Author: Hugh Dickins <hughd@google.com>
+Date:   Wed May 29 09:25:40 2019 +0200
+
+    x86/fpu: Use fault_in_pages_writeable() for pre-faulting
+    
+    Since commit
+    
+       d9c9ce34ed5c8 ("x86/fpu: Fault-in user stack if copy_fpstate_to_sigframe() fails")
+    
+    get_user_pages_unlocked() pre-faults user's memory if a write generates
+    a page fault while the handler is disabled.
+    
+    This works in general and uncovered a bug as reported by Mike
+    Rapoport¹. It has been pointed out that this function may be fragile
+    and a simple pre-fault as in fault_in_pages_writeable() would be a
+    better solution. Better as in taste and simplicity: that write (as
+    performed by the alternative function) performs exactly the same
+    faulting of memory as before. This was suggested by Hugh Dickins and
+    Andrew Morton.
+    
+    Use fault_in_pages_writeable() for pre-faulting user's stack.
+    
+      [ bigeasy: Write commit message. ]
+      [ bp: Massage some. ]
+    
+    ¹ https://lkml.kernel.org/r/1557844195-18882-1-git-send-email-rppt@linux.ibm.com
+    
+    Fixes: d9c9ce34ed5c8 ("x86/fpu: Fault-in user stack if copy_fpstate_to_sigframe() fails")
+    Suggested-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Hugh Dickins <hughd@google.com>
+    Signed-off-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+    Signed-off-by: Borislav Petkov <bp@suse.de>
+    Tested-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Cc: Andrea Arcangeli <aarcange@redhat.com>
+    Cc: Andrew Morton <akpm@linux-foundation.org>
+    Cc: Dave Hansen <dave.hansen@linux.intel.com>
+    Cc: "H. Peter Anvin" <hpa@zytor.com>
+    Cc: Ingo Molnar <mingo@redhat.com>
+    Cc: Jann Horn <jannh@google.com>
+    Cc: linux-mm <linux-mm@kvack.org>
+    Cc: Mike Rapoport <rppt@linux.ibm.com>
+    Cc: Pavel Machek <pavel@ucw.cz>
+    Cc: Rik van Riel <riel@surriel.com>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: x86-ml <x86@kernel.org>
+    Link: https://lkml.kernel.org/r/20190529072540.g46j4kfeae37a3iu@linutronix.de
+    Link: https://lkml.kernel.org/r/1557844195-18882-1-git-send-email-rppt@linux.ibm.com
+
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+index 5a8d118bc423..060d6188b453 100644
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -5,6 +5,7 @@
+ 
+ #include <linux/compat.h>
+ #include <linux/cpu.h>
++#include <linux/pagemap.h>
+ 
+ #include <asm/fpu/internal.h>
+ #include <asm/fpu/signal.h>
+@@ -189,15 +190,7 @@ int copy_fpstate_to_sigframe(void __user *buf, void __user *buf_fx, int size)
+ 	fpregs_unlock();
+ 
+ 	if (ret) {
+-		int aligned_size;
+-		int nr_pages;
+-
+-		aligned_size = offset_in_page(buf_fx) + fpu_user_xstate_size;
+-		nr_pages = DIV_ROUND_UP(aligned_size, PAGE_SIZE);
+-
+-		ret = get_user_pages_unlocked((unsigned long)buf_fx, nr_pages,
+-					      NULL, FOLL_WRITE);
+-		if (ret == nr_pages)
++		if (!fault_in_pages_writeable(buf_fx, fpu_user_xstate_size))
+ 			goto retry;
+ 		return -EFAULT;
+ 	}
+
+commit d9c9ce34ed5c892323cbf5b4f9a4c498e036316a
+Author: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Date:   Thu May 2 19:11:39 2019 +0200
+
+    x86/fpu: Fault-in user stack if copy_fpstate_to_sigframe() fails
+    
+    In the compacted form, XSAVES may save only the XMM+SSE state but skip
+    FP (x87 state).
+    
+    This is denoted by header->xfeatures = 6. The fastpath
+    (copy_fpregs_to_sigframe()) does that but _also_ initialises the FP
+    state (cwd to 0x37f, mxcsr as we do, remaining fields to 0).
+    
+    The slowpath (copy_xstate_to_user()) leaves most of the FP
+    state untouched. Only mxcsr and mxcsr_flags are set due to
+    xfeatures_mxcsr_quirk(). Now that XFEATURE_MASK_FP is set
+    unconditionally, see
+    
+      04944b793e18 ("x86: xsave: set FP, SSE bits in the xsave header in the user sigcontext"),
+    
+    on return from the signal, random garbage is loaded as the FP state.
+    
+    Instead of utilizing copy_xstate_to_user(), fault-in the user memory
+    and retry the fast path. Ideally, the fast path succeeds on the second
+    attempt but may be retried again if the memory is swapped out due
+    to memory pressure. If the user memory can not be faulted-in then
+    get_user_pages() returns an error so we don't loop forever.
+    
+    Fault in memory via get_user_pages_unlocked() so
+    copy_fpregs_to_sigframe() succeeds without a fault.
+    
+    Fixes: 69277c98f5eef ("x86/fpu: Always store the registers in copy_fpstate_to_sigframe()")
+    Reported-by: Kurt Kanzenbach <kurt.kanzenbach@linutronix.de>
+    Suggested-by: Dave Hansen <dave.hansen@intel.com>
+    Signed-off-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+    Signed-off-by: Borislav Petkov <bp@suse.de>
+    Cc: Andy Lutomirski <luto@amacapital.net>
+    Cc: Dave Hansen <dave.hansen@intel.com>
+    Cc: "H. Peter Anvin" <hpa@zytor.com>
+    Cc: Ingo Molnar <mingo@kernel.org>
+    Cc: Jann Horn <jannh@google.com>
+    Cc: "linux-mm@kvack.org" <linux-mm@kvack.org>
+    Cc: Qian Cai <cai@lca.pw>
+    Cc: Rik van Riel <riel@surriel.com>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: x86-ml <x86@kernel.org>
+    Link: https://lkml.kernel.org/r/20190502171139.mqtegctsg35cir2e@linutronix.de
+
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+index 7026f1c4e5e3..5a8d118bc423 100644
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -157,11 +157,9 @@ static inline int copy_fpregs_to_sigframe(struct xregs_state __user *buf)
+  */
+ int copy_fpstate_to_sigframe(void __user *buf, void __user *buf_fx, int size)
+ {
+-	struct fpu *fpu = &current->thread.fpu;
+-	struct xregs_state *xsave = &fpu->state.xsave;
+ 	struct task_struct *tsk = current;
+ 	int ia32_fxstate = (buf != buf_fx);
+-	int ret = -EFAULT;
++	int ret;
+ 
+ 	ia32_fxstate &= (IS_ENABLED(CONFIG_X86_32) ||
+ 			 IS_ENABLED(CONFIG_IA32_EMULATION));
+@@ -174,11 +172,12 @@ int copy_fpstate_to_sigframe(void __user *buf, void __user *buf_fx, int size)
+ 			sizeof(struct user_i387_ia32_struct), NULL,
+ 			(struct _fpstate_32 __user *) buf) ? -1 : 1;
+ 
++retry:
+ 	/*
+ 	 * Load the FPU registers if they are not valid for the current task.
+ 	 * With a valid FPU state we can attempt to save the state directly to
+-	 * userland's stack frame which will likely succeed. If it does not, do
+-	 * the slowpath.
++	 * userland's stack frame which will likely succeed. If it does not,
++	 * resolve the fault in the user memory and try again.
+ 	 */
+ 	fpregs_lock();
+ 	if (test_thread_flag(TIF_NEED_FPU_LOAD))
+@@ -187,20 +186,20 @@ int copy_fpstate_to_sigframe(void __user *buf, void __user *buf_fx, int size)
+ 	pagefault_disable();
+ 	ret = copy_fpregs_to_sigframe(buf_fx);
+ 	pagefault_enable();
+-	if (ret && !test_thread_flag(TIF_NEED_FPU_LOAD))
+-		copy_fpregs_to_fpstate(fpu);
+-	set_thread_flag(TIF_NEED_FPU_LOAD);
+ 	fpregs_unlock();
+ 
+ 	if (ret) {
+-		if (using_compacted_format()) {
+-			if (copy_xstate_to_user(buf_fx, xsave, 0, size))
+-				return -1;
+-		} else {
+-			fpstate_sanitize_xstate(fpu);
+-			if (__copy_to_user(buf_fx, xsave, fpu_user_xstate_size))
+-				return -1;
+-		}
++		int aligned_size;
++		int nr_pages;
++
++		aligned_size = offset_in_page(buf_fx) + fpu_user_xstate_size;
++		nr_pages = DIV_ROUND_UP(aligned_size, PAGE_SIZE);
++
++		ret = get_user_pages_unlocked((unsigned long)buf_fx, nr_pages,
++					      NULL, FOLL_WRITE);
++		if (ret == nr_pages)
++			goto retry;
++		return -EFAULT;
+ 	}
+ 
+ 	/* Save the fsave header for the 32-bit frames. */
+
+commit 06b251dff78704c7d122bd109384d970a7dbe94d
+Author: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Date:   Fri Apr 12 20:16:15 2019 +0200
+
+    x86/fpu: Restore regs in copy_fpstate_to_sigframe() in order to use the fastpath
+    
+    If a task is scheduled out and receives a signal then it won't be
+    able to take the fastpath because the registers aren't available. The
+    slowpath is more expensive compared to XRSTOR + XSAVE which usually
+    succeeds.
+    
+    Here are some clock_gettime() numbers from a bigger box with AVX512
+    during bootup:
+    
+    - __fpregs_load_activate() takes 140ns - 350ns. If it was the most recent
+      FPU context on the CPU then the optimisation in __fpregs_load_activate()
+      will skip the load (which was disabled during the test).
+    
+    - copy_fpregs_to_sigframe() takes 200ns - 450ns if it succeeds. On a
+      pagefault it is 1.8us - 3us usually in the 2.6us area.
+    
+    - The slowpath takes 1.5us - 6us. Usually in the 2.6us area.
+    
+    My testcases (including lat_sig) take the fastpath without
+    __fpregs_load_activate(). I expect this to be the majority.
+    
+    Since the slowpath is in the >1us area it makes sense to load the
+    registers and attempt to save them directly. The direct save may fail
+    but should only happen on the first invocation or after fork() while the
+    page is read-only.
+    
+     [ bp: Massage a bit. ]
+    
+    Signed-off-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+    Signed-off-by: Borislav Petkov <bp@suse.de>
+    Reviewed-by: Dave Hansen <dave.hansen@intel.com>
+    Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Andy Lutomirski <luto@kernel.org>
+    Cc: "H. Peter Anvin" <hpa@zytor.com>
+    Cc: Ingo Molnar <mingo@redhat.com>
+    Cc: Jann Horn <jannh@google.com>
+    Cc: "Jason A. Donenfeld" <Jason@zx2c4.com>
+    Cc: kvm ML <kvm@vger.kernel.org>
+    Cc: Paolo Bonzini <pbonzini@redhat.com>
+    Cc: Radim Krčmář <rkrcmar@redhat.com>
+    Cc: Rik van Riel <riel@surriel.com>
+    Cc: x86-ml <x86@kernel.org>
+    Link: https://lkml.kernel.org/r/20190403164156.19645-27-bigeasy@linutronix.de
+
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+index 3c3167576216..7026f1c4e5e3 100644
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -175,20 +175,21 @@ int copy_fpstate_to_sigframe(void __user *buf, void __user *buf_fx, int size)
+ 			(struct _fpstate_32 __user *) buf) ? -1 : 1;
+ 
+ 	/*
+-	 * If we do not need to load the FPU registers at return to userspace
+-	 * then the CPU has the current state. Try to save it directly to
+-	 * userland's stack frame if it does not cause a pagefault. If it does,
+-	 * try the slowpath.
++	 * Load the FPU registers if they are not valid for the current task.
++	 * With a valid FPU state we can attempt to save the state directly to
++	 * userland's stack frame which will likely succeed. If it does not, do
++	 * the slowpath.
+ 	 */
+ 	fpregs_lock();
+-	if (!test_thread_flag(TIF_NEED_FPU_LOAD)) {
+-		pagefault_disable();
+-		ret = copy_fpregs_to_sigframe(buf_fx);
+-		pagefault_enable();
+-		if (ret)
+-			copy_fpregs_to_fpstate(fpu);
+-		set_thread_flag(TIF_NEED_FPU_LOAD);
+-	}
++	if (test_thread_flag(TIF_NEED_FPU_LOAD))
++		__fpregs_load_activate();
++
++	pagefault_disable();
++	ret = copy_fpregs_to_sigframe(buf_fx);
++	pagefault_enable();
++	if (ret && !test_thread_flag(TIF_NEED_FPU_LOAD))
++		copy_fpregs_to_fpstate(fpu);
++	set_thread_flag(TIF_NEED_FPU_LOAD);
+ 	fpregs_unlock();
+ 
+ 	if (ret) {
+
+commit da2f32fb8dc7cbd9433cb2e990693734b30a2465
+Author: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Date:   Wed Apr 3 18:41:54 2019 +0200
+
+    x86/fpu: Add a fastpath to copy_fpstate_to_sigframe()
+    
+    Try to save the FPU registers directly to the userland stack frame if
+    the CPU holds the FPU registers for the current task. This has to be
+    done with the pagefault disabled because we can't fault (while the FPU
+    registers are locked) and therefore the operation might fail. If it
+    fails try the slowpath which can handle faults.
+    
+     [ bp: Massage a bit. ]
+    
+    Signed-off-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+    Signed-off-by: Borislav Petkov <bp@suse.de>
+    Reviewed-by: Dave Hansen <dave.hansen@intel.com>
+    Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Andy Lutomirski <luto@kernel.org>
+    Cc: "H. Peter Anvin" <hpa@zytor.com>
+    Cc: Ingo Molnar <mingo@redhat.com>
+    Cc: Jann Horn <jannh@google.com>
+    Cc: "Jason A. Donenfeld" <Jason@zx2c4.com>
+    Cc: kvm ML <kvm@vger.kernel.org>
+    Cc: Paolo Bonzini <pbonzini@redhat.com>
+    Cc: Radim Krčmář <rkrcmar@redhat.com>
+    Cc: Rik van Riel <riel@surriel.com>
+    Cc: x86-ml <x86@kernel.org>
+    Link: https://lkml.kernel.org/r/20190403164156.19645-26-bigeasy@linutronix.de
+
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+index a1bd7be70206..3c3167576216 100644
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -144,8 +144,10 @@ static inline int copy_fpregs_to_sigframe(struct xregs_state __user *buf)
+  *	buf == buf_fx for 64-bit frames and 32-bit fsave frame.
+  *	buf != buf_fx for 32-bit frames with fxstate.
+  *
+- * Save the state to task's fpu->state and then copy it to the user frame
+- * pointed to by the aligned pointer 'buf_fx'.
++ * Try to save it directly to the user frame with disabled page fault handler.
++ * If this fails then do the slow path where the FPU state is first saved to
++ * task's fpu->state and then copy it to the user frame pointed to by the
++ * aligned pointer 'buf_fx'.
+  *
+  * If this is a 32-bit frame with fxstate, put a fsave header before
+  * the aligned state at 'buf_fx'.
+@@ -159,6 +161,7 @@ int copy_fpstate_to_sigframe(void __user *buf, void __user *buf_fx, int size)
+ 	struct xregs_state *xsave = &fpu->state.xsave;
+ 	struct task_struct *tsk = current;
+ 	int ia32_fxstate = (buf != buf_fx);
++	int ret = -EFAULT;
+ 
+ 	ia32_fxstate &= (IS_ENABLED(CONFIG_X86_32) ||
+ 			 IS_ENABLED(CONFIG_IA32_EMULATION));
+@@ -173,23 +176,30 @@ int copy_fpstate_to_sigframe(void __user *buf, void __user *buf_fx, int size)
+ 
+ 	/*
+ 	 * If we do not need to load the FPU registers at return to userspace
+-	 * then the CPU has the current state and we need to save it. Otherwise,
+-	 * it has already been done and we can skip it.
++	 * then the CPU has the current state. Try to save it directly to
++	 * userland's stack frame if it does not cause a pagefault. If it does,
++	 * try the slowpath.
+ 	 */
+ 	fpregs_lock();
+ 	if (!test_thread_flag(TIF_NEED_FPU_LOAD)) {
+-		copy_fpregs_to_fpstate(fpu);
++		pagefault_disable();
++		ret = copy_fpregs_to_sigframe(buf_fx);
++		pagefault_enable();
++		if (ret)
++			copy_fpregs_to_fpstate(fpu);
+ 		set_thread_flag(TIF_NEED_FPU_LOAD);
+ 	}
+ 	fpregs_unlock();
+ 
+-	if (using_compacted_format()) {
+-		if (copy_xstate_to_user(buf_fx, xsave, 0, size))
+-			return -1;
+-	} else {
+-		fpstate_sanitize_xstate(fpu);
+-		if (__copy_to_user(buf_fx, xsave, fpu_user_xstate_size))
+-			return -1;
++	if (ret) {
++		if (using_compacted_format()) {
++			if (copy_xstate_to_user(buf_fx, xsave, 0, size))
++				return -1;
++		} else {
++			fpstate_sanitize_xstate(fpu);
++			if (__copy_to_user(buf_fx, xsave, fpu_user_xstate_size))
++				return -1;
++		}
+ 	}
+ 
+ 	/* Save the fsave header for the 32-bit frames. */
+
+commit 1d731e731c4cd7cbd3b1aa295f0932e7610da82f
+Author: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Date:   Wed Apr 3 18:41:53 2019 +0200
+
+    x86/fpu: Add a fastpath to __fpu__restore_sig()
+    
+    The previous commits refactor the restoration of the FPU registers so
+    that they can be loaded from in-kernel memory. This overhead can be
+    avoided if the load can be performed without a pagefault.
+    
+    Attempt to restore FPU registers by invoking
+    copy_user_to_fpregs_zeroing(). If it fails try the slowpath which can
+    handle pagefaults.
+    
+     [ bp: Add a comment over the fastpath to be able to find one's way
+       around the function. ]
+    
+    Signed-off-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+    Signed-off-by: Borislav Petkov <bp@suse.de>
+    Reviewed-by: Dave Hansen <dave.hansen@intel.com>
+    Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Andy Lutomirski <luto@kernel.org>
+    Cc: "H. Peter Anvin" <hpa@zytor.com>
+    Cc: Ingo Molnar <mingo@redhat.com>
+    Cc: Jann Horn <jannh@google.com>
+    Cc: "Jason A. Donenfeld" <Jason@zx2c4.com>
+    Cc: kvm ML <kvm@vger.kernel.org>
+    Cc: Paolo Bonzini <pbonzini@redhat.com>
+    Cc: Radim Krčmář <rkrcmar@redhat.com>
+    Cc: Rik van Riel <riel@surriel.com>
+    Cc: x86-ml <x86@kernel.org>
+    Link: https://lkml.kernel.org/r/20190403164156.19645-25-bigeasy@linutronix.de
+
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+index 6df1f15e0cd5..a1bd7be70206 100644
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -242,10 +242,10 @@ sanitize_restored_xstate(union fpregs_state *state,
+ /*
+  * Restore the extended state if present. Otherwise, restore the FP/SSE state.
+  */
+-static inline int copy_user_to_fpregs_zeroing(void __user *buf, u64 xbv, int fx_only)
++static int copy_user_to_fpregs_zeroing(void __user *buf, u64 xbv, int fx_only)
+ {
+ 	if (use_xsave()) {
+-		if ((unsigned long)buf % 64 || fx_only) {
++		if (fx_only) {
+ 			u64 init_bv = xfeatures_mask & ~XFEATURE_MASK_FPSSE;
+ 			copy_kernel_to_xregs(&init_fpstate.xsave, init_bv);
+ 			return copy_user_to_fxregs(buf);
+@@ -327,8 +327,27 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 		if (ret)
+ 			goto err_out;
+ 		envp = &env;
++	} else {
++		/*
++		 * Attempt to restore the FPU registers directly from user
++		 * memory. For that to succeed, the user access cannot cause
++		 * page faults. If it does, fall back to the slow path below,
++		 * going through the kernel buffer with the enabled pagefault
++		 * handler.
++		 */
++		fpregs_lock();
++		pagefault_disable();
++		ret = copy_user_to_fpregs_zeroing(buf_fx, xfeatures, fx_only);
++		pagefault_enable();
++		if (!ret) {
++			fpregs_mark_activate();
++			fpregs_unlock();
++			return 0;
++		}
++		fpregs_unlock();
+ 	}
+ 
++
+ 	if (use_xsave() && !fx_only) {
+ 		u64 init_bv = xfeatures_mask & ~xfeatures;
+ 
+
+commit 5f409e20b794565e2d60ad333e79334630a6c798
+Author: Rik van Riel <riel@surriel.com>
+Date:   Wed Apr 3 18:41:52 2019 +0200
+
+    x86/fpu: Defer FPU state load until return to userspace
+    
+    Defer loading of FPU state until return to userspace. This gives
+    the kernel the potential to skip loading FPU state for tasks that
+    stay in kernel mode, or for tasks that end up with repeated
+    invocations of kernel_fpu_begin() & kernel_fpu_end().
+    
+    The fpregs_lock/unlock() section ensures that the registers remain
+    unchanged. Otherwise a context switch or a bottom half could save the
+    registers to its FPU context and the processor's FPU registers would
+    became random if modified at the same time.
+    
+    KVM swaps the host/guest registers on entry/exit path. This flow has
+    been kept as is. First it ensures that the registers are loaded and then
+    saves the current (host) state before it loads the guest's registers. The
+    swap is done at the very end with disabled interrupts so it should not
+    change anymore before theg guest is entered. The read/save version seems
+    to be cheaper compared to memcpy() in a micro benchmark.
+    
+    Each thread gets TIF_NEED_FPU_LOAD set as part of fork() / fpu__copy().
+    For kernel threads, this flag gets never cleared which avoids saving /
+    restoring the FPU state for kernel threads and during in-kernel usage of
+    the FPU registers.
+    
+     [
+       bp: Correct and update commit message and fix checkpatch warnings.
+       s/register/registers/ where it is used in plural.
+       minor comment corrections.
+       remove unused trace_x86_fpu_activate_state() TP.
+     ]
+    
+    Signed-off-by: Rik van Riel <riel@surriel.com>
+    Signed-off-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+    Signed-off-by: Borislav Petkov <bp@suse.de>
+    Reviewed-by: Dave Hansen <dave.hansen@intel.com>
+    Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Andy Lutomirski <luto@kernel.org>
+    Cc: Aubrey Li <aubrey.li@intel.com>
+    Cc: Babu Moger <Babu.Moger@amd.com>
+    Cc: "Chang S. Bae" <chang.seok.bae@intel.com>
+    Cc: Dmitry Safonov <dima@arista.com>
+    Cc: "H. Peter Anvin" <hpa@zytor.com>
+    Cc: Ingo Molnar <mingo@redhat.com>
+    Cc: Jann Horn <jannh@google.com>
+    Cc: "Jason A. Donenfeld" <Jason@zx2c4.com>
+    Cc: Joerg Roedel <jroedel@suse.de>
+    Cc: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+    Cc: kvm ML <kvm@vger.kernel.org>
+    Cc: Nicolai Stange <nstange@suse.de>
+    Cc: Paolo Bonzini <pbonzini@redhat.com>
+    Cc: "Radim Krčmář" <rkrcmar@redhat.com>
+    Cc: Tim Chen <tim.c.chen@linux.intel.com>
+    Cc: Waiman Long <longman@redhat.com>
+    Cc: x86-ml <x86@kernel.org>
+    Cc: Yi Wang <wang.yi59@zte.com.cn>
+    Link: https://lkml.kernel.org/r/20190403164156.19645-24-bigeasy@linutronix.de
+
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+index b13e86b29426..6df1f15e0cd5 100644
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -269,11 +269,9 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 	struct task_struct *tsk = current;
+ 	struct fpu *fpu = &tsk->thread.fpu;
+ 	struct user_i387_ia32_struct env;
+-	union fpregs_state *state;
+ 	u64 xfeatures = 0;
+ 	int fx_only = 0;
+ 	int ret = 0;
+-	void *tmp;
+ 
+ 	ia32_fxstate &= (IS_ENABLED(CONFIG_X86_32) ||
+ 			 IS_ENABLED(CONFIG_IA32_EMULATION));
+@@ -308,14 +306,18 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 		}
+ 	}
+ 
+-	tmp = kzalloc(sizeof(*state) + fpu_kernel_xstate_size + 64, GFP_KERNEL);
+-	if (!tmp)
+-		return -ENOMEM;
+-	state = PTR_ALIGN(tmp, 64);
++	/*
++	 * The current state of the FPU registers does not matter. By setting
++	 * TIF_NEED_FPU_LOAD unconditionally it is ensured that the our xstate
++	 * is not modified on context switch and that the xstate is considered
++	 * to be loaded again on return to userland (overriding last_cpu avoids
++	 * the optimisation).
++	 */
++	set_thread_flag(TIF_NEED_FPU_LOAD);
++	__fpu_invalidate_fpregs_state(fpu);
+ 
+ 	if ((unsigned long)buf_fx % 64)
+ 		fx_only = 1;
+-
+ 	/*
+ 	 * For 32-bit frames with fxstate, copy the fxstate so it can be
+ 	 * reconstructed later.
+@@ -331,43 +333,52 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 		u64 init_bv = xfeatures_mask & ~xfeatures;
+ 
+ 		if (using_compacted_format()) {
+-			ret = copy_user_to_xstate(&state->xsave, buf_fx);
++			ret = copy_user_to_xstate(&fpu->state.xsave, buf_fx);
+ 		} else {
+-			ret = __copy_from_user(&state->xsave, buf_fx, state_size);
++			ret = __copy_from_user(&fpu->state.xsave, buf_fx, state_size);
+ 
+ 			if (!ret && state_size > offsetof(struct xregs_state, header))
+-				ret = validate_xstate_header(&state->xsave.header);
++				ret = validate_xstate_header(&fpu->state.xsave.header);
+ 		}
+ 		if (ret)
+ 			goto err_out;
+ 
+-		sanitize_restored_xstate(state, envp, xfeatures, fx_only);
++		sanitize_restored_xstate(&fpu->state, envp, xfeatures, fx_only);
+ 
++		fpregs_lock();
+ 		if (unlikely(init_bv))
+ 			copy_kernel_to_xregs(&init_fpstate.xsave, init_bv);
+-		ret = copy_kernel_to_xregs_err(&state->xsave, xfeatures);
++		ret = copy_kernel_to_xregs_err(&fpu->state.xsave, xfeatures);
+ 
+ 	} else if (use_fxsr()) {
+-		ret = __copy_from_user(&state->fxsave, buf_fx, state_size);
+-		if (ret)
++		ret = __copy_from_user(&fpu->state.fxsave, buf_fx, state_size);
++		if (ret) {
++			ret = -EFAULT;
+ 			goto err_out;
++		}
++
++		sanitize_restored_xstate(&fpu->state, envp, xfeatures, fx_only);
+ 
+-		sanitize_restored_xstate(state, envp, xfeatures, fx_only);
++		fpregs_lock();
+ 		if (use_xsave()) {
+ 			u64 init_bv = xfeatures_mask & ~XFEATURE_MASK_FPSSE;
+ 			copy_kernel_to_xregs(&init_fpstate.xsave, init_bv);
+ 		}
+ 
+-		ret = copy_kernel_to_fxregs_err(&state->fxsave);
++		ret = copy_kernel_to_fxregs_err(&fpu->state.fxsave);
+ 	} else {
+-		ret = __copy_from_user(&state->fsave, buf_fx, state_size);
++		ret = __copy_from_user(&fpu->state.fsave, buf_fx, state_size);
+ 		if (ret)
+ 			goto err_out;
+-		ret = copy_kernel_to_fregs_err(&state->fsave);
++
++		fpregs_lock();
++		ret = copy_kernel_to_fregs_err(&fpu->state.fsave);
+ 	}
++	if (!ret)
++		fpregs_mark_activate();
++	fpregs_unlock();
+ 
+ err_out:
+-	kfree(tmp);
+ 	if (ret)
+ 		fpu__clear(fpu);
+ 	return ret;
+
+commit c2ff9e9a3d9d6c019394a22989a228d02970a8b1
+Author: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Date:   Wed Apr 3 18:41:51 2019 +0200
+
+    x86/fpu: Merge the two code paths in __fpu__restore_sig()
+    
+    The ia32_fxstate case (32bit with fxsr) and the other (64bit frames or
+    32bit frames without fxsr) restore both from kernel memory and sanitize
+    the content.
+    
+    The !ia32_fxstate version restores missing xstates from "init state"
+    while the ia32_fxstate doesn't and skips it.
+    
+    Merge the two code paths and keep the !ia32_fxstate one. Copy only the
+    user_i387_ia32_struct data structure in the ia32_fxstate.
+    
+    Signed-off-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+    Signed-off-by: Borislav Petkov <bp@suse.de>
+    Reviewed-by: Dave Hansen <dave.hansen@intel.com>
+    Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Andy Lutomirski <luto@kernel.org>
+    Cc: "H. Peter Anvin" <hpa@zytor.com>
+    Cc: Ingo Molnar <mingo@redhat.com>
+    Cc: Jann Horn <jannh@google.com>
+    Cc: "Jason A. Donenfeld" <Jason@zx2c4.com>
+    Cc: kvm ML <kvm@vger.kernel.org>
+    Cc: Paolo Bonzini <pbonzini@redhat.com>
+    Cc: Radim Krčmář <rkrcmar@redhat.com>
+    Cc: Rik van Riel <riel@surriel.com>
+    Cc: x86-ml <x86@kernel.org>
+    Link: https://lkml.kernel.org/r/20190403164156.19645-23-bigeasy@linutronix.de
+
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+index 9ea1eaa4c9b1..b13e86b29426 100644
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -263,12 +263,17 @@ static inline int copy_user_to_fpregs_zeroing(void __user *buf, u64 xbv, int fx_
+ 
+ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ {
++	struct user_i387_ia32_struct *envp = NULL;
++	int state_size = fpu_kernel_xstate_size;
+ 	int ia32_fxstate = (buf != buf_fx);
+ 	struct task_struct *tsk = current;
+ 	struct fpu *fpu = &tsk->thread.fpu;
+-	int state_size = fpu_kernel_xstate_size;
++	struct user_i387_ia32_struct env;
++	union fpregs_state *state;
+ 	u64 xfeatures = 0;
+ 	int fx_only = 0;
++	int ret = 0;
++	void *tmp;
+ 
+ 	ia32_fxstate &= (IS_ENABLED(CONFIG_X86_32) ||
+ 			 IS_ENABLED(CONFIG_IA32_EMULATION));
+@@ -303,105 +308,69 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 		}
+ 	}
+ 
++	tmp = kzalloc(sizeof(*state) + fpu_kernel_xstate_size + 64, GFP_KERNEL);
++	if (!tmp)
++		return -ENOMEM;
++	state = PTR_ALIGN(tmp, 64);
++
++	if ((unsigned long)buf_fx % 64)
++		fx_only = 1;
++
++	/*
++	 * For 32-bit frames with fxstate, copy the fxstate so it can be
++	 * reconstructed later.
++	 */
+ 	if (ia32_fxstate) {
+-		/*
+-		 * For 32-bit frames with fxstate, copy the user state to the
+-		 * thread's fpu state, reconstruct fxstate from the fsave
+-		 * header. Validate and sanitize the copied state.
+-		 */
+-		struct user_i387_ia32_struct env;
+-		union fpregs_state *state;
+-		int err = 0;
+-		void *tmp;
++		ret = __copy_from_user(&env, buf, sizeof(env));
++		if (ret)
++			goto err_out;
++		envp = &env;
++	}
+ 
+-		tmp = kzalloc(sizeof(*state) + fpu_kernel_xstate_size + 64, GFP_KERNEL);
+-		if (!tmp)
+-			return -ENOMEM;
+-		state = PTR_ALIGN(tmp, 64);
++	if (use_xsave() && !fx_only) {
++		u64 init_bv = xfeatures_mask & ~xfeatures;
+ 
+ 		if (using_compacted_format()) {
+-			err = copy_user_to_xstate(&state->xsave, buf_fx);
++			ret = copy_user_to_xstate(&state->xsave, buf_fx);
+ 		} else {
+-			err = __copy_from_user(&state->xsave, buf_fx, state_size);
++			ret = __copy_from_user(&state->xsave, buf_fx, state_size);
+ 
+-			if (!err && state_size > offsetof(struct xregs_state, header))
+-				err = validate_xstate_header(&state->xsave.header);
++			if (!ret && state_size > offsetof(struct xregs_state, header))
++				ret = validate_xstate_header(&state->xsave.header);
+ 		}
++		if (ret)
++			goto err_out;
+ 
+-		if (err || __copy_from_user(&env, buf, sizeof(env))) {
+-			err = -1;
+-		} else {
+-			sanitize_restored_xstate(state, &env, xfeatures, fx_only);
+-			copy_kernel_to_fpregs(state);
+-		}
+-
+-		kfree(tmp);
+-		return err;
+-	} else {
+-		union fpregs_state *state;
+-		void *tmp;
+-		int ret;
+-
+-		tmp = kzalloc(sizeof(*state) + fpu_kernel_xstate_size + 64, GFP_KERNEL);
+-		if (!tmp)
+-			return -ENOMEM;
+-		state = PTR_ALIGN(tmp, 64);
+-
+-		/*
+-		 * For 64-bit frames and 32-bit fsave frames, restore the user
+-		 * state to the registers directly (with exceptions handled).
+-		 */
+-		if ((unsigned long)buf_fx % 64)
+-			fx_only = 1;
+-
+-		if (use_xsave() && !fx_only) {
+-			u64 init_bv = xfeatures_mask & ~xfeatures;
+-
+-			if (using_compacted_format()) {
+-				ret = copy_user_to_xstate(&state->xsave, buf_fx);
+-			} else {
+-				ret = __copy_from_user(&state->xsave, buf_fx, state_size);
+-
+-				if (!ret && state_size > offsetof(struct xregs_state, header))
+-					ret = validate_xstate_header(&state->xsave.header);
+-			}
+-			if (ret)
+-				goto err_out;
+-
+-			sanitize_restored_xstate(state, NULL, xfeatures, fx_only);
+-
+-			if (unlikely(init_bv))
+-				copy_kernel_to_xregs(&init_fpstate.xsave, init_bv);
+-			ret = copy_kernel_to_xregs_err(&state->xsave, xfeatures);
++		sanitize_restored_xstate(state, envp, xfeatures, fx_only);
+ 
+-		} else if (use_fxsr()) {
+-			ret = __copy_from_user(&state->fxsave, buf_fx, state_size);
+-			if (ret)
+-				goto err_out;
++		if (unlikely(init_bv))
++			copy_kernel_to_xregs(&init_fpstate.xsave, init_bv);
++		ret = copy_kernel_to_xregs_err(&state->xsave, xfeatures);
+ 
+-			if (use_xsave()) {
+-				u64 init_bv = xfeatures_mask & ~XFEATURE_MASK_FPSSE;
+-				copy_kernel_to_xregs(&init_fpstate.xsave, init_bv);
+-			}
+-			state->fxsave.mxcsr &= mxcsr_feature_mask;
++	} else if (use_fxsr()) {
++		ret = __copy_from_user(&state->fxsave, buf_fx, state_size);
++		if (ret)
++			goto err_out;
+ 
+-			ret = copy_kernel_to_fxregs_err(&state->fxsave);
+-		} else {
+-			ret = __copy_from_user(&state->fsave, buf_fx, state_size);
+-			if (ret)
+-				goto err_out;
+-			ret = copy_kernel_to_fregs_err(&state->fsave);
++		sanitize_restored_xstate(state, envp, xfeatures, fx_only);
++		if (use_xsave()) {
++			u64 init_bv = xfeatures_mask & ~XFEATURE_MASK_FPSSE;
++			copy_kernel_to_xregs(&init_fpstate.xsave, init_bv);
+ 		}
+ 
+-err_out:
+-		kfree(tmp);
+-		if (ret) {
+-			fpu__clear(fpu);
+-			return -1;
+-		}
++		ret = copy_kernel_to_fxregs_err(&state->fxsave);
++	} else {
++		ret = __copy_from_user(&state->fsave, buf_fx, state_size);
++		if (ret)
++			goto err_out;
++		ret = copy_kernel_to_fregs_err(&state->fsave);
+ 	}
+ 
+-	return 0;
++err_out:
++	kfree(tmp);
++	if (ret)
++		fpu__clear(fpu);
++	return ret;
+ }
+ 
+ static inline int xstate_sigframe_size(void)
+
+commit 926b21f37b072ae4c117052de45a975c6d468fec
+Author: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Date:   Wed Apr 3 18:41:50 2019 +0200
+
+    x86/fpu: Restore from kernel memory on the 64-bit path too
+    
+    The 64-bit case (both 64-bit and 32-bit frames) loads the new state from
+    user memory.
+    
+    However, doing this is not desired if the FPU state is going to be
+    restored on return to userland: it would be required to disable
+    preemption in order to avoid a context switch which would set
+    TIF_NEED_FPU_LOAD. If this happens before the restore operation then the
+    loaded registers would become volatile.
+    
+    Furthermore, disabling preemption while accessing user memory requires
+    to disable the pagefault handler. An error during FXRSTOR would then
+    mean that either a page fault occurred (and it would have to be retried
+    with enabled page fault handler) or a #GP occurred because the xstate is
+    bogus (after all, the signal handler can modify it).
+    
+    In order to avoid that mess, copy the FPU state from userland, validate
+    it and then load it. The copy_kernel_…() helpers are basically just
+    like the old helpers except that they operate on kernel memory and the
+    fault handler just sets the error value and the caller handles it.
+    
+    copy_user_to_fpregs_zeroing() and its helpers remain and will be used
+    later for a fastpath optimisation.
+    
+     [ bp: Clarify commit message. ]
+    
+    Signed-off-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+    Signed-off-by: Borislav Petkov <bp@suse.de>
+    Reviewed-by: Dave Hansen <dave.hansen@intel.com>
+    Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Andy Lutomirski <luto@kernel.org>
+    Cc: Aubrey Li <aubrey.li@intel.com>
+    Cc: "H. Peter Anvin" <hpa@zytor.com>
+    Cc: Ingo Molnar <mingo@redhat.com>
+    Cc: Jann Horn <jannh@google.com>
+    Cc: "Jason A. Donenfeld" <Jason@zx2c4.com>
+    Cc: kvm ML <kvm@vger.kernel.org>
+    Cc: Paolo Bonzini <pbonzini@redhat.com>
+    Cc: Radim Krčmář <rkrcmar@redhat.com>
+    Cc: Rik van Riel <riel@surriel.com>
+    Cc: x86-ml <x86@kernel.org>
+    Link: https://lkml.kernel.org/r/20190403164156.19645-22-bigeasy@linutronix.de
+
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+index c2ff43fbbd07..9ea1eaa4c9b1 100644
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -234,7 +234,8 @@ sanitize_restored_xstate(union fpregs_state *state,
+ 		 */
+ 		xsave->i387.mxcsr &= mxcsr_feature_mask;
+ 
+-		convert_to_fxsr(&state->fxsave, ia32_env);
++		if (ia32_env)
++			convert_to_fxsr(&state->fxsave, ia32_env);
+ 	}
+ }
+ 
+@@ -337,28 +338,63 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 		kfree(tmp);
+ 		return err;
+ 	} else {
++		union fpregs_state *state;
++		void *tmp;
+ 		int ret;
+ 
++		tmp = kzalloc(sizeof(*state) + fpu_kernel_xstate_size + 64, GFP_KERNEL);
++		if (!tmp)
++			return -ENOMEM;
++		state = PTR_ALIGN(tmp, 64);
++
+ 		/*
+ 		 * For 64-bit frames and 32-bit fsave frames, restore the user
+ 		 * state to the registers directly (with exceptions handled).
+ 		 */
+-		if (use_xsave()) {
+-			if ((unsigned long)buf_fx % 64 || fx_only) {
+-				u64 init_bv = xfeatures_mask & ~XFEATURE_MASK_FPSSE;
+-				copy_kernel_to_xregs(&init_fpstate.xsave, init_bv);
+-				ret = copy_user_to_fxregs(buf_fx);
++		if ((unsigned long)buf_fx % 64)
++			fx_only = 1;
++
++		if (use_xsave() && !fx_only) {
++			u64 init_bv = xfeatures_mask & ~xfeatures;
++
++			if (using_compacted_format()) {
++				ret = copy_user_to_xstate(&state->xsave, buf_fx);
+ 			} else {
+-				u64 init_bv = xfeatures_mask & ~xfeatures;
+-				if (unlikely(init_bv))
+-					copy_kernel_to_xregs(&init_fpstate.xsave, init_bv);
+-				ret = copy_user_to_xregs(buf_fx, xfeatures);
++				ret = __copy_from_user(&state->xsave, buf_fx, state_size);
++
++				if (!ret && state_size > offsetof(struct xregs_state, header))
++					ret = validate_xstate_header(&state->xsave.header);
+ 			}
++			if (ret)
++				goto err_out;
++
++			sanitize_restored_xstate(state, NULL, xfeatures, fx_only);
++
++			if (unlikely(init_bv))
++				copy_kernel_to_xregs(&init_fpstate.xsave, init_bv);
++			ret = copy_kernel_to_xregs_err(&state->xsave, xfeatures);
++
+ 		} else if (use_fxsr()) {
+-			ret = copy_user_to_fxregs(buf_fx);
+-		} else
+-			ret = copy_user_to_fregs(buf_fx);
++			ret = __copy_from_user(&state->fxsave, buf_fx, state_size);
++			if (ret)
++				goto err_out;
+ 
++			if (use_xsave()) {
++				u64 init_bv = xfeatures_mask & ~XFEATURE_MASK_FPSSE;
++				copy_kernel_to_xregs(&init_fpstate.xsave, init_bv);
++			}
++			state->fxsave.mxcsr &= mxcsr_feature_mask;
++
++			ret = copy_kernel_to_fxregs_err(&state->fxsave);
++		} else {
++			ret = __copy_from_user(&state->fsave, buf_fx, state_size);
++			if (ret)
++				goto err_out;
++			ret = copy_kernel_to_fregs_err(&state->fsave);
++		}
++
++err_out:
++		kfree(tmp);
+ 		if (ret) {
+ 			fpu__clear(fpu);
+ 			return -1;
+
+commit e0d3602f933367881bddfff310a744e6e61c284c
+Author: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Date:   Wed Apr 3 18:41:49 2019 +0200
+
+    x86/fpu: Inline copy_user_to_fpregs_zeroing()
+    
+    Start refactoring __fpu__restore_sig() by inlining
+    copy_user_to_fpregs_zeroing(). The original function remains and will be
+    used to restore from userland memory if possible.
+    
+    Signed-off-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+    Signed-off-by: Borislav Petkov <bp@suse.de>
+    Reviewed-by: Dave Hansen <dave.hansen@intel.com>
+    Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Andy Lutomirski <luto@kernel.org>
+    Cc: "H. Peter Anvin" <hpa@zytor.com>
+    Cc: Ingo Molnar <mingo@redhat.com>
+    Cc: Jann Horn <jannh@google.com>
+    Cc: "Jason A. Donenfeld" <Jason@zx2c4.com>
+    Cc: kvm ML <kvm@vger.kernel.org>
+    Cc: Paolo Bonzini <pbonzini@redhat.com>
+    Cc: Radim Krčmář <rkrcmar@redhat.com>
+    Cc: Rik van Riel <riel@surriel.com>
+    Cc: x86-ml <x86@kernel.org>
+    Link: https://lkml.kernel.org/r/20190403164156.19645-21-bigeasy@linutronix.de
+
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+index 9b9dfdc96285..c2ff43fbbd07 100644
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -337,11 +337,29 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 		kfree(tmp);
+ 		return err;
+ 	} else {
++		int ret;
++
+ 		/*
+ 		 * For 64-bit frames and 32-bit fsave frames, restore the user
+ 		 * state to the registers directly (with exceptions handled).
+ 		 */
+-		if (copy_user_to_fpregs_zeroing(buf_fx, xfeatures, fx_only)) {
++		if (use_xsave()) {
++			if ((unsigned long)buf_fx % 64 || fx_only) {
++				u64 init_bv = xfeatures_mask & ~XFEATURE_MASK_FPSSE;
++				copy_kernel_to_xregs(&init_fpstate.xsave, init_bv);
++				ret = copy_user_to_fxregs(buf_fx);
++			} else {
++				u64 init_bv = xfeatures_mask & ~xfeatures;
++				if (unlikely(init_bv))
++					copy_kernel_to_xregs(&init_fpstate.xsave, init_bv);
++				ret = copy_user_to_xregs(buf_fx, xfeatures);
++			}
++		} else if (use_fxsr()) {
++			ret = copy_user_to_fxregs(buf_fx);
++		} else
++			ret = copy_user_to_fregs(buf_fx);
++
++		if (ret) {
+ 			fpu__clear(fpu);
+ 			return -1;
+ 		}
+
+commit a352a3b7b7920212ee4c45a41500c66826318e92
+Author: Rik van Riel <riel@surriel.com>
+Date:   Wed Apr 3 18:41:47 2019 +0200
+
+    x86/fpu: Prepare copy_fpstate_to_sigframe() for TIF_NEED_FPU_LOAD
+    
+    The FPU registers need only to be saved if TIF_NEED_FPU_LOAD is not set.
+    Otherwise this has been already done and can be skipped.
+    
+     [ bp: Massage a bit. ]
+    
+    Signed-off-by: Rik van Riel <riel@surriel.com>
+    Signed-off-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+    Signed-off-by: Borislav Petkov <bp@suse.de>
+    Reviewed-by: Dave Hansen <dave.hansen@intel.com>
+    Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Andy Lutomirski <luto@kernel.org>
+    Cc: "H. Peter Anvin" <hpa@zytor.com>
+    Cc: Ingo Molnar <mingo@redhat.com>
+    Cc: Jann Horn <jannh@google.com>
+    Cc: "Jason A. Donenfeld" <Jason@zx2c4.com>
+    Cc: kvm ML <kvm@vger.kernel.org>
+    Cc: Paolo Bonzini <pbonzini@redhat.com>
+    Cc: Radim Krčmář <rkrcmar@redhat.com>
+    Cc: Rik van Riel <riel@surriel.com>
+    Cc: x86-ml <x86@kernel.org>
+    Link: https://lkml.kernel.org/r/20190403164156.19645-19-bigeasy@linutronix.de
+
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+index 8f23f5237218..9b9dfdc96285 100644
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -171,7 +171,17 @@ int copy_fpstate_to_sigframe(void __user *buf, void __user *buf_fx, int size)
+ 			sizeof(struct user_i387_ia32_struct), NULL,
+ 			(struct _fpstate_32 __user *) buf) ? -1 : 1;
+ 
+-	copy_fpregs_to_fpstate(fpu);
++	/*
++	 * If we do not need to load the FPU registers at return to userspace
++	 * then the CPU has the current state and we need to save it. Otherwise,
++	 * it has already been done and we can skip it.
++	 */
++	fpregs_lock();
++	if (!test_thread_flag(TIF_NEED_FPU_LOAD)) {
++		copy_fpregs_to_fpstate(fpu);
++		set_thread_flag(TIF_NEED_FPU_LOAD);
++	}
++	fpregs_unlock();
+ 
+ 	if (using_compacted_format()) {
+ 		if (copy_xstate_to_user(buf_fx, xsave, 0, size))
+
+commit 69277c98f5eef0d9839699b7825923c3985f665f
+Author: Rik van Riel <riel@surriel.com>
+Date:   Wed Apr 3 18:41:46 2019 +0200
+
+    x86/fpu: Always store the registers in copy_fpstate_to_sigframe()
+    
+    copy_fpstate_to_sigframe() stores the registers directly to user space.
+    This is okay because the FPU registers are valid and saving them
+    directly avoids saving them into kernel memory and making a copy.
+    
+    However, this cannot be done anymore if the FPU registers are going
+    to be restored on the return to userland. It is possible that the FPU
+    registers will be invalidated in the middle of the save operation and
+    this should be done with disabled preemption / BH.
+    
+    Save the FPU registers to the task's FPU struct and copy them to the
+    user memory later on.
+    
+    Signed-off-by: Rik van Riel <riel@surriel.com>
+    Signed-off-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+    Signed-off-by: Borislav Petkov <bp@suse.de>
+    Reviewed-by: Dave Hansen <dave.hansen@intel.com>
+    Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Andy Lutomirski <luto@kernel.org>
+    Cc: "H. Peter Anvin" <hpa@zytor.com>
+    Cc: Ingo Molnar <mingo@redhat.com>
+    Cc: Jann Horn <jannh@google.com>
+    Cc: "Jason A. Donenfeld" <Jason@zx2c4.com>
+    Cc: kvm ML <kvm@vger.kernel.org>
+    Cc: Paolo Bonzini <pbonzini@redhat.com>
+    Cc: Radim Krčmář <rkrcmar@redhat.com>
+    Cc: x86-ml <x86@kernel.org>
+    Link: https://lkml.kernel.org/r/20190403164156.19645-18-bigeasy@linutronix.de
+
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+index 155f4552413e..8f23f5237218 100644
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -144,8 +144,8 @@ static inline int copy_fpregs_to_sigframe(struct xregs_state __user *buf)
+  *	buf == buf_fx for 64-bit frames and 32-bit fsave frame.
+  *	buf != buf_fx for 32-bit frames with fxstate.
+  *
+- * Save the state directly to the user frame pointed by the aligned pointer
+- * 'buf_fx'.
++ * Save the state to task's fpu->state and then copy it to the user frame
++ * pointed to by the aligned pointer 'buf_fx'.
+  *
+  * If this is a 32-bit frame with fxstate, put a fsave header before
+  * the aligned state at 'buf_fx'.
+@@ -155,6 +155,8 @@ static inline int copy_fpregs_to_sigframe(struct xregs_state __user *buf)
+  */
+ int copy_fpstate_to_sigframe(void __user *buf, void __user *buf_fx, int size)
+ {
++	struct fpu *fpu = &current->thread.fpu;
++	struct xregs_state *xsave = &fpu->state.xsave;
+ 	struct task_struct *tsk = current;
+ 	int ia32_fxstate = (buf != buf_fx);
+ 
+@@ -169,9 +171,16 @@ int copy_fpstate_to_sigframe(void __user *buf, void __user *buf_fx, int size)
+ 			sizeof(struct user_i387_ia32_struct), NULL,
+ 			(struct _fpstate_32 __user *) buf) ? -1 : 1;
+ 
+-	/* Save the live registers state to the user frame directly. */
+-	if (copy_fpregs_to_sigframe(buf_fx))
+-		return -1;
++	copy_fpregs_to_fpstate(fpu);
++
++	if (using_compacted_format()) {
++		if (copy_xstate_to_user(buf_fx, xsave, 0, size))
++			return -1;
++	} else {
++		fpstate_sanitize_xstate(fpu);
++		if (__copy_to_user(buf_fx, xsave, fpu_user_xstate_size))
++			return -1;
++	}
+ 
+ 	/* Save the fsave header for the 32-bit frames. */
+ 	if ((ia32_fxstate || !use_fxsr()) && save_fsave_header(tsk, buf))
+
+commit 0169f53e0d97bb675075506810494bd86b8c934e
+Author: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Date:   Wed Apr 3 18:41:37 2019 +0200
+
+    x86/fpu: Remove user_fpu_begin()
+    
+    user_fpu_begin() sets fpu_fpregs_owner_ctx to task's fpu struct. This is
+    always the case since there is no lazy FPU anymore.
+    
+    fpu_fpregs_owner_ctx is used during context switch to decide if it needs
+    to load the saved registers or if the currently loaded registers are
+    valid. It could be skipped during a
+    
+      taskA -> kernel thread -> taskA
+    
+    switch because the switch to the kernel thread would not alter the CPU's
+    sFPU tate.
+    
+    Since this field is always updated during context switch and
+    never invalidated, setting it manually (in user context) makes no
+    difference. A kernel thread with kernel_fpu_begin() block could
+    set fpu_fpregs_owner_ctx to NULL but a kernel thread does not use
+    user_fpu_begin().
+    
+    This is a leftover from the lazy-FPU time.
+    
+    Remove user_fpu_begin(), it does not change fpu_fpregs_owner_ctx's
+    content.
+    
+    Signed-off-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+    Signed-off-by: Borislav Petkov <bp@suse.de>
+    Reviewed-by: Borislav Petkov <bp@suse.de>
+    Reviewed-by: Dave Hansen <dave.hansen@intel.com>
+    Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Andy Lutomirski <luto@kernel.org>
+    Cc: Aubrey Li <aubrey.li@intel.com>
+    Cc: "H. Peter Anvin" <hpa@zytor.com>
+    Cc: Ingo Molnar <mingo@redhat.com>
+    Cc: Jann Horn <jannh@google.com>
+    Cc: "Jason A. Donenfeld" <Jason@zx2c4.com>
+    Cc: kvm ML <kvm@vger.kernel.org>
+    Cc: Nicolai Stange <nstange@suse.de>
+    Cc: Paolo Bonzini <pbonzini@redhat.com>
+    Cc: Radim Krčmář <rkrcmar@redhat.com>
+    Cc: Rik van Riel <riel@surriel.com>
+    Cc: x86-ml <x86@kernel.org>
+    Link: https://lkml.kernel.org/r/20190403164156.19645-9-bigeasy@linutronix.de
+
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+index 34989d2a8893..155f4552413e 100644
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -322,7 +322,6 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 		 * For 64-bit frames and 32-bit fsave frames, restore the user
+ 		 * state to the registers directly (with exceptions handled).
+ 		 */
+-		user_fpu_begin();
+ 		if (copy_user_to_fpregs_zeroing(buf_fx, xfeatures, fx_only)) {
+ 			fpu__clear(fpu);
+ 			return -1;
+
+commit 39388e80f9b0c3788bfb6efe3054bdce0c3ead45
+Author: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Date:   Wed Apr 3 18:41:35 2019 +0200
+
+    x86/fpu: Don't save fxregs for ia32 frames in copy_fpstate_to_sigframe()
+    
+    In commit
+    
+      72a671ced66db ("x86, fpu: Unify signal handling code paths for x86 and x86_64 kernels")
+    
+    the 32bit and 64bit path of the signal delivery code were merged.
+    
+    The 32bit version:
+    
+      int save_i387_xstate_ia32(void __user *buf)
+      …
+             if (cpu_has_xsave)
+                     return save_i387_xsave(fp);
+             if (cpu_has_fxsr)
+                     return save_i387_fxsave(fp);
+    
+    The 64bit version:
+    
+      int save_i387_xstate(void __user *buf)
+      …
+             if (user_has_fpu()) {
+                     if (use_xsave())
+                             err = xsave_user(buf);
+                     else
+                             err = fxsave_user(buf);
+    
+                     if (unlikely(err)) {
+                             __clear_user(buf, xstate_size);
+                             return err;
+    
+    The merge:
+    
+      int save_xstate_sig(void __user *buf, void __user *buf_fx, int size)
+      …
+             if (user_has_fpu()) {
+                     /* Save the live register state to the user directly. */
+                     if (save_user_xstate(buf_fx))
+                             return -1;
+                     /* Update the thread's fxstate to save the fsave header. */
+                     if (ia32_fxstate)
+                             fpu_fxsave(&tsk->thread.fpu);
+    
+    I don't think that we needed to save the FPU registers to ->thread.fpu
+    because the registers were stored in buf_fx. Today the state will be
+    restored from buf_fx after the signal was handled (I assume that this
+    was also the case with lazy-FPU).
+    
+    Since commit
+    
+      66463db4fc560 ("x86, fpu: shift drop_init_fpu() from save_xstate_sig() to handle_signal()")
+    
+    it is ensured that the signal handler starts with clear/fresh set of FPU
+    registers which means that the previous store is futile.
+    
+    Remove the copy_fxregs_to_kernel() call because task's FPU state is
+    cleared later in handle_signal() via fpu__clear().
+    
+    Signed-off-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+    Signed-off-by: Borislav Petkov <bp@suse.de>
+    Reviewed-by: Dave Hansen <dave.hansen@intel.com>
+    Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Andy Lutomirski <luto@kernel.org>
+    Cc: "H. Peter Anvin" <hpa@zytor.com>
+    Cc: Ingo Molnar <mingo@redhat.com>
+    Cc: Jann Horn <jannh@google.com>
+    Cc: "Jason A. Donenfeld" <Jason@zx2c4.com>
+    Cc: kvm ML <kvm@vger.kernel.org>
+    Cc: Paolo Bonzini <pbonzini@redhat.com>
+    Cc: Radim Krčmář <rkrcmar@redhat.com>
+    Cc: Rik van Riel <riel@surriel.com>
+    Cc: x86-ml <x86@kernel.org>
+    Link: https://lkml.kernel.org/r/20190403164156.19645-7-bigeasy@linutronix.de
+
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+index c1a5999affa0..34989d2a8893 100644
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -155,7 +155,6 @@ static inline int copy_fpregs_to_sigframe(struct xregs_state __user *buf)
+  */
+ int copy_fpstate_to_sigframe(void __user *buf, void __user *buf_fx, int size)
+ {
+-	struct fpu *fpu = &current->thread.fpu;
+ 	struct task_struct *tsk = current;
+ 	int ia32_fxstate = (buf != buf_fx);
+ 
+@@ -173,9 +172,6 @@ int copy_fpstate_to_sigframe(void __user *buf, void __user *buf_fx, int size)
+ 	/* Save the live registers state to the user frame directly. */
+ 	if (copy_fpregs_to_sigframe(buf_fx))
+ 		return -1;
+-	/* Update the thread's fxstate to save the fsave header. */
+-	if (ia32_fxstate)
+-		copy_fxregs_to_kernel(fpu);
+ 
+ 	/* Save the fsave header for the 32-bit frames. */
+ 	if ((ia32_fxstate || !use_fxsr()) && save_fsave_header(tsk, buf))
+
+commit fbcc9e0c37ba3186c41b5eb1aee2f7f3b711bc1e
+Author: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Date:   Wed Apr 3 18:41:34 2019 +0200
+
+    x86/fpu: Remove fpu->initialized usage in copy_fpstate_to_sigframe()
+    
+    With lazy-FPU support the (now named variable) ->initialized was set to
+    true if the CPU's FPU registers were holding a valid state of the
+    FPU registers for the active process. If it was set to false then the
+    FPU state was saved in fpu->state and the FPU was deactivated.
+    
+    With lazy-FPU gone, ->initialized is always true for user threads and
+    kernel threads never call this function so ->initialized is always true
+    in copy_fpstate_to_sigframe().
+    
+    The using_compacted_format() check is also a leftover from the lazy-FPU
+    time. In the
+    
+      ->initialized == false
+    
+    case copy_to_user() would copy the compacted buffer while userland would
+    expect the non-compacted format instead. So in order to save the FPU
+    state in the non-compacted form it issues XSAVE to save the *current*
+    FPU state.
+    
+    If the FPU is not enabled, the attempt raises the FPU trap, the trap
+    restores the FPU contents and re-enables the FPU and XSAVE is invoked
+    again and succeeds.
+    
+    *This* does not longer work since commit
+    
+      bef8b6da9522 ("x86/fpu: Handle #NM without FPU emulation as an error")
+    
+    Remove the check for ->initialized because it is always true and remove
+    the false condition. Update the comment to reflect that the state is
+    always live.
+    
+     [ bp: Massage. ]
+    
+    Signed-off-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+    Signed-off-by: Borislav Petkov <bp@suse.de>
+    Reviewed-by: Dave Hansen <dave.hansen@intel.com>
+    Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Andy Lutomirski <luto@kernel.org>
+    Cc: "H. Peter Anvin" <hpa@zytor.com>
+    Cc: Ingo Molnar <mingo@redhat.com>
+    Cc: Jann Horn <jannh@google.com>
+    Cc: "Jason A. Donenfeld" <Jason@zx2c4.com>
+    Cc: kvm ML <kvm@vger.kernel.org>
+    Cc: Paolo Bonzini <pbonzini@redhat.com>
+    Cc: Radim Krčmář <rkrcmar@redhat.com>
+    Cc: Rik van Riel <riel@surriel.com>
+    Cc: x86-ml <x86@kernel.org>
+    Link: https://lkml.kernel.org/r/20190403164156.19645-6-bigeasy@linutronix.de
+
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+index 7296a9bb78e7..c1a5999affa0 100644
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -144,9 +144,8 @@ static inline int copy_fpregs_to_sigframe(struct xregs_state __user *buf)
+  *	buf == buf_fx for 64-bit frames and 32-bit fsave frame.
+  *	buf != buf_fx for 32-bit frames with fxstate.
+  *
+- * If the fpu, extended register state is live, save the state directly
+- * to the user frame pointed by the aligned pointer 'buf_fx'. Otherwise,
+- * copy the thread's fpu state to the user frame starting at 'buf_fx'.
++ * Save the state directly to the user frame pointed by the aligned pointer
++ * 'buf_fx'.
+  *
+  * If this is a 32-bit frame with fxstate, put a fsave header before
+  * the aligned state at 'buf_fx'.
+@@ -157,7 +156,6 @@ static inline int copy_fpregs_to_sigframe(struct xregs_state __user *buf)
+ int copy_fpstate_to_sigframe(void __user *buf, void __user *buf_fx, int size)
+ {
+ 	struct fpu *fpu = &current->thread.fpu;
+-	struct xregs_state *xsave = &fpu->state.xsave;
+ 	struct task_struct *tsk = current;
+ 	int ia32_fxstate = (buf != buf_fx);
+ 
+@@ -172,29 +170,12 @@ int copy_fpstate_to_sigframe(void __user *buf, void __user *buf_fx, int size)
+ 			sizeof(struct user_i387_ia32_struct), NULL,
+ 			(struct _fpstate_32 __user *) buf) ? -1 : 1;
+ 
+-	if (fpu->initialized || using_compacted_format()) {
+-		/* Save the live register state to the user directly. */
+-		if (copy_fpregs_to_sigframe(buf_fx))
+-			return -1;
+-		/* Update the thread's fxstate to save the fsave header. */
+-		if (ia32_fxstate)
+-			copy_fxregs_to_kernel(fpu);
+-	} else {
+-		/*
+-		 * It is a *bug* if kernel uses compacted-format for xsave
+-		 * area and we copy it out directly to a signal frame. It
+-		 * should have been handled above by saving the registers
+-		 * directly.
+-		 */
+-		if (boot_cpu_has(X86_FEATURE_XSAVES)) {
+-			WARN_ONCE(1, "x86/fpu: saving compacted-format xsave area to a signal frame!\n");
+-			return -1;
+-		}
+-
+-		fpstate_sanitize_xstate(fpu);
+-		if (__copy_to_user(buf_fx, xsave, fpu_user_xstate_size))
+-			return -1;
+-	}
++	/* Save the live registers state to the user frame directly. */
++	if (copy_fpregs_to_sigframe(buf_fx))
++		return -1;
++	/* Update the thread's fxstate to save the fsave header. */
++	if (ia32_fxstate)
++		copy_fxregs_to_kernel(fpu);
+ 
+ 	/* Save the fsave header for the 32-bit frames. */
+ 	if ((ia32_fxstate || !use_fxsr()) && save_fsave_header(tsk, buf))
+
+commit 39ea9baffda91df8bfee9b45610242a3191ea1ec
+Author: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Date:   Wed Apr 3 18:41:30 2019 +0200
+
+    x86/fpu: Remove fpu->initialized usage in __fpu__restore_sig()
+    
+    This is a preparation for the removal of the ->initialized member in the
+    fpu struct.
+    
+    __fpu__restore_sig() is deactivating the FPU via fpu__drop() and then
+    setting manually ->initialized followed by fpu__restore(). The result is
+    that it is possible to manipulate fpu->state and the state of registers
+    won't be saved/restored on a context switch which would overwrite
+    fpu->state:
+    
+    fpu__drop(fpu):
+      ...
+      fpu->initialized = 0;
+      preempt_enable();
+    
+      <--- context switch
+    
+    Don't access the fpu->state while the content is read from user space
+    and examined/sanitized. Use a temporary kmalloc() buffer for the
+    preparation of the FPU registers and once the state is considered okay,
+    load it. Should something go wrong, return with an error and without
+    altering the original FPU registers.
+    
+    The removal of fpu__initialize() is a nop because fpu->initialized is
+    already set for the user task.
+    
+     [ bp: Massage a bit. ]
+    
+    Signed-off-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+    Signed-off-by: Borislav Petkov <bp@suse.de>
+    Reviewed-by: Dave Hansen <dave.hansen@intel.com>
+    Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+    Acked-by: Borislav Petkov <bp@suse.de>
+    Cc: Andy Lutomirski <luto@kernel.org>
+    Cc: "H. Peter Anvin" <hpa@zytor.com>
+    Cc: Ingo Molnar <mingo@redhat.com>
+    Cc: Jann Horn <jannh@google.com>
+    Cc: "Jason A. Donenfeld" <Jason@zx2c4.com>
+    Cc: kvm ML <kvm@vger.kernel.org>
+    Cc: Paolo Bonzini <pbonzini@redhat.com>
+    Cc: Radim Krčmář <rkrcmar@redhat.com>
+    Cc: Rik van Riel <riel@surriel.com>
+    Cc: x86-ml <x86@kernel.org>
+    Link: https://lkml.kernel.org/r/20190403164156.19645-2-bigeasy@linutronix.de
+
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+index 55b80de13ea5..7296a9bb78e7 100644
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -207,11 +207,11 @@ int copy_fpstate_to_sigframe(void __user *buf, void __user *buf_fx, int size)
+ }
+ 
+ static inline void
+-sanitize_restored_xstate(struct task_struct *tsk,
++sanitize_restored_xstate(union fpregs_state *state,
+ 			 struct user_i387_ia32_struct *ia32_env,
+ 			 u64 xfeatures, int fx_only)
+ {
+-	struct xregs_state *xsave = &tsk->thread.fpu.state.xsave;
++	struct xregs_state *xsave = &state->xsave;
+ 	struct xstate_header *header = &xsave->header;
+ 
+ 	if (use_xsave()) {
+@@ -238,7 +238,7 @@ sanitize_restored_xstate(struct task_struct *tsk,
+ 		 */
+ 		xsave->i387.mxcsr &= mxcsr_feature_mask;
+ 
+-		convert_to_fxsr(tsk, ia32_env);
++		convert_to_fxsr(&state->fxsave, ia32_env);
+ 	}
+ }
+ 
+@@ -284,8 +284,6 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 	if (!access_ok(buf, size))
+ 		return -EACCES;
+ 
+-	fpu__initialize(fpu);
+-
+ 	if (!static_cpu_has(X86_FEATURE_FPU))
+ 		return fpregs_soft_set(current, NULL,
+ 				       0, sizeof(struct user_i387_ia32_struct),
+@@ -315,40 +313,32 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 		 * header. Validate and sanitize the copied state.
+ 		 */
+ 		struct user_i387_ia32_struct env;
++		union fpregs_state *state;
+ 		int err = 0;
++		void *tmp;
+ 
+-		/*
+-		 * Drop the current fpu which clears fpu->initialized. This ensures
+-		 * that any context-switch during the copy of the new state,
+-		 * avoids the intermediate state from getting restored/saved.
+-		 * Thus avoiding the new restored state from getting corrupted.
+-		 * We will be ready to restore/save the state only after
+-		 * fpu->initialized is again set.
+-		 */
+-		fpu__drop(fpu);
++		tmp = kzalloc(sizeof(*state) + fpu_kernel_xstate_size + 64, GFP_KERNEL);
++		if (!tmp)
++			return -ENOMEM;
++		state = PTR_ALIGN(tmp, 64);
+ 
+ 		if (using_compacted_format()) {
+-			err = copy_user_to_xstate(&fpu->state.xsave, buf_fx);
++			err = copy_user_to_xstate(&state->xsave, buf_fx);
+ 		} else {
+-			err = __copy_from_user(&fpu->state.xsave, buf_fx, state_size);
++			err = __copy_from_user(&state->xsave, buf_fx, state_size);
+ 
+ 			if (!err && state_size > offsetof(struct xregs_state, header))
+-				err = validate_xstate_header(&fpu->state.xsave.header);
++				err = validate_xstate_header(&state->xsave.header);
+ 		}
+ 
+ 		if (err || __copy_from_user(&env, buf, sizeof(env))) {
+-			fpstate_init(&fpu->state);
+-			trace_x86_fpu_init_state(fpu);
+ 			err = -1;
+ 		} else {
+-			sanitize_restored_xstate(tsk, &env, xfeatures, fx_only);
++			sanitize_restored_xstate(state, &env, xfeatures, fx_only);
++			copy_kernel_to_fpregs(state);
+ 		}
+ 
+-		local_bh_disable();
+-		fpu->initialized = 1;
+-		fpu__restore(fpu);
+-		local_bh_enable();
+-
++		kfree(tmp);
+ 		return err;
+ 	} else {
+ 		/*
+
+commit 89833fab15d6017ba006a45b5af68caa067171a7
+Author: Jann Horn <jannh@google.com>
+Date:   Fri Mar 29 22:46:51 2019 +0100
+
+    x86/fpu: Fix __user annotations
+    
+    In save_xstate_epilog(), use __user when type-casting userspace
+    pointers.
+    
+    In setup_sigcontext() and x32_setup_rt_frame(), cast the userspace
+    pointers to 'unsigned long __user *' before writing into them. These
+    pointers are originally '__u32 __user *' or '__u64 __user *', causing
+    sparse to complain when a userspace pointer is written into them. The
+    casts are okay because the pointers always point to pointer-sized
+    values.
+    
+    Thanks to Luc Van Oostenryck and Al Viro for explaining this to me.
+    
+    Signed-off-by: Jann Horn <jannh@google.com>
+    Signed-off-by: Borislav Petkov <bp@suse.de>
+    Cc: Andy Lutomirski <luto@kernel.org>
+    Cc: "H. Peter Anvin" <hpa@zytor.com>
+    Cc: Ingo Molnar <mingo@redhat.com>
+    Cc: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
+    Cc: Mukesh Ojha <mojha@codeaurora.org>
+    Cc: Qiaowei Ren <qiaowei.ren@intel.com>
+    Cc: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Will Deacon <will.deacon@arm.com>
+    Cc: x86-ml <x86@kernel.org>
+    Link: https://lkml.kernel.org/r/20190329214652.258477-3-jannh@google.com
+
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+index f6a1d299627c..55b80de13ea5 100644
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -92,13 +92,13 @@ static inline int save_xstate_epilog(void __user *buf, int ia32_frame)
+ 		return err;
+ 
+ 	err |= __put_user(FP_XSTATE_MAGIC2,
+-			  (__u32 *)(buf + fpu_user_xstate_size));
++			  (__u32 __user *)(buf + fpu_user_xstate_size));
+ 
+ 	/*
+ 	 * Read the xfeatures which we copied (directly from the cpu or
+ 	 * from the state in task struct) to the user buffers.
+ 	 */
+-	err |= __get_user(xfeatures, (__u32 *)&x->header.xfeatures);
++	err |= __get_user(xfeatures, (__u32 __user *)&x->header.xfeatures);
+ 
+ 	/*
+ 	 * For legacy compatible, we always set FP/SSE bits in the bit
+@@ -113,7 +113,7 @@ static inline int save_xstate_epilog(void __user *buf, int ia32_frame)
+ 	 */
+ 	xfeatures |= XFEATURE_MASK_FPSSE;
+ 
+-	err |= __put_user(xfeatures, (__u32 *)&x->header.xfeatures);
++	err |= __put_user(xfeatures, (__u32 __user *)&x->header.xfeatures);
+ 
+ 	return err;
+ }
+
+commit 96d4f267e40f9509e8a66e2b39e8b95655617693
+Author: Linus Torvalds <torvalds@linux-foundation.org>
+Date:   Thu Jan 3 18:57:57 2019 -0800
+
+    Remove 'type' argument from access_ok() function
+    
+    Nobody has actually used the type (VERIFY_READ vs VERIFY_WRITE) argument
+    of the user address range verification function since we got rid of the
+    old racy i386-only code to walk page tables by hand.
+    
+    It existed because the original 80386 would not honor the write protect
+    bit when in kernel mode, so you had to do COW by hand before doing any
+    user access.  But we haven't supported that in a long time, and these
+    days the 'type' argument is a purely historical artifact.
+    
+    A discussion about extending 'user_access_begin()' to do the range
+    checking resulted this patch, because there is no way we're going to
+    move the old VERIFY_xyz interface to that model.  And it's best done at
+    the end of the merge window when I've done most of my merges, so let's
+    just get this done once and for all.
+    
+    This patch was mostly done with a sed-script, with manual fix-ups for
+    the cases that weren't of the trivial 'access_ok(VERIFY_xyz' form.
+    
+    There were a couple of notable cases:
+    
+     - csky still had the old "verify_area()" name as an alias.
+    
+     - the iter_iov code had magical hardcoded knowledge of the actual
+       values of VERIFY_{READ,WRITE} (not that they mattered, since nothing
+       really used it)
+    
+     - microblaze used the type argument for a debug printout
+    
+    but other than those oddities this should be a total no-op patch.
+    
+    I tried to fix up all architectures, did fairly extensive grepping for
+    access_ok() uses, and the changes are trivial, but I may have missed
+    something.  Any missed conversion should be trivially fixable, though.
+    
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+index d99a8ee9e185..f6a1d299627c 100644
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -164,7 +164,7 @@ int copy_fpstate_to_sigframe(void __user *buf, void __user *buf_fx, int size)
+ 	ia32_fxstate &= (IS_ENABLED(CONFIG_X86_32) ||
+ 			 IS_ENABLED(CONFIG_IA32_EMULATION));
+ 
+-	if (!access_ok(VERIFY_WRITE, buf, size))
++	if (!access_ok(buf, size))
+ 		return -EACCES;
+ 
+ 	if (!static_cpu_has(X86_FEATURE_FPU))
+@@ -281,7 +281,7 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 		return 0;
+ 	}
+ 
+-	if (!access_ok(VERIFY_READ, buf, size))
++	if (!access_ok(buf, size))
+ 		return -EACCES;
+ 
+ 	fpu__initialize(fpu);
+
+commit 68239654acafe6aad5a3c1dc7237e60accfebc03
+Author: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Date:   Tue Nov 20 11:26:35 2018 +0100
+
+    x86/fpu: Disable bottom halves while loading FPU registers
+    
+    The sequence
+    
+      fpu->initialized = 1;         /* step A */
+      preempt_disable();            /* step B */
+      fpu__restore(fpu);
+      preempt_enable();
+    
+    in __fpu__restore_sig() is racy in regard to a context switch.
+    
+    For 32bit frames, __fpu__restore_sig() prepares the FPU state within
+    fpu->state. To ensure that a context switch (switch_fpu_prepare() in
+    particular) does not modify fpu->state it uses fpu__drop() which sets
+    fpu->initialized to 0.
+    
+    After fpu->initialized is cleared, the CPU's FPU state is not saved
+    to fpu->state during a context switch. The new state is loaded via
+    fpu__restore(). It gets loaded into fpu->state from userland and
+    ensured it is sane. fpu->initialized is then set to 1 in order to avoid
+    fpu__initialize() doing anything (overwrite the new state) which is part
+    of fpu__restore().
+    
+    A context switch between step A and B above would save CPU's current FPU
+    registers to fpu->state and overwrite the newly prepared state. This
+    looks like a tiny race window but the Kernel Test Robot reported this
+    back in 2016 while we had lazy FPU support. Borislav Petkov made the
+    link between that report and another patch that has been posted. Since
+    the removal of the lazy FPU support, this race goes unnoticed because
+    the warning has been removed.
+    
+    Disable bottom halves around the restore sequence to avoid the race. BH
+    need to be disabled because BH is allowed to run (even with preemption
+    disabled) and might invoke kernel_fpu_begin() by doing IPsec.
+    
+     [ bp: massage commit message a bit. ]
+    
+    Signed-off-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+    Signed-off-by: Borislav Petkov <bp@suse.de>
+    Acked-by: Ingo Molnar <mingo@kernel.org>
+    Acked-by: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Andy Lutomirski <luto@kernel.org>
+    Cc: Dave Hansen <dave.hansen@linux.intel.com>
+    Cc: "H. Peter Anvin" <hpa@zytor.com>
+    Cc: "Jason A. Donenfeld" <Jason@zx2c4.com>
+    Cc: kvm ML <kvm@vger.kernel.org>
+    Cc: Paolo Bonzini <pbonzini@redhat.com>
+    Cc: Radim Krčmář <rkrcmar@redhat.com>
+    Cc: Rik van Riel <riel@surriel.com>
+    Cc: stable@vger.kernel.org
+    Cc: x86-ml <x86@kernel.org>
+    Link: http://lkml.kernel.org/r/20181120102635.ddv3fvavxajjlfqk@linutronix.de
+    Link: https://lkml.kernel.org/r/20160226074940.GA28911@pd.tnic
+
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+index 61a949d84dfa..d99a8ee9e185 100644
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -344,10 +344,10 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 			sanitize_restored_xstate(tsk, &env, xfeatures, fx_only);
+ 		}
+ 
++		local_bh_disable();
+ 		fpu->initialized = 1;
+-		preempt_disable();
+ 		fpu__restore(fpu);
+-		preempt_enable();
++		local_bh_enable();
+ 
+ 		return err;
+ 	} else {
+
+commit 6aa676761d4c1acfa31320e55fa1f83f3fcbbc7a
+Author: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Date:   Tue Oct 16 22:25:24 2018 +0200
+
+    x86/fpu: Remove second definition of fpu in __fpu__restore_sig()
+    
+    Commit:
+    
+      c5bedc6847c3b ("x86/fpu: Get rid of PF_USED_MATH usage, convert it to fpu->fpstate_active")
+    
+    introduced the 'fpu' variable at top of __restore_xstate_sig(),
+    which now shadows the other definition:
+    
+      arch/x86/kernel/fpu/signal.c:318:28: warning: symbol 'fpu' shadows an earlier one
+      arch/x86/kernel/fpu/signal.c:271:20: originally declared here
+    
+    Remove the shadowed definition of 'fpu', as the two definitions are the same.
+    
+    Signed-off-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+    Reviewed-by: Andy Lutomirski <luto@kernel.org>
+    Cc: Borislav Petkov <bp@alien8.de>
+    Cc: Dave Hansen <dave.hansen@linux.intel.com>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Fixes: c5bedc6847c3b ("x86/fpu: Get rid of PF_USED_MATH usage, convert it to fpu->fpstate_active")
+    Link: http://lkml.kernel.org/r/20181016202525.29437-3-bigeasy@linutronix.de
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+index 23f1691670b6..61a949d84dfa 100644
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -314,7 +314,6 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 		 * thread's fpu state, reconstruct fxstate from the fsave
+ 		 * header. Validate and sanitize the copied state.
+ 		 */
+-		struct fpu *fpu = &tsk->thread.fpu;
+ 		struct user_i387_ia32_struct env;
+ 		int err = 0;
+ 
+
+commit b24413180f5600bcb3bb70fbed5cf186b60864bd
+Author: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Date:   Wed Nov 1 15:07:57 2017 +0100
+
+    License cleanup: add SPDX GPL-2.0 license identifier to files with no license
+    
+    Many source files in the tree are missing licensing information, which
+    makes it harder for compliance tools to determine the correct license.
+    
+    By default all files without license information are under the default
+    license of the kernel, which is GPL version 2.
+    
+    Update the files which contain no license information with the 'GPL-2.0'
+    SPDX license identifier.  The SPDX identifier is a legally binding
+    shorthand, which can be used instead of the full boiler plate text.
+    
+    This patch is based on work done by Thomas Gleixner and Kate Stewart and
+    Philippe Ombredanne.
+    
+    How this work was done:
+    
+    Patches were generated and checked against linux-4.14-rc6 for a subset of
+    the use cases:
+     - file had no licensing information it it.
+     - file was a */uapi/* one with no licensing information in it,
+     - file was a */uapi/* one with existing licensing information,
+    
+    Further patches will be generated in subsequent months to fix up cases
+    where non-standard license headers were used, and references to license
+    had to be inferred by heuristics based on keywords.
+    
+    The analysis to determine which SPDX License Identifier to be applied to
+    a file was done in a spreadsheet of side by side results from of the
+    output of two independent scanners (ScanCode & Windriver) producing SPDX
+    tag:value files created by Philippe Ombredanne.  Philippe prepared the
+    base worksheet, and did an initial spot review of a few 1000 files.
+    
+    The 4.13 kernel was the starting point of the analysis with 60,537 files
+    assessed.  Kate Stewart did a file by file comparison of the scanner
+    results in the spreadsheet to determine which SPDX license identifier(s)
+    to be applied to the file. She confirmed any determination that was not
+    immediately clear with lawyers working with the Linux Foundation.
+    
+    Criteria used to select files for SPDX license identifier tagging was:
+     - Files considered eligible had to be source code files.
+     - Make and config files were included as candidates if they contained >5
+       lines of source
+     - File already had some variant of a license header in it (even if <5
+       lines).
+    
+    All documentation files were explicitly excluded.
+    
+    The following heuristics were used to determine which SPDX license
+    identifiers to apply.
+    
+     - when both scanners couldn't find any license traces, file was
+       considered to have no license information in it, and the top level
+       COPYING file license applied.
+    
+       For non */uapi/* files that summary was:
+    
+       SPDX license identifier                            # files
+       ---------------------------------------------------|-------
+       GPL-2.0                                              11139
+    
+       and resulted in the first patch in this series.
+    
+       If that file was a */uapi/* path one, it was "GPL-2.0 WITH
+       Linux-syscall-note" otherwise it was "GPL-2.0".  Results of that was:
+    
+       SPDX license identifier                            # files
+       ---------------------------------------------------|-------
+       GPL-2.0 WITH Linux-syscall-note                        930
+    
+       and resulted in the second patch in this series.
+    
+     - if a file had some form of licensing information in it, and was one
+       of the */uapi/* ones, it was denoted with the Linux-syscall-note if
+       any GPL family license was found in the file or had no licensing in
+       it (per prior point).  Results summary:
+    
+       SPDX license identifier                            # files
+       ---------------------------------------------------|------
+       GPL-2.0 WITH Linux-syscall-note                       270
+       GPL-2.0+ WITH Linux-syscall-note                      169
+       ((GPL-2.0 WITH Linux-syscall-note) OR BSD-2-Clause)    21
+       ((GPL-2.0 WITH Linux-syscall-note) OR BSD-3-Clause)    17
+       LGPL-2.1+ WITH Linux-syscall-note                      15
+       GPL-1.0+ WITH Linux-syscall-note                       14
+       ((GPL-2.0+ WITH Linux-syscall-note) OR BSD-3-Clause)    5
+       LGPL-2.0+ WITH Linux-syscall-note                       4
+       LGPL-2.1 WITH Linux-syscall-note                        3
+       ((GPL-2.0 WITH Linux-syscall-note) OR MIT)              3
+       ((GPL-2.0 WITH Linux-syscall-note) AND MIT)             1
+    
+       and that resulted in the third patch in this series.
+    
+     - when the two scanners agreed on the detected license(s), that became
+       the concluded license(s).
+    
+     - when there was disagreement between the two scanners (one detected a
+       license but the other didn't, or they both detected different
+       licenses) a manual inspection of the file occurred.
+    
+     - In most cases a manual inspection of the information in the file
+       resulted in a clear resolution of the license that should apply (and
+       which scanner probably needed to revisit its heuristics).
+    
+     - When it was not immediately clear, the license identifier was
+       confirmed with lawyers working with the Linux Foundation.
+    
+     - If there was any question as to the appropriate license identifier,
+       the file was flagged for further research and to be revisited later
+       in time.
+    
+    In total, over 70 hours of logged manual review was done on the
+    spreadsheet to determine the SPDX license identifiers to apply to the
+    source files by Kate, Philippe, Thomas and, in some cases, confirmation
+    by lawyers working with the Linux Foundation.
+    
+    Kate also obtained a third independent scan of the 4.13 code base from
+    FOSSology, and compared selected files where the other two scanners
+    disagreed against that SPDX file, to see if there was new insights.  The
+    Windriver scanner is based on an older version of FOSSology in part, so
+    they are related.
+    
+    Thomas did random spot checks in about 500 files from the spreadsheets
+    for the uapi headers and agreed with SPDX license identifier in the
+    files he inspected. For the non-uapi files Thomas did random spot checks
+    in about 15000 files.
+    
+    In initial set of patches against 4.14-rc6, 3 files were found to have
+    copy/paste license identifier errors, and have been fixed to reflect the
+    correct identifier.
+    
+    Additionally Philippe spent 10 hours this week doing a detailed manual
+    inspection and review of the 12,461 patched files from the initial patch
+    version early this week with:
+     - a full scancode scan run, collecting the matched texts, detected
+       license ids and scores
+     - reviewing anything where there was a license detected (about 500+
+       files) to ensure that the applied SPDX license was correct
+     - reviewing anything where there was no detection but the patch license
+       was not GPL-2.0 WITH Linux-syscall-note to ensure that the applied
+       SPDX license was correct
+    
+    This produced a worksheet with 20 files needing minor correction.  This
+    worksheet was then exported into 3 different .csv files for the
+    different types of files to be modified.
+    
+    These .csv files were then reviewed by Greg.  Thomas wrote a script to
+    parse the csv files and add the proper SPDX tag to the file, in the
+    format that the file expected.  This script was further refined by Greg
+    based on the output to detect more types of files automatically and to
+    distinguish between header and source .c files (which need different
+    comment types.)  Finally Greg ran the script using the .csv files to
+    generate the patches.
+    
+    Reviewed-by: Kate Stewart <kstewart@linuxfoundation.org>
+    Reviewed-by: Philippe Ombredanne <pombredanne@nexb.com>
+    Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+index fb639e70048f..23f1691670b6 100644
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -1,3 +1,4 @@
++// SPDX-License-Identifier: GPL-2.0
+ /*
+  * FPU signal frame handling routines.
+  */
+
+commit b11e2e18a7fc8eaa3d592c260d50c7129e094ded
+Author: Eric Biggers <ebiggers@google.com>
+Date:   Sun Sep 24 12:59:06 2017 +0200
+
+    x86/fpu: Use validate_xstate_header() to validate the xstate_header in __fpu__restore_sig()
+    
+    Tighten the checks in __fpu__restore_sig() and update comments.
+    
+    Signed-off-by: Eric Biggers <ebiggers@google.com>
+    Cc: Andrew Morton <akpm@linux-foundation.org>
+    Cc: Andy Lutomirski <luto@amacapital.net>
+    Cc: Andy Lutomirski <luto@kernel.org>
+    Cc: Borislav Petkov <bp@alien8.de>
+    Cc: Dave Hansen <dave.hansen@linux.intel.com>
+    Cc: Dmitry Vyukov <dvyukov@google.com>
+    Cc: Eric Biggers <ebiggers3@gmail.com>
+    Cc: Fenghua Yu <fenghua.yu@intel.com>
+    Cc: Kees Cook <keescook@chromium.org>
+    Cc: Kevin Hao <haokexin@gmail.com>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Michael Halcrow <mhalcrow@google.com>
+    Cc: Oleg Nesterov <oleg@redhat.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Rik van Riel <riel@redhat.com>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Wanpeng Li <wanpeng.li@hotmail.com>
+    Cc: Yu-cheng Yu <yu-cheng.yu@intel.com>
+    Cc: kernel-hardening@lists.openwall.com
+    Link: http://lkml.kernel.org/r/20170924105913.9157-4-mingo@kernel.org
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+index 7fa3bdb331e9..fb639e70048f 100644
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -214,8 +214,11 @@ sanitize_restored_xstate(struct task_struct *tsk,
+ 	struct xstate_header *header = &xsave->header;
+ 
+ 	if (use_xsave()) {
+-		/* These bits must be zero. */
+-		memset(header->reserved, 0, 48);
++		/*
++		 * Note: we don't need to zero the reserved bits in the
++		 * xstate_header here because we either didn't copy them at all,
++		 * or we checked earlier that they aren't set.
++		 */
+ 
+ 		/*
+ 		 * Init the state that is not present in the memory
+@@ -224,7 +227,7 @@ sanitize_restored_xstate(struct task_struct *tsk,
+ 		if (fx_only)
+ 			header->xfeatures = XFEATURE_MASK_FPSSE;
+ 		else
+-			header->xfeatures &= (xfeatures_mask & xfeatures);
++			header->xfeatures &= xfeatures;
+ 	}
+ 
+ 	if (use_fxsr()) {
+@@ -308,7 +311,7 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 		/*
+ 		 * For 32-bit frames with fxstate, copy the user state to the
+ 		 * thread's fpu state, reconstruct fxstate from the fsave
+-		 * header. Sanitize the copied state etc.
++		 * header. Validate and sanitize the copied state.
+ 		 */
+ 		struct fpu *fpu = &tsk->thread.fpu;
+ 		struct user_i387_ia32_struct env;
+@@ -329,9 +332,8 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 		} else {
+ 			err = __copy_from_user(&fpu->state.xsave, buf_fx, state_size);
+ 
+-			/* xcomp_bv must be 0 when using uncompacted format */
+-			if (!err && state_size > offsetof(struct xregs_state, header) && fpu->state.xsave.header.xcomp_bv)
+-				err = -EINVAL;
++			if (!err && state_size > offsetof(struct xregs_state, header))
++				err = validate_xstate_header(&fpu->state.xsave.header);
+ 		}
+ 
+ 		if (err || __copy_from_user(&env, buf, sizeof(env))) {
+
+commit 2ce03d850b9a2f17d55596ecfa86e72b5687a627
+Author: Ingo Molnar <mingo@kernel.org>
+Date:   Sat Sep 23 15:00:15 2017 +0200
+
+    x86/fpu: Rename fpu__activate_curr() to fpu__initialize()
+    
+    Rename this function to better express that it's all about
+    initializing the FPU state of a task which goes hand in hand
+    with the fpu::initialized field.
+    
+    Cc: Andrew Morton <akpm@linux-foundation.org>
+    Cc: Andy Lutomirski <luto@amacapital.net>
+    Cc: Borislav Petkov <bp@alien8.de>
+    Cc: Dave Hansen <dave.hansen@linux.intel.com>
+    Cc: Eric Biggers <ebiggers3@gmail.com>
+    Cc: Fenghua Yu <fenghua.yu@intel.com>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Oleg Nesterov <oleg@redhat.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Rik van Riel <riel@redhat.com>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Yu-cheng Yu <yu-cheng.yu@intel.com>
+    Link: http://lkml.kernel.org/r/20170923130016.21448-33-mingo@kernel.org
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+index ab2dd24cfea4..7fa3bdb331e9 100644
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -280,7 +280,7 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 	if (!access_ok(VERIFY_READ, buf, size))
+ 		return -EACCES;
+ 
+-	fpu__activate_curr(fpu);
++	fpu__initialize(fpu);
+ 
+ 	if (!static_cpu_has(X86_FEATURE_FPU))
+ 		return fpregs_soft_set(current, NULL,
+
+commit e4a81bfcaae1ebbdc6efe74e8ea563144d90e9a9
+Author: Ingo Molnar <mingo@kernel.org>
+Date:   Tue Sep 26 09:43:36 2017 +0200
+
+    x86/fpu: Rename fpu::fpstate_active to fpu::initialized
+    
+    The x86 FPU code used to have a complex state machine where both the FPU
+    registers and the FPU state context could be 'active' (or inactive)
+    independently of each other - which enabled features like lazy FPU restore.
+    
+    Much of this complexity is gone in the current code: now we basically can
+    have FPU-less tasks (kernel threads) that don't use (and save/restore) FPU
+    state at all, plus full FPU users that save/restore directly with no laziness
+    whatsoever.
+    
+    But the fpu::fpstate_active still carries bits of the old complexity - meanwhile
+    this flag has become a simple flag that shows whether the FPU context saving
+    area in the thread struct is initialized and used, or not.
+    
+    Rename it to fpu::initialized to express this simplicity in the name as well.
+    
+    Cc: Andrew Morton <akpm@linux-foundation.org>
+    Cc: Andy Lutomirski <luto@amacapital.net>
+    Cc: Borislav Petkov <bp@alien8.de>
+    Cc: Dave Hansen <dave.hansen@linux.intel.com>
+    Cc: Eric Biggers <ebiggers3@gmail.com>
+    Cc: Fenghua Yu <fenghua.yu@intel.com>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Oleg Nesterov <oleg@redhat.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Rik van Riel <riel@redhat.com>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Yu-cheng Yu <yu-cheng.yu@intel.com>
+    Link: http://lkml.kernel.org/r/20170923130016.21448-30-mingo@kernel.org
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+index da68ea1c3a44..ab2dd24cfea4 100644
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -171,7 +171,7 @@ int copy_fpstate_to_sigframe(void __user *buf, void __user *buf_fx, int size)
+ 			sizeof(struct user_i387_ia32_struct), NULL,
+ 			(struct _fpstate_32 __user *) buf) ? -1 : 1;
+ 
+-	if (fpu->fpstate_active || using_compacted_format()) {
++	if (fpu->initialized || using_compacted_format()) {
+ 		/* Save the live register state to the user directly. */
+ 		if (copy_fpregs_to_sigframe(buf_fx))
+ 			return -1;
+@@ -315,12 +315,12 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 		int err = 0;
+ 
+ 		/*
+-		 * Drop the current fpu which clears fpu->fpstate_active. This ensures
++		 * Drop the current fpu which clears fpu->initialized. This ensures
+ 		 * that any context-switch during the copy of the new state,
+ 		 * avoids the intermediate state from getting restored/saved.
+ 		 * Thus avoiding the new restored state from getting corrupted.
+ 		 * We will be ready to restore/save the state only after
+-		 * fpu->fpstate_active is again set.
++		 * fpu->initialized is again set.
+ 		 */
+ 		fpu__drop(fpu);
+ 
+@@ -342,7 +342,7 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 			sanitize_restored_xstate(tsk, &env, xfeatures, fx_only);
+ 		}
+ 
+-		fpu->fpstate_active = 1;
++		fpu->initialized = 1;
+ 		preempt_disable();
+ 		fpu__restore(fpu);
+ 		preempt_enable();
+
+commit 814fb7bb7db5433757d76f4c4502c96fc53b0b5e
+Author: Eric Biggers <ebiggers@google.com>
+Date:   Sat Sep 23 15:00:07 2017 +0200
+
+    x86/fpu: Don't let userspace set bogus xcomp_bv
+    
+    On x86, userspace can use the ptrace() or rt_sigreturn() system calls to
+    set a task's extended state (xstate) or "FPU" registers.  ptrace() can
+    set them for another task using the PTRACE_SETREGSET request with
+    NT_X86_XSTATE, while rt_sigreturn() can set them for the current task.
+    In either case, registers can be set to any value, but the kernel
+    assumes that the XSAVE area itself remains valid in the sense that the
+    CPU can restore it.
+    
+    However, in the case where the kernel is using the uncompacted xstate
+    format (which it does whenever the XSAVES instruction is unavailable),
+    it was possible for userspace to set the xcomp_bv field in the
+    xstate_header to an arbitrary value.  However, all bits in that field
+    are reserved in the uncompacted case, so when switching to a task with
+    nonzero xcomp_bv, the XRSTOR instruction failed with a #GP fault.  This
+    caused the WARN_ON_FPU(err) in copy_kernel_to_xregs() to be hit.  In
+    addition, since the error is otherwise ignored, the FPU registers from
+    the task previously executing on the CPU were leaked.
+    
+    Fix the bug by checking that the user-supplied value of xcomp_bv is 0 in
+    the uncompacted case, and returning an error otherwise.
+    
+    The reason for validating xcomp_bv rather than simply overwriting it
+    with 0 is that we want userspace to see an error if it (incorrectly)
+    provides an XSAVE area in compacted format rather than in uncompacted
+    format.
+    
+    Note that as before, in case of error we clear the task's FPU state.
+    This is perhaps non-ideal, especially for PTRACE_SETREGSET; it might be
+    better to return an error before changing anything.  But it seems the
+    "clear on error" behavior is fine for now, and it's a little tricky to
+    do otherwise because it would mean we couldn't simply copy the full
+    userspace state into kernel memory in one __copy_from_user().
+    
+    This bug was found by syzkaller, which hit the above-mentioned
+    WARN_ON_FPU():
+    
+        WARNING: CPU: 1 PID: 0 at ./arch/x86/include/asm/fpu/internal.h:373 __switch_to+0x5b5/0x5d0
+        CPU: 1 PID: 0 Comm: swapper/1 Not tainted 4.13.0 #453
+        Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS Bochs 01/01/2011
+        task: ffff9ba2bc8e42c0 task.stack: ffffa78cc036c000
+        RIP: 0010:__switch_to+0x5b5/0x5d0
+        RSP: 0000:ffffa78cc08bbb88 EFLAGS: 00010082
+        RAX: 00000000fffffffe RBX: ffff9ba2b8bf2180 RCX: 00000000c0000100
+        RDX: 00000000ffffffff RSI: 000000005cb10700 RDI: ffff9ba2b8bf36c0
+        RBP: ffffa78cc08bbbd0 R08: 00000000929fdf46 R09: 0000000000000001
+        R10: 0000000000000000 R11: 0000000000000000 R12: ffff9ba2bc8e42c0
+        R13: 0000000000000000 R14: ffff9ba2b8bf3680 R15: ffff9ba2bf5d7b40
+        FS:  00007f7e5cb10700(0000) GS:ffff9ba2bf400000(0000) knlGS:0000000000000000
+        CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+        CR2: 00000000004005cc CR3: 0000000079fd5000 CR4: 00000000001406e0
+        Call Trace:
+        Code: 84 00 00 00 00 00 e9 11 fd ff ff 0f ff 66 0f 1f 84 00 00 00 00 00 e9 e7 fa ff ff 0f ff 66 0f 1f 84 00 00 00 00 00 e9 c2 fa ff ff <0f> ff 66 0f 1f 84 00 00 00 00 00 e9 d4 fc ff ff 66 66 2e 0f 1f
+    
+    Here is a C reproducer.  The expected behavior is that the program spin
+    forever with no output.  However, on a buggy kernel running on a
+    processor with the "xsave" feature but without the "xsaves" feature
+    (e.g. Sandy Bridge through Broadwell for Intel), within a second or two
+    the program reports that the xmm registers were corrupted, i.e. were not
+    restored correctly.  With CONFIG_X86_DEBUG_FPU=y it also hits the above
+    kernel warning.
+    
+        #define _GNU_SOURCE
+        #include <stdbool.h>
+        #include <inttypes.h>
+        #include <linux/elf.h>
+        #include <stdio.h>
+        #include <sys/ptrace.h>
+        #include <sys/uio.h>
+        #include <sys/wait.h>
+        #include <unistd.h>
+    
+        int main(void)
+        {
+            int pid = fork();
+            uint64_t xstate[512];
+            struct iovec iov = { .iov_base = xstate, .iov_len = sizeof(xstate) };
+    
+            if (pid == 0) {
+                bool tracee = true;
+                for (int i = 0; i < sysconf(_SC_NPROCESSORS_ONLN) && tracee; i++)
+                    tracee = (fork() != 0);
+                uint32_t xmm0[4] = { [0 ... 3] = tracee ? 0x00000000 : 0xDEADBEEF };
+                asm volatile("   movdqu %0, %%xmm0\n"
+                             "   mov %0, %%rbx\n"
+                             "1: movdqu %%xmm0, %0\n"
+                             "   mov %0, %%rax\n"
+                             "   cmp %%rax, %%rbx\n"
+                             "   je 1b\n"
+                             : "+m" (xmm0) : : "rax", "rbx", "xmm0");
+                printf("BUG: xmm registers corrupted!  tracee=%d, xmm0=%08X%08X%08X%08X\n",
+                       tracee, xmm0[0], xmm0[1], xmm0[2], xmm0[3]);
+            } else {
+                usleep(100000);
+                ptrace(PTRACE_ATTACH, pid, 0, 0);
+                wait(NULL);
+                ptrace(PTRACE_GETREGSET, pid, NT_X86_XSTATE, &iov);
+                xstate[65] = -1;
+                ptrace(PTRACE_SETREGSET, pid, NT_X86_XSTATE, &iov);
+                ptrace(PTRACE_CONT, pid, 0, 0);
+                wait(NULL);
+            }
+            return 1;
+        }
+    
+    Note: the program only tests for the bug using the ptrace() system call.
+    The bug can also be reproduced using the rt_sigreturn() system call, but
+    only when called from a 32-bit program, since for 64-bit programs the
+    kernel restores the FPU state from the signal frame by doing XRSTOR
+    directly from userspace memory (with proper error checking).
+    
+    Reported-by: Dmitry Vyukov <dvyukov@google.com>
+    Signed-off-by: Eric Biggers <ebiggers@google.com>
+    Reviewed-by: Kees Cook <keescook@chromium.org>
+    Reviewed-by: Rik van Riel <riel@redhat.com>
+    Acked-by: Dave Hansen <dave.hansen@linux.intel.com>
+    Cc: <stable@vger.kernel.org> [v3.17+]
+    Cc: Andrew Morton <akpm@linux-foundation.org>
+    Cc: Andy Lutomirski <luto@amacapital.net>
+    Cc: Andy Lutomirski <luto@kernel.org>
+    Cc: Borislav Petkov <bp@alien8.de>
+    Cc: Eric Biggers <ebiggers3@gmail.com>
+    Cc: Fenghua Yu <fenghua.yu@intel.com>
+    Cc: Kevin Hao <haokexin@gmail.com>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Michael Halcrow <mhalcrow@google.com>
+    Cc: Oleg Nesterov <oleg@redhat.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Wanpeng Li <wanpeng.li@hotmail.com>
+    Cc: Yu-cheng Yu <yu-cheng.yu@intel.com>
+    Cc: kernel-hardening@lists.openwall.com
+    Fixes: 0b29643a5843 ("x86/xsaves: Change compacted format xsave area header")
+    Link: http://lkml.kernel.org/r/20170922174156.16780-2-ebiggers3@gmail.com
+    Link: http://lkml.kernel.org/r/20170923130016.21448-25-mingo@kernel.org
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+index 629106e51a29..da68ea1c3a44 100644
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -324,11 +324,16 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 		 */
+ 		fpu__drop(fpu);
+ 
+-		if (using_compacted_format())
++		if (using_compacted_format()) {
+ 			err = copy_user_to_xstate(&fpu->state.xsave, buf_fx);
+-		else
++		} else {
+ 			err = __copy_from_user(&fpu->state.xsave, buf_fx, state_size);
+ 
++			/* xcomp_bv must be 0 when using uncompacted format */
++			if (!err && state_size > offsetof(struct xregs_state, header) && fpu->state.xsave.header.xcomp_bv)
++				err = -EINVAL;
++		}
++
+ 		if (err || __copy_from_user(&env, buf, sizeof(env))) {
+ 			fpstate_init(&fpu->state);
+ 			trace_x86_fpu_init_state(fpu);
+
+commit 99dc26bda233ee722bbd370bddf20beece3ffb93
+Author: Ingo Molnar <mingo@kernel.org>
+Date:   Sat Sep 23 15:00:03 2017 +0200
+
+    x86/fpu: Remove struct fpu::fpregs_active
+    
+    The previous changes paved the way for the removal of the
+    fpu::fpregs_active state flag - we now only have the
+    fpu::fpstate_active and fpu::last_cpu fields left.
+    
+    Cc: Andrew Morton <akpm@linux-foundation.org>
+    Cc: Andy Lutomirski <luto@amacapital.net>
+    Cc: Andy Lutomirski <luto@kernel.org>
+    Cc: Borislav Petkov <bp@alien8.de>
+    Cc: Dave Hansen <dave.hansen@linux.intel.com>
+    Cc: Eric Biggers <ebiggers3@gmail.com>
+    Cc: Fenghua Yu <fenghua.yu@intel.com>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Oleg Nesterov <oleg@redhat.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Rik van Riel <riel@redhat.com>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Yu-cheng Yu <yu-cheng.yu@intel.com>
+    Link: http://lkml.kernel.org/r/20170923130016.21448-21-mingo@kernel.org
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+index a88083ba7f8b..629106e51a29 100644
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -171,8 +171,6 @@ int copy_fpstate_to_sigframe(void __user *buf, void __user *buf_fx, int size)
+ 			sizeof(struct user_i387_ia32_struct), NULL,
+ 			(struct _fpstate_32 __user *) buf) ? -1 : 1;
+ 
+-	WARN_ON_FPU(fpu->fpstate_active != fpu->fpregs_active);
+-
+ 	if (fpu->fpstate_active || using_compacted_format()) {
+ 		/* Save the live register state to the user directly. */
+ 		if (copy_fpregs_to_sigframe(buf_fx))
+
+commit f1c8cd0176078c7bcafdc89cac447cab672a0b5e
+Author: Ingo Molnar <mingo@kernel.org>
+Date:   Sat Sep 23 15:00:01 2017 +0200
+
+    x86/fpu: Change fpu->fpregs_active users to fpu->fpstate_active
+    
+    We want to simplify the FPU state machine by eliminating fpu->fpregs_active,
+    and we can do that because the two state flags (::fpregs_active and
+    ::fpstate_active) are set essentially together.
+    
+    The old lazy FPU switching code used to make a distinction - but there's
+    no lazy switching code anymore, we always switch in an 'eager' fashion.
+    
+    Do this by first changing all substantial uses of fpu->fpregs_active
+    to fpu->fpstate_active and adding a few debug checks to double check
+    our assumption is correct.
+    
+    Cc: Andrew Morton <akpm@linux-foundation.org>
+    Cc: Andy Lutomirski <luto@amacapital.net>
+    Cc: Andy Lutomirski <luto@kernel.org>
+    Cc: Borislav Petkov <bp@alien8.de>
+    Cc: Dave Hansen <dave.hansen@linux.intel.com>
+    Cc: Eric Biggers <ebiggers3@gmail.com>
+    Cc: Fenghua Yu <fenghua.yu@intel.com>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Oleg Nesterov <oleg@redhat.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Rik van Riel <riel@redhat.com>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Yu-cheng Yu <yu-cheng.yu@intel.com>
+    Link: http://lkml.kernel.org/r/20170923130016.21448-19-mingo@kernel.org
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+index 684025654d0c..a88083ba7f8b 100644
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -171,7 +171,9 @@ int copy_fpstate_to_sigframe(void __user *buf, void __user *buf_fx, int size)
+ 			sizeof(struct user_i387_ia32_struct), NULL,
+ 			(struct _fpstate_32 __user *) buf) ? -1 : 1;
+ 
+-	if (fpu->fpregs_active || using_compacted_format()) {
++	WARN_ON_FPU(fpu->fpstate_active != fpu->fpregs_active);
++
++	if (fpu->fpstate_active || using_compacted_format()) {
+ 		/* Save the live register state to the user directly. */
+ 		if (copy_fpregs_to_sigframe(buf_fx))
+ 			return -1;
+
+commit b3a163081c28d1a4d1ad76259a9d93b34a82f1da
+Author: Ingo Molnar <mingo@kernel.org>
+Date:   Sat Sep 23 14:59:58 2017 +0200
+
+    x86/fpu: Simplify fpu->fpregs_active use
+    
+    The fpregs_active() inline function is pretty pointless - in almost
+    all the callsites it can be replaced with a direct fpu->fpregs_active
+    access.
+    
+    Do so and eliminate the extra layer of obfuscation.
+    
+    Cc: Andrew Morton <akpm@linux-foundation.org>
+    Cc: Andy Lutomirski <luto@amacapital.net>
+    Cc: Andy Lutomirski <luto@kernel.org>
+    Cc: Borislav Petkov <bp@alien8.de>
+    Cc: Dave Hansen <dave.hansen@linux.intel.com>
+    Cc: Eric Biggers <ebiggers3@gmail.com>
+    Cc: Fenghua Yu <fenghua.yu@intel.com>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Oleg Nesterov <oleg@redhat.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Rik van Riel <riel@redhat.com>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Yu-cheng Yu <yu-cheng.yu@intel.com>
+    Link: http://lkml.kernel.org/r/20170923130016.21448-16-mingo@kernel.org
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+index 2d682dac35d4..684025654d0c 100644
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -155,7 +155,8 @@ static inline int copy_fpregs_to_sigframe(struct xregs_state __user *buf)
+  */
+ int copy_fpstate_to_sigframe(void __user *buf, void __user *buf_fx, int size)
+ {
+-	struct xregs_state *xsave = &current->thread.fpu.state.xsave;
++	struct fpu *fpu = &current->thread.fpu;
++	struct xregs_state *xsave = &fpu->state.xsave;
+ 	struct task_struct *tsk = current;
+ 	int ia32_fxstate = (buf != buf_fx);
+ 
+@@ -170,13 +171,13 @@ int copy_fpstate_to_sigframe(void __user *buf, void __user *buf_fx, int size)
+ 			sizeof(struct user_i387_ia32_struct), NULL,
+ 			(struct _fpstate_32 __user *) buf) ? -1 : 1;
+ 
+-	if (fpregs_active() || using_compacted_format()) {
++	if (fpu->fpregs_active || using_compacted_format()) {
+ 		/* Save the live register state to the user directly. */
+ 		if (copy_fpregs_to_sigframe(buf_fx))
+ 			return -1;
+ 		/* Update the thread's fxstate to save the fsave header. */
+ 		if (ia32_fxstate)
+-			copy_fxregs_to_kernel(&tsk->thread.fpu);
++			copy_fxregs_to_kernel(fpu);
+ 	} else {
+ 		/*
+ 		 * It is a *bug* if kernel uses compacted-format for xsave
+@@ -189,7 +190,7 @@ int copy_fpstate_to_sigframe(void __user *buf, void __user *buf_fx, int size)
+ 			return -1;
+ 		}
+ 
+-		fpstate_sanitize_xstate(&tsk->thread.fpu);
++		fpstate_sanitize_xstate(fpu);
+ 		if (__copy_to_user(buf_fx, xsave, fpu_user_xstate_size))
+ 			return -1;
+ 	}
+
+commit 6d7f7da5533a3f841eeb1d9657257c9367924274
+Author: Ingo Molnar <mingo@kernel.org>
+Date:   Sat Sep 23 14:59:57 2017 +0200
+
+    x86/fpu: Flip the parameter order in copy_*_to_xstate()
+    
+    Make it more consistent with regular memcpy() semantics, where the destination
+    argument comes first.
+    
+    No change in functionality.
+    
+    Cc: Andrew Morton <akpm@linux-foundation.org>
+    Cc: Andy Lutomirski <luto@amacapital.net>
+    Cc: Andy Lutomirski <luto@kernel.org>
+    Cc: Borislav Petkov <bp@alien8.de>
+    Cc: Dave Hansen <dave.hansen@linux.intel.com>
+    Cc: Eric Biggers <ebiggers3@gmail.com>
+    Cc: Fenghua Yu <fenghua.yu@intel.com>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Oleg Nesterov <oleg@redhat.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Rik van Riel <riel@redhat.com>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Yu-cheng Yu <yu-cheng.yu@intel.com>
+    Link: http://lkml.kernel.org/r/20170923130016.21448-15-mingo@kernel.org
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+index 2c685b492fd6..2d682dac35d4 100644
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -324,7 +324,7 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 		fpu__drop(fpu);
+ 
+ 		if (using_compacted_format())
+-			err = copy_user_to_xstate(buf_fx, &fpu->state.xsave);
++			err = copy_user_to_xstate(&fpu->state.xsave, buf_fx);
+ 		else
+ 			err = __copy_from_user(&fpu->state.xsave, buf_fx, state_size);
+ 
+
+commit 7b9094c688f807c110a2dab6f6edc5876bfa7b0b
+Author: Ingo Molnar <mingo@kernel.org>
+Date:   Sat Sep 23 14:59:56 2017 +0200
+
+    x86/fpu: Remove 'kbuf' parameter from the copy_user_to_xstate() API
+    
+    No change in functionality.
+    
+    Cc: Andrew Morton <akpm@linux-foundation.org>
+    Cc: Andy Lutomirski <luto@amacapital.net>
+    Cc: Andy Lutomirski <luto@kernel.org>
+    Cc: Borislav Petkov <bp@alien8.de>
+    Cc: Dave Hansen <dave.hansen@linux.intel.com>
+    Cc: Eric Biggers <ebiggers3@gmail.com>
+    Cc: Fenghua Yu <fenghua.yu@intel.com>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Oleg Nesterov <oleg@redhat.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Rik van Riel <riel@redhat.com>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Yu-cheng Yu <yu-cheng.yu@intel.com>
+    Link: http://lkml.kernel.org/r/20170923130016.21448-14-mingo@kernel.org
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+index b1fe9a1fc4e0..2c685b492fd6 100644
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -323,13 +323,10 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 		 */
+ 		fpu__drop(fpu);
+ 
+-		if (using_compacted_format()) {
+-			err = copy_user_to_xstate(NULL, buf_fx,
+-					       &fpu->state.xsave);
+-		} else {
+-			err = __copy_from_user(&fpu->state.xsave,
+-					       buf_fx, state_size);
+-		}
++		if (using_compacted_format())
++			err = copy_user_to_xstate(buf_fx, &fpu->state.xsave);
++		else
++			err = __copy_from_user(&fpu->state.xsave, buf_fx, state_size);
+ 
+ 		if (err || __copy_from_user(&env, buf, sizeof(env))) {
+ 			fpstate_init(&fpu->state);
+
+commit 656f083116a4799d8c0194976b8a2d66bf306538
+Author: Ingo Molnar <mingo@kernel.org>
+Date:   Sat Sep 23 14:59:44 2017 +0200
+
+    x86/fpu: Rename copyin_to_xsaves()/copyout_from_xsaves() to copy_user_to_xstate()/copy_xstate_to_user()
+    
+    The 'copyin/copyout' nomenclature needlessly departs from what the modern FPU code
+    uses, which is:
+    
+     copy_fpregs_to_fpstate()
+     copy_fpstate_to_sigframe()
+     copy_fregs_to_user()
+     copy_fxregs_to_kernel()
+     copy_fxregs_to_user()
+     copy_kernel_to_fpregs()
+     copy_kernel_to_fregs()
+     copy_kernel_to_fxregs()
+     copy_kernel_to_xregs()
+     copy_user_to_fregs()
+     copy_user_to_fxregs()
+     copy_user_to_xregs()
+     copy_xregs_to_kernel()
+     copy_xregs_to_user()
+    
+    I.e. according to this pattern, the following rename should be done:
+    
+      copyin_to_xsaves()    -> copy_user_to_xstate()
+      copyout_from_xsaves() -> copy_xstate_to_user()
+    
+    or, if we want to be pedantic, denote that that the user-space format is ptrace:
+    
+      copyin_to_xsaves()    -> copy_user_ptrace_to_xstate()
+      copyout_from_xsaves() -> copy_xstate_to_user_ptrace()
+    
+    But I'd suggest the shorter, non-pedantic name.
+    
+    Cc: Andrew Morton <akpm@linux-foundation.org>
+    Cc: Andy Lutomirski <luto@amacapital.net>
+    Cc: Andy Lutomirski <luto@kernel.org>
+    Cc: Borislav Petkov <bp@alien8.de>
+    Cc: Dave Hansen <dave.hansen@linux.intel.com>
+    Cc: Eric Biggers <ebiggers3@gmail.com>
+    Cc: Fenghua Yu <fenghua.yu@intel.com>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Oleg Nesterov <oleg@redhat.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Rik van Riel <riel@redhat.com>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Yu-cheng Yu <yu-cheng.yu@intel.com>
+    Link: http://lkml.kernel.org/r/20170923130016.21448-2-mingo@kernel.org
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+index 83c23c230b4c..b1fe9a1fc4e0 100644
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -324,7 +324,7 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 		fpu__drop(fpu);
+ 
+ 		if (using_compacted_format()) {
+-			err = copyin_to_xsaves(NULL, buf_fx,
++			err = copy_user_to_xstate(NULL, buf_fx,
+ 					       &fpu->state.xsave);
+ 		} else {
+ 			err = __copy_from_user(&fpu->state.xsave,
+
+commit c592b57347069abfc0dcad3b3a302cf882602597
+Author: Andy Lutomirski <luto@kernel.org>
+Date:   Tue Oct 4 20:34:33 2016 -0400
+
+    x86/fpu: Remove use_eager_fpu()
+    
+    This removes all the obvious code paths that depend on lazy FPU mode.
+    It shouldn't change the generated code at all.
+    
+    Signed-off-by: Andy Lutomirski <luto@kernel.org>
+    Signed-off-by: Rik van Riel <riel@redhat.com>
+    Cc: Borislav Petkov <bp@alien8.de>
+    Cc: Brian Gerst <brgerst@gmail.com>
+    Cc: Dave Hansen <dave.hansen@linux.intel.com>
+    Cc: Denys Vlasenko <dvlasenk@redhat.com>
+    Cc: Fenghua Yu <fenghua.yu@intel.com>
+    Cc: H. Peter Anvin <hpa@zytor.com>
+    Cc: Josh Poimboeuf <jpoimboe@redhat.com>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Oleg Nesterov <oleg@redhat.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Quentin Casasnovas <quentin.casasnovas@oracle.com>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: pbonzini@redhat.com
+    Link: http://lkml.kernel.org/r/1475627678-20788-5-git-send-email-riel@redhat.com
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+index a184c210efba..83c23c230b4c 100644
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -340,11 +340,9 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 		}
+ 
+ 		fpu->fpstate_active = 1;
+-		if (use_eager_fpu()) {
+-			preempt_disable();
+-			fpu__restore(fpu);
+-			preempt_enable();
+-		}
++		preempt_disable();
++		fpu__restore(fpu);
++		preempt_enable();
+ 
+ 		return err;
+ 	} else {
+
+commit 97f2645f358b411ba2afb22e5966753f0ad92916
+Author: Masahiro Yamada <yamada.masahiro@socionext.com>
+Date:   Wed Aug 3 13:45:50 2016 -0700
+
+    tree-wide: replace config_enabled() with IS_ENABLED()
+    
+    The use of config_enabled() against config options is ambiguous.  In
+    practical terms, config_enabled() is equivalent to IS_BUILTIN(), but the
+    author might have used it for the meaning of IS_ENABLED().  Using
+    IS_ENABLED(), IS_BUILTIN(), IS_MODULE() etc.  makes the intention
+    clearer.
+    
+    This commit replaces config_enabled() with IS_ENABLED() where possible.
+    This commit is only touching bool config options.
+    
+    I noticed two cases where config_enabled() is used against a tristate
+    option:
+    
+     - config_enabled(CONFIG_HWMON)
+      [ drivers/net/wireless/ath/ath10k/thermal.c ]
+    
+     - config_enabled(CONFIG_BACKLIGHT_CLASS_DEVICE)
+      [ drivers/gpu/drm/gma500/opregion.c ]
+    
+    I did not touch them because they should be converted to IS_BUILTIN()
+    in order to keep the logic, but I was not sure it was the authors'
+    intention.
+    
+    Link: http://lkml.kernel.org/r/1465215656-20569-1-git-send-email-yamada.masahiro@socionext.com
+    Signed-off-by: Masahiro Yamada <yamada.masahiro@socionext.com>
+    Acked-by: Kees Cook <keescook@chromium.org>
+    Cc: Stas Sergeev <stsp@list.ru>
+    Cc: Matt Redfearn <matt.redfearn@imgtec.com>
+    Cc: Joshua Kinard <kumba@gentoo.org>
+    Cc: Jiri Slaby <jslaby@suse.com>
+    Cc: Bjorn Helgaas <bhelgaas@google.com>
+    Cc: Borislav Petkov <bp@suse.de>
+    Cc: Markos Chandras <markos.chandras@imgtec.com>
+    Cc: "Dmitry V. Levin" <ldv@altlinux.org>
+    Cc: yu-cheng yu <yu-cheng.yu@intel.com>
+    Cc: James Hogan <james.hogan@imgtec.com>
+    Cc: Brian Gerst <brgerst@gmail.com>
+    Cc: Johannes Berg <johannes@sipsolutions.net>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Al Viro <viro@zeniv.linux.org.uk>
+    Cc: Will Drewry <wad@chromium.org>
+    Cc: Nikolay Martynov <mar.kolya@gmail.com>
+    Cc: Huacai Chen <chenhc@lemote.com>
+    Cc: "H. Peter Anvin" <hpa@zytor.com>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Daniel Borkmann <daniel@iogearbox.net>
+    Cc: Leonid Yegoshin <Leonid.Yegoshin@imgtec.com>
+    Cc: Rafal Milecki <zajec5@gmail.com>
+    Cc: James Cowgill <James.Cowgill@imgtec.com>
+    Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+    Cc: Ralf Baechle <ralf@linux-mips.org>
+    Cc: Alex Smith <alex.smith@imgtec.com>
+    Cc: Adam Buchbinder <adam.buchbinder@gmail.com>
+    Cc: Qais Yousef <qais.yousef@imgtec.com>
+    Cc: Jiang Liu <jiang.liu@linux.intel.com>
+    Cc: Mikko Rapeli <mikko.rapeli@iki.fi>
+    Cc: Paul Gortmaker <paul.gortmaker@windriver.com>
+    Cc: Denys Vlasenko <dvlasenk@redhat.com>
+    Cc: Brian Norris <computersforpeace@gmail.com>
+    Cc: Hidehiro Kawai <hidehiro.kawai.ez@hitachi.com>
+    Cc: "Luis R. Rodriguez" <mcgrof@do-not-panic.com>
+    Cc: Andy Lutomirski <luto@amacapital.net>
+    Cc: Ingo Molnar <mingo@redhat.com>
+    Cc: Dave Hansen <dave.hansen@linux.intel.com>
+    Cc: "Kirill A. Shutemov" <kirill.shutemov@linux.intel.com>
+    Cc: Roland McGrath <roland@hack.frob.com>
+    Cc: Paul Burton <paul.burton@imgtec.com>
+    Cc: Kalle Valo <kvalo@qca.qualcomm.com>
+    Cc: Viresh Kumar <viresh.kumar@linaro.org>
+    Cc: Tony Wu <tung7970@gmail.com>
+    Cc: Huaitong Han <huaitong.han@intel.com>
+    Cc: Sumit Semwal <sumit.semwal@linaro.org>
+    Cc: Alexei Starovoitov <ast@kernel.org>
+    Cc: Juergen Gross <jgross@suse.com>
+    Cc: Jason Cooper <jason@lakedaemon.net>
+    Cc: "David S. Miller" <davem@davemloft.net>
+    Cc: Oleg Nesterov <oleg@redhat.com>
+    Cc: Andrea Gelmini <andrea.gelmini@gelma.net>
+    Cc: David Woodhouse <dwmw2@infradead.org>
+    Cc: Marc Zyngier <marc.zyngier@arm.com>
+    Cc: Rabin Vincent <rabin@rab.in>
+    Cc: "Maciej W. Rozycki" <macro@imgtec.com>
+    Cc: David Daney <david.daney@cavium.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+index 9e231d88bb33..a184c210efba 100644
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -159,8 +159,8 @@ int copy_fpstate_to_sigframe(void __user *buf, void __user *buf_fx, int size)
+ 	struct task_struct *tsk = current;
+ 	int ia32_fxstate = (buf != buf_fx);
+ 
+-	ia32_fxstate &= (config_enabled(CONFIG_X86_32) ||
+-			 config_enabled(CONFIG_IA32_EMULATION));
++	ia32_fxstate &= (IS_ENABLED(CONFIG_X86_32) ||
++			 IS_ENABLED(CONFIG_IA32_EMULATION));
+ 
+ 	if (!access_ok(VERIFY_WRITE, buf, size))
+ 		return -EACCES;
+@@ -268,8 +268,8 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 	u64 xfeatures = 0;
+ 	int fx_only = 0;
+ 
+-	ia32_fxstate &= (config_enabled(CONFIG_X86_32) ||
+-			 config_enabled(CONFIG_IA32_EMULATION));
++	ia32_fxstate &= (IS_ENABLED(CONFIG_X86_32) ||
++			 IS_ENABLED(CONFIG_IA32_EMULATION));
+ 
+ 	if (!buf) {
+ 		fpu__clear(fpu);
+@@ -416,8 +416,8 @@ void fpu__init_prepare_fx_sw_frame(void)
+ 	fx_sw_reserved.xfeatures = xfeatures_mask;
+ 	fx_sw_reserved.xstate_size = fpu_user_xstate_size;
+ 
+-	if (config_enabled(CONFIG_IA32_EMULATION) ||
+-	    config_enabled(CONFIG_X86_32)) {
++	if (IS_ENABLED(CONFIG_IA32_EMULATION) ||
++	    IS_ENABLED(CONFIG_X86_32)) {
+ 		int fsave_header_size = sizeof(struct fregs_state);
+ 
+ 		fx_sw_reserved_ia32 = fx_sw_reserved;
+
+commit 1fc2b67b43d5001b92b3a002b988884ad0137e99
+Author: Yu-cheng Yu <yu-cheng.yu@intel.com>
+Date:   Mon Jul 11 09:18:54 2016 -0700
+
+    x86/fpu/xstate: Fix __fpu_restore_sig() for XSAVES
+    
+    When the kernel is using XSAVES compacted format, we cannot do
+    __copy_from_user() from a signal frame, which has standard-format data.
+    Fix it by using copyin_to_xsaves(), which converts between formats and
+    filters out all supervisor states that we do not allow userspace to
+    write.
+    
+    Signed-off-by: Yu-cheng Yu <yu-cheng.yu@intel.com>
+    Signed-off-by: Fenghua Yu <fenghua.yu@intel.com>
+    Reviewed-by: Dave Hansen <dave.hansen@intel.com>
+    Cc: H. Peter Anvin <h.peter.anvin@intel.com>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Ravi V Shankar <ravi.v.shankar@intel.com>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Link: http://lkml.kernel.org/r/1468253937-40008-2-git-send-email-fenghua.yu@intel.com
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+index 8aa96cbb5dfb..9e231d88bb33 100644
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -323,8 +323,15 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 		 */
+ 		fpu__drop(fpu);
+ 
+-		if (__copy_from_user(&fpu->state.xsave, buf_fx, state_size) ||
+-		    __copy_from_user(&env, buf, sizeof(env))) {
++		if (using_compacted_format()) {
++			err = copyin_to_xsaves(NULL, buf_fx,
++					       &fpu->state.xsave);
++		} else {
++			err = __copy_from_user(&fpu->state.xsave,
++					       buf_fx, state_size);
++		}
++
++		if (err || __copy_from_user(&env, buf, sizeof(env))) {
+ 			fpstate_init(&fpu->state);
+ 			trace_x86_fpu_init_state(fpu);
+ 			err = -1;
+
+commit 99aa22d0d8f70d9317727ab40c85b2ead740a6ca
+Author: Yu-cheng Yu <yu-cheng.yu@intel.com>
+Date:   Fri May 20 10:47:08 2016 -0700
+
+    x86/fpu/xstate: Copy xstate registers directly to the signal frame when compacted format is in use
+    
+    XSAVES is a kernel instruction and uses a compacted format. When working
+    with user space, the kernel should provide standard-format, non-supervisor
+    state data. We cannot do __copy_to_user() from a compacted-format kernel
+    xstate area to a signal frame.
+    
+    Dave Hansen proposes this method to simplify copy xstate directly to user.
+    
+    This patch is based on an earlier patch from Fenghua Yu <fenghua.yu@intel.com>
+    
+    Originally-from: Fenghua Yu <fenghua.yu@intel.com>
+    Signed-off-by: Yu-cheng Yu <yu-cheng.yu@intel.com>
+    Reviewed-by: Dave Hansen <dave.hansen@intel.com>
+    Cc: Andy Lutomirski <luto@kernel.org>
+    Cc: Borislav Petkov <bp@alien8.de>
+    Cc: Brian Gerst <brgerst@gmail.com>
+    Cc: Dave Hansen <dave.hansen@linux.intel.com>
+    Cc: Denys Vlasenko <dvlasenk@redhat.com>
+    Cc: Fenghua Yu <fenghua.yu@intel.com>
+    Cc: H. Peter Anvin <hpa@zytor.com>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Oleg Nesterov <oleg@redhat.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Quentin Casasnovas <quentin.casasnovas@oracle.com>
+    Cc: Ravi V. Shankar <ravi.v.shankar@intel.com>
+    Cc: Sai Praneeth Prakhya <sai.praneeth.prakhya@intel.com>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Link: http://lkml.kernel.org/r/c36f419d525517d04209a28dd8e1e5af9000036e.1463760376.git.yu-cheng.yu@intel.com
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+index 06d80f62c03f..8aa96cbb5dfb 100644
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -8,6 +8,7 @@
+ #include <asm/fpu/internal.h>
+ #include <asm/fpu/signal.h>
+ #include <asm/fpu/regset.h>
++#include <asm/fpu/xstate.h>
+ 
+ #include <asm/sigframe.h>
+ #include <asm/trace/fpu.h>
+@@ -169,7 +170,7 @@ int copy_fpstate_to_sigframe(void __user *buf, void __user *buf_fx, int size)
+ 			sizeof(struct user_i387_ia32_struct), NULL,
+ 			(struct _fpstate_32 __user *) buf) ? -1 : 1;
+ 
+-	if (fpregs_active()) {
++	if (fpregs_active() || using_compacted_format()) {
+ 		/* Save the live register state to the user directly. */
+ 		if (copy_fpregs_to_sigframe(buf_fx))
+ 			return -1;
+
+commit bf15a8cf8d14879b785c548728415d36ccb6a33b
+Author: Fenghua Yu <fenghua.yu@intel.com>
+Date:   Fri May 20 10:47:06 2016 -0700
+
+    x86/fpu/xstate: Rename 'xstate_size' to 'fpu_kernel_xstate_size', to distinguish it from 'fpu_user_xstate_size'
+    
+    User space uses standard format xsave area. fpstate in signal frame
+    should have standard format size.
+    
+    To explicitly distinguish between xstate size in kernel space and the
+    one in user space, we rename 'xstate_size' to 'fpu_kernel_xstate_size'.
+    
+    Cleanup only, no change in functionality.
+    
+    Signed-off-by: Fenghua Yu <fenghua.yu@intel.com>
+    [ Rebased the patch and cleaned up the naming. ]
+    Signed-off-by: Yu-cheng Yu <yu-cheng.yu@intel.com>
+    Reviewed-by: Dave Hansen <dave.hansen@intel.com>
+    Cc: Andy Lutomirski <luto@kernel.org>
+    Cc: Borislav Petkov <bp@alien8.de>
+    Cc: Brian Gerst <brgerst@gmail.com>
+    Cc: Dave Hansen <dave.hansen@linux.intel.com>
+    Cc: Denys Vlasenko <dvlasenk@redhat.com>
+    Cc: H. Peter Anvin <hpa@zytor.com>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Oleg Nesterov <oleg@redhat.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Quentin Casasnovas <quentin.casasnovas@oracle.com>
+    Cc: Ravi V. Shankar <ravi.v.shankar@intel.com>
+    Cc: Sai Praneeth Prakhya <sai.praneeth.prakhya@intel.com>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Link: http://lkml.kernel.org/r/2ecbae347a5152d94be52adf7d0f3b7305d90d99.1463760376.git.yu-cheng.yu@intel.com
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+index 0d29d4de4209..06d80f62c03f 100644
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -263,7 +263,7 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 	int ia32_fxstate = (buf != buf_fx);
+ 	struct task_struct *tsk = current;
+ 	struct fpu *fpu = &tsk->thread.fpu;
+-	int state_size = xstate_size;
++	int state_size = fpu_kernel_xstate_size;
+ 	u64 xfeatures = 0;
+ 	int fx_only = 0;
+ 
+
+commit a1141e0b5ca6ee3e5e35d5f1a310a5ecb9c96ce5
+Author: Fenghua Yu <fenghua.yu@intel.com>
+Date:   Fri May 20 10:47:05 2016 -0700
+
+    x86/fpu/xstate: Define and use 'fpu_user_xstate_size'
+    
+    The kernel xstate area can be in standard or compacted format;
+    it is always in standard format for user mode. When XSAVES is
+    enabled, the kernel uses the compacted format and it is necessary
+    to use a separate fpu_user_xstate_size for signal/ptrace frames.
+    
+    Signed-off-by: Fenghua Yu <fenghua.yu@intel.com>
+    [ Rebased the patch and cleaned up the naming. ]
+    Signed-off-by: Yu-cheng Yu <yu-cheng.yu@intel.com>
+    Reviewed-by: Dave Hansen <dave.hansen@intel.com>
+    Cc: Andy Lutomirski <luto@kernel.org>
+    Cc: Borislav Petkov <bp@alien8.de>
+    Cc: Brian Gerst <brgerst@gmail.com>
+    Cc: Dave Hansen <dave.hansen@linux.intel.com>
+    Cc: Denys Vlasenko <dvlasenk@redhat.com>
+    Cc: H. Peter Anvin <hpa@zytor.com>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Oleg Nesterov <oleg@redhat.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Quentin Casasnovas <quentin.casasnovas@oracle.com>
+    Cc: Ravi V. Shankar <ravi.v.shankar@intel.com>
+    Cc: Sai Praneeth Prakhya <sai.praneeth.prakhya@intel.com>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Link: http://lkml.kernel.org/r/8756ec34dabddfc727cda5743195eb81e8caf91c.1463760376.git.yu-cheng.yu@intel.com
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+index c6f2a3cee2c2..0d29d4de4209 100644
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -32,7 +32,7 @@ static inline int check_for_xstate(struct fxregs_state __user *buf,
+ 	/* Check for the first magic field and other error scenarios. */
+ 	if (fx_sw->magic1 != FP_XSTATE_MAGIC1 ||
+ 	    fx_sw->xstate_size < min_xstate_size ||
+-	    fx_sw->xstate_size > xstate_size ||
++	    fx_sw->xstate_size > fpu_user_xstate_size ||
+ 	    fx_sw->xstate_size > fx_sw->extended_size)
+ 		return -1;
+ 
+@@ -89,7 +89,8 @@ static inline int save_xstate_epilog(void __user *buf, int ia32_frame)
+ 	if (!use_xsave())
+ 		return err;
+ 
+-	err |= __put_user(FP_XSTATE_MAGIC2, (__u32 *)(buf + xstate_size));
++	err |= __put_user(FP_XSTATE_MAGIC2,
++			  (__u32 *)(buf + fpu_user_xstate_size));
+ 
+ 	/*
+ 	 * Read the xfeatures which we copied (directly from the cpu or
+@@ -126,7 +127,7 @@ static inline int copy_fpregs_to_sigframe(struct xregs_state __user *buf)
+ 	else
+ 		err = copy_fregs_to_user((struct fregs_state __user *) buf);
+ 
+-	if (unlikely(err) && __clear_user(buf, xstate_size))
++	if (unlikely(err) && __clear_user(buf, fpu_user_xstate_size))
+ 		err = -EFAULT;
+ 	return err;
+ }
+@@ -176,8 +177,19 @@ int copy_fpstate_to_sigframe(void __user *buf, void __user *buf_fx, int size)
+ 		if (ia32_fxstate)
+ 			copy_fxregs_to_kernel(&tsk->thread.fpu);
+ 	} else {
++		/*
++		 * It is a *bug* if kernel uses compacted-format for xsave
++		 * area and we copy it out directly to a signal frame. It
++		 * should have been handled above by saving the registers
++		 * directly.
++		 */
++		if (boot_cpu_has(X86_FEATURE_XSAVES)) {
++			WARN_ONCE(1, "x86/fpu: saving compacted-format xsave area to a signal frame!\n");
++			return -1;
++		}
++
+ 		fpstate_sanitize_xstate(&tsk->thread.fpu);
+-		if (__copy_to_user(buf_fx, xsave, xstate_size))
++		if (__copy_to_user(buf_fx, xsave, fpu_user_xstate_size))
+ 			return -1;
+ 	}
+ 
+@@ -344,7 +356,8 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 
+ static inline int xstate_sigframe_size(void)
+ {
+-	return use_xsave() ? xstate_size + FP_XSTATE_MAGIC2_SIZE : xstate_size;
++	return use_xsave() ? fpu_user_xstate_size + FP_XSTATE_MAGIC2_SIZE :
++			fpu_user_xstate_size;
+ }
+ 
+ /*
+@@ -388,12 +401,12 @@ fpu__alloc_mathframe(unsigned long sp, int ia32_frame,
+  */
+ void fpu__init_prepare_fx_sw_frame(void)
+ {
+-	int size = xstate_size + FP_XSTATE_MAGIC2_SIZE;
++	int size = fpu_user_xstate_size + FP_XSTATE_MAGIC2_SIZE;
+ 
+ 	fx_sw_reserved.magic1 = FP_XSTATE_MAGIC1;
+ 	fx_sw_reserved.extended_size = size;
+ 	fx_sw_reserved.xfeatures = xfeatures_mask;
+-	fx_sw_reserved.xstate_size = xstate_size;
++	fx_sw_reserved.xstate_size = fpu_user_xstate_size;
+ 
+ 	if (config_enabled(CONFIG_IA32_EMULATION) ||
+ 	    config_enabled(CONFIG_X86_32)) {
+
+commit d1898b733619bd46194bd25aa6452d238ff2dc4e
+Author: Dave Hansen <dave.hansen@linux.intel.com>
+Date:   Wed Jun 1 10:42:20 2016 -0700
+
+    x86/fpu: Add tracepoints to dump FPU state at key points
+    
+    I've been carrying this patch around for a bit and it's helped me
+    solve at least a couple FPU-related bugs.  In addition to using
+    it for debugging, I also drug it out because using AVX (and
+    AVX2/AVX-512) can have serious power consequences for a modern
+    core.  It's very important to be able to figure out who is using
+    it.
+    
+    It's also insanely useful to go out and see who is using a given
+    feature, like MPX or Memory Protection Keys.  If you, for
+    instance, want to find all processes using protection keys, you
+    can do:
+    
+            echo 'xfeatures & 0x200' > filter
+    
+    Since 0x200 is the protection keys feature bit.
+    
+    Note that this touches the KVM code.  KVM did a CREATE_TRACE_POINTS
+    and then included a bunch of random headers.  If anyone one of
+    those included other tracepoints, it would have defined the *OTHER*
+    tracepoints.  That's bogus, so move it to the right place.
+    
+    Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+    Cc: Andy Lutomirski <luto@amacapital.net>
+    Cc: Borislav Petkov <bp@alien8.de>
+    Cc: Brian Gerst <brgerst@gmail.com>
+    Cc: Dave Hansen <dave@sr71.net>
+    Cc: Denys Vlasenko <dvlasenk@redhat.com>
+    Cc: Fenghua Yu <fenghua.yu@intel.com>
+    Cc: H. Peter Anvin <hpa@zytor.com>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Oleg Nesterov <oleg@redhat.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Quentin Casasnovas <quentin.casasnovas@oracle.com>
+    Cc: Steven Rostedt <rostedt@goodmis.org>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Link: http://lkml.kernel.org/r/20160601174220.3CDFB90E@viggo.jf.intel.com
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+index 31c6a60505e6..c6f2a3cee2c2 100644
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -10,6 +10,7 @@
+ #include <asm/fpu/regset.h>
+ 
+ #include <asm/sigframe.h>
++#include <asm/trace/fpu.h>
+ 
+ static struct _fpx_sw_bytes fx_sw_reserved, fx_sw_reserved_ia32;
+ 
+@@ -282,6 +283,7 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 			 */
+ 			state_size = sizeof(struct fxregs_state);
+ 			fx_only = 1;
++			trace_x86_fpu_xstate_check_failed(fpu);
+ 		} else {
+ 			state_size = fx_sw_user.xstate_size;
+ 			xfeatures = fx_sw_user.xfeatures;
+@@ -311,6 +313,7 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 		if (__copy_from_user(&fpu->state.xsave, buf_fx, state_size) ||
+ 		    __copy_from_user(&env, buf, sizeof(env))) {
+ 			fpstate_init(&fpu->state);
++			trace_x86_fpu_init_state(fpu);
+ 			err = -1;
+ 		} else {
+ 			sanitize_restored_xstate(tsk, &env, xfeatures, fx_only);
+
+commit ab6b52947545a5355154f64f449f97af9d05845f
+Author: Dave Hansen <dave.hansen@linux.intel.com>
+Date:   Tue Nov 10 16:23:54 2015 -0800
+
+    x86/fpu: Fix 32-bit signal frame handling
+    
+    (This should have gone to LKML originally. Sorry for the extra
+     noise, folks on the cc.)
+    
+    Background:
+    
+    Signal frames on x86 have two formats:
+    
+      1. For 32-bit executables (whether on a real 32-bit kernel or
+         under 32-bit emulation on a 64-bit kernel) we have a
+        'fpregset_t' that includes the "FSAVE" registers.
+    
+      2. For 64-bit executables (on 64-bit kernels obviously), the
+         'fpregset_t' is smaller and does not contain the "FSAVE"
+         state.
+    
+    When creating the signal frame, we have to be aware of whether
+    we are running a 32 or 64-bit executable so we create the
+    correct format signal frame.
+    
+    Problem:
+    
+    save_xstate_epilog() uses 'fx_sw_reserved_ia32' whenever it is
+    called for a 32-bit executable.  This is for real 32-bit and
+    ia32 emulation.
+    
+    But, fpu__init_prepare_fx_sw_frame() only initializes
+    'fx_sw_reserved_ia32' when emulation is enabled, *NOT* for real
+    32-bit kernels.
+    
+    This leads to really wierd situations where 32-bit programs
+    lose their extended state when returning from a signal handler.
+    The kernel copies the uninitialized (zero) 'fx_sw_reserved_ia32'
+    out to userspace in save_xstate_epilog().  But when returning
+    from the signal, the kernel errors out in check_for_xstate()
+    when it does not see FP_XSTATE_MAGIC1 present (because it was
+    zeroed).  This leads to the FPU/XSAVE state being initialized.
+    
+    For MPX, this leads to the most permissive state and means we
+    silently lose bounds violations.  I think this would also mean
+    that we could lose *ANY* FPU/SSE/AVX state.  I'm not sure why
+    no one has spotted this bug.
+    
+    I believe this was broken by:
+    
+            72a671ced66d ("x86, fpu: Unify signal handling code paths for x86 and x86_64 kernels")
+    
+    way back in 2012.
+    
+    Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+    Cc: <stable@vger.kernel.org>
+    Cc: Andy Lutomirski <luto@amacapital.net>
+    Cc: Borislav Petkov <bp@alien8.de>
+    Cc: Brian Gerst <brgerst@gmail.com>
+    Cc: Denys Vlasenko <dvlasenk@redhat.com>
+    Cc: H. Peter Anvin <hpa@zytor.com>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: dave@sr71.net
+    Cc: fenghua.yu@intel.com
+    Cc: yu-cheng.yu@intel.com
+    Link: http://lkml.kernel.org/r/20151111002354.A0799571@viggo.jf.intel.com
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+index ef29b742cea7..31c6a60505e6 100644
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -385,20 +385,19 @@ fpu__alloc_mathframe(unsigned long sp, int ia32_frame,
+  */
+ void fpu__init_prepare_fx_sw_frame(void)
+ {
+-	int fsave_header_size = sizeof(struct fregs_state);
+ 	int size = xstate_size + FP_XSTATE_MAGIC2_SIZE;
+ 
+-	if (config_enabled(CONFIG_X86_32))
+-		size += fsave_header_size;
+-
+ 	fx_sw_reserved.magic1 = FP_XSTATE_MAGIC1;
+ 	fx_sw_reserved.extended_size = size;
+ 	fx_sw_reserved.xfeatures = xfeatures_mask;
+ 	fx_sw_reserved.xstate_size = xstate_size;
+ 
+-	if (config_enabled(CONFIG_IA32_EMULATION)) {
++	if (config_enabled(CONFIG_IA32_EMULATION) ||
++	    config_enabled(CONFIG_X86_32)) {
++		int fsave_header_size = sizeof(struct fregs_state);
++
+ 		fx_sw_reserved_ia32 = fx_sw_reserved;
+-		fx_sw_reserved_ia32.extended_size += fsave_header_size;
++		fx_sw_reserved_ia32.extended_size = size + fsave_header_size;
+ 	}
+ }
+ 
+
+commit 4302d506d5f3419109abdd0d6e400ed6e8148209
+Merge: ce4d72fac16a 0e2815de552a
+Author: Linus Torvalds <torvalds@linux-foundation.org>
+Date:   Tue Nov 3 21:05:40 2015 -0800
+
+    Merge branch 'x86-headers-for-linus' of git://git.kernel.org/pub/scm/linux/kernel/git/tip/tip
+    
+    Pull x86 sigcontext header cleanups from Ingo Molnar:
+     "This series reorganizes and cleans up various aspects of the main
+      sigcontext UAPI headers, such as unifying the data structures and
+      updating/adding lots of comments to explain all the ABI details and
+      quirks.  The headers can now also be built in user-space standalone"
+    
+    * 'x86-headers-for-linus' of git://git.kernel.org/pub/scm/linux/kernel/git/tip/tip:
+      x86/headers: Clean up too long lines
+      x86/headers: Remove <asm/sigcontext.h> references on the kernel side
+      x86/headers: Remove direct sigcontext32.h uses
+      x86/headers: Convert sigcontext_ia32 uses to sigcontext_32
+      x86/headers: Unify 'struct sigcontext_ia32' and 'struct sigcontext_32'
+      x86/headers: Make sigcontext pointers bit independent
+      x86/headers: Move the 'struct sigcontext' definitions into the UAPI header
+      x86/headers: Clean up the kernel's struct sigcontext types to be ABI-clean
+      x86/headers: Convert uses of _fpstate_ia32 to _fpstate_32
+      x86/headers: Unify 'struct _fpstate_ia32' and i386 struct _fpstate
+      x86/headers: Unify register type definitions between 32-bit compat and i386
+      x86/headers: Use ABI types consistently in sigcontext*.h
+      x86/headers: Separate out legacy user-space structure definitions
+      x86/headers: Clean up and better document uapi/asm/sigcontext.h
+      x86/headers: Clean up uapi/asm/sigcontext32.h
+      x86/headers: Fix (old) header file dependency bug in uapi/asm/sigcontext32.h
+
+commit d91cab78133d33b1dfd3d3fa7167fcbf74fb5f99
+Author: Dave Hansen <dave.hansen@linux.intel.com>
+Date:   Wed Sep 2 16:31:26 2015 -0700
+
+    x86/fpu: Rename XSAVE macros
+    
+    There are two concepts that have some confusing naming:
+     1. Extended State Component numbers (currently called
+        XFEATURE_BIT_*)
+     2. Extended State Component masks (currently called XSTATE_*)
+    
+    The numbers are (currently) from 0-9.  State component 3 is the
+    bounds registers for MPX, for instance.
+    
+    But when we want to enable "state component 3", we go set a bit
+    in XCR0.  The bit we set is 1<<3.  We can check to see if a
+    state component feature is enabled by looking at its bit.
+    
+    The current 'xfeature_bit's are at best xfeature bit _numbers_.
+    Calling them bits is at best inconsistent with ending the enum
+    list with 'XFEATURES_NR_MAX'.
+    
+    This patch renames the enum to be 'xfeature'.  These also
+    happen to be what the Intel documentation calls a "state
+    component".
+    
+    We also want to differentiate these from the "XSTATE_*" macros.
+    The "XSTATE_*" macros are a mask, and we rename them to match.
+    
+    These macros are reasonably widely used so this patch is a
+    wee bit big, but this really is just a rename.
+    
+    The only non-mechanical part of this is the
+    
+            s/XSTATE_EXTEND_MASK/XFEATURE_MASK_EXTEND/
+    
+    We need a better name for it, but that's another patch.
+    
+    Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+    Cc: Andy Lutomirski <luto@amacapital.net>
+    Cc: Borislav Petkov <bp@alien8.de>
+    Cc: Brian Gerst <brgerst@gmail.com>
+    Cc: Denys Vlasenko <dvlasenk@redhat.com>
+    Cc: Fenghua Yu <fenghua.yu@intel.com>
+    Cc: H. Peter Anvin <hpa@zytor.com>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: Tim Chen <tim.c.chen@linux.intel.com>
+    Cc: dave@sr71.net
+    Cc: linux-kernel@vger.kernel.org
+    Link: http://lkml.kernel.org/r/20150902233126.38653250@viggo.jf.intel.com
+    [ Ported to v4.3-rc1. ]
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+index 50ec9af1bd51..eb032677f939 100644
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -107,7 +107,7 @@ static inline int save_xstate_epilog(void __user *buf, int ia32_frame)
+ 	 * header as well as change any contents in the memory layout.
+ 	 * xrestore as part of sigreturn will capture all the changes.
+ 	 */
+-	xfeatures |= XSTATE_FPSSE;
++	xfeatures |= XFEATURE_MASK_FPSSE;
+ 
+ 	err |= __put_user(xfeatures, (__u32 *)&x->header.xfeatures);
+ 
+@@ -207,7 +207,7 @@ sanitize_restored_xstate(struct task_struct *tsk,
+ 		 * layout and not enabled by the OS.
+ 		 */
+ 		if (fx_only)
+-			header->xfeatures = XSTATE_FPSSE;
++			header->xfeatures = XFEATURE_MASK_FPSSE;
+ 		else
+ 			header->xfeatures &= (xfeatures_mask & xfeatures);
+ 	}
+@@ -230,7 +230,7 @@ static inline int copy_user_to_fpregs_zeroing(void __user *buf, u64 xbv, int fx_
+ {
+ 	if (use_xsave()) {
+ 		if ((unsigned long)buf % 64 || fx_only) {
+-			u64 init_bv = xfeatures_mask & ~XSTATE_FPSSE;
++			u64 init_bv = xfeatures_mask & ~XFEATURE_MASK_FPSSE;
+ 			copy_kernel_to_xregs(&init_fpstate.xsave, init_bv);
+ 			return copy_user_to_fxregs(buf);
+ 		} else {
+
+commit 86e9fc3a0ecdd3c21a938e325daf462ca1724f68
+Author: Ingo Molnar <mingo@kernel.org>
+Date:   Sat Sep 5 09:32:36 2015 +0200
+
+    x86/headers: Convert uses of _fpstate_ia32 to _fpstate_32
+    
+    Remove uses of _fpstate_ia32 from the kernel, and move the
+    legacy _fpstate_ia32 definition to the user-space only portion
+    of the header.
+    
+    Acked-by: Mikko Rapeli <mikko.rapeli@iki.fi>
+    Cc: Andy Lutomirski <luto@amacapital.net>
+    Cc: Borislav Petkov <bp@alien8.de>
+    Cc: Brian Gerst <brgerst@gmail.com>
+    Cc: Denys Vlasenko <dvlasenk@redhat.com>
+    Cc: H. Peter Anvin <hpa@zytor.com>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Oleg Nesterov <oleg@redhat.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: linux-kernel@vger.kernel.org
+    Link: http://lkml.kernel.org/r/1441438363-9999-9-git-send-email-mingo@kernel.org
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+index 50ec9af1bd51..24aac16603a2 100644
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -56,7 +56,7 @@ static inline int save_fsave_header(struct task_struct *tsk, void __user *buf)
+ 	if (use_fxsr()) {
+ 		struct xregs_state *xsave = &tsk->thread.fpu.state.xsave;
+ 		struct user_i387_ia32_struct env;
+-		struct _fpstate_ia32 __user *fp = buf;
++		struct _fpstate_32 __user *fp = buf;
+ 
+ 		convert_from_fxsr(&env, tsk);
+ 
+@@ -165,7 +165,7 @@ int copy_fpstate_to_sigframe(void __user *buf, void __user *buf_fx, int size)
+ 	if (!static_cpu_has(X86_FEATURE_FPU))
+ 		return fpregs_soft_get(current, NULL, 0,
+ 			sizeof(struct user_i387_ia32_struct), NULL,
+-			(struct _fpstate_ia32 __user *) buf) ? -1 : 1;
++			(struct _fpstate_32 __user *) buf) ? -1 : 1;
+ 
+ 	if (fpregs_active()) {
+ 		/* Save the live register state to the user directly. */
+
+commit e1884d69f643c743806ebb9bc9292863ef39e894
+Author: Ingo Molnar <mingo@kernel.org>
+Date:   Mon May 4 11:49:58 2015 +0200
+
+    x86/fpu: Pass 'struct fpu' to fpu__restore()
+    
+    This cleans up the call sites and the function a bit,
+    and also makes it more symmetric with the other high
+    level FPU state handling functions.
+    
+    It's still only valid for the current task, as we copy
+    to the FPU registers of the current CPU.
+    
+    No change in functionality.
+    
+    Cc: Andy Lutomirski <luto@amacapital.net>
+    Cc: Borislav Petkov <bp@alien8.de>
+    Cc: Dave Hansen <dave.hansen@linux.intel.com>
+    Cc: Fenghua Yu <fenghua.yu@intel.com>
+    Cc: H. Peter Anvin <hpa@zytor.com>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Oleg Nesterov <oleg@redhat.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+index 99f73093333d..50ec9af1bd51 100644
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -319,7 +319,7 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 		fpu->fpstate_active = 1;
+ 		if (use_eager_fpu()) {
+ 			preempt_disable();
+-			fpu__restore();
++			fpu__restore(fpu);
+ 			preempt_enable();
+ 		}
+ 
+
+commit c47ada305de3803517ae64aa50686f644c5456fa
+Author: Ingo Molnar <mingo@kernel.org>
+Date:   Thu Apr 30 17:15:32 2015 +0200
+
+    x86/fpu: Harmonize FPU register state types
+    
+    Use these consistent names:
+    
+        struct fregs_state           # was: i387_fsave_struct
+        struct fxregs_state          # was: i387_fxsave_struct
+        struct swregs_state          # was: i387_soft_struct
+        struct xregs_state           # was: xsave_struct
+        union  fpregs_state          # was: thread_xstate
+    
+    Cc: Andy Lutomirski <luto@amacapital.net>
+    Cc: Borislav Petkov <bp@alien8.de>
+    Cc: Dave Hansen <dave.hansen@linux.intel.com>
+    Cc: Fenghua Yu <fenghua.yu@intel.com>
+    Cc: H. Peter Anvin <hpa@zytor.com>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Oleg Nesterov <oleg@redhat.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+index 8d0c26ab5123..99f73093333d 100644
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -17,11 +17,11 @@ static struct _fpx_sw_bytes fx_sw_reserved, fx_sw_reserved_ia32;
+  * Check for the presence of extended state information in the
+  * user fpstate pointer in the sigcontext.
+  */
+-static inline int check_for_xstate(struct i387_fxsave_struct __user *buf,
++static inline int check_for_xstate(struct fxregs_state __user *buf,
+ 				   void __user *fpstate,
+ 				   struct _fpx_sw_bytes *fx_sw)
+ {
+-	int min_xstate_size = sizeof(struct i387_fxsave_struct) +
++	int min_xstate_size = sizeof(struct fxregs_state) +
+ 			      sizeof(struct xstate_header);
+ 	unsigned int magic2;
+ 
+@@ -54,7 +54,7 @@ static inline int check_for_xstate(struct i387_fxsave_struct __user *buf,
+ static inline int save_fsave_header(struct task_struct *tsk, void __user *buf)
+ {
+ 	if (use_fxsr()) {
+-		struct xsave_struct *xsave = &tsk->thread.fpu.state.xsave;
++		struct xregs_state *xsave = &tsk->thread.fpu.state.xsave;
+ 		struct user_i387_ia32_struct env;
+ 		struct _fpstate_ia32 __user *fp = buf;
+ 
+@@ -65,7 +65,7 @@ static inline int save_fsave_header(struct task_struct *tsk, void __user *buf)
+ 		    __put_user(X86_FXSR_MAGIC, &fp->magic))
+ 			return -1;
+ 	} else {
+-		struct i387_fsave_struct __user *fp = buf;
++		struct fregs_state __user *fp = buf;
+ 		u32 swd;
+ 		if (__get_user(swd, &fp->swd) || __put_user(swd, &fp->status))
+ 			return -1;
+@@ -76,7 +76,7 @@ static inline int save_fsave_header(struct task_struct *tsk, void __user *buf)
+ 
+ static inline int save_xstate_epilog(void __user *buf, int ia32_frame)
+ {
+-	struct xsave_struct __user *x = buf;
++	struct xregs_state __user *x = buf;
+ 	struct _fpx_sw_bytes *sw_bytes;
+ 	u32 xfeatures;
+ 	int err;
+@@ -114,16 +114,16 @@ static inline int save_xstate_epilog(void __user *buf, int ia32_frame)
+ 	return err;
+ }
+ 
+-static inline int copy_fpregs_to_sigframe(struct xsave_struct __user *buf)
++static inline int copy_fpregs_to_sigframe(struct xregs_state __user *buf)
+ {
+ 	int err;
+ 
+ 	if (use_xsave())
+ 		err = copy_xregs_to_user(buf);
+ 	else if (use_fxsr())
+-		err = copy_fxregs_to_user((struct i387_fxsave_struct __user *) buf);
++		err = copy_fxregs_to_user((struct fxregs_state __user *) buf);
+ 	else
+-		err = copy_fregs_to_user((struct i387_fsave_struct __user *) buf);
++		err = copy_fregs_to_user((struct fregs_state __user *) buf);
+ 
+ 	if (unlikely(err) && __clear_user(buf, xstate_size))
+ 		err = -EFAULT;
+@@ -152,7 +152,7 @@ static inline int copy_fpregs_to_sigframe(struct xsave_struct __user *buf)
+  */
+ int copy_fpstate_to_sigframe(void __user *buf, void __user *buf_fx, int size)
+ {
+-	struct xsave_struct *xsave = &current->thread.fpu.state.xsave;
++	struct xregs_state *xsave = &current->thread.fpu.state.xsave;
+ 	struct task_struct *tsk = current;
+ 	int ia32_fxstate = (buf != buf_fx);
+ 
+@@ -195,7 +195,7 @@ sanitize_restored_xstate(struct task_struct *tsk,
+ 			 struct user_i387_ia32_struct *ia32_env,
+ 			 u64 xfeatures, int fx_only)
+ {
+-	struct xsave_struct *xsave = &tsk->thread.fpu.state.xsave;
++	struct xregs_state *xsave = &tsk->thread.fpu.state.xsave;
+ 	struct xstate_header *header = &xsave->header;
+ 
+ 	if (use_xsave()) {
+@@ -280,7 +280,7 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 			 * memory layout. Restore just the FP/SSE and init all
+ 			 * the other extended state.
+ 			 */
+-			state_size = sizeof(struct i387_fxsave_struct);
++			state_size = sizeof(struct fxregs_state);
+ 			fx_only = 1;
+ 		} else {
+ 			state_size = fx_sw_user.xstate_size;
+@@ -353,8 +353,8 @@ int fpu__restore_sig(void __user *buf, int ia32_frame)
+ 	int size = xstate_sigframe_size();
+ 
+ 	if (ia32_frame && use_fxsr()) {
+-		buf_fx = buf + sizeof(struct i387_fsave_struct);
+-		size += sizeof(struct i387_fsave_struct);
++		buf_fx = buf + sizeof(struct fregs_state);
++		size += sizeof(struct fregs_state);
+ 	}
+ 
+ 	return __fpu__restore_sig(buf, buf_fx, size);
+@@ -368,8 +368,8 @@ fpu__alloc_mathframe(unsigned long sp, int ia32_frame,
+ 
+ 	*buf_fx = sp = round_down(sp - frame_size, 64);
+ 	if (ia32_frame && use_fxsr()) {
+-		frame_size += sizeof(struct i387_fsave_struct);
+-		sp -= sizeof(struct i387_fsave_struct);
++		frame_size += sizeof(struct fregs_state);
++		sp -= sizeof(struct fregs_state);
+ 	}
+ 
+ 	*size = frame_size;
+@@ -385,7 +385,7 @@ fpu__alloc_mathframe(unsigned long sp, int ia32_frame,
+  */
+ void fpu__init_prepare_fx_sw_frame(void)
+ {
+-	int fsave_header_size = sizeof(struct i387_fsave_struct);
++	int fsave_header_size = sizeof(struct fregs_state);
+ 	int size = xstate_size + FP_XSTATE_MAGIC2_SIZE;
+ 
+ 	if (config_enabled(CONFIG_X86_32))
+
+commit b992c660d3b3161ddb992e1b0cac727de574709c
+Author: Ingo Molnar <mingo@kernel.org>
+Date:   Thu Apr 30 12:45:38 2015 +0200
+
+    x86/fpu: Factor out fpu/signal.c
+    
+    fpu/xstate.c has a lot of generic FPU signal frame handling routines,
+    move them into a separate file: fpu/signal.c.
+    
+    Cc: Andy Lutomirski <luto@amacapital.net>
+    Cc: Borislav Petkov <bp@alien8.de>
+    Cc: Dave Hansen <dave.hansen@linux.intel.com>
+    Cc: Fenghua Yu <fenghua.yu@intel.com>
+    Cc: H. Peter Anvin <hpa@zytor.com>
+    Cc: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Oleg Nesterov <oleg@redhat.com>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+new file mode 100644
+index 000000000000..8d0c26ab5123
+--- /dev/null
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -0,0 +1,404 @@
++/*
++ * FPU signal frame handling routines.
++ */
++
++#include <linux/compat.h>
++#include <linux/cpu.h>
++
++#include <asm/fpu/internal.h>
++#include <asm/fpu/signal.h>
++#include <asm/fpu/regset.h>
++
++#include <asm/sigframe.h>
++
++static struct _fpx_sw_bytes fx_sw_reserved, fx_sw_reserved_ia32;
++
++/*
++ * Check for the presence of extended state information in the
++ * user fpstate pointer in the sigcontext.
++ */
++static inline int check_for_xstate(struct i387_fxsave_struct __user *buf,
++				   void __user *fpstate,
++				   struct _fpx_sw_bytes *fx_sw)
++{
++	int min_xstate_size = sizeof(struct i387_fxsave_struct) +
++			      sizeof(struct xstate_header);
++	unsigned int magic2;
++
++	if (__copy_from_user(fx_sw, &buf->sw_reserved[0], sizeof(*fx_sw)))
++		return -1;
++
++	/* Check for the first magic field and other error scenarios. */
++	if (fx_sw->magic1 != FP_XSTATE_MAGIC1 ||
++	    fx_sw->xstate_size < min_xstate_size ||
++	    fx_sw->xstate_size > xstate_size ||
++	    fx_sw->xstate_size > fx_sw->extended_size)
++		return -1;
++
++	/*
++	 * Check for the presence of second magic word at the end of memory
++	 * layout. This detects the case where the user just copied the legacy
++	 * fpstate layout with out copying the extended state information
++	 * in the memory layout.
++	 */
++	if (__get_user(magic2, (__u32 __user *)(fpstate + fx_sw->xstate_size))
++	    || magic2 != FP_XSTATE_MAGIC2)
++		return -1;
++
++	return 0;
++}
++
++/*
++ * Signal frame handlers.
++ */
++static inline int save_fsave_header(struct task_struct *tsk, void __user *buf)
++{
++	if (use_fxsr()) {
++		struct xsave_struct *xsave = &tsk->thread.fpu.state.xsave;
++		struct user_i387_ia32_struct env;
++		struct _fpstate_ia32 __user *fp = buf;
++
++		convert_from_fxsr(&env, tsk);
++
++		if (__copy_to_user(buf, &env, sizeof(env)) ||
++		    __put_user(xsave->i387.swd, &fp->status) ||
++		    __put_user(X86_FXSR_MAGIC, &fp->magic))
++			return -1;
++	} else {
++		struct i387_fsave_struct __user *fp = buf;
++		u32 swd;
++		if (__get_user(swd, &fp->swd) || __put_user(swd, &fp->status))
++			return -1;
++	}
++
++	return 0;
++}
++
++static inline int save_xstate_epilog(void __user *buf, int ia32_frame)
++{
++	struct xsave_struct __user *x = buf;
++	struct _fpx_sw_bytes *sw_bytes;
++	u32 xfeatures;
++	int err;
++
++	/* Setup the bytes not touched by the [f]xsave and reserved for SW. */
++	sw_bytes = ia32_frame ? &fx_sw_reserved_ia32 : &fx_sw_reserved;
++	err = __copy_to_user(&x->i387.sw_reserved, sw_bytes, sizeof(*sw_bytes));
++
++	if (!use_xsave())
++		return err;
++
++	err |= __put_user(FP_XSTATE_MAGIC2, (__u32 *)(buf + xstate_size));
++
++	/*
++	 * Read the xfeatures which we copied (directly from the cpu or
++	 * from the state in task struct) to the user buffers.
++	 */
++	err |= __get_user(xfeatures, (__u32 *)&x->header.xfeatures);
++
++	/*
++	 * For legacy compatible, we always set FP/SSE bits in the bit
++	 * vector while saving the state to the user context. This will
++	 * enable us capturing any changes(during sigreturn) to
++	 * the FP/SSE bits by the legacy applications which don't touch
++	 * xfeatures in the xsave header.
++	 *
++	 * xsave aware apps can change the xfeatures in the xsave
++	 * header as well as change any contents in the memory layout.
++	 * xrestore as part of sigreturn will capture all the changes.
++	 */
++	xfeatures |= XSTATE_FPSSE;
++
++	err |= __put_user(xfeatures, (__u32 *)&x->header.xfeatures);
++
++	return err;
++}
++
++static inline int copy_fpregs_to_sigframe(struct xsave_struct __user *buf)
++{
++	int err;
++
++	if (use_xsave())
++		err = copy_xregs_to_user(buf);
++	else if (use_fxsr())
++		err = copy_fxregs_to_user((struct i387_fxsave_struct __user *) buf);
++	else
++		err = copy_fregs_to_user((struct i387_fsave_struct __user *) buf);
++
++	if (unlikely(err) && __clear_user(buf, xstate_size))
++		err = -EFAULT;
++	return err;
++}
++
++/*
++ * Save the fpu, extended register state to the user signal frame.
++ *
++ * 'buf_fx' is the 64-byte aligned pointer at which the [f|fx|x]save
++ *  state is copied.
++ *  'buf' points to the 'buf_fx' or to the fsave header followed by 'buf_fx'.
++ *
++ *	buf == buf_fx for 64-bit frames and 32-bit fsave frame.
++ *	buf != buf_fx for 32-bit frames with fxstate.
++ *
++ * If the fpu, extended register state is live, save the state directly
++ * to the user frame pointed by the aligned pointer 'buf_fx'. Otherwise,
++ * copy the thread's fpu state to the user frame starting at 'buf_fx'.
++ *
++ * If this is a 32-bit frame with fxstate, put a fsave header before
++ * the aligned state at 'buf_fx'.
++ *
++ * For [f]xsave state, update the SW reserved fields in the [f]xsave frame
++ * indicating the absence/presence of the extended state to the user.
++ */
++int copy_fpstate_to_sigframe(void __user *buf, void __user *buf_fx, int size)
++{
++	struct xsave_struct *xsave = &current->thread.fpu.state.xsave;
++	struct task_struct *tsk = current;
++	int ia32_fxstate = (buf != buf_fx);
++
++	ia32_fxstate &= (config_enabled(CONFIG_X86_32) ||
++			 config_enabled(CONFIG_IA32_EMULATION));
++
++	if (!access_ok(VERIFY_WRITE, buf, size))
++		return -EACCES;
++
++	if (!static_cpu_has(X86_FEATURE_FPU))
++		return fpregs_soft_get(current, NULL, 0,
++			sizeof(struct user_i387_ia32_struct), NULL,
++			(struct _fpstate_ia32 __user *) buf) ? -1 : 1;
++
++	if (fpregs_active()) {
++		/* Save the live register state to the user directly. */
++		if (copy_fpregs_to_sigframe(buf_fx))
++			return -1;
++		/* Update the thread's fxstate to save the fsave header. */
++		if (ia32_fxstate)
++			copy_fxregs_to_kernel(&tsk->thread.fpu);
++	} else {
++		fpstate_sanitize_xstate(&tsk->thread.fpu);
++		if (__copy_to_user(buf_fx, xsave, xstate_size))
++			return -1;
++	}
++
++	/* Save the fsave header for the 32-bit frames. */
++	if ((ia32_fxstate || !use_fxsr()) && save_fsave_header(tsk, buf))
++		return -1;
++
++	if (use_fxsr() && save_xstate_epilog(buf_fx, ia32_fxstate))
++		return -1;
++
++	return 0;
++}
++
++static inline void
++sanitize_restored_xstate(struct task_struct *tsk,
++			 struct user_i387_ia32_struct *ia32_env,
++			 u64 xfeatures, int fx_only)
++{
++	struct xsave_struct *xsave = &tsk->thread.fpu.state.xsave;
++	struct xstate_header *header = &xsave->header;
++
++	if (use_xsave()) {
++		/* These bits must be zero. */
++		memset(header->reserved, 0, 48);
++
++		/*
++		 * Init the state that is not present in the memory
++		 * layout and not enabled by the OS.
++		 */
++		if (fx_only)
++			header->xfeatures = XSTATE_FPSSE;
++		else
++			header->xfeatures &= (xfeatures_mask & xfeatures);
++	}
++
++	if (use_fxsr()) {
++		/*
++		 * mscsr reserved bits must be masked to zero for security
++		 * reasons.
++		 */
++		xsave->i387.mxcsr &= mxcsr_feature_mask;
++
++		convert_to_fxsr(tsk, ia32_env);
++	}
++}
++
++/*
++ * Restore the extended state if present. Otherwise, restore the FP/SSE state.
++ */
++static inline int copy_user_to_fpregs_zeroing(void __user *buf, u64 xbv, int fx_only)
++{
++	if (use_xsave()) {
++		if ((unsigned long)buf % 64 || fx_only) {
++			u64 init_bv = xfeatures_mask & ~XSTATE_FPSSE;
++			copy_kernel_to_xregs(&init_fpstate.xsave, init_bv);
++			return copy_user_to_fxregs(buf);
++		} else {
++			u64 init_bv = xfeatures_mask & ~xbv;
++			if (unlikely(init_bv))
++				copy_kernel_to_xregs(&init_fpstate.xsave, init_bv);
++			return copy_user_to_xregs(buf, xbv);
++		}
++	} else if (use_fxsr()) {
++		return copy_user_to_fxregs(buf);
++	} else
++		return copy_user_to_fregs(buf);
++}
++
++static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
++{
++	int ia32_fxstate = (buf != buf_fx);
++	struct task_struct *tsk = current;
++	struct fpu *fpu = &tsk->thread.fpu;
++	int state_size = xstate_size;
++	u64 xfeatures = 0;
++	int fx_only = 0;
++
++	ia32_fxstate &= (config_enabled(CONFIG_X86_32) ||
++			 config_enabled(CONFIG_IA32_EMULATION));
++
++	if (!buf) {
++		fpu__clear(fpu);
++		return 0;
++	}
++
++	if (!access_ok(VERIFY_READ, buf, size))
++		return -EACCES;
++
++	fpu__activate_curr(fpu);
++
++	if (!static_cpu_has(X86_FEATURE_FPU))
++		return fpregs_soft_set(current, NULL,
++				       0, sizeof(struct user_i387_ia32_struct),
++				       NULL, buf) != 0;
++
++	if (use_xsave()) {
++		struct _fpx_sw_bytes fx_sw_user;
++		if (unlikely(check_for_xstate(buf_fx, buf_fx, &fx_sw_user))) {
++			/*
++			 * Couldn't find the extended state information in the
++			 * memory layout. Restore just the FP/SSE and init all
++			 * the other extended state.
++			 */
++			state_size = sizeof(struct i387_fxsave_struct);
++			fx_only = 1;
++		} else {
++			state_size = fx_sw_user.xstate_size;
++			xfeatures = fx_sw_user.xfeatures;
++		}
++	}
++
++	if (ia32_fxstate) {
++		/*
++		 * For 32-bit frames with fxstate, copy the user state to the
++		 * thread's fpu state, reconstruct fxstate from the fsave
++		 * header. Sanitize the copied state etc.
++		 */
++		struct fpu *fpu = &tsk->thread.fpu;
++		struct user_i387_ia32_struct env;
++		int err = 0;
++
++		/*
++		 * Drop the current fpu which clears fpu->fpstate_active. This ensures
++		 * that any context-switch during the copy of the new state,
++		 * avoids the intermediate state from getting restored/saved.
++		 * Thus avoiding the new restored state from getting corrupted.
++		 * We will be ready to restore/save the state only after
++		 * fpu->fpstate_active is again set.
++		 */
++		fpu__drop(fpu);
++
++		if (__copy_from_user(&fpu->state.xsave, buf_fx, state_size) ||
++		    __copy_from_user(&env, buf, sizeof(env))) {
++			fpstate_init(&fpu->state);
++			err = -1;
++		} else {
++			sanitize_restored_xstate(tsk, &env, xfeatures, fx_only);
++		}
++
++		fpu->fpstate_active = 1;
++		if (use_eager_fpu()) {
++			preempt_disable();
++			fpu__restore();
++			preempt_enable();
++		}
++
++		return err;
++	} else {
++		/*
++		 * For 64-bit frames and 32-bit fsave frames, restore the user
++		 * state to the registers directly (with exceptions handled).
++		 */
++		user_fpu_begin();
++		if (copy_user_to_fpregs_zeroing(buf_fx, xfeatures, fx_only)) {
++			fpu__clear(fpu);
++			return -1;
++		}
++	}
++
++	return 0;
++}
++
++static inline int xstate_sigframe_size(void)
++{
++	return use_xsave() ? xstate_size + FP_XSTATE_MAGIC2_SIZE : xstate_size;
++}
++
++/*
++ * Restore FPU state from a sigframe:
++ */
++int fpu__restore_sig(void __user *buf, int ia32_frame)
++{
++	void __user *buf_fx = buf;
++	int size = xstate_sigframe_size();
++
++	if (ia32_frame && use_fxsr()) {
++		buf_fx = buf + sizeof(struct i387_fsave_struct);
++		size += sizeof(struct i387_fsave_struct);
++	}
++
++	return __fpu__restore_sig(buf, buf_fx, size);
++}
++
++unsigned long
++fpu__alloc_mathframe(unsigned long sp, int ia32_frame,
++		     unsigned long *buf_fx, unsigned long *size)
++{
++	unsigned long frame_size = xstate_sigframe_size();
++
++	*buf_fx = sp = round_down(sp - frame_size, 64);
++	if (ia32_frame && use_fxsr()) {
++		frame_size += sizeof(struct i387_fsave_struct);
++		sp -= sizeof(struct i387_fsave_struct);
++	}
++
++	*size = frame_size;
++
++	return sp;
++}
++/*
++ * Prepare the SW reserved portion of the fxsave memory layout, indicating
++ * the presence of the extended state information in the memory layout
++ * pointed by the fpstate pointer in the sigcontext.
++ * This will be saved when ever the FP and extended state context is
++ * saved on the user stack during the signal handler delivery to the user.
++ */
++void fpu__init_prepare_fx_sw_frame(void)
++{
++	int fsave_header_size = sizeof(struct i387_fsave_struct);
++	int size = xstate_size + FP_XSTATE_MAGIC2_SIZE;
++
++	if (config_enabled(CONFIG_X86_32))
++		size += fsave_header_size;
++
++	fx_sw_reserved.magic1 = FP_XSTATE_MAGIC1;
++	fx_sw_reserved.extended_size = size;
++	fx_sw_reserved.xfeatures = xfeatures_mask;
++	fx_sw_reserved.xstate_size = xstate_size;
++
++	if (config_enabled(CONFIG_IA32_EMULATION)) {
++		fx_sw_reserved_ia32 = fx_sw_reserved;
++		fx_sw_reserved_ia32.extended_size += fsave_header_size;
++	}
++}
++

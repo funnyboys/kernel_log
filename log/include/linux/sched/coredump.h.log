@@ -1,0 +1,594 @@
+commit 9bcdeb51bd7d2ae9fe65ea4d60643d2aeef5bfe3
+Author: Tetsuo Handa <penguin-kernel@I-love.SAKURA.ne.jp>
+Date:   Fri Feb 1 14:20:31 2019 -0800
+
+    oom, oom_reaper: do not enqueue same task twice
+    
+    Arkadiusz reported that enabling memcg's group oom killing causes
+    strange memcg statistics where there is no task in a memcg despite the
+    number of tasks in that memcg is not 0.  It turned out that there is a
+    bug in wake_oom_reaper() which allows enqueuing same task twice which
+    makes impossible to decrease the number of tasks in that memcg due to a
+    refcount leak.
+    
+    This bug existed since the OOM reaper became invokable from
+    task_will_free_mem(current) path in out_of_memory() in Linux 4.7,
+    
+      T1@P1     |T2@P1     |T3@P1     |OOM reaper
+      ----------+----------+----------+------------
+                                       # Processing an OOM victim in a different memcg domain.
+                            try_charge()
+                              mem_cgroup_out_of_memory()
+                                mutex_lock(&oom_lock)
+                 try_charge()
+                   mem_cgroup_out_of_memory()
+                     mutex_lock(&oom_lock)
+      try_charge()
+        mem_cgroup_out_of_memory()
+          mutex_lock(&oom_lock)
+                                out_of_memory()
+                                  oom_kill_process(P1)
+                                    do_send_sig_info(SIGKILL, @P1)
+                                    mark_oom_victim(T1@P1)
+                                    wake_oom_reaper(T1@P1) # T1@P1 is enqueued.
+                                mutex_unlock(&oom_lock)
+                     out_of_memory()
+                       mark_oom_victim(T2@P1)
+                       wake_oom_reaper(T2@P1) # T2@P1 is enqueued.
+                     mutex_unlock(&oom_lock)
+          out_of_memory()
+            mark_oom_victim(T1@P1)
+            wake_oom_reaper(T1@P1) # T1@P1 is enqueued again due to oom_reaper_list == T2@P1 && T1@P1->oom_reaper_list == NULL.
+          mutex_unlock(&oom_lock)
+                                       # Completed processing an OOM victim in a different memcg domain.
+                                       spin_lock(&oom_reaper_lock)
+                                       # T1P1 is dequeued.
+                                       spin_unlock(&oom_reaper_lock)
+    
+    but memcg's group oom killing made it easier to trigger this bug by
+    calling wake_oom_reaper() on the same task from one out_of_memory()
+    request.
+    
+    Fix this bug using an approach used by commit 855b018325737f76 ("oom,
+    oom_reaper: disable oom_reaper for oom_kill_allocating_task").  As a
+    side effect of this patch, this patch also avoids enqueuing multiple
+    threads sharing memory via task_will_free_mem(current) path.
+    
+    Link: http://lkml.kernel.org/r/e865a044-2c10-9858-f4ef-254bc71d6cc2@i-love.sakura.ne.jp
+    Link: http://lkml.kernel.org/r/5ee34fc6-1485-34f8-8790-903ddabaa809@i-love.sakura.ne.jp
+    Fixes: af8e15cc85a25315 ("oom, oom_reaper: do not enqueue task if it is on the oom_reaper_list head")
+    Signed-off-by: Tetsuo Handa <penguin-kernel@I-love.SAKURA.ne.jp>
+    Reported-by: Arkadiusz Miskiewicz <arekm@maven.pl>
+    Tested-by: Arkadiusz Miskiewicz <arekm@maven.pl>
+    Acked-by: Michal Hocko <mhocko@suse.com>
+    Acked-by: Roman Gushchin <guro@fb.com>
+    Cc: Tejun Heo <tj@kernel.org>
+    Cc: Aleksa Sarai <asarai@suse.de>
+    Cc: Jay Kamat <jgkamat@fb.com>
+    Cc: Johannes Weiner <hannes@cmpxchg.org>
+    Cc: <stable@vger.kernel.org>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/include/linux/sched/coredump.h b/include/linux/sched/coredump.h
+index ec912d01126f..ecdc6542070f 100644
+--- a/include/linux/sched/coredump.h
++++ b/include/linux/sched/coredump.h
+@@ -71,6 +71,7 @@ static inline int get_dumpable(struct mm_struct *mm)
+ #define MMF_HUGE_ZERO_PAGE	23      /* mm has ever used the global huge zero page */
+ #define MMF_DISABLE_THP		24	/* disable THP for all VMAs */
+ #define MMF_OOM_VICTIM		25	/* mm is the oom victim */
++#define MMF_OOM_REAP_QUEUED	26	/* mm was queued for oom_reaper */
+ #define MMF_DISABLE_THP_MASK	(1 << MMF_DISABLE_THP)
+ 
+ #define MMF_INIT_MASK		(MMF_DUMPABLE_MASK | MMF_DUMP_FILTER_MASK |\
+
+commit 4837fe37adff1d159904f0c013471b1ecbcb455e
+Author: Michal Hocko <mhocko@suse.com>
+Date:   Thu Dec 14 15:33:15 2017 -0800
+
+    mm, oom_reaper: fix memory corruption
+    
+    David Rientjes has reported the following memory corruption while the
+    oom reaper tries to unmap the victims address space
+    
+      BUG: Bad page map in process oom_reaper  pte:6353826300000000 pmd:00000000
+      addr:00007f50cab1d000 vm_flags:08100073 anon_vma:ffff9eea335603f0 mapping:          (null) index:7f50cab1d
+      file:          (null) fault:          (null) mmap:          (null) readpage:          (null)
+      CPU: 2 PID: 1001 Comm: oom_reaper
+      Call Trace:
+         unmap_page_range+0x1068/0x1130
+         __oom_reap_task_mm+0xd5/0x16b
+         oom_reaper+0xff/0x14c
+         kthread+0xc1/0xe0
+    
+    Tetsuo Handa has noticed that the synchronization inside exit_mmap is
+    insufficient.  We only synchronize with the oom reaper if
+    tsk_is_oom_victim which is not true if the final __mmput is called from
+    a different context than the oom victim exit path.  This can trivially
+    happen from context of any task which has grabbed mm reference (e.g.  to
+    read /proc/<pid>/ file which requires mm etc.).
+    
+    The race would look like this
+    
+      oom_reaper            oom_victim              task
+                                                    mmget_not_zero
+                            do_exit
+                              mmput
+      __oom_reap_task_mm                            mmput
+                                                      __mmput
+                                                        exit_mmap
+                                                          remove_vma
+        unmap_page_range
+    
+    Fix this issue by providing a new mm_is_oom_victim() helper which
+    operates on the mm struct rather than a task.  Any context which
+    operates on a remote mm struct should use this helper in place of
+    tsk_is_oom_victim.  The flag is set in mark_oom_victim and never cleared
+    so it is stable in the exit_mmap path.
+    
+    Debugged by Tetsuo Handa.
+    
+    Link: http://lkml.kernel.org/r/20171210095130.17110-1-mhocko@kernel.org
+    Fixes: 212925802454 ("mm: oom: let oom_reap_task and exit_mmap run concurrently")
+    Signed-off-by: Michal Hocko <mhocko@suse.com>
+    Reported-by: David Rientjes <rientjes@google.com>
+    Acked-by: David Rientjes <rientjes@google.com>
+    Cc: Tetsuo Handa <penguin-kernel@I-love.SAKURA.ne.jp>
+    Cc: Andrea Argangeli <andrea@kernel.org>
+    Cc: <stable@vger.kernel.org>    [4.14]
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/include/linux/sched/coredump.h b/include/linux/sched/coredump.h
+index 9c8847395b5e..ec912d01126f 100644
+--- a/include/linux/sched/coredump.h
++++ b/include/linux/sched/coredump.h
+@@ -70,6 +70,7 @@ static inline int get_dumpable(struct mm_struct *mm)
+ #define MMF_UNSTABLE		22	/* mm is unstable for copy_from_user */
+ #define MMF_HUGE_ZERO_PAGE	23      /* mm has ever used the global huge zero page */
+ #define MMF_DISABLE_THP		24	/* disable THP for all VMAs */
++#define MMF_OOM_VICTIM		25	/* mm is the oom victim */
+ #define MMF_DISABLE_THP_MASK	(1 << MMF_DISABLE_THP)
+ 
+ #define MMF_INIT_MASK		(MMF_DUMPABLE_MASK | MMF_DUMP_FILTER_MASK |\
+
+commit b24413180f5600bcb3bb70fbed5cf186b60864bd
+Author: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Date:   Wed Nov 1 15:07:57 2017 +0100
+
+    License cleanup: add SPDX GPL-2.0 license identifier to files with no license
+    
+    Many source files in the tree are missing licensing information, which
+    makes it harder for compliance tools to determine the correct license.
+    
+    By default all files without license information are under the default
+    license of the kernel, which is GPL version 2.
+    
+    Update the files which contain no license information with the 'GPL-2.0'
+    SPDX license identifier.  The SPDX identifier is a legally binding
+    shorthand, which can be used instead of the full boiler plate text.
+    
+    This patch is based on work done by Thomas Gleixner and Kate Stewart and
+    Philippe Ombredanne.
+    
+    How this work was done:
+    
+    Patches were generated and checked against linux-4.14-rc6 for a subset of
+    the use cases:
+     - file had no licensing information it it.
+     - file was a */uapi/* one with no licensing information in it,
+     - file was a */uapi/* one with existing licensing information,
+    
+    Further patches will be generated in subsequent months to fix up cases
+    where non-standard license headers were used, and references to license
+    had to be inferred by heuristics based on keywords.
+    
+    The analysis to determine which SPDX License Identifier to be applied to
+    a file was done in a spreadsheet of side by side results from of the
+    output of two independent scanners (ScanCode & Windriver) producing SPDX
+    tag:value files created by Philippe Ombredanne.  Philippe prepared the
+    base worksheet, and did an initial spot review of a few 1000 files.
+    
+    The 4.13 kernel was the starting point of the analysis with 60,537 files
+    assessed.  Kate Stewart did a file by file comparison of the scanner
+    results in the spreadsheet to determine which SPDX license identifier(s)
+    to be applied to the file. She confirmed any determination that was not
+    immediately clear with lawyers working with the Linux Foundation.
+    
+    Criteria used to select files for SPDX license identifier tagging was:
+     - Files considered eligible had to be source code files.
+     - Make and config files were included as candidates if they contained >5
+       lines of source
+     - File already had some variant of a license header in it (even if <5
+       lines).
+    
+    All documentation files were explicitly excluded.
+    
+    The following heuristics were used to determine which SPDX license
+    identifiers to apply.
+    
+     - when both scanners couldn't find any license traces, file was
+       considered to have no license information in it, and the top level
+       COPYING file license applied.
+    
+       For non */uapi/* files that summary was:
+    
+       SPDX license identifier                            # files
+       ---------------------------------------------------|-------
+       GPL-2.0                                              11139
+    
+       and resulted in the first patch in this series.
+    
+       If that file was a */uapi/* path one, it was "GPL-2.0 WITH
+       Linux-syscall-note" otherwise it was "GPL-2.0".  Results of that was:
+    
+       SPDX license identifier                            # files
+       ---------------------------------------------------|-------
+       GPL-2.0 WITH Linux-syscall-note                        930
+    
+       and resulted in the second patch in this series.
+    
+     - if a file had some form of licensing information in it, and was one
+       of the */uapi/* ones, it was denoted with the Linux-syscall-note if
+       any GPL family license was found in the file or had no licensing in
+       it (per prior point).  Results summary:
+    
+       SPDX license identifier                            # files
+       ---------------------------------------------------|------
+       GPL-2.0 WITH Linux-syscall-note                       270
+       GPL-2.0+ WITH Linux-syscall-note                      169
+       ((GPL-2.0 WITH Linux-syscall-note) OR BSD-2-Clause)    21
+       ((GPL-2.0 WITH Linux-syscall-note) OR BSD-3-Clause)    17
+       LGPL-2.1+ WITH Linux-syscall-note                      15
+       GPL-1.0+ WITH Linux-syscall-note                       14
+       ((GPL-2.0+ WITH Linux-syscall-note) OR BSD-3-Clause)    5
+       LGPL-2.0+ WITH Linux-syscall-note                       4
+       LGPL-2.1 WITH Linux-syscall-note                        3
+       ((GPL-2.0 WITH Linux-syscall-note) OR MIT)              3
+       ((GPL-2.0 WITH Linux-syscall-note) AND MIT)             1
+    
+       and that resulted in the third patch in this series.
+    
+     - when the two scanners agreed on the detected license(s), that became
+       the concluded license(s).
+    
+     - when there was disagreement between the two scanners (one detected a
+       license but the other didn't, or they both detected different
+       licenses) a manual inspection of the file occurred.
+    
+     - In most cases a manual inspection of the information in the file
+       resulted in a clear resolution of the license that should apply (and
+       which scanner probably needed to revisit its heuristics).
+    
+     - When it was not immediately clear, the license identifier was
+       confirmed with lawyers working with the Linux Foundation.
+    
+     - If there was any question as to the appropriate license identifier,
+       the file was flagged for further research and to be revisited later
+       in time.
+    
+    In total, over 70 hours of logged manual review was done on the
+    spreadsheet to determine the SPDX license identifiers to apply to the
+    source files by Kate, Philippe, Thomas and, in some cases, confirmation
+    by lawyers working with the Linux Foundation.
+    
+    Kate also obtained a third independent scan of the 4.13 code base from
+    FOSSology, and compared selected files where the other two scanners
+    disagreed against that SPDX file, to see if there was new insights.  The
+    Windriver scanner is based on an older version of FOSSology in part, so
+    they are related.
+    
+    Thomas did random spot checks in about 500 files from the spreadsheets
+    for the uapi headers and agreed with SPDX license identifier in the
+    files he inspected. For the non-uapi files Thomas did random spot checks
+    in about 15000 files.
+    
+    In initial set of patches against 4.14-rc6, 3 files were found to have
+    copy/paste license identifier errors, and have been fixed to reflect the
+    correct identifier.
+    
+    Additionally Philippe spent 10 hours this week doing a detailed manual
+    inspection and review of the 12,461 patched files from the initial patch
+    version early this week with:
+     - a full scancode scan run, collecting the matched texts, detected
+       license ids and scores
+     - reviewing anything where there was a license detected (about 500+
+       files) to ensure that the applied SPDX license was correct
+     - reviewing anything where there was no detection but the patch license
+       was not GPL-2.0 WITH Linux-syscall-note to ensure that the applied
+       SPDX license was correct
+    
+    This produced a worksheet with 20 files needing minor correction.  This
+    worksheet was then exported into 3 different .csv files for the
+    different types of files to be modified.
+    
+    These .csv files were then reviewed by Greg.  Thomas wrote a script to
+    parse the csv files and add the proper SPDX tag to the file, in the
+    format that the file expected.  This script was further refined by Greg
+    based on the output to detect more types of files automatically and to
+    distinguish between header and source .c files (which need different
+    comment types.)  Finally Greg ran the script using the .csv files to
+    generate the patches.
+    
+    Reviewed-by: Kate Stewart <kstewart@linuxfoundation.org>
+    Reviewed-by: Philippe Ombredanne <pombredanne@nexb.com>
+    Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/include/linux/sched/coredump.h b/include/linux/sched/coredump.h
+index 98ae0d05aa32..9c8847395b5e 100644
+--- a/include/linux/sched/coredump.h
++++ b/include/linux/sched/coredump.h
+@@ -1,3 +1,4 @@
++/* SPDX-License-Identifier: GPL-2.0 */
+ #ifndef _LINUX_SCHED_COREDUMP_H
+ #define _LINUX_SCHED_COREDUMP_H
+ 
+
+commit 1860033237d4be09c5d7382585f0c7229367a534
+Author: Michal Hocko <mhocko@suse.com>
+Date:   Mon Jul 10 15:48:02 2017 -0700
+
+    mm: make PR_SET_THP_DISABLE immediately active
+    
+    PR_SET_THP_DISABLE has a rather subtle semantic.  It doesn't affect any
+    existing mapping because it only updated mm->def_flags which is a
+    template for new mappings.
+    
+    The mappings created after prctl(PR_SET_THP_DISABLE) have VM_NOHUGEPAGE
+    flag set.  This can be quite surprising for all those applications which
+    do not do prctl(); fork() & exec() and want to control their own THP
+    behavior.
+    
+    Another usecase when the immediate semantic of the prctl might be useful
+    is a combination of pre- and post-copy migration of containers with
+    CRIU.  In this case CRIU populates a part of a memory region with data
+    that was saved during the pre-copy stage.  Afterwards, the region is
+    registered with userfaultfd and CRIU expects to get page faults for the
+    parts of the region that were not yet populated.  However, khugepaged
+    collapses the pages and the expected page faults do not occur.
+    
+    In more general case, the prctl(PR_SET_THP_DISABLE) could be used as a
+    temporary mechanism for enabling/disabling THP process wide.
+    
+    Implementation wise, a new MMF_DISABLE_THP flag is added.  This flag is
+    tested when decision whether to use huge pages is taken either during
+    page fault of at the time of THP collapse.
+    
+    It should be noted, that the new implementation makes PR_SET_THP_DISABLE
+    master override to any per-VMA setting, which was not the case
+    previously.
+    
+    Fixes: a0715cc22601 ("mm, thp: add VM_INIT_DEF_MASK and PRCTL_THP_DISABLE")
+    Link: http://lkml.kernel.org/r/1496415802-30944-1-git-send-email-rppt@linux.vnet.ibm.com
+    Signed-off-by: Michal Hocko <mhocko@suse.com>
+    Signed-off-by: Mike Rapoport <rppt@linux.vnet.ibm.com>
+    Cc: Vlastimil Babka <vbabka@suse.cz>
+    Cc: Andrea Arcangeli <aarcange@redhat.com>
+    Cc: Arnd Bergmann <arnd@arndb.de>
+    Cc: "Kirill A. Shutemov" <kirill.shutemov@linux.intel.com>
+    Cc: Pavel Emelyanov <xemul@virtuozzo.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/include/linux/sched/coredump.h b/include/linux/sched/coredump.h
+index 69eedcef8f03..98ae0d05aa32 100644
+--- a/include/linux/sched/coredump.h
++++ b/include/linux/sched/coredump.h
+@@ -68,7 +68,10 @@ static inline int get_dumpable(struct mm_struct *mm)
+ #define MMF_OOM_SKIP		21	/* mm is of no interest for the OOM killer */
+ #define MMF_UNSTABLE		22	/* mm is unstable for copy_from_user */
+ #define MMF_HUGE_ZERO_PAGE	23      /* mm has ever used the global huge zero page */
++#define MMF_DISABLE_THP		24	/* disable THP for all VMAs */
++#define MMF_DISABLE_THP_MASK	(1 << MMF_DISABLE_THP)
+ 
+-#define MMF_INIT_MASK		(MMF_DUMPABLE_MASK | MMF_DUMP_FILTER_MASK)
++#define MMF_INIT_MASK		(MMF_DUMPABLE_MASK | MMF_DUMP_FILTER_MASK |\
++				 MMF_DISABLE_THP_MASK)
+ 
+ #endif /* _LINUX_SCHED_COREDUMP_H */
+
+commit ae1cc8823204bb938d039afa43c28a84591ada9f
+Author: Ingo Molnar <mingo@kernel.org>
+Date:   Wed Feb 8 18:51:54 2017 +0100
+
+    sched/headers: Remove <linux/sched.h> from <linux/sched/coredump.h>
+    
+    The <linux/sched/coredump.h> file is a self-contained header and users of
+    it either don't need <linux/sched.h> - or have already included it.
+    
+    Include <linux/mm_types.h>.
+    
+    This reduces the size of the header dependency graph.
+    
+    Acked-by: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Mike Galbraith <efault@gmx.de>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/include/linux/sched/coredump.h b/include/linux/sched/coredump.h
+index f46912aa4f4c..69eedcef8f03 100644
+--- a/include/linux/sched/coredump.h
++++ b/include/linux/sched/coredump.h
+@@ -1,7 +1,6 @@
+ #ifndef _LINUX_SCHED_COREDUMP_H
+ #define _LINUX_SCHED_COREDUMP_H
+ 
+-#include <linux/sched.h>
+ #include <linux/mm_types.h>
+ 
+ #define SUID_DUMP_DISABLE	0	/* No setuid dumping */
+
+commit 11701c6768367294c5086738d49196192aaf3d60
+Author: Ingo Molnar <mingo@kernel.org>
+Date:   Wed Feb 1 19:21:47 2017 +0100
+
+    sched/headers: Move task->mm coredumping related defines and methods from <linux/sched.h> to <linux/sched/coredump.h>
+    
+    This further reduces the size and complexity of <linux/sched.h>.
+    
+    These are the definitions and APIs that are moved:
+    
+      # MMF_*:
+      fs/binfmt_elf.c
+      fs/binfmt_elf_fdpic.c
+      fs/exec.c
+      fs/proc/base.c
+      include/linux/khugepaged.h
+      include/linux/ksm.h
+      include/linux/sched/coredump.h
+      kernel/events/uprobes.c
+      kernel/fork.c
+      mm/huge_memory.c
+      mm/khugepaged.c
+      mm/ksm.c
+      mm/memory.c
+      mm/oom_kill.c
+    
+      # SUID_DUMP_*:
+      arch/ia64/include/asm/processor.h
+      fs/coredump.c
+      fs/exec.c
+      fs/proc/internal.h
+      include/linux/sched/coredump.h
+      kernel/ptrace.c
+      kernel/sys.c
+      kernel/sysctl.c
+    
+      # get_dumpable():
+      arch/ia64/include/asm/processor.h
+      fs/coredump.c
+      fs/exec.c
+      fs/proc/internal.h
+      include/linux/sched/coredump.h
+      kernel/ptrace.c
+      kernel/sys.c
+    
+      # set_dumpable():
+      fs/exec.c
+      include/linux/sched/coredump.h
+      kernel/cred.c
+      kernel/sys.c
+    
+    Acked-by: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Mike Galbraith <efault@gmx.de>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/include/linux/sched/coredump.h b/include/linux/sched/coredump.h
+index ab81e564e076..f46912aa4f4c 100644
+--- a/include/linux/sched/coredump.h
++++ b/include/linux/sched/coredump.h
+@@ -2,5 +2,74 @@
+ #define _LINUX_SCHED_COREDUMP_H
+ 
+ #include <linux/sched.h>
++#include <linux/mm_types.h>
++
++#define SUID_DUMP_DISABLE	0	/* No setuid dumping */
++#define SUID_DUMP_USER		1	/* Dump as user of process */
++#define SUID_DUMP_ROOT		2	/* Dump as root */
++
++/* mm flags */
++
++/* for SUID_DUMP_* above */
++#define MMF_DUMPABLE_BITS 2
++#define MMF_DUMPABLE_MASK ((1 << MMF_DUMPABLE_BITS) - 1)
++
++extern void set_dumpable(struct mm_struct *mm, int value);
++/*
++ * This returns the actual value of the suid_dumpable flag. For things
++ * that are using this for checking for privilege transitions, it must
++ * test against SUID_DUMP_USER rather than treating it as a boolean
++ * value.
++ */
++static inline int __get_dumpable(unsigned long mm_flags)
++{
++	return mm_flags & MMF_DUMPABLE_MASK;
++}
++
++static inline int get_dumpable(struct mm_struct *mm)
++{
++	return __get_dumpable(mm->flags);
++}
++
++/* coredump filter bits */
++#define MMF_DUMP_ANON_PRIVATE	2
++#define MMF_DUMP_ANON_SHARED	3
++#define MMF_DUMP_MAPPED_PRIVATE	4
++#define MMF_DUMP_MAPPED_SHARED	5
++#define MMF_DUMP_ELF_HEADERS	6
++#define MMF_DUMP_HUGETLB_PRIVATE 7
++#define MMF_DUMP_HUGETLB_SHARED  8
++#define MMF_DUMP_DAX_PRIVATE	9
++#define MMF_DUMP_DAX_SHARED	10
++
++#define MMF_DUMP_FILTER_SHIFT	MMF_DUMPABLE_BITS
++#define MMF_DUMP_FILTER_BITS	9
++#define MMF_DUMP_FILTER_MASK \
++	(((1 << MMF_DUMP_FILTER_BITS) - 1) << MMF_DUMP_FILTER_SHIFT)
++#define MMF_DUMP_FILTER_DEFAULT \
++	((1 << MMF_DUMP_ANON_PRIVATE) |	(1 << MMF_DUMP_ANON_SHARED) |\
++	 (1 << MMF_DUMP_HUGETLB_PRIVATE) | MMF_DUMP_MASK_DEFAULT_ELF)
++
++#ifdef CONFIG_CORE_DUMP_DEFAULT_ELF_HEADERS
++# define MMF_DUMP_MASK_DEFAULT_ELF	(1 << MMF_DUMP_ELF_HEADERS)
++#else
++# define MMF_DUMP_MASK_DEFAULT_ELF	0
++#endif
++					/* leave room for more dump flags */
++#define MMF_VM_MERGEABLE	16	/* KSM may merge identical pages */
++#define MMF_VM_HUGEPAGE		17	/* set when VM_HUGEPAGE is set on vma */
++/*
++ * This one-shot flag is dropped due to necessity of changing exe once again
++ * on NFS restore
++ */
++//#define MMF_EXE_FILE_CHANGED	18	/* see prctl_set_mm_exe_file() */
++
++#define MMF_HAS_UPROBES		19	/* has uprobes */
++#define MMF_RECALC_UPROBES	20	/* MMF_HAS_UPROBES can be wrong */
++#define MMF_OOM_SKIP		21	/* mm is of no interest for the OOM killer */
++#define MMF_UNSTABLE		22	/* mm is unstable for copy_from_user */
++#define MMF_HUGE_ZERO_PAGE	23      /* mm has ever used the global huge zero page */
++
++#define MMF_INIT_MASK		(MMF_DUMPABLE_MASK | MMF_DUMP_FILTER_MASK)
+ 
+ #endif /* _LINUX_SCHED_COREDUMP_H */
+
+commit f7ccbae45c5e2c1077654b0e857e7efb1aa31c92
+Author: Ingo Molnar <mingo@kernel.org>
+Date:   Wed Feb 8 18:51:30 2017 +0100
+
+    sched/headers: Prepare for new header dependencies before moving code to <linux/sched/coredump.h>
+    
+    We are going to split <linux/sched/coredump.h> out of <linux/sched.h>, which
+    will have to be picked up from other headers and a couple of .c files.
+    
+    Create a trivial placeholder <linux/sched/coredump.h> file that just
+    maps to <linux/sched.h> to make this patch obviously correct and
+    bisectable.
+    
+    Include the new header in the files that are going to need it.
+    
+    Acked-by: Linus Torvalds <torvalds@linux-foundation.org>
+    Cc: Mike Galbraith <efault@gmx.de>
+    Cc: Peter Zijlstra <peterz@infradead.org>
+    Cc: Thomas Gleixner <tglx@linutronix.de>
+    Cc: linux-kernel@vger.kernel.org
+    Signed-off-by: Ingo Molnar <mingo@kernel.org>
+
+diff --git a/include/linux/sched/coredump.h b/include/linux/sched/coredump.h
+new file mode 100644
+index 000000000000..ab81e564e076
+--- /dev/null
++++ b/include/linux/sched/coredump.h
+@@ -0,0 +1,6 @@
++#ifndef _LINUX_SCHED_COREDUMP_H
++#define _LINUX_SCHED_COREDUMP_H
++
++#include <linux/sched.h>
++
++#endif /* _LINUX_SCHED_COREDUMP_H */

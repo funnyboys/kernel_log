@@ -1,0 +1,206 @@
+commit 3e5a428b264eca8c7f1c261cffbe139538d7965f
+Author: Darrick J. Wong <darrick.wong@oracle.com>
+Date:   Wed Jul 3 07:33:27 2019 -0700
+
+    xfs: poll waiting for quotacheck
+    
+    Create a pwork destroy function that uses polling instead of
+    uninterruptible sleep to wait for work items to finish so that we can
+    touch the softlockup watchdog.  IOWs, gross hack.
+    
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Reviewed-by: Brian Foster <bfoster@redhat.com>
+
+diff --git a/fs/xfs/xfs_pwork.c b/fs/xfs/xfs_pwork.c
+index 752c897741e0..4bcc3e61056c 100644
+--- a/fs/xfs/xfs_pwork.c
++++ b/fs/xfs/xfs_pwork.c
+@@ -13,6 +13,7 @@
+ #include "xfs_trace.h"
+ #include "xfs_sysctl.h"
+ #include "xfs_pwork.h"
++#include <linux/nmi.h>
+ 
+ /*
+  * Parallel Work Queue
+@@ -46,6 +47,8 @@ xfs_pwork_work(
+ 	error = pctl->work_fn(pctl->mp, pwork);
+ 	if (error && !pctl->error)
+ 		pctl->error = error;
++	if (atomic_dec_and_test(&pctl->nr_work))
++		wake_up(&pctl->poll_wait);
+ }
+ 
+ /*
+@@ -74,6 +77,8 @@ xfs_pwork_init(
+ 	pctl->work_fn = work_fn;
+ 	pctl->error = 0;
+ 	pctl->mp = mp;
++	atomic_set(&pctl->nr_work, 0);
++	init_waitqueue_head(&pctl->poll_wait);
+ 
+ 	return 0;
+ }
+@@ -86,6 +91,7 @@ xfs_pwork_queue(
+ {
+ 	INIT_WORK(&pwork->work, xfs_pwork_work);
+ 	pwork->pctl = pctl;
++	atomic_inc(&pctl->nr_work);
+ 	queue_work(pctl->wq, &pwork->work);
+ }
+ 
+@@ -99,6 +105,19 @@ xfs_pwork_destroy(
+ 	return pctl->error;
+ }
+ 
++/*
++ * Wait for the work to finish by polling completion status and touch the soft
++ * lockup watchdog.  This is for callers such as mount which hold locks.
++ */
++void
++xfs_pwork_poll(
++	struct xfs_pwork_ctl	*pctl)
++{
++	while (wait_event_timeout(pctl->poll_wait,
++				atomic_read(&pctl->nr_work) == 0, HZ) == 0)
++		touch_softlockup_watchdog();
++}
++
+ /*
+  * Return the amount of parallelism that the data device can handle, or 0 for
+  * no limit.
+
+commit 40786717c88c2d4cb426cc2eb99ac50000e5a910
+Author: Darrick J. Wong <darrick.wong@oracle.com>
+Date:   Wed Jul 3 07:33:26 2019 -0700
+
+    xfs: multithreaded iwalk implementation
+    
+    Create a parallel iwalk implementation and switch quotacheck to use it.
+    
+    Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+    Reviewed-by: Brian Foster <bfoster@redhat.com>
+
+diff --git a/fs/xfs/xfs_pwork.c b/fs/xfs/xfs_pwork.c
+new file mode 100644
+index 000000000000..752c897741e0
+--- /dev/null
++++ b/fs/xfs/xfs_pwork.c
+@@ -0,0 +1,117 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * Copyright (C) 2019 Oracle.  All Rights Reserved.
++ * Author: Darrick J. Wong <darrick.wong@oracle.com>
++ */
++#include "xfs.h"
++#include "xfs_fs.h"
++#include "xfs_shared.h"
++#include "xfs_format.h"
++#include "xfs_log_format.h"
++#include "xfs_trans_resv.h"
++#include "xfs_mount.h"
++#include "xfs_trace.h"
++#include "xfs_sysctl.h"
++#include "xfs_pwork.h"
++
++/*
++ * Parallel Work Queue
++ * ===================
++ *
++ * Abstract away the details of running a large and "obviously" parallelizable
++ * task across multiple CPUs.  Callers initialize the pwork control object with
++ * a desired level of parallelization and a work function.  Next, they embed
++ * struct xfs_pwork in whatever structure they use to pass work context to a
++ * worker thread and queue that pwork.  The work function will be passed the
++ * pwork item when it is run (from process context) and any returned error will
++ * be recorded in xfs_pwork_ctl.error.  Work functions should check for errors
++ * and abort if necessary; the non-zeroness of xfs_pwork_ctl.error does not
++ * stop workqueue item processing.
++ *
++ * This is the rough equivalent of the xfsprogs workqueue code, though we can't
++ * reuse that name here.
++ */
++
++/* Invoke our caller's function. */
++static void
++xfs_pwork_work(
++	struct work_struct	*work)
++{
++	struct xfs_pwork	*pwork;
++	struct xfs_pwork_ctl	*pctl;
++	int			error;
++
++	pwork = container_of(work, struct xfs_pwork, work);
++	pctl = pwork->pctl;
++	error = pctl->work_fn(pctl->mp, pwork);
++	if (error && !pctl->error)
++		pctl->error = error;
++}
++
++/*
++ * Set up control data for parallel work.  @work_fn is the function that will
++ * be called.  @tag will be written into the kernel threads.  @nr_threads is
++ * the level of parallelism desired, or 0 for no limit.
++ */
++int
++xfs_pwork_init(
++	struct xfs_mount	*mp,
++	struct xfs_pwork_ctl	*pctl,
++	xfs_pwork_work_fn	work_fn,
++	const char		*tag,
++	unsigned int		nr_threads)
++{
++#ifdef DEBUG
++	if (xfs_globals.pwork_threads >= 0)
++		nr_threads = xfs_globals.pwork_threads;
++#endif
++	trace_xfs_pwork_init(mp, nr_threads, current->pid);
++
++	pctl->wq = alloc_workqueue("%s-%d", WQ_FREEZABLE, nr_threads, tag,
++			current->pid);
++	if (!pctl->wq)
++		return -ENOMEM;
++	pctl->work_fn = work_fn;
++	pctl->error = 0;
++	pctl->mp = mp;
++
++	return 0;
++}
++
++/* Queue some parallel work. */
++void
++xfs_pwork_queue(
++	struct xfs_pwork_ctl	*pctl,
++	struct xfs_pwork	*pwork)
++{
++	INIT_WORK(&pwork->work, xfs_pwork_work);
++	pwork->pctl = pctl;
++	queue_work(pctl->wq, &pwork->work);
++}
++
++/* Wait for the work to finish and tear down the control structure. */
++int
++xfs_pwork_destroy(
++	struct xfs_pwork_ctl	*pctl)
++{
++	destroy_workqueue(pctl->wq);
++	pctl->wq = NULL;
++	return pctl->error;
++}
++
++/*
++ * Return the amount of parallelism that the data device can handle, or 0 for
++ * no limit.
++ */
++unsigned int
++xfs_pwork_guess_datadev_parallelism(
++	struct xfs_mount	*mp)
++{
++	struct xfs_buftarg	*btp = mp->m_ddev_targp;
++
++	/*
++	 * For now we'll go with the most conservative setting possible,
++	 * which is two threads for an SSD and 1 thread everywhere else.
++	 */
++	return blk_queue_nonrot(btp->bt_bdev->bd_queue) ? 2 : 1;
++}

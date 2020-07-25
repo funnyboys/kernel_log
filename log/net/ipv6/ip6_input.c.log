@@ -1,0 +1,5280 @@
+commit cf7fbe660f2dbd738ab58aea8e9b0ca6ad232449
+Author: Joe Stringer <joe@wand.net.nz>
+Date:   Sun Mar 29 15:53:38 2020 -0700
+
+    bpf: Add socket assign support
+    
+    Add support for TPROXY via a new bpf helper, bpf_sk_assign().
+    
+    This helper requires the BPF program to discover the socket via a call
+    to bpf_sk*_lookup_*(), then pass this socket to the new helper. The
+    helper takes its own reference to the socket in addition to any existing
+    reference that may or may not currently be obtained for the duration of
+    BPF processing. For the destination socket to receive the traffic, the
+    traffic must be routed towards that socket via local route. The
+    simplest example route is below, but in practice you may want to route
+    traffic more narrowly (eg by CIDR):
+    
+      $ ip route add local default dev lo
+    
+    This patch avoids trying to introduce an extra bit into the skb->sk, as
+    that would require more invasive changes to all code interacting with
+    the socket to ensure that the bit is handled correctly, such as all
+    error-handling cases along the path from the helper in BPF through to
+    the orphan path in the input. Instead, we opt to use the destructor
+    variable to switch on the prefetch of the socket.
+    
+    Signed-off-by: Joe Stringer <joe@wand.net.nz>
+    Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+    Acked-by: Martin KaFai Lau <kafai@fb.com>
+    Link: https://lore.kernel.org/bpf/20200329225342.16317-2-joe@wand.net.nz
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index 7b089d0ac8cd..e96304d8a4a7 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -285,7 +285,8 @@ static struct sk_buff *ip6_rcv_core(struct sk_buff *skb, struct net_device *dev,
+ 	rcu_read_unlock();
+ 
+ 	/* Must drop socket now because of tproxy. */
+-	skb_orphan(skb);
++	if (!skb_sk_is_prefetched(skb))
++		skb_orphan(skb);
+ 
+ 	return skb;
+ err:
+
+commit 197dbf24e360ed8dbbbe8ed17c2c496f501a0bda
+Author: Paolo Abeni <pabeni@redhat.com>
+Date:   Wed Nov 20 13:47:35 2019 +0100
+
+    ipv6: introduce and uses route look hints for list input.
+    
+    When doing RX batch packet processing, we currently always repeat
+    the route lookup for each ingress packet. When no custom rules are
+    in place, and there aren't routes depending on source addresses,
+    we know that packets with the same destination address will use
+    the same dst.
+    
+    This change tries to avoid per packet route lookup caching
+    the destination address of the latest successful lookup, and
+    reusing it for the next packet when the above conditions are
+    in place. Ingress traffic for most servers should fit.
+    
+    The measured performance delta under UDP flood vs a recvmmsg
+    receiver is as follow:
+    
+    vanilla         patched         delta
+    Kpps            Kpps            %
+    1431            1674            +17
+    
+    In the worst-case scenario - each packet has a different
+    destination address - the performance delta is within noise
+    range.
+    
+    v3 -> v4:
+     - support hints for SUBFLOW build, too (David A.)
+     - several style fixes (Eric)
+    
+    v2 -> v3:
+     - add fib6_has_custom_rules() helpers (David A.)
+     - add ip6_extract_route_hint() helper (Edward C.)
+     - use hint directly in ip6_list_rcv_finish() (Willem)
+    
+    v1 -> v2:
+     - fix build issue with !CONFIG_IPV6_MULTIPLE_TABLES
+     - fix potential race when fib6_has_custom_rules is set
+       while processing a packet batch
+    
+    Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+    Reviewed-by: David Ahern <dsahern@gmail.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index ef7f707d9ae3..7b089d0ac8cd 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -86,11 +86,27 @@ static void ip6_sublist_rcv_finish(struct list_head *head)
+ 	}
+ }
+ 
++static bool ip6_can_use_hint(const struct sk_buff *skb,
++			     const struct sk_buff *hint)
++{
++	return hint && !skb_dst(skb) &&
++	       ipv6_addr_equal(&ipv6_hdr(hint)->daddr, &ipv6_hdr(skb)->daddr);
++}
++
++static struct sk_buff *ip6_extract_route_hint(const struct net *net,
++					      struct sk_buff *skb)
++{
++	if (fib6_routes_require_src(net) || fib6_has_custom_rules(net))
++		return NULL;
++
++	return skb;
++}
++
+ static void ip6_list_rcv_finish(struct net *net, struct sock *sk,
+ 				struct list_head *head)
+ {
++	struct sk_buff *skb, *next, *hint = NULL;
+ 	struct dst_entry *curr_dst = NULL;
+-	struct sk_buff *skb, *next;
+ 	struct list_head sublist;
+ 
+ 	INIT_LIST_HEAD(&sublist);
+@@ -104,9 +120,15 @@ static void ip6_list_rcv_finish(struct net *net, struct sock *sk,
+ 		skb = l3mdev_ip6_rcv(skb);
+ 		if (!skb)
+ 			continue;
+-		ip6_rcv_finish_core(net, sk, skb);
++
++		if (ip6_can_use_hint(skb, hint))
++			skb_dst_copy(skb, hint);
++		else
++			ip6_rcv_finish_core(net, sk, skb);
+ 		dst = skb_dst(skb);
+ 		if (curr_dst != dst) {
++			hint = ip6_extract_route_hint(net, skb);
++
+ 			/* dispatch old sublist */
+ 			if (!list_empty(&sublist))
+ 				ip6_sublist_rcv_finish(&sublist);
+
+commit 51210ad5a558dcc7511d0c083f5cd796077b4e4d
+Author: Florian Westphal <fw@strlen.de>
+Date:   Tue Oct 29 01:44:04 2019 +0100
+
+    inet: do not call sublist_rcv on empty list
+    
+    syzbot triggered struct net NULL deref in NF_HOOK_LIST:
+    RIP: 0010:NF_HOOK_LIST include/linux/netfilter.h:331 [inline]
+    RIP: 0010:ip6_sublist_rcv+0x5c9/0x930 net/ipv6/ip6_input.c:292
+     ipv6_list_rcv+0x373/0x4b0 net/ipv6/ip6_input.c:328
+     __netif_receive_skb_list_ptype net/core/dev.c:5274 [inline]
+    
+    Reason:
+    void ipv6_list_rcv(struct list_head *head, struct packet_type *pt,
+                       struct net_device *orig_dev)
+    [..]
+            list_for_each_entry_safe(skb, next, head, list) {
+                    /* iterates list */
+                    skb = ip6_rcv_core(skb, dev, net);
+                    /* ip6_rcv_core drops skb -> NULL is returned */
+                    if (skb == NULL)
+                            continue;
+            [..]
+            }
+            /* sublist is empty -> curr_net is NULL */
+            ip6_sublist_rcv(&sublist, curr_dev, curr_net);
+    
+    Before the recent change NF_HOOK_LIST did a list iteration before
+    struct net deref, i.e. it was a no-op in the empty list case.
+    
+    List iteration now happens after *net deref, causing crash.
+    
+    Follow the same pattern as the ip(v6)_list_rcv loop and add a list_empty
+    test for the final sublist dispatch too.
+    
+    Cc: Edward Cree <ecree@solarflare.com>
+    Reported-by: syzbot+c54f457cad330e57e967@syzkaller.appspotmail.com
+    Fixes: ca58fbe06c54 ("netfilter: add and use nf_hook_slow_list()")
+    Signed-off-by: Florian Westphal <fw@strlen.de>
+    Tested-by: Leon Romanovsky <leonro@mellanox.com>
+    Tested-by: Nikolay Aleksandrov <nikolay@cumulusnetworks.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index 3d71c7d6102c..ef7f707d9ae3 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -325,7 +325,8 @@ void ipv6_list_rcv(struct list_head *head, struct packet_type *pt,
+ 		list_add_tail(&skb->list, &sublist);
+ 	}
+ 	/* dispatch final sublist */
+-	ip6_sublist_rcv(&sublist, curr_dev, curr_net);
++	if (!list_empty(&sublist))
++		ip6_sublist_rcv(&sublist, curr_dev, curr_net);
+ }
+ 
+ INDIRECT_CALLABLE_DECLARE(int udpv6_rcv(struct sk_buff *));
+
+commit 6af1799aaf3f1bc8defedddfa00df3192445bbf3
+Author: Eric Dumazet <edumazet@google.com>
+Date:   Wed Oct 2 09:38:55 2019 -0700
+
+    ipv6: drop incoming packets having a v4mapped source address
+    
+    This began with a syzbot report. syzkaller was injecting
+    IPv6 TCP SYN packets having a v4mapped source address.
+    
+    After an unsuccessful 4-tuple lookup, TCP creates a request
+    socket (SYN_RECV) and calls reqsk_queue_hash_req()
+    
+    reqsk_queue_hash_req() calls sk_ehashfn(sk)
+    
+    At this point we have AF_INET6 sockets, and the heuristic
+    used by sk_ehashfn() to either hash the IPv4 or IPv6 addresses
+    is to use ipv6_addr_v4mapped(&sk->sk_v6_daddr)
+    
+    For the particular spoofed packet, we end up hashing V4 addresses
+    which were not initialized by the TCP IPv6 stack, so KMSAN fired
+    a warning.
+    
+    I first fixed sk_ehashfn() to test both source and destination addresses,
+    but then faced various problems, including user-space programs
+    like packetdrill that had similar assumptions.
+    
+    Instead of trying to fix the whole ecosystem, it is better
+    to admit that we have a dual stack behavior, and that we
+    can not build linux kernels without V4 stack anyway.
+    
+    The dual stack API automatically forces the traffic to be IPv4
+    if v4mapped addresses are used at bind() or connect(), so it makes
+    no sense to allow IPv6 traffic to use the same v4mapped class.
+    
+    Fixes: 1da177e4c3f4 ("Linux-2.6.12-rc2")
+    Signed-off-by: Eric Dumazet <edumazet@google.com>
+    Cc: Florian Westphal <fw@strlen.de>
+    Cc: Hannes Frederic Sowa <hannes@stressinduktion.org>
+    Reported-by: syzbot <syzkaller@googlegroups.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index 7e5df23cbe7b..3d71c7d6102c 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -223,6 +223,16 @@ static struct sk_buff *ip6_rcv_core(struct sk_buff *skb, struct net_device *dev,
+ 	if (ipv6_addr_is_multicast(&hdr->saddr))
+ 		goto err;
+ 
++	/* While RFC4291 is not explicit about v4mapped addresses
++	 * in IPv6 headers, it seems clear linux dual-stack
++	 * model can not deal properly with these.
++	 * Security models could be fooled by ::ffff:127.0.0.1 for example.
++	 *
++	 * https://tools.ietf.org/html/draft-itojun-v6ops-v4mapped-harmful-02
++	 */
++	if (ipv6_addr_v4mapped(&hdr->saddr))
++		goto err;
++
+ 	skb->transport_header = skb->network_header + sizeof(*hdr);
+ 	IP6CB(skb)->nhoff = offsetof(struct ipv6hdr, nexthdr);
+ 
+
+commit 895b5c9f206eb7d25dc1360a8ccfc5958895eb89
+Author: Florian Westphal <fw@strlen.de>
+Date:   Sun Sep 29 20:54:03 2019 +0200
+
+    netfilter: drop bridge nf reset from nf_reset
+    
+    commit 174e23810cd31
+    ("sk_buff: drop all skb extensions on free and skb scrubbing") made napi
+    recycle always drop skb extensions.  The additional skb_ext_del() that is
+    performed via nf_reset on napi skb recycle is not needed anymore.
+    
+    Most nf_reset() calls in the stack are there so queued skb won't block
+    'rmmod nf_conntrack' indefinitely.
+    
+    This removes the skb_ext_del from nf_reset, and renames it to a more
+    fitting nf_reset_ct().
+    
+    In a few selected places, add a call to skb_ext_reset to make sure that
+    no active extensions remain.
+    
+    I am submitting this for "net", because we're still early in the release
+    cycle.  The patch applies to net-next too, but I think the rename causes
+    needless divergence between those trees.
+    
+    Suggested-by: Eric Dumazet <edumazet@google.com>
+    Signed-off-by: Florian Westphal <fw@strlen.de>
+    Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index d432d0011c16..7e5df23cbe7b 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -371,7 +371,7 @@ void ip6_protocol_deliver_rcu(struct net *net, struct sk_buff *skb, int nexthdr,
+ 			/* Free reference early: we don't need it any more,
+ 			   and it may hold ip_conntrack module loaded
+ 			   indefinitely. */
+-			nf_reset(skb);
++			nf_reset_ct(skb);
+ 
+ 			skb_postpull_rcsum(skb, skb_network_header(skb),
+ 					   skb_network_header_len(skb));
+
+commit c7a42eb49212f93a800560662d17d5293960d3c3
+Author: Xin Long <lucien.xin@gmail.com>
+Date:   Fri Aug 23 19:33:03 2019 +0800
+
+    net: ipv6: fix listify ip6_rcv_finish in case of forwarding
+    
+    We need a similar fix for ipv6 as Commit 0761680d5215 ("net: ipv4: fix
+    listify ip_rcv_finish in case of forwarding") does for ipv4.
+    
+    This issue can be reprocuded by syzbot since Commit 323ebb61e32b ("net:
+    use listified RX for handling GRO_NORMAL skbs") on net-next. The call
+    trace was:
+    
+      kernel BUG at include/linux/skbuff.h:2225!
+      RIP: 0010:__skb_pull include/linux/skbuff.h:2225 [inline]
+      RIP: 0010:skb_pull+0xea/0x110 net/core/skbuff.c:1902
+      Call Trace:
+        sctp_inq_pop+0x2f1/0xd80 net/sctp/inqueue.c:202
+        sctp_endpoint_bh_rcv+0x184/0x8d0 net/sctp/endpointola.c:385
+        sctp_inq_push+0x1e4/0x280 net/sctp/inqueue.c:80
+        sctp_rcv+0x2807/0x3590 net/sctp/input.c:256
+        sctp6_rcv+0x17/0x30 net/sctp/ipv6.c:1049
+        ip6_protocol_deliver_rcu+0x2fe/0x1660 net/ipv6/ip6_input.c:397
+        ip6_input_finish+0x84/0x170 net/ipv6/ip6_input.c:438
+        NF_HOOK include/linux/netfilter.h:305 [inline]
+        NF_HOOK include/linux/netfilter.h:299 [inline]
+        ip6_input+0xe4/0x3f0 net/ipv6/ip6_input.c:447
+        dst_input include/net/dst.h:442 [inline]
+        ip6_sublist_rcv_finish+0x98/0x1e0 net/ipv6/ip6_input.c:84
+        ip6_list_rcv_finish net/ipv6/ip6_input.c:118 [inline]
+        ip6_sublist_rcv+0x80c/0xcf0 net/ipv6/ip6_input.c:282
+        ipv6_list_rcv+0x373/0x4b0 net/ipv6/ip6_input.c:316
+        __netif_receive_skb_list_ptype net/core/dev.c:5049 [inline]
+        __netif_receive_skb_list_core+0x5fc/0x9d0 net/core/dev.c:5097
+        __netif_receive_skb_list net/core/dev.c:5149 [inline]
+        netif_receive_skb_list_internal+0x7eb/0xe60 net/core/dev.c:5244
+        gro_normal_list.part.0+0x1e/0xb0 net/core/dev.c:5757
+        gro_normal_list net/core/dev.c:5755 [inline]
+        gro_normal_one net/core/dev.c:5769 [inline]
+        napi_frags_finish net/core/dev.c:5782 [inline]
+        napi_gro_frags+0xa6a/0xea0 net/core/dev.c:5855
+        tun_get_user+0x2e98/0x3fa0 drivers/net/tun.c:1974
+        tun_chr_write_iter+0xbd/0x156 drivers/net/tun.c:2020
+    
+    Fixes: d8269e2cbf90 ("net: ipv6: listify ipv6_rcv() and ip6_rcv_finish()")
+    Fixes: 323ebb61e32b ("net: use listified RX for handling GRO_NORMAL skbs")
+    Reported-by: syzbot+eb349eeee854e389c36d@syzkaller.appspotmail.com
+    Reported-by: syzbot+4a0643a653ac375612d1@syzkaller.appspotmail.com
+    Signed-off-by: Xin Long <lucien.xin@gmail.com>
+    Acked-by: Edward Cree <ecree@solarflare.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index fa014d5f1732..d432d0011c16 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -80,8 +80,10 @@ static void ip6_sublist_rcv_finish(struct list_head *head)
+ {
+ 	struct sk_buff *skb, *next;
+ 
+-	list_for_each_entry_safe(skb, next, head, list)
++	list_for_each_entry_safe(skb, next, head, list) {
++		skb_list_del_init(skb);
+ 		dst_input(skb);
++	}
+ }
+ 
+ static void ip6_list_rcv_finish(struct net *net, struct sock *sk,
+
+commit 2874c5fd284268364ece81a7bd936f3c8168e567
+Author: Thomas Gleixner <tglx@linutronix.de>
+Date:   Mon May 27 08:55:01 2019 +0200
+
+    treewide: Replace GPLv2 boilerplate/reference with SPDX - rule 152
+    
+    Based on 1 normalized pattern(s):
+    
+      this program is free software you can redistribute it and or modify
+      it under the terms of the gnu general public license as published by
+      the free software foundation either version 2 of the license or at
+      your option any later version
+    
+    extracted by the scancode license scanner the SPDX license identifier
+    
+      GPL-2.0-or-later
+    
+    has been chosen to replace the boilerplate/reference in 3029 file(s).
+    
+    Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+    Reviewed-by: Allison Randal <allison@lohutok.net>
+    Cc: linux-spdx@vger.kernel.org
+    Link: https://lkml.kernel.org/r/20190527070032.746973796@linutronix.de
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index b50b1af1f530..fa014d5f1732 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -1,3 +1,4 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
+ /*
+  *	IPv6 input
+  *	Linux INET6 implementation
+@@ -7,11 +8,6 @@
+  *	Ian P. Morris		<I.P.Morris@soton.ac.uk>
+  *
+  *	Based in linux/net/ipv4/ip_input.c
+- *
+- *	This program is free software; you can redistribute it and/or
+- *      modify it under the terms of the GNU General Public License
+- *      as published by the Free Software Foundation; either version
+- *      2 of the License, or (at your option) any later version.
+  */
+ /* Changes
+  *
+
+commit 97ff7ffb11fe7a859a490771e7ce23f1f335176b
+Author: Paolo Abeni <pabeni@redhat.com>
+Date:   Fri May 3 17:01:38 2019 +0200
+
+    net: use indirect calls helpers at early demux stage
+    
+    So that we avoid another indirect call per RX packet, if
+    early demux is enabled.
+    
+    Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index adf06159837f..b50b1af1f530 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -48,6 +48,8 @@
+ #include <net/inet_ecn.h>
+ #include <net/dst_metadata.h>
+ 
++INDIRECT_CALLABLE_DECLARE(void udp_v6_early_demux(struct sk_buff *));
++INDIRECT_CALLABLE_DECLARE(void tcp_v6_early_demux(struct sk_buff *));
+ static void ip6_rcv_finish_core(struct net *net, struct sock *sk,
+ 				struct sk_buff *skb)
+ {
+@@ -58,7 +60,8 @@ static void ip6_rcv_finish_core(struct net *net, struct sock *sk,
+ 
+ 		ipprot = rcu_dereference(inet6_protos[ipv6_hdr(skb)->nexthdr]);
+ 		if (ipprot && (edemux = READ_ONCE(ipprot->early_demux)))
+-			edemux(skb);
++			INDIRECT_CALL_2(edemux, tcp_v6_early_demux,
++					udp_v6_early_demux, skb);
+ 	}
+ 	if (!skb_valid_dst(skb))
+ 		ip6_route_input(skb);
+
+commit 0e219ae48c3bbf382ef96adf3825457315728c03
+Author: Paolo Abeni <pabeni@redhat.com>
+Date:   Fri May 3 17:01:37 2019 +0200
+
+    net: use indirect calls helpers for L3 handler hooks
+    
+    So that we avoid another indirect call per RX packet in the common
+    case.
+    
+    Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index c7ed2b6d5a1d..adf06159837f 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -29,6 +29,7 @@
+ #include <linux/icmpv6.h>
+ #include <linux/mroute6.h>
+ #include <linux/slab.h>
++#include <linux/indirect_call_wrapper.h>
+ 
+ #include <linux/netfilter.h>
+ #include <linux/netfilter_ipv6.h>
+@@ -316,6 +317,9 @@ void ipv6_list_rcv(struct list_head *head, struct packet_type *pt,
+ 	ip6_sublist_rcv(&sublist, curr_dev, curr_net);
+ }
+ 
++INDIRECT_CALLABLE_DECLARE(int udpv6_rcv(struct sk_buff *));
++INDIRECT_CALLABLE_DECLARE(int tcp_v6_rcv(struct sk_buff *));
++
+ /*
+  *	Deliver the packet to the host
+  */
+@@ -391,7 +395,8 @@ void ip6_protocol_deliver_rcu(struct net *net, struct sk_buff *skb, int nexthdr,
+ 		    !xfrm6_policy_check(NULL, XFRM_POLICY_IN, skb))
+ 			goto discard;
+ 
+-		ret = ipprot->handler(skb);
++		ret = INDIRECT_CALL_2(ipprot->handler, tcp_v6_rcv, udpv6_rcv,
++				      skb);
+ 		if (ret > 0) {
+ 			if (ipprot->flags & INET6_PROTO_FINAL) {
+ 				/* Not an extension header, most likely UDP
+
+commit 4cc1feeb6ffc2799f8badb4dea77c637d340cb0d
+Merge: a60956ed72f7 40e020c129cf
+Author: David S. Miller <davem@davemloft.net>
+Date:   Sun Dec 9 21:27:48 2018 -0800
+
+    Merge git://git.kernel.org/pub/scm/linux/kernel/git/davem/net
+    
+    Several conflicts, seemingly all over the place.
+    
+    I used Stephen Rothwell's sample resolutions for many of these, if not
+    just to double check my own work, so definitely the credit largely
+    goes to him.
+    
+    The NFP conflict consisted of a bug fix (moving operations
+    past the rhashtable operation) while chaning the initial
+    argument in the function call in the moved code.
+    
+    The net/dsa/master.c conflict had to do with a bug fix intermixing of
+    making dsa_master_set_mtu() static with the fixing of the tagging
+    attribute location.
+    
+    cls_flower had a conflict because the dup reject fix from Or
+    overlapped with the addition of port range classifiction.
+    
+    __set_phy_supported()'s conflict was relatively easy to resolve
+    because Andrew fixed it in both trees, so it was just a matter
+    of taking the net-next copy.  Or at least I think it was :-)
+    
+    Joe Stringer's fix to the handling of netns id 0 in bpf_sk_lookup()
+    intermixed with changes on how the sdif and caller_net are calculated
+    in these code paths in net-next.
+    
+    The remaining BPF conflicts were largely about the addition of the
+    __bpf_md_ptr stuff in 'net' overlapping with adjustments and additions
+    to the relevant data structure where the MD pointer macros are used.
+    
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+commit 22f6bbb7bcfcef0b373b0502a7ff390275c575dd
+Author: Edward Cree <ecree@solarflare.com>
+Date:   Tue Dec 4 17:37:57 2018 +0000
+
+    net: use skb_list_del_init() to remove from RX sublists
+    
+    list_del() leaves the skb->next pointer poisoned, which can then lead to
+     a crash in e.g. OVS forwarding.  For example, setting up an OVS VXLAN
+     forwarding bridge on sfc as per:
+    
+    ========
+    $ ovs-vsctl show
+    5dfd9c47-f04b-4aaa-aa96-4fbb0a522a30
+        Bridge "br0"
+            Port "br0"
+                Interface "br0"
+                    type: internal
+            Port "enp6s0f0"
+                Interface "enp6s0f0"
+            Port "vxlan0"
+                Interface "vxlan0"
+                    type: vxlan
+                    options: {key="1", local_ip="10.0.0.5", remote_ip="10.0.0.4"}
+        ovs_version: "2.5.0"
+    ========
+    (where 10.0.0.5 is an address on enp6s0f1)
+    and sending traffic across it will lead to the following panic:
+    ========
+    general protection fault: 0000 [#1] SMP PTI
+    CPU: 5 PID: 0 Comm: swapper/5 Not tainted 4.20.0-rc3-ehc+ #701
+    Hardware name: Dell Inc. PowerEdge R710/0M233H, BIOS 6.4.0 07/23/2013
+    RIP: 0010:dev_hard_start_xmit+0x38/0x200
+    Code: 53 48 89 fb 48 83 ec 20 48 85 ff 48 89 54 24 08 48 89 4c 24 18 0f 84 ab 01 00 00 48 8d 86 90 00 00 00 48 89 f5 48 89 44 24 10 <4c> 8b 33 48 c7 03 00 00 00 00 48 8b 05 c7 d1 b3 00 4d 85 f6 0f 95
+    RSP: 0018:ffff888627b437e0 EFLAGS: 00010202
+    RAX: 0000000000000000 RBX: dead000000000100 RCX: ffff88862279c000
+    RDX: ffff888614a342c0 RSI: 0000000000000000 RDI: 0000000000000000
+    RBP: ffff888618a88000 R08: 0000000000000001 R09: 00000000000003e8
+    R10: 0000000000000000 R11: ffff888614a34140 R12: 0000000000000000
+    R13: 0000000000000062 R14: dead000000000100 R15: ffff888616430000
+    FS:  0000000000000000(0000) GS:ffff888627b40000(0000) knlGS:0000000000000000
+    CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+    CR2: 00007f6d2bc6d000 CR3: 000000000200a000 CR4: 00000000000006e0
+    Call Trace:
+     <IRQ>
+     __dev_queue_xmit+0x623/0x870
+     ? masked_flow_lookup+0xf7/0x220 [openvswitch]
+     ? ep_poll_callback+0x101/0x310
+     do_execute_actions+0xaba/0xaf0 [openvswitch]
+     ? __wake_up_common+0x8a/0x150
+     ? __wake_up_common_lock+0x87/0xc0
+     ? queue_userspace_packet+0x31c/0x5b0 [openvswitch]
+     ovs_execute_actions+0x47/0x120 [openvswitch]
+     ovs_dp_process_packet+0x7d/0x110 [openvswitch]
+     ovs_vport_receive+0x6e/0xd0 [openvswitch]
+     ? dst_alloc+0x64/0x90
+     ? rt_dst_alloc+0x50/0xd0
+     ? ip_route_input_slow+0x19a/0x9a0
+     ? __udp_enqueue_schedule_skb+0x198/0x1b0
+     ? __udp4_lib_rcv+0x856/0xa30
+     ? __udp4_lib_rcv+0x856/0xa30
+     ? cpumask_next_and+0x19/0x20
+     ? find_busiest_group+0x12d/0xcd0
+     netdev_frame_hook+0xce/0x150 [openvswitch]
+     __netif_receive_skb_core+0x205/0xae0
+     __netif_receive_skb_list_core+0x11e/0x220
+     netif_receive_skb_list+0x203/0x460
+     ? __efx_rx_packet+0x335/0x5e0 [sfc]
+     efx_poll+0x182/0x320 [sfc]
+     net_rx_action+0x294/0x3c0
+     __do_softirq+0xca/0x297
+     irq_exit+0xa6/0xb0
+     do_IRQ+0x54/0xd0
+     common_interrupt+0xf/0xf
+     </IRQ>
+    ========
+    So, in all listified-receive handling, instead pull skbs off the lists with
+     skb_list_del_init().
+    
+    Fixes: 9af86f933894 ("net: core: fix use-after-free in __netif_receive_skb_list_core")
+    Fixes: 7da517a3bc52 ("net: core: Another step of skb receive list processing")
+    Fixes: a4ca8b7df73c ("net: ipv4: fix drop handling in ip_list_rcv() and ip_list_rcv_finish()")
+    Fixes: d8269e2cbf90 ("net: ipv6: listify ipv6_rcv() and ip6_rcv_finish()")
+    Signed-off-by: Edward Cree <ecree@solarflare.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index 96577e742afd..c1d85830c906 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -95,7 +95,7 @@ static void ip6_list_rcv_finish(struct net *net, struct sock *sk,
+ 	list_for_each_entry_safe(skb, next, head, list) {
+ 		struct dst_entry *dst;
+ 
+-		list_del(&skb->list);
++		skb_list_del_init(skb);
+ 		/* if ingress device is enslaved to an L3 master device pass the
+ 		 * skb to its handler for processing
+ 		 */
+@@ -296,7 +296,7 @@ void ipv6_list_rcv(struct list_head *head, struct packet_type *pt,
+ 		struct net_device *dev = skb->dev;
+ 		struct net *net = dev_net(dev);
+ 
+-		list_del(&skb->list);
++		skb_list_del_init(skb);
+ 		skb = ip6_rcv_core(skb, dev, net);
+ 		if (skb == NULL)
+ 			continue;
+
+commit 80bde363f9a43d942e404821b966e362131cd0ca
+Author: Paolo Abeni <pabeni@redhat.com>
+Date:   Wed Nov 7 12:38:32 2018 +0100
+
+    ipv6: factor out protocol delivery helper
+    
+    So that we can re-use it at the UDP level in the next patch
+    
+    rfc v3 -> v1:
+     - add the helper declaration into the ipv6 header
+    
+    Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index df58e1100226..3c06cc9e9b79 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -319,28 +319,26 @@ void ipv6_list_rcv(struct list_head *head, struct packet_type *pt,
+ /*
+  *	Deliver the packet to the host
+  */
+-
+-
+-static int ip6_input_finish(struct net *net, struct sock *sk, struct sk_buff *skb)
++void ip6_protocol_deliver_rcu(struct net *net, struct sk_buff *skb, int nexthdr,
++			      bool have_final)
+ {
+ 	const struct inet6_protocol *ipprot;
+ 	struct inet6_dev *idev;
+ 	unsigned int nhoff;
+-	int nexthdr;
+ 	bool raw;
+-	bool have_final = false;
+ 
+ 	/*
+ 	 *	Parse extension headers
+ 	 */
+ 
+-	rcu_read_lock();
+ resubmit:
+ 	idev = ip6_dst_idev(skb_dst(skb));
+-	if (!pskb_pull(skb, skb_transport_offset(skb)))
+-		goto discard;
+ 	nhoff = IP6CB(skb)->nhoff;
+-	nexthdr = skb_network_header(skb)[nhoff];
++	if (!have_final) {
++		if (!pskb_pull(skb, skb_transport_offset(skb)))
++			goto discard;
++		nexthdr = skb_network_header(skb)[nhoff];
++	}
+ 
+ resubmit_final:
+ 	raw = raw6_local_deliver(skb, nexthdr);
+@@ -423,13 +421,19 @@ static int ip6_input_finish(struct net *net, struct sock *sk, struct sk_buff *sk
+ 			consume_skb(skb);
+ 		}
+ 	}
+-	rcu_read_unlock();
+-	return 0;
++	return;
+ 
+ discard:
+ 	__IP6_INC_STATS(net, idev, IPSTATS_MIB_INDISCARDS);
+-	rcu_read_unlock();
+ 	kfree_skb(skb);
++}
++
++static int ip6_input_finish(struct net *net, struct sock *sk, struct sk_buff *skb)
++{
++	rcu_read_lock();
++	ip6_protocol_deliver_rcu(net, skb, 0, false);
++	rcu_read_unlock();
++
+ 	return 0;
+ }
+ 
+
+commit 5226b6a920ba78d9fbcbb843388d2a844a1fa1c8
+Author: Mike Manning <mmanning@vyatta.att-mail.com>
+Date:   Wed Nov 7 15:36:09 2018 +0000
+
+    ipv6: handling of multicast packets received in VRF
+    
+    If the skb for multicast packets marked as enslaved to a VRF are
+    received, then the secondary device index should be used to obtain
+    the real device. And verify the multicast address against the
+    enslaved rather than the l3mdev device.
+    
+    Signed-off-by: Dewi Morgan <morgand@vyatta.att-mail.com>
+    Signed-off-by: Mike Manning <mmanning@vyatta.att-mail.com>
+    Reviewed-by: David Ahern <dsahern@gmail.com>
+    Tested-by: David Ahern <dsahern@gmail.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index 96577e742afd..df58e1100226 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -359,6 +359,8 @@ static int ip6_input_finish(struct net *net, struct sock *sk, struct sk_buff *sk
+ 			}
+ 		} else if (ipprot->flags & INET6_PROTO_FINAL) {
+ 			const struct ipv6hdr *hdr;
++			int sdif = inet6_sdif(skb);
++			struct net_device *dev;
+ 
+ 			/* Only do this once for first final protocol */
+ 			have_final = true;
+@@ -371,9 +373,19 @@ static int ip6_input_finish(struct net *net, struct sock *sk, struct sk_buff *sk
+ 			skb_postpull_rcsum(skb, skb_network_header(skb),
+ 					   skb_network_header_len(skb));
+ 			hdr = ipv6_hdr(skb);
++
++			/* skb->dev passed may be master dev for vrfs. */
++			if (sdif) {
++				dev = dev_get_by_index_rcu(net, sdif);
++				if (!dev)
++					goto discard;
++			} else {
++				dev = skb->dev;
++			}
++
+ 			if (ipv6_addr_is_multicast(&hdr->daddr) &&
+-			    !ipv6_chk_mcast_addr(skb->dev, &hdr->daddr,
+-			    &hdr->saddr) &&
++			    !ipv6_chk_mcast_addr(dev, &hdr->daddr,
++						 &hdr->saddr) &&
+ 			    !ipv6_is_mld(skb, nexthdr, skb_network_header_len(skb)))
+ 				goto discard;
+ 		}
+@@ -432,15 +444,32 @@ EXPORT_SYMBOL_GPL(ip6_input);
+ 
+ int ip6_mc_input(struct sk_buff *skb)
+ {
++	int sdif = inet6_sdif(skb);
+ 	const struct ipv6hdr *hdr;
++	struct net_device *dev;
+ 	bool deliver;
+ 
+ 	__IP6_UPD_PO_STATS(dev_net(skb_dst(skb)->dev),
+ 			 __in6_dev_get_safely(skb->dev), IPSTATS_MIB_INMCAST,
+ 			 skb->len);
+ 
++	/* skb->dev passed may be master dev for vrfs. */
++	if (sdif) {
++		rcu_read_lock();
++		dev = dev_get_by_index_rcu(dev_net(skb->dev), sdif);
++		if (!dev) {
++			rcu_read_unlock();
++			kfree_skb(skb);
++			return -ENODEV;
++		}
++	} else {
++		dev = skb->dev;
++	}
++
+ 	hdr = ipv6_hdr(skb);
+-	deliver = ipv6_chk_mcast_addr(skb->dev, &hdr->daddr, NULL);
++	deliver = ipv6_chk_mcast_addr(dev, &hdr->daddr, NULL);
++	if (sdif)
++		rcu_read_unlock();
+ 
+ #ifdef CONFIG_IPV6_MROUTE
+ 	/*
+
+commit 3ede0bbcdfc94ccdbe56bed4e66beb3f4f4f6b00
+Author: Robert Shearman <rshearma@vyatta.att-mail.com>
+Date:   Wed Sep 19 13:56:53 2018 +0100
+
+    ipv6: Allow the l3mdev to be a loopback
+    
+    There is no way currently for an IPv6 client connect using a loopback
+    address in a VRF, whereas for IPv4 the loopback address can be added:
+    
+        $ sudo ip addr add dev vrfred 127.0.0.1/8
+        $ sudo ip -6 addr add ::1/128 dev vrfred
+        RTNETLINK answers: Cannot assign requested address
+    
+    So allow ::1 to be configured on an L3 master device. In order for
+    this to be usable ip_route_output_flags needs to not consider ::1 to
+    be a link scope address (since oif == l3mdev and so it would be
+    dropped), and ipv6_rcv needs to consider the l3mdev to be a loopback
+    device so that it doesn't drop the packets.
+    
+    Signed-off-by: Robert Shearman <rshearma@vyatta.att-mail.com>
+    Signed-off-by: Mike Manning <mmanning@vyatta.att-mail.com>
+    Reviewed-by: David Ahern <dsahern@gmail.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index 6242682be876..96577e742afd 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -178,7 +178,8 @@ static struct sk_buff *ip6_rcv_core(struct sk_buff *skb, struct net_device *dev,
+ 	 */
+ 	if ((ipv6_addr_loopback(&hdr->saddr) ||
+ 	     ipv6_addr_loopback(&hdr->daddr)) &&
+-	     !(dev->flags & IFF_LOOPBACK))
++	    !(dev->flags & IFF_LOOPBACK) &&
++	    !netif_is_l3_master(dev))
+ 		goto err;
+ 
+ 	/* RFC4291 Errata ID: 3480
+
+commit d8269e2cbf908f9d26aa5d3217236227dffd1d89
+Author: Edward Cree <ecree@solarflare.com>
+Date:   Thu Jul 5 15:49:42 2018 +0100
+
+    net: ipv6: listify ipv6_rcv() and ip6_rcv_finish()
+    
+    Essentially the same as the ipv4 equivalents.
+    
+    Signed-off-by: Edward Cree <ecree@solarflare.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index f08d34491ece..6242682be876 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -47,17 +47,11 @@
+ #include <net/inet_ecn.h>
+ #include <net/dst_metadata.h>
+ 
+-int ip6_rcv_finish(struct net *net, struct sock *sk, struct sk_buff *skb)
++static void ip6_rcv_finish_core(struct net *net, struct sock *sk,
++				struct sk_buff *skb)
+ {
+ 	void (*edemux)(struct sk_buff *skb);
+ 
+-	/* if ingress device is enslaved to an L3 master device pass the
+-	 * skb to its handler for processing
+-	 */
+-	skb = l3mdev_ip6_rcv(skb);
+-	if (!skb)
+-		return NET_RX_SUCCESS;
+-
+ 	if (net->ipv4.sysctl_ip_early_demux && !skb_dst(skb) && skb->sk == NULL) {
+ 		const struct inet6_protocol *ipprot;
+ 
+@@ -67,20 +61,73 @@ int ip6_rcv_finish(struct net *net, struct sock *sk, struct sk_buff *skb)
+ 	}
+ 	if (!skb_valid_dst(skb))
+ 		ip6_route_input(skb);
++}
++
++int ip6_rcv_finish(struct net *net, struct sock *sk, struct sk_buff *skb)
++{
++	/* if ingress device is enslaved to an L3 master device pass the
++	 * skb to its handler for processing
++	 */
++	skb = l3mdev_ip6_rcv(skb);
++	if (!skb)
++		return NET_RX_SUCCESS;
++	ip6_rcv_finish_core(net, sk, skb);
+ 
+ 	return dst_input(skb);
+ }
+ 
+-int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt, struct net_device *orig_dev)
++static void ip6_sublist_rcv_finish(struct list_head *head)
++{
++	struct sk_buff *skb, *next;
++
++	list_for_each_entry_safe(skb, next, head, list)
++		dst_input(skb);
++}
++
++static void ip6_list_rcv_finish(struct net *net, struct sock *sk,
++				struct list_head *head)
++{
++	struct dst_entry *curr_dst = NULL;
++	struct sk_buff *skb, *next;
++	struct list_head sublist;
++
++	INIT_LIST_HEAD(&sublist);
++	list_for_each_entry_safe(skb, next, head, list) {
++		struct dst_entry *dst;
++
++		list_del(&skb->list);
++		/* if ingress device is enslaved to an L3 master device pass the
++		 * skb to its handler for processing
++		 */
++		skb = l3mdev_ip6_rcv(skb);
++		if (!skb)
++			continue;
++		ip6_rcv_finish_core(net, sk, skb);
++		dst = skb_dst(skb);
++		if (curr_dst != dst) {
++			/* dispatch old sublist */
++			if (!list_empty(&sublist))
++				ip6_sublist_rcv_finish(&sublist);
++			/* start new sublist */
++			INIT_LIST_HEAD(&sublist);
++			curr_dst = dst;
++		}
++		list_add_tail(&skb->list, &sublist);
++	}
++	/* dispatch final sublist */
++	ip6_sublist_rcv_finish(&sublist);
++}
++
++static struct sk_buff *ip6_rcv_core(struct sk_buff *skb, struct net_device *dev,
++				    struct net *net)
+ {
+ 	const struct ipv6hdr *hdr;
+ 	u32 pkt_len;
+ 	struct inet6_dev *idev;
+-	struct net *net = dev_net(skb->dev);
+ 
+ 	if (skb->pkt_type == PACKET_OTHERHOST) {
+ 		kfree_skb(skb);
+-		return NET_RX_DROP;
++		return NULL;
+ 	}
+ 
+ 	rcu_read_lock();
+@@ -196,7 +243,7 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+ 		if (ipv6_parse_hopopts(skb) < 0) {
+ 			__IP6_INC_STATS(net, idev, IPSTATS_MIB_INHDRERRORS);
+ 			rcu_read_unlock();
+-			return NET_RX_DROP;
++			return NULL;
+ 		}
+ 	}
+ 
+@@ -205,15 +252,67 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+ 	/* Must drop socket now because of tproxy. */
+ 	skb_orphan(skb);
+ 
+-	return NF_HOOK(NFPROTO_IPV6, NF_INET_PRE_ROUTING,
+-		       net, NULL, skb, dev, NULL,
+-		       ip6_rcv_finish);
++	return skb;
+ err:
+ 	__IP6_INC_STATS(net, idev, IPSTATS_MIB_INHDRERRORS);
+ drop:
+ 	rcu_read_unlock();
+ 	kfree_skb(skb);
+-	return NET_RX_DROP;
++	return NULL;
++}
++
++int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt, struct net_device *orig_dev)
++{
++	struct net *net = dev_net(skb->dev);
++
++	skb = ip6_rcv_core(skb, dev, net);
++	if (skb == NULL)
++		return NET_RX_DROP;
++	return NF_HOOK(NFPROTO_IPV6, NF_INET_PRE_ROUTING,
++		       net, NULL, skb, dev, NULL,
++		       ip6_rcv_finish);
++}
++
++static void ip6_sublist_rcv(struct list_head *head, struct net_device *dev,
++			    struct net *net)
++{
++	NF_HOOK_LIST(NFPROTO_IPV6, NF_INET_PRE_ROUTING, net, NULL,
++		     head, dev, NULL, ip6_rcv_finish);
++	ip6_list_rcv_finish(net, NULL, head);
++}
++
++/* Receive a list of IPv6 packets */
++void ipv6_list_rcv(struct list_head *head, struct packet_type *pt,
++		   struct net_device *orig_dev)
++{
++	struct net_device *curr_dev = NULL;
++	struct net *curr_net = NULL;
++	struct sk_buff *skb, *next;
++	struct list_head sublist;
++
++	INIT_LIST_HEAD(&sublist);
++	list_for_each_entry_safe(skb, next, head, list) {
++		struct net_device *dev = skb->dev;
++		struct net *net = dev_net(dev);
++
++		list_del(&skb->list);
++		skb = ip6_rcv_core(skb, dev, net);
++		if (skb == NULL)
++			continue;
++
++		if (curr_dev != dev || curr_net != net) {
++			/* dispatch old sublist */
++			if (!list_empty(&sublist))
++				ip6_sublist_rcv(&sublist, curr_dev, curr_net);
++			/* start new sublist */
++			INIT_LIST_HEAD(&sublist);
++			curr_dev = dev;
++			curr_net = net;
++		}
++		list_add_tail(&skb->list, &sublist);
++	}
++	/* dispatch final sublist */
++	ip6_sublist_rcv(&sublist, curr_dev, curr_net);
+ }
+ 
+ /*
+
+commit bdb7cc643fc9db8d6ed9a2b9e524e27ac5882029
+Author: Stephen Suryaputra <ssuryaextr@gmail.com>
+Date:   Mon Apr 16 13:42:16 2018 -0400
+
+    ipv6: Count interface receive statistics on the ingress netdev
+    
+    The statistics such as InHdrErrors should be counted on the ingress
+    netdev rather than on the dev from the dst, which is the egress.
+    
+    Signed-off-by: Stephen Suryaputra <ssuryaextr@gmail.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index 9ee208a348f5..f08d34491ece 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -336,7 +336,7 @@ int ip6_mc_input(struct sk_buff *skb)
+ 	bool deliver;
+ 
+ 	__IP6_UPD_PO_STATS(dev_net(skb_dst(skb)->dev),
+-			 ip6_dst_idev(skb_dst(skb)), IPSTATS_MIB_INMCAST,
++			 __in6_dev_get_safely(skb->dev), IPSTATS_MIB_INMCAST,
+ 			 skb->len);
+ 
+ 	hdr = ipv6_hdr(skb);
+
+commit 7b9f6da175f9387ebfc202f35e0d39514899ab19
+Merge: 9868879f293c 1debdc8f9ebd
+Author: David S. Miller <davem@davemloft.net>
+Date:   Thu Apr 20 10:35:33 2017 -0400
+
+    Merge git://git.kernel.org/pub/scm/linux/kernel/git/davem/net
+    
+    A function in kernel/bpf/syscall.c which got a bug fix in 'net'
+    was moved to kernel/bpf/verifier.c in 'net-next'.
+    
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+commit 0aa8c13eb512823bc4d60397d666a6b6260bb965
+Author: Florian Westphal <fw@strlen.de>
+Date:   Fri Apr 14 20:22:43 2017 +0200
+
+    ipv6: drop non loopback packets claiming to originate from ::1
+    
+    We lack a saddr check for ::1. This causes security issues e.g. with acls
+    permitting connections from ::1 because of assumption that these originate
+    from local machine.
+    
+    Assuming a source address of ::1 is local seems reasonable.
+    RFC4291 doesn't allow such a source address either, so drop such packets.
+    
+    Reported-by: Eric Dumazet <edumazet@google.com>
+    Signed-off-by: Florian Westphal <fw@strlen.de>
+    Acked-by: Eric Dumazet <edumazet@google.com>
+    Acked-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index aacfb4bce153..c45b12b4431c 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -122,11 +122,14 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+ 			max_t(unsigned short, 1, skb_shinfo(skb)->gso_segs));
+ 	/*
+ 	 * RFC4291 2.5.3
++	 * The loopback address must not be used as the source address in IPv6
++	 * packets that are sent outside of a single node. [..]
+ 	 * A packet received on an interface with a destination address
+ 	 * of loopback must be dropped.
+ 	 */
+-	if (!(dev->flags & IFF_LOOPBACK) &&
+-	    ipv6_addr_loopback(&hdr->daddr))
++	if ((ipv6_addr_loopback(&hdr->saddr) ||
++	     ipv6_addr_loopback(&hdr->daddr)) &&
++	     !(dev->flags & IFF_LOOPBACK))
+ 		goto err;
+ 
+ 	/* RFC4291 Errata ID: 3480
+
+commit dddb64bcb34615bf48a2c9cb9881eb76795cc5c5
+Author: subashab@codeaurora.org <subashab@codeaurora.org>
+Date:   Thu Mar 23 13:34:16 2017 -0600
+
+    net: Add sysctl to toggle early demux for tcp and udp
+    
+    Certain system process significant unconnected UDP workload.
+    It would be preferrable to disable UDP early demux for those systems
+    and enable it for TCP only.
+    
+    By disabling UDP demux, we see these slight gains on an ARM64 system-
+    782 -> 788Mbps unconnected single stream UDPv4
+    633 -> 654Mbps unconnected UDPv4 different sources
+    
+    The performance impact can change based on CPU architecure and cache
+    sizes. There will not much difference seen if entire UDP hash table
+    is in cache.
+    
+    Both sysctls are enabled by default to preserve existing behavior.
+    
+    v1->v2: Change function pointer instead of adding conditional as
+    suggested by Stephen.
+    
+    v2->v3: Read once in callers to avoid issues due to compiler
+    optimizations. Also update commit message with the tests.
+    
+    v3->v4: Store and use read once result instead of querying pointer
+    again incorrectly.
+    
+    v4->v5: Refactor to avoid errors due to compilation with IPV6={m,n}
+    
+    Signed-off-by: Subash Abhinov Kasiviswanathan <subashab@codeaurora.org>
+    Suggested-by: Eric Dumazet <edumazet@google.com>
+    Cc: Stephen Hemminger <stephen@networkplumber.org>
+    Cc: Tom Herbert <tom@herbertland.com>
+    Cc: David Miller <davem@davemloft.net>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index aacfb4bce153..b04539dd4629 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -49,6 +49,8 @@
+ 
+ int ip6_rcv_finish(struct net *net, struct sock *sk, struct sk_buff *skb)
+ {
++	void (*edemux)(struct sk_buff *skb);
++
+ 	/* if ingress device is enslaved to an L3 master device pass the
+ 	 * skb to its handler for processing
+ 	 */
+@@ -60,8 +62,8 @@ int ip6_rcv_finish(struct net *net, struct sock *sk, struct sk_buff *skb)
+ 		const struct inet6_protocol *ipprot;
+ 
+ 		ipprot = rcu_dereference(inet6_protos[ipv6_hdr(skb)->nexthdr]);
+-		if (ipprot && ipprot->early_demux)
+-			ipprot->early_demux(skb);
++		if (ipprot && (edemux = READ_ONCE(ipprot->early_demux)))
++			edemux(skb);
+ 	}
+ 	if (!skb_valid_dst(skb))
+ 		ip6_route_input(skb);
+
+commit b4869aa2f881ea4fcd36cd01ad591e4ed96eb33b
+Author: David Ahern <dsa@cumulusnetworks.com>
+Date:   Mon Jun 6 20:50:40 2016 -0700
+
+    net: vrf: ipv6 support for local traffic to local addresses
+    
+    Add support for locally originated traffic to VRF-local IPv6 addresses.
+    Similar to IPv4 a local dst is set on the skb and the packet is
+    reinserted with a call to netif_rx. With this patch, ping, tcp and udp
+    packets to a local IPv6 address are successfully routed:
+    
+        $ ip addr show dev eth1
+        4: eth1: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc pfifo_fast master red state UP group default qlen 1000
+            link/ether 02:e0:f9:1c:b9:74 brd ff:ff:ff:ff:ff:ff
+            inet 10.100.1.1/24 brd 10.100.1.255 scope global eth1
+               valid_lft forever preferred_lft forever
+            inet6 2100:1::1/120 scope global
+               valid_lft forever preferred_lft forever
+            inet6 fe80::e0:f9ff:fe1c:b974/64 scope link
+               valid_lft forever preferred_lft forever
+    
+        $ ping6 -c1 -I red 2100:1::1
+        ping6: Warning: source address might be selected on device other than red.
+        PING 2100:1::1(2100:1::1) from 2100:1::1 red: 56 data bytes
+        64 bytes from 2100:1::1: icmp_seq=1 ttl=64 time=0.098 ms
+    
+    ip6_input is exported so the VRF driver can use it for the dst input
+    function. The dst_alloc function for IPv4 defaults to setting the input and
+    output functions; IPv6's does not. VRF does not need to duplicate the Rx path
+    so just export the ipv6 input function.
+    
+    Signed-off-by: David Ahern <dsa@cumulusnetworks.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index 94611e450ec9..aacfb4bce153 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -323,6 +323,7 @@ int ip6_input(struct sk_buff *skb)
+ 		       dev_net(skb->dev), NULL, skb, skb->dev, NULL,
+ 		       ip6_input_finish);
+ }
++EXPORT_SYMBOL_GPL(ip6_input);
+ 
+ int ip6_mc_input(struct sk_buff *skb)
+ {
+
+commit 1da44f9c15e6389d45e034d5fd0b937e2928b412
+Author: Tom Herbert <tom@herbertland.com>
+Date:   Wed May 18 09:06:12 2016 -0700
+
+    ipv6: Change "final" protocol processing for encapsulation
+    
+    When performing foo-over-UDP, UDP packets are processed by the
+    encapsulation handler which returns another protocol to process.
+    This may result in processing two (or more) protocols in the
+    loop that are marked as INET6_PROTO_FINAL. The actions taken
+    for hitting a final protocol, in particular the skb_postpull_rcsum
+    can only be performed once.
+    
+    This patch set adds a check of a final protocol has been seen. The
+    rules are:
+      - If the final protocol has not been seen any protocol is processed
+        (final and non-final). In the case of a final protocol, the final
+        actions are taken (like the skb_postpull_rcsum)
+      - If a final protocol has been seen (e.g. an encapsulating UDP
+        header) then no further non-final protocols are allowed
+        (e.g. extension headers). For more final protocols the
+        final actions are not taken (e.g. skb_postpull_rcsum).
+    
+    Signed-off-by: Tom Herbert <tom@herbertland.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index d35dff23f609..94611e450ec9 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -223,6 +223,7 @@ static int ip6_input_finish(struct net *net, struct sock *sk, struct sk_buff *sk
+ 	unsigned int nhoff;
+ 	int nexthdr;
+ 	bool raw;
++	bool have_final = false;
+ 
+ 	/*
+ 	 *	Parse extension headers
+@@ -242,9 +243,21 @@ static int ip6_input_finish(struct net *net, struct sock *sk, struct sk_buff *sk
+ 	if (ipprot) {
+ 		int ret;
+ 
+-		if (ipprot->flags & INET6_PROTO_FINAL) {
++		if (have_final) {
++			if (!(ipprot->flags & INET6_PROTO_FINAL)) {
++				/* Once we've seen a final protocol don't
++				 * allow encapsulation on any non-final
++				 * ones. This allows foo in UDP encapsulation
++				 * to work.
++				 */
++				goto discard;
++			}
++		} else if (ipprot->flags & INET6_PROTO_FINAL) {
+ 			const struct ipv6hdr *hdr;
+ 
++			/* Only do this once for first final protocol */
++			have_final = true;
++
+ 			/* Free reference early: we don't need it any more,
+ 			   and it may hold ip_conntrack module loaded
+ 			   indefinitely. */
+
+commit 4c64242a90a4932260d9ad32b12c745c466e2987
+Author: Tom Herbert <tom@herbertland.com>
+Date:   Wed May 18 09:06:11 2016 -0700
+
+    ipv6: Fix nexthdr for reinjection
+    
+    In ip6_input_finish the nexthdr protocol is retrieved from the
+    next header offset that is returned in the cb of the skb.
+    This method does not work for UDP encapsulation that may not
+    even have a concept of a nexthdr field (e.g. FOU).
+    
+    This patch checks for a final protocol (INET6_PROTO_FINAL) when a
+    protocol handler returns > 0. If the protocol is not final then
+    resubmission is performed on nhoff value. If the protocol is final
+    then the nexthdr is taken to be the return value.
+    
+    Signed-off-by: Tom Herbert <tom@herbertland.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index f185cbcda114..d35dff23f609 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -236,6 +236,7 @@ static int ip6_input_finish(struct net *net, struct sock *sk, struct sk_buff *sk
+ 	nhoff = IP6CB(skb)->nhoff;
+ 	nexthdr = skb_network_header(skb)[nhoff];
+ 
++resubmit_final:
+ 	raw = raw6_local_deliver(skb, nexthdr);
+ 	ipprot = rcu_dereference(inet6_protos[nexthdr]);
+ 	if (ipprot) {
+@@ -263,10 +264,21 @@ static int ip6_input_finish(struct net *net, struct sock *sk, struct sk_buff *sk
+ 			goto discard;
+ 
+ 		ret = ipprot->handler(skb);
+-		if (ret > 0)
+-			goto resubmit;
+-		else if (ret == 0)
++		if (ret > 0) {
++			if (ipprot->flags & INET6_PROTO_FINAL) {
++				/* Not an extension header, most likely UDP
++				 * encapsulation. Use return value as nexthdr
++				 * protocol not nhoff (which presumably is
++				 * not set by handler).
++				 */
++				nexthdr = ret;
++				goto resubmit_final;
++			} else {
++				goto resubmit;
++			}
++		} else if (ret == 0) {
+ 			__IP6_INC_STATS(net, idev, IPSTATS_MIB_INDELIVERS);
++		}
+ 	} else {
+ 		if (!raw) {
+ 			if (xfrm6_policy_check(NULL, XFRM_POLICY_IN, skb)) {
+
+commit 74b20582ac389ee9f18a6fcc0eef244658ce8de0
+Author: David Ahern <dsa@cumulusnetworks.com>
+Date:   Tue May 10 11:19:50 2016 -0700
+
+    net: l3mdev: Add hook in ip and ipv6
+    
+    Currently the VRF driver uses the rx_handler to switch the skb device
+    to the VRF device. Switching the dev prior to the ip / ipv6 layer
+    means the VRF driver has to duplicate IP/IPv6 processing which adds
+    overhead and makes features such as retaining the ingress device index
+    more complicated than necessary.
+    
+    This patch moves the hook to the L3 layer just after the first NF_HOOK
+    for PRE_ROUTING. This location makes exposing the original ingress device
+    trivial (next patch) and allows adding other NF_HOOKs to the VRF driver
+    in the future.
+    
+    dev_queue_xmit_nit is exported so that the VRF driver can cycle the skb
+    with the switched device through the packet taps to maintain current
+    behavior (tcpdump can be used on either the vrf device or the enslaved
+    devices).
+    
+    Signed-off-by: David Ahern <dsa@cumulusnetworks.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index 6ed56012005d..f185cbcda114 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -49,6 +49,13 @@
+ 
+ int ip6_rcv_finish(struct net *net, struct sock *sk, struct sk_buff *skb)
+ {
++	/* if ingress device is enslaved to an L3 master device pass the
++	 * skb to its handler for processing
++	 */
++	skb = l3mdev_ip6_rcv(skb);
++	if (!skb)
++		return NET_RX_SUCCESS;
++
+ 	if (net->ipv4.sysctl_ip_early_demux && !skb_dst(skb) && skb->sk == NULL) {
+ 		const struct inet6_protocol *ipprot;
+ 
+
+commit c2005eb01044e82498209ee4ee43be604da3ef2a
+Author: Eric Dumazet <edumazet@google.com>
+Date:   Wed Apr 27 16:44:41 2016 -0700
+
+    ipv6: rename IP6_UPD_PO_STATS_BH()
+    
+    Rename IP6_UPD_PO_STATS_BH() to __IP6_UPD_PO_STATS()
+    
+    Signed-off-by: Eric Dumazet <edumazet@google.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index 218bb906c620..6ed56012005d 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -78,7 +78,7 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+ 
+ 	idev = __in6_dev_get(skb->dev);
+ 
+-	IP6_UPD_PO_STATS_BH(net, idev, IPSTATS_MIB_IN, skb->len);
++	__IP6_UPD_PO_STATS(net, idev, IPSTATS_MIB_IN, skb->len);
+ 
+ 	if ((skb = skb_share_check(skb, GFP_ATOMIC)) == NULL ||
+ 	    !idev || unlikely(idev->cnf.disable_ipv6)) {
+@@ -297,7 +297,7 @@ int ip6_mc_input(struct sk_buff *skb)
+ 	const struct ipv6hdr *hdr;
+ 	bool deliver;
+ 
+-	IP6_UPD_PO_STATS_BH(dev_net(skb_dst(skb)->dev),
++	__IP6_UPD_PO_STATS(dev_net(skb_dst(skb)->dev),
+ 			 ip6_dst_idev(skb_dst(skb)), IPSTATS_MIB_INMCAST,
+ 			 skb->len);
+ 
+
+commit 1d0155035918aa44e634941ac05721536b461d7c
+Author: Eric Dumazet <edumazet@google.com>
+Date:   Wed Apr 27 16:44:40 2016 -0700
+
+    ipv6: rename IP6_INC_STATS_BH()
+    
+    Rename IP6_INC_STATS_BH() to __IP6_INC_STATS()
+    and IP6_ADD_STATS_BH() to __IP6_ADD_STATS()
+    
+    Signed-off-by: Eric Dumazet <edumazet@google.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index c05c425c2389..218bb906c620 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -82,7 +82,7 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+ 
+ 	if ((skb = skb_share_check(skb, GFP_ATOMIC)) == NULL ||
+ 	    !idev || unlikely(idev->cnf.disable_ipv6)) {
+-		IP6_INC_STATS_BH(net, idev, IPSTATS_MIB_INDISCARDS);
++		__IP6_INC_STATS(net, idev, IPSTATS_MIB_INDISCARDS);
+ 		goto drop;
+ 	}
+ 
+@@ -109,10 +109,10 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+ 	if (hdr->version != 6)
+ 		goto err;
+ 
+-	IP6_ADD_STATS_BH(net, idev,
+-			 IPSTATS_MIB_NOECTPKTS +
++	__IP6_ADD_STATS(net, idev,
++			IPSTATS_MIB_NOECTPKTS +
+ 				(ipv6_get_dsfield(hdr) & INET_ECN_MASK),
+-			 max_t(unsigned short, 1, skb_shinfo(skb)->gso_segs));
++			max_t(unsigned short, 1, skb_shinfo(skb)->gso_segs));
+ 	/*
+ 	 * RFC4291 2.5.3
+ 	 * A packet received on an interface with a destination address
+@@ -169,12 +169,12 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+ 	/* pkt_len may be zero if Jumbo payload option is present */
+ 	if (pkt_len || hdr->nexthdr != NEXTHDR_HOP) {
+ 		if (pkt_len + sizeof(struct ipv6hdr) > skb->len) {
+-			IP6_INC_STATS_BH(net,
+-					 idev, IPSTATS_MIB_INTRUNCATEDPKTS);
++			__IP6_INC_STATS(net,
++					idev, IPSTATS_MIB_INTRUNCATEDPKTS);
+ 			goto drop;
+ 		}
+ 		if (pskb_trim_rcsum(skb, pkt_len + sizeof(struct ipv6hdr))) {
+-			IP6_INC_STATS_BH(net, idev, IPSTATS_MIB_INHDRERRORS);
++			__IP6_INC_STATS(net, idev, IPSTATS_MIB_INHDRERRORS);
+ 			goto drop;
+ 		}
+ 		hdr = ipv6_hdr(skb);
+@@ -182,7 +182,7 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+ 
+ 	if (hdr->nexthdr == NEXTHDR_HOP) {
+ 		if (ipv6_parse_hopopts(skb) < 0) {
+-			IP6_INC_STATS_BH(net, idev, IPSTATS_MIB_INHDRERRORS);
++			__IP6_INC_STATS(net, idev, IPSTATS_MIB_INHDRERRORS);
+ 			rcu_read_unlock();
+ 			return NET_RX_DROP;
+ 		}
+@@ -197,7 +197,7 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+ 		       net, NULL, skb, dev, NULL,
+ 		       ip6_rcv_finish);
+ err:
+-	IP6_INC_STATS_BH(net, idev, IPSTATS_MIB_INHDRERRORS);
++	__IP6_INC_STATS(net, idev, IPSTATS_MIB_INHDRERRORS);
+ drop:
+ 	rcu_read_unlock();
+ 	kfree_skb(skb);
+@@ -259,18 +259,18 @@ static int ip6_input_finish(struct net *net, struct sock *sk, struct sk_buff *sk
+ 		if (ret > 0)
+ 			goto resubmit;
+ 		else if (ret == 0)
+-			IP6_INC_STATS_BH(net, idev, IPSTATS_MIB_INDELIVERS);
++			__IP6_INC_STATS(net, idev, IPSTATS_MIB_INDELIVERS);
+ 	} else {
+ 		if (!raw) {
+ 			if (xfrm6_policy_check(NULL, XFRM_POLICY_IN, skb)) {
+-				IP6_INC_STATS_BH(net, idev,
+-						 IPSTATS_MIB_INUNKNOWNPROTOS);
++				__IP6_INC_STATS(net, idev,
++						IPSTATS_MIB_INUNKNOWNPROTOS);
+ 				icmpv6_send(skb, ICMPV6_PARAMPROB,
+ 					    ICMPV6_UNK_NEXTHDR, nhoff);
+ 			}
+ 			kfree_skb(skb);
+ 		} else {
+-			IP6_INC_STATS_BH(net, idev, IPSTATS_MIB_INDELIVERS);
++			__IP6_INC_STATS(net, idev, IPSTATS_MIB_INDELIVERS);
+ 			consume_skb(skb);
+ 		}
+ 	}
+@@ -278,7 +278,7 @@ static int ip6_input_finish(struct net *net, struct sock *sk, struct sk_buff *sk
+ 	return 0;
+ 
+ discard:
+-	IP6_INC_STATS_BH(net, idev, IPSTATS_MIB_INDISCARDS);
++	__IP6_INC_STATS(net, idev, IPSTATS_MIB_INDISCARDS);
+ 	rcu_read_unlock();
+ 	kfree_skb(skb);
+ 	return 0;
+
+commit e21145a9871aa5ae07e01926105bb8e523d64095
+Author: Nikolay Borisov <kernel@kyup.com>
+Date:   Mon Feb 15 12:11:30 2016 +0200
+
+    ipv4: namespacify ip_early_demux sysctl knob
+    
+    Signed-off-by: Nikolay Borisov <kernel@kyup.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index 31ac3c56da4b..c05c425c2389 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -49,7 +49,7 @@
+ 
+ int ip6_rcv_finish(struct net *net, struct sock *sk, struct sk_buff *skb)
+ {
+-	if (sysctl_ip_early_demux && !skb_dst(skb) && skb->sk == NULL) {
++	if (net->ipv4.sysctl_ip_early_demux && !skb_dst(skb) && skb->sk == NULL) {
+ 		const struct inet6_protocol *ipprot;
+ 
+ 		ipprot = rcu_dereference(inet6_protos[ipv6_hdr(skb)->nexthdr]);
+
+commit abbc30436d39dfed8ebfca338d253f211ac7b094
+Author: Johannes Berg <johannes.berg@intel.com>
+Date:   Thu Feb 4 13:31:19 2016 +0100
+
+    ipv6: add option to drop unicast encapsulated in L2 multicast
+    
+    In order to solve a problem with 802.11, the so-called hole-196 attack,
+    add an option (sysctl) called "drop_unicast_in_l2_multicast" which, if
+    enabled, causes the stack to drop IPv6 unicast packets encapsulated in
+    link-layer multi- or broadcast frames. Such frames can (as an attack)
+    be created by any member of the same wireless network and transmitted
+    as valid encrypted frames since the symmetric key for broadcast frames
+    is shared between all stations.
+    
+    Reviewed-by: Julian Anastasov <ja@ssi.bg>
+    Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index 9075acf081dd..31ac3c56da4b 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -134,6 +134,16 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+ 	    IPV6_ADDR_MC_SCOPE(&hdr->daddr) == 1)
+ 		goto err;
+ 
++	/* If enabled, drop unicast packets that were encapsulated in link-layer
++	 * multicast or broadcast to protected against the so-called "hole-196"
++	 * attack in 802.11 wireless.
++	 */
++	if (!ipv6_addr_is_multicast(&hdr->daddr) &&
++	    (skb->pkt_type == PACKET_BROADCAST ||
++	     skb->pkt_type == PACKET_MULTICAST) &&
++	    idev->cnf.drop_unicast_in_l2_multicast)
++		goto err;
++
+ 	/* RFC4291 2.7
+ 	 * Nodes must not originate a packet to a multicast address whose scope
+ 	 * field contains the reserved value 0; if such a packet is received, it
+
+commit 0c4b51f0054ce85c0ec578ab818f0631834573eb
+Author: Eric W. Biederman <ebiederm@xmission.com>
+Date:   Tue Sep 15 20:04:18 2015 -0500
+
+    netfilter: Pass net into okfn
+    
+    This is immediately motivated by the bridge code that chains functions that
+    call into netfilter.  Without passing net into the okfns the bridge code would
+    need to guess about the best expression for the network namespace to process
+    packets in.
+    
+    As net is frequently one of the first things computed in continuation functions
+    after netfilter has done it's job passing in the desired network namespace is in
+    many cases a code simplification.
+    
+    To support this change the function dst_output_okfn is introduced to
+    simplify passing dst_output as an okfn.  For the moment dst_output_okfn
+    just silently drops the struct net.
+    
+    Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index 583cf959c23d..9075acf081dd 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -47,7 +47,7 @@
+ #include <net/inet_ecn.h>
+ #include <net/dst_metadata.h>
+ 
+-int ip6_rcv_finish(struct sock *sk, struct sk_buff *skb)
++int ip6_rcv_finish(struct net *net, struct sock *sk, struct sk_buff *skb)
+ {
+ 	if (sysctl_ip_early_demux && !skb_dst(skb) && skb->sk == NULL) {
+ 		const struct inet6_protocol *ipprot;
+@@ -199,9 +199,8 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+  */
+ 
+ 
+-static int ip6_input_finish(struct sock *sk, struct sk_buff *skb)
++static int ip6_input_finish(struct net *net, struct sock *sk, struct sk_buff *skb)
+ {
+-	struct net *net = dev_net(skb_dst(skb)->dev);
+ 	const struct inet6_protocol *ipprot;
+ 	struct inet6_dev *idev;
+ 	unsigned int nhoff;
+
+commit 29a26a56803855a79dbd028cd61abee56237d6e5
+Author: Eric W. Biederman <ebiederm@xmission.com>
+Date:   Tue Sep 15 20:04:16 2015 -0500
+
+    netfilter: Pass struct net into the netfilter hooks
+    
+    Pass a network namespace parameter into the netfilter hooks.  At the
+    call site of the netfilter hooks the path a packet is taking through
+    the network stack is well known which allows the network namespace to
+    be easily and reliabily.
+    
+    This allows the replacement of magic code like
+    "dev_net(state->in?:state->out)" that appears at the start of most
+    netfilter hooks with "state->net".
+    
+    In almost all cases the network namespace passed in is derived
+    from the first network device passed in, guaranteeing those
+    paths will not see any changes in practice.
+    
+    The exceptions are:
+    xfrm/xfrm_output.c:xfrm_output_resume()         xs_net(skb_dst(skb)->xfrm)
+    ipvs/ip_vs_xmit.c:ip_vs_nat_send_or_cont()      ip_vs_conn_net(cp)
+    ipvs/ip_vs_xmit.c:ip_vs_send_or_cont()          ip_vs_conn_net(cp)
+    ipv4/raw.c:raw_send_hdrinc()                    sock_net(sk)
+    ipv6/ip6_output.c:ip6_xmit()                    sock_net(sk)
+    ipv6/ndisc.c:ndisc_send_skb()                   dev_net(skb->dev) not dev_net(dst->dev)
+    ipv6/raw.c:raw6_send_hdrinc()                   sock_net(sk)
+    br_netfilter_hooks.c:br_nf_pre_routing_finish() dev_net(skb->dev) before skb->dev is set to nf_bridge->physindev
+    
+    In all cases these exceptions seem to be a better expression for the
+    network namespace the packet is being processed in then the historic
+    "dev_net(in?in:out)".  I am documenting them in case something odd
+    pops up and someone starts trying to track down what happened.
+    
+    Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index c628dba477d4..583cf959c23d 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -183,8 +183,8 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+ 	/* Must drop socket now because of tproxy. */
+ 	skb_orphan(skb);
+ 
+-	return NF_HOOK(NFPROTO_IPV6, NF_INET_PRE_ROUTING, NULL, skb,
+-		       dev, NULL,
++	return NF_HOOK(NFPROTO_IPV6, NF_INET_PRE_ROUTING,
++		       net, NULL, skb, dev, NULL,
+ 		       ip6_rcv_finish);
+ err:
+ 	IP6_INC_STATS_BH(net, idev, IPSTATS_MIB_INHDRERRORS);
+@@ -278,8 +278,8 @@ static int ip6_input_finish(struct sock *sk, struct sk_buff *skb)
+ 
+ int ip6_input(struct sk_buff *skb)
+ {
+-	return NF_HOOK(NFPROTO_IPV6, NF_INET_LOCAL_IN, NULL, skb,
+-		       skb->dev, NULL,
++	return NF_HOOK(NFPROTO_IPV6, NF_INET_LOCAL_IN,
++		       dev_net(skb->dev), NULL, skb, skb->dev, NULL,
+ 		       ip6_input_finish);
+ }
+ 
+
+commit 9865249fd19d1416f70aa73ac7f214cbee4f6b51
+Author: Eric W. Biederman <ebiederm@xmission.com>
+Date:   Tue Sep 15 20:04:08 2015 -0500
+
+    ipv6: Don't recompute net in ip6_rcv
+    
+    Avoid silly redundant code
+    
+    Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index adba03ac7ce9..c628dba477d4 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -109,7 +109,7 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+ 	if (hdr->version != 6)
+ 		goto err;
+ 
+-	IP6_ADD_STATS_BH(dev_net(dev), idev,
++	IP6_ADD_STATS_BH(net, idev,
+ 			 IPSTATS_MIB_NOECTPKTS +
+ 				(ipv6_get_dsfield(hdr) & INET_ECN_MASK),
+ 			 max_t(unsigned short, 1, skb_shinfo(skb)->gso_segs));
+
+commit 48fb6b554501914b6befcf9b38292cbeb91de330
+Author: Wei-Chun Chao <weichunc@plumgrid.com>
+Date:   Wed Jul 22 18:13:12 2015 -0700
+
+    ipv6: fix crash over flow-based vxlan device
+    
+    Similar check was added in ip_rcv but not in ipv6_rcv.
+    
+    BUG: unable to handle kernel NULL pointer dereference at (null)
+    IP: [<ffffffff81734e0a>] ipv6_rcv+0xfa/0x500
+    Call Trace:
+    [<ffffffff816c9786>] ? ip_rcv+0x296/0x400
+    [<ffffffff817732d2>] ? packet_rcv+0x52/0x410
+    [<ffffffff8168e99f>] __netif_receive_skb_core+0x63f/0x9a0
+    [<ffffffffc02b34a0>] ? br_handle_frame_finish+0x580/0x580 [bridge]
+    [<ffffffff8109912c>] ? update_rq_clock.part.81+0x1c/0x40
+    [<ffffffff8168ed18>] __netif_receive_skb+0x18/0x60
+    [<ffffffff8168fa1f>] process_backlog+0x9f/0x150
+    
+    Fixes: ee122c79d422 (vxlan: Flow based tunneling)
+    Signed-off-by: Wei-Chun Chao <weichunc@plumgrid.com>
+    Acked-by: Thomas Graf <tgraf@suug.ch>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index 57990c929cd8..adba03ac7ce9 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -45,6 +45,7 @@
+ #include <net/addrconf.h>
+ #include <net/xfrm.h>
+ #include <net/inet_ecn.h>
++#include <net/dst_metadata.h>
+ 
+ int ip6_rcv_finish(struct sock *sk, struct sk_buff *skb)
+ {
+@@ -55,7 +56,7 @@ int ip6_rcv_finish(struct sock *sk, struct sk_buff *skb)
+ 		if (ipprot && ipprot->early_demux)
+ 			ipprot->early_demux(skb);
+ 	}
+-	if (!skb_dst(skb))
++	if (!skb_valid_dst(skb))
+ 		ip6_route_input(skb);
+ 
+ 	return dst_input(skb);
+@@ -98,7 +99,7 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+ 	 * arrived via the sending interface (ethX), because of the
+ 	 * nature of scoping architecture. --yoshfuji
+ 	 */
+-	IP6CB(skb)->iif = skb_dst(skb) ? ip6_dst_idev(skb_dst(skb))->dev->ifindex : dev->ifindex;
++	IP6CB(skb)->iif = skb_valid_dst(skb) ? ip6_dst_idev(skb_dst(skb))->dev->ifindex : dev->ifindex;
+ 
+ 	if (unlikely(!pskb_may_pull(skb, sizeof(*hdr))))
+ 		goto err;
+
+commit 4c938d22c88a9ddccc8c55a85e0430e9c62b1ac5
+Author: Angga <Hermin.Anggawijaya@alliedtelesis.co.nz>
+Date:   Fri Jul 3 14:40:52 2015 +1200
+
+    ipv6: Make MLD packets to only be processed locally
+    
+    Before commit daad151263cf ("ipv6: Make ipv6_is_mld() inline and use it
+    from ip6_mc_input().") MLD packets were only processed locally. After the
+    change, a copy of MLD packet goes through ip6_mr_input, causing
+    MRT6MSG_NOCACHE message to be generated to user space.
+    
+    Make MLD packet only processed locally.
+    
+    Fixes: daad151263cf ("ipv6: Make ipv6_is_mld() inline and use it from ip6_mc_input().")
+    Signed-off-by: Hermin Anggawijaya <hermin.anggawijaya@alliedtelesis.co.nz>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index f2e464eba5ef..57990c929cd8 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -331,10 +331,10 @@ int ip6_mc_input(struct sk_buff *skb)
+ 				if (offset < 0)
+ 					goto out;
+ 
+-				if (!ipv6_is_mld(skb, nexthdr, offset))
+-					goto out;
++				if (ipv6_is_mld(skb, nexthdr, offset))
++					deliver = true;
+ 
+-				deliver = true;
++				goto out;
+ 			}
+ 			/* unknown RA - process it normally */
+ 		}
+
+commit 1b0ccfe54a6abd1bc4d7bdd1c33e61e2c58f72c7
+Author: David S. Miller <davem@davemloft.net>
+Date:   Wed Jun 10 15:29:31 2015 -0700
+
+    Revert "ipv6: Fix protocol resubmission"
+    
+    This reverts commit 0243508edd317ff1fa63b495643a7c192fbfcd92.
+    
+    It introduces new regressions.
+    
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index 41a73da371a9..f2e464eba5ef 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -212,13 +212,13 @@ static int ip6_input_finish(struct sock *sk, struct sk_buff *skb)
+ 	 */
+ 
+ 	rcu_read_lock();
++resubmit:
+ 	idev = ip6_dst_idev(skb_dst(skb));
+ 	if (!pskb_pull(skb, skb_transport_offset(skb)))
+ 		goto discard;
+ 	nhoff = IP6CB(skb)->nhoff;
+ 	nexthdr = skb_network_header(skb)[nhoff];
+ 
+-resubmit:
+ 	raw = raw6_local_deliver(skb, nexthdr);
+ 	ipprot = rcu_dereference(inet6_protos[nexthdr]);
+ 	if (ipprot) {
+@@ -246,12 +246,10 @@ static int ip6_input_finish(struct sock *sk, struct sk_buff *skb)
+ 			goto discard;
+ 
+ 		ret = ipprot->handler(skb);
+-		if (ret < 0) {
+-			nexthdr = -ret;
++		if (ret > 0)
+ 			goto resubmit;
+-		} else if (ret == 0) {
++		else if (ret == 0)
+ 			IP6_INC_STATS_BH(net, idev, IPSTATS_MIB_INDELIVERS);
+-		}
+ 	} else {
+ 		if (!raw) {
+ 			if (xfrm6_policy_check(NULL, XFRM_POLICY_IN, skb)) {
+
+commit 0243508edd317ff1fa63b495643a7c192fbfcd92
+Author: Josh Hunt <johunt@akamai.com>
+Date:   Mon Jun 8 12:00:59 2015 -0400
+
+    ipv6: Fix protocol resubmission
+    
+    UDP encapsulation is broken on IPv6. This is because the logic to resubmit
+    the nexthdr is inverted, checking for a ret value > 0 instead of < 0. Also,
+    the resubmit label is in the wrong position since we already get the
+    nexthdr value when performing decapsulation. In addition the skb pull is no
+    longer necessary either.
+    
+    This changes the return value check to look for < 0, using it for the
+    nexthdr on the next iteration, and moves the resubmit label to the proper
+    location.
+    
+    With these changes the v6 code now matches what we do in the v4 ip input
+    code wrt resubmitting when decapsulating.
+    
+    Signed-off-by: Josh Hunt <johunt@akamai.com>
+    Acked-by: "Tom Herbert" <tom@herbertland.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index f2e464eba5ef..41a73da371a9 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -212,13 +212,13 @@ static int ip6_input_finish(struct sock *sk, struct sk_buff *skb)
+ 	 */
+ 
+ 	rcu_read_lock();
+-resubmit:
+ 	idev = ip6_dst_idev(skb_dst(skb));
+ 	if (!pskb_pull(skb, skb_transport_offset(skb)))
+ 		goto discard;
+ 	nhoff = IP6CB(skb)->nhoff;
+ 	nexthdr = skb_network_header(skb)[nhoff];
+ 
++resubmit:
+ 	raw = raw6_local_deliver(skb, nexthdr);
+ 	ipprot = rcu_dereference(inet6_protos[nexthdr]);
+ 	if (ipprot) {
+@@ -246,10 +246,12 @@ static int ip6_input_finish(struct sock *sk, struct sk_buff *skb)
+ 			goto discard;
+ 
+ 		ret = ipprot->handler(skb);
+-		if (ret > 0)
++		if (ret < 0) {
++			nexthdr = -ret;
+ 			goto resubmit;
+-		else if (ret == 0)
++		} else if (ret == 0) {
+ 			IP6_INC_STATS_BH(net, idev, IPSTATS_MIB_INDELIVERS);
++		}
+ 	} else {
+ 		if (!raw) {
+ 			if (xfrm6_policy_check(NULL, XFRM_POLICY_IN, skb)) {
+
+commit 7026b1ddb6b8d4e6ee33dc2bd06c0ca8746fa7ab
+Author: David Miller <davem@davemloft.net>
+Date:   Sun Apr 5 22:19:04 2015 -0400
+
+    netfilter: Pass socket pointer down through okfn().
+    
+    On the output paths in particular, we have to sometimes deal with two
+    socket contexts.  First, and usually skb->sk, is the local socket that
+    generated the frame.
+    
+    And second, is potentially the socket used to control a tunneling
+    socket, such as one the encapsulates using UDP.
+    
+    We do not want to disassociate skb->sk when encapsulating in order
+    to fix this, because that would break socket memory accounting.
+    
+    The most extreme case where this can cause huge problems is an
+    AF_PACKET socket transmitting over a vxlan device.  We hit code
+    paths doing checks that assume they are dealing with an ipv4
+    socket, but are actually operating upon the AF_PACKET one.
+    
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index fb97f7f8d4ed..f2e464eba5ef 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -46,8 +46,7 @@
+ #include <net/xfrm.h>
+ #include <net/inet_ecn.h>
+ 
+-
+-int ip6_rcv_finish(struct sk_buff *skb)
++int ip6_rcv_finish(struct sock *sk, struct sk_buff *skb)
+ {
+ 	if (sysctl_ip_early_demux && !skb_dst(skb) && skb->sk == NULL) {
+ 		const struct inet6_protocol *ipprot;
+@@ -183,7 +182,8 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+ 	/* Must drop socket now because of tproxy. */
+ 	skb_orphan(skb);
+ 
+-	return NF_HOOK(NFPROTO_IPV6, NF_INET_PRE_ROUTING, skb, dev, NULL,
++	return NF_HOOK(NFPROTO_IPV6, NF_INET_PRE_ROUTING, NULL, skb,
++		       dev, NULL,
+ 		       ip6_rcv_finish);
+ err:
+ 	IP6_INC_STATS_BH(net, idev, IPSTATS_MIB_INHDRERRORS);
+@@ -198,7 +198,7 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+  */
+ 
+ 
+-static int ip6_input_finish(struct sk_buff *skb)
++static int ip6_input_finish(struct sock *sk, struct sk_buff *skb)
+ {
+ 	struct net *net = dev_net(skb_dst(skb)->dev);
+ 	const struct inet6_protocol *ipprot;
+@@ -277,7 +277,8 @@ static int ip6_input_finish(struct sk_buff *skb)
+ 
+ int ip6_input(struct sk_buff *skb)
+ {
+-	return NF_HOOK(NFPROTO_IPV6, NF_INET_LOCAL_IN, skb, skb->dev, NULL,
++	return NF_HOOK(NFPROTO_IPV6, NF_INET_LOCAL_IN, NULL, skb,
++		       skb->dev, NULL,
+ 		       ip6_input_finish);
+ }
+ 
+
+commit 53b24b8f94cb15e38e332db82177cf3f0f4df0c5
+Author: Ian Morris <ipm@chirality.org.uk>
+Date:   Sun Mar 29 14:00:05 2015 +0100
+
+    ipv6: coding style: comparison for inequality with NULL
+    
+    The ipv6 code uses a mixture of coding styles. In some instances check for NULL
+    pointer is done as x != NULL and sometimes as x. x is preferred according to
+    checkpatch and this patch makes the code consistent by adopting the latter
+    form.
+    
+    No changes detected by objdiff.
+    
+    Signed-off-by: Ian Morris <ipm@chirality.org.uk>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index aacdcb4dc762..fb97f7f8d4ed 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -221,7 +221,7 @@ static int ip6_input_finish(struct sk_buff *skb)
+ 
+ 	raw = raw6_local_deliver(skb, nexthdr);
+ 	ipprot = rcu_dereference(inet6_protos[nexthdr]);
+-	if (ipprot != NULL) {
++	if (ipprot) {
+ 		int ret;
+ 
+ 		if (ipprot->flags & INET6_PROTO_FINAL) {
+
+commit e5d08d718a7cd72c6aa79b5f0c309d9f0d7e4a95
+Author: Ian Morris <ipm@chirality.org.uk>
+Date:   Sun Nov 23 21:28:43 2014 +0000
+
+    ipv6: coding style improvements (remove assignment in if statements)
+    
+    This change has no functional impact and simply addresses some coding
+    style issues detected by checkpatch. Specifically this change
+    adjusts "if" statements which also include the assignment of a
+    variable.
+    
+    No changes to the resultant object files result as determined by objdiff.
+    
+    Signed-off-by: Ian Morris <ipm@chirality.org.uk>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index a3084ab5df6c..aacdcb4dc762 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -220,7 +220,8 @@ static int ip6_input_finish(struct sk_buff *skb)
+ 	nexthdr = skb_network_header(skb)[nhoff];
+ 
+ 	raw = raw6_local_deliver(skb, nexthdr);
+-	if ((ipprot = rcu_dereference(inet6_protos[nexthdr])) != NULL) {
++	ipprot = rcu_dereference(inet6_protos[nexthdr]);
++	if (ipprot != NULL) {
+ 		int ret;
+ 
+ 		if (ipprot->flags & INET6_PROTO_FINAL) {
+
+commit 67ba4152e8b77eada6a9c64e3c2c84d6112794fc
+Author: Ian Morris <ipm@chirality.org.uk>
+Date:   Sun Aug 24 21:53:10 2014 +0100
+
+    ipv6: White-space cleansing : Line Layouts
+    
+    This patch makes no changes to the logic of the code but simply addresses
+    coding style issues as detected by checkpatch.
+    
+    Both objdump and diff -w show no differences.
+    
+    A number of items are addressed in this patch:
+    * Multiple spaces converted to tabs
+    * Spaces before tabs removed.
+    * Spaces in pointer typing cleansed (char *)foo etc.
+    * Remove space after sizeof
+    * Ensure spacing around comparators such as if statements.
+    
+    Signed-off-by: Ian Morris <ipm@chirality.org.uk>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index 51d54dc376f3..a3084ab5df6c 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -15,8 +15,8 @@
+  */
+ /* Changes
+  *
+- * 	Mitsuru KANDA @USAGI and
+- * 	YOSHIFUJI Hideaki @USAGI: Remove ipv6_parse_exthdrs().
++ *	Mitsuru KANDA @USAGI and
++ *	YOSHIFUJI Hideaki @USAGI: Remove ipv6_parse_exthdrs().
+  */
+ 
+ #include <linux/errno.h>
+@@ -65,7 +65,7 @@ int ip6_rcv_finish(struct sk_buff *skb)
+ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt, struct net_device *orig_dev)
+ {
+ 	const struct ipv6hdr *hdr;
+-	u32 		pkt_len;
++	u32 pkt_len;
+ 	struct inet6_dev *idev;
+ 	struct net *net = dev_net(skb->dev);
+ 
+
+commit a452ce345d63ddf92cd101e4196569f8718ad319
+Author: Holger Eitzenberger <holger@eitzenberger.org>
+Date:   Mon Jan 27 10:33:18 2014 +0100
+
+    net: Fix memory leak if TPROXY used with TCP early demux
+    
+    I see a memory leak when using a transparent HTTP proxy using TPROXY
+    together with TCP early demux and Kernel v3.8.13.15 (Ubuntu stable):
+    
+    unreferenced object 0xffff88008cba4a40 (size 1696):
+      comm "softirq", pid 0, jiffies 4294944115 (age 8907.520s)
+      hex dump (first 32 bytes):
+        0a e0 20 6a 40 04 1b 37 92 be 32 e2 e8 b4 00 00  .. j@..7..2.....
+        02 00 07 01 00 00 00 00 00 00 00 00 00 00 00 00  ................
+      backtrace:
+        [<ffffffff810b710a>] kmem_cache_alloc+0xad/0xb9
+        [<ffffffff81270185>] sk_prot_alloc+0x29/0xc5
+        [<ffffffff812702cf>] sk_clone_lock+0x14/0x283
+        [<ffffffff812aaf3a>] inet_csk_clone_lock+0xf/0x7b
+        [<ffffffff8129a893>] netlink_broadcast+0x14/0x16
+        [<ffffffff812c1573>] tcp_create_openreq_child+0x1b/0x4c3
+        [<ffffffff812c033e>] tcp_v4_syn_recv_sock+0x38/0x25d
+        [<ffffffff812c13e4>] tcp_check_req+0x25c/0x3d0
+        [<ffffffff812bf87a>] tcp_v4_do_rcv+0x287/0x40e
+        [<ffffffff812a08a7>] ip_route_input_noref+0x843/0xa55
+        [<ffffffff812bfeca>] tcp_v4_rcv+0x4c9/0x725
+        [<ffffffff812a26f4>] ip_local_deliver_finish+0xe9/0x154
+        [<ffffffff8127a927>] __netif_receive_skb+0x4b2/0x514
+        [<ffffffff8127aa77>] process_backlog+0xee/0x1c5
+        [<ffffffff8127c949>] net_rx_action+0xa7/0x200
+        [<ffffffff81209d86>] add_interrupt_randomness+0x39/0x157
+    
+    But there are many more, resulting in the machine going OOM after some
+    days.
+    
+    From looking at the TPROXY code, and with help from Florian, I see
+    that the memory leak is introduced in tcp_v4_early_demux():
+    
+      void tcp_v4_early_demux(struct sk_buff *skb)
+      {
+        /* ... */
+    
+        iph = ip_hdr(skb);
+        th = tcp_hdr(skb);
+    
+        if (th->doff < sizeof(struct tcphdr) / 4)
+            return;
+    
+        sk = __inet_lookup_established(dev_net(skb->dev), &tcp_hashinfo,
+                           iph->saddr, th->source,
+                           iph->daddr, ntohs(th->dest),
+                           skb->skb_iif);
+        if (sk) {
+            skb->sk = sk;
+    
+    where the socket is assigned unconditionally to skb->sk, also bumping
+    the refcnt on it.  This is problematic, because in our case the skb
+    has already a socket assigned in the TPROXY target.  This then results
+    in the leak I see.
+    
+    The very same issue seems to be with IPv6, but haven't tested.
+    
+    Reviewed-by: Florian Westphal <fw@strlen.de>
+    Signed-off-by: Holger Eitzenberger <holger@eitzenberger.org>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index 302d6fb1ff2b..51d54dc376f3 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -49,7 +49,7 @@
+ 
+ int ip6_rcv_finish(struct sk_buff *skb)
+ {
+-	if (sysctl_ip_early_demux && !skb_dst(skb)) {
++	if (sysctl_ip_early_demux && !skb_dst(skb) && skb->sk == NULL) {
+ 		const struct inet6_protocol *ipprot;
+ 
+ 		ipprot = rcu_dereference(inet6_protos[ipv6_hdr(skb)->nexthdr]);
+
+commit 1f07d03e2069df2ecd82301936b598a3b257c6d6
+Author: Eric Dumazet <edumazet@google.com>
+Date:   Tue Aug 6 03:32:11 2013 -0700
+
+    net: add SNMP counters tracking incoming ECN bits
+    
+    With GRO/LRO processing, there is a problem because Ip[6]InReceives SNMP
+    counters do not count the number of frames, but number of aggregated
+    segments.
+    
+    Its probably too late to change this now.
+    
+    This patch adds four new counters, tracking number of frames, regardless
+    of LRO/GRO, and on a per ECN status basis, for IPv4 and IPv6.
+    
+    Ip[6]NoECTPkts : Number of packets received with NOECT
+    Ip[6]ECT1Pkts  : Number of packets received with ECT(1)
+    Ip[6]ECT0Pkts  : Number of packets received with ECT(0)
+    Ip[6]CEPkts    : Number of packets received with Congestion Experienced
+    
+    lph37:~# nstat | egrep "Pkts|InReceive"
+    IpInReceives                    1634137            0.0
+    Ip6InReceives                   3714107            0.0
+    Ip6InNoECTPkts                  19205              0.0
+    Ip6InECT0Pkts                   52651828           0.0
+    IpExtInNoECTPkts                33630              0.0
+    IpExtInECT0Pkts                 15581379           0.0
+    IpExtInCEPkts                   6                  0.0
+    
+    Signed-off-by: Eric Dumazet <edumazet@google.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index 2bab2aa59745..302d6fb1ff2b 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -44,7 +44,7 @@
+ #include <net/ip6_route.h>
+ #include <net/addrconf.h>
+ #include <net/xfrm.h>
+-
++#include <net/inet_ecn.h>
+ 
+ 
+ int ip6_rcv_finish(struct sk_buff *skb)
+@@ -109,6 +109,10 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+ 	if (hdr->version != 6)
+ 		goto err;
+ 
++	IP6_ADD_STATS_BH(dev_net(dev), idev,
++			 IPSTATS_MIB_NOECTPKTS +
++				(ipv6_get_dsfield(hdr) & INET_ECN_MASK),
++			 max_t(unsigned short, 1, skb_shinfo(skb)->gso_segs));
+ 	/*
+ 	 * RFC4291 2.5.3
+ 	 * A packet received on an interface with a destination address
+
+commit 1c4a154e5253687c51123956dfcee9e9dfa8542d
+Author: Hannes Frederic Sowa <hannes@stressinduktion.org>
+Date:   Tue Mar 26 08:13:34 2013 +0000
+
+    ipv6: don't accept node local multicast traffic from the wire
+    
+    Erik Hugne's errata proposal (Errata ID: 3480) to RFC4291 has been
+    verified: http://www.rfc-editor.org/errata_search.php?eid=3480
+    
+    We have to check for pkt_type and loopback flag because either the
+    packets are allowed to travel over the loopback interface (in which case
+    pkt_type is PACKET_HOST and IFF_LOOPBACK flag is set) or they travel
+    over a non-loopback interface back to us (in which case PACKET_TYPE is
+    PACKET_LOOPBACK and IFF_LOOPBACK flag is not set).
+    
+    Cc: Erik Hugne <erik.hugne@ericsson.com>
+    Cc: YOSHIFUJI Hideaki <yoshfuji@linux-ipv6.org>
+    Signed-off-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index e33fe0ab2568..2bab2aa59745 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -118,6 +118,18 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+ 	    ipv6_addr_loopback(&hdr->daddr))
+ 		goto err;
+ 
++	/* RFC4291 Errata ID: 3480
++	 * Interface-Local scope spans only a single interface on a
++	 * node and is useful only for loopback transmission of
++	 * multicast.  Packets with interface-local scope received
++	 * from another node must be discarded.
++	 */
++	if (!(skb->pkt_type == PACKET_LOOPBACK ||
++	      dev->flags & IFF_LOOPBACK) &&
++	    ipv6_addr_is_multicast(&hdr->daddr) &&
++	    IPV6_ADDR_MC_SCOPE(&hdr->daddr) == 1)
++		goto err;
++
+ 	/* RFC4291 2.7
+ 	 * Nodes must not originate a packet to a multicast address whose scope
+ 	 * field contains the reserved value 0; if such a packet is received, it
+
+commit ddf64354af4a702ee0b85d0a285ba74c7278a460
+Author: Hannes Frederic Sowa <hannes@stressinduktion.org>
+Date:   Fri Mar 8 02:07:23 2013 +0000
+
+    ipv6: stop multicast forwarding to process interface scoped addresses
+    
+    v2:
+    a) used struct ipv6_addr_props
+    
+    v3:
+    a) reverted changes for ipv6_addr_props
+    
+    v4:
+    a) do not use __ipv6_addr_needs_scope_id
+    
+    Cc: YOSHIFUJI Hideaki <yoshfuji@linux-ipv6.org>
+    Signed-off-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+    Acked-by: YOSHIFUJI Hideaki <yoshfuji@linux-ipv6.org>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index b1876e52091e..e33fe0ab2568 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -281,7 +281,8 @@ int ip6_mc_input(struct sk_buff *skb)
+ 	 *      IPv6 multicast router mode is now supported ;)
+ 	 */
+ 	if (dev_net(skb->dev)->ipv6.devconf_all->mc_forwarding &&
+-	    !(ipv6_addr_type(&hdr->daddr) & IPV6_ADDR_LINKLOCAL) &&
++	    !(ipv6_addr_type(&hdr->daddr) &
++	      (IPV6_ADDR_LOOPBACK|IPV6_ADDR_LINKLOCAL)) &&
+ 	    likely(!(IP6CB(skb)->flags & IP6SKB_FORWARDED))) {
+ 		/*
+ 		 * Okay, we try to forward - split and duplicate
+
+commit d8c6f4b9b7848bca8babfc0ae43a50c8ab22fbb9
+Author: Neil Horman <nhorman@tuxdriver.com>
+Date:   Fri Mar 1 07:44:08 2013 +0000
+
+    ipv[4|6]: correct dropwatch false positive in local_deliver_finish
+    
+    I had a report recently of a user trying to use dropwatch to localise some frame
+    loss, and they were getting false positives.  Turned out they were using a user
+    space SCTP stack that used raw sockets to grab frames.  When we don't have a
+    registered protocol for a given packet, we record it as a drop, even if a raw
+    socket receieves the frame.  We should only record the drop in the event a raw
+    socket doesnt exist to receive the frames
+    
+    Tested by the reported successfully
+    
+    Signed-off-by: Neil Horman <nhorman@tuxdriver.com>
+    Reported-by: William Reich <reich@ulticom.com>
+    Tested-by: William Reich <reich@ulticom.com>
+    CC: "David S. Miller" <davem@davemloft.net>
+    CC: William Reich <reich@ulticom.com>
+    CC: eric.dumazet@gmail.com
+    Acked-by: Eric Dumazet <edumazet@google.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index 5b10414e619e..b1876e52091e 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -241,9 +241,11 @@ static int ip6_input_finish(struct sk_buff *skb)
+ 				icmpv6_send(skb, ICMPV6_PARAMPROB,
+ 					    ICMPV6_UNK_NEXTHDR, nhoff);
+ 			}
+-		} else
++			kfree_skb(skb);
++		} else {
+ 			IP6_INC_STATS_BH(net, idev, IPSTATS_MIB_INDELIVERS);
+-		kfree_skb(skb);
++			consume_skb(skb);
++		}
+ 	}
+ 	rcu_read_unlock();
+ 	return 0;
+
+commit 20314092c1b41894d8c181bf9aa6f022be2416aa
+Author: Hannes Frederic Sowa <hannes@stressinduktion.org>
+Date:   Sun Feb 10 05:35:22 2013 +0000
+
+    ipv6: don't accept multicast traffic with scope 0
+    
+    v2:
+    a) moved before multicast source address check
+    b) changed comment to netdev style
+    
+    Cc: Erik Hugne <erik.hugne@ericsson.com>
+    Cc: YOSHIFUJI Hideaki <yoshfuji@linux-ipv6.org>
+    Acked-by: YOSHIFUJI Hideaki <yoshfuji@linux-ipv6.org>
+    Signed-off-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+    Acked-by: YOSHIFUJI Hideaki <yoshfuji@linux-ipv6.org>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index 4ac5bf30e16a..5b10414e619e 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -118,6 +118,15 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+ 	    ipv6_addr_loopback(&hdr->daddr))
+ 		goto err;
+ 
++	/* RFC4291 2.7
++	 * Nodes must not originate a packet to a multicast address whose scope
++	 * field contains the reserved value 0; if such a packet is received, it
++	 * must be silently dropped.
++	 */
++	if (ipv6_addr_is_multicast(&hdr->daddr) &&
++	    IPV6_ADDR_MC_SCOPE(&hdr->daddr) == 0)
++		goto err;
++
+ 	/*
+ 	 * RFC4291 2.7
+ 	 * Multicast addresses must not be used as source addresses in IPv6
+
+commit dd3332bfcb2223458f553f341d3388cb84040e6a
+Author: YOSHIFUJI Hideaki / 吉藤英明 <yoshfuji@linux-ipv6.org>
+Date:   Sun Jan 13 05:02:45 2013 +0000
+
+    ipv6: Store Router Alert option in IP6CB directly.
+    
+    Router Alert option is very small and we can store the value
+    itself in the skb.
+    
+    Signed-off-by: YOSHIFUJI Hideaki <yoshfuji@linux-ipv6.org>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index 2ccd35ec3628..4ac5bf30e16a 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -280,9 +280,8 @@ int ip6_mc_input(struct sk_buff *skb)
+ 		struct inet6_skb_parm *opt = IP6CB(skb);
+ 
+ 		/* Check for MLD */
+-		if (unlikely(opt->ra)) {
++		if (unlikely(opt->flags & IP6SKB_ROUTERALERT)) {
+ 			/* Check if this is a mld message */
+-			u8 *ptr = skb_network_header(skb) + opt->ra;
+ 			u8 nexthdr = hdr->nexthdr;
+ 			__be16 frag_off;
+ 			int offset;
+@@ -290,7 +289,7 @@ int ip6_mc_input(struct sk_buff *skb)
+ 			/* Check if the value of Router Alert
+ 			 * is for MLD (0x0000).
+ 			 */
+-			if ((ptr[2] | ptr[3]) == 0) {
++			if (opt->ra == htons(IPV6_OPT_ROUTERALERT_MLD)) {
+ 				deliver = false;
+ 
+ 				if (!ipv6_ext_hdr(nexthdr)) {
+
+commit daad151263cf334d57fcc0270e2483d4b4639650
+Author: YOSHIFUJI Hideaki / 吉藤英明 <yoshfuji@linux-ipv6.org>
+Date:   Sun Jan 13 05:02:18 2013 +0000
+
+    ipv6: Make ipv6_is_mld() inline and use it from ip6_mc_input().
+    
+    Move generalized version of ipv6_is_mld() to header,
+    and use it from ip6_mc_input().
+    
+    Signed-off-by: YOSHIFUJI Hideaki <yoshfuji@linux-ipv6.org>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index a52d864d562b..2ccd35ec3628 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -212,7 +212,7 @@ static int ip6_input_finish(struct sk_buff *skb)
+ 			if (ipv6_addr_is_multicast(&hdr->daddr) &&
+ 			    !ipv6_chk_mcast_addr(skb->dev, &hdr->daddr,
+ 			    &hdr->saddr) &&
+-			    !ipv6_is_mld(skb, nexthdr))
++			    !ipv6_is_mld(skb, nexthdr, skb_network_header_len(skb)))
+ 				goto discard;
+ 		}
+ 		if (!(ipprot->flags & INET6_PROTO_NOPOLICY) &&
+@@ -283,7 +283,6 @@ int ip6_mc_input(struct sk_buff *skb)
+ 		if (unlikely(opt->ra)) {
+ 			/* Check if this is a mld message */
+ 			u8 *ptr = skb_network_header(skb) + opt->ra;
+-			struct icmp6hdr *icmp6;
+ 			u8 nexthdr = hdr->nexthdr;
+ 			__be16 frag_off;
+ 			int offset;
+@@ -303,24 +302,10 @@ int ip6_mc_input(struct sk_buff *skb)
+ 				if (offset < 0)
+ 					goto out;
+ 
+-				if (nexthdr != IPPROTO_ICMPV6)
++				if (!ipv6_is_mld(skb, nexthdr, offset))
+ 					goto out;
+ 
+-				if (!pskb_may_pull(skb, (skb_network_header(skb) +
+-						   offset + 1 - skb->data)))
+-					goto out;
+-
+-				icmp6 = (struct icmp6hdr *)(skb_network_header(skb) + offset);
+-
+-				switch (icmp6->icmp6_type) {
+-				case ICMPV6_MGM_QUERY:
+-				case ICMPV6_MGM_REPORT:
+-				case ICMPV6_MGM_REDUCTION:
+-				case ICMPV6_MLD2_REPORT:
+-					deliver = true;
+-					break;
+-				}
+-				goto out;
++				deliver = true;
+ 			}
+ 			/* unknown RA - process it normally */
+ 		}
+
+commit cca32e4bf999a34ac08d959f351f2b30bcd02460
+Author: Eric Dumazet <edumazet@google.com>
+Date:   Sun Jul 29 21:06:13 2012 +0000
+
+    net: TCP early demux cleanup
+    
+    early_demux() handlers should be called in RCU context, and as we
+    use skb_dst_set_noref(skb, dst), caller must not exit from RCU context
+    before dst use (skb_dst(skb)) or release (skb_drop(dst))
+    
+    Therefore, rcu_read_lock()/rcu_read_unlock() pairs around
+    ->early_demux() are confusing and not needed :
+    
+    Protocol handlers are already in an RCU read lock section.
+    (__netif_receive_skb() does the rcu_read_lock() )
+    
+    Signed-off-by: Eric Dumazet <edumazet@google.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index 47975e363fcd..a52d864d562b 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -52,11 +52,9 @@ int ip6_rcv_finish(struct sk_buff *skb)
+ 	if (sysctl_ip_early_demux && !skb_dst(skb)) {
+ 		const struct inet6_protocol *ipprot;
+ 
+-		rcu_read_lock();
+ 		ipprot = rcu_dereference(inet6_protos[ipv6_hdr(skb)->nexthdr]);
+ 		if (ipprot && ipprot->early_demux)
+ 			ipprot->early_demux(skb);
+-		rcu_read_unlock();
+ 	}
+ 	if (!skb_dst(skb))
+ 		ip6_route_input(skb);
+
+commit c7109986db3c945f50ceed884a30e0fd8af3b89b
+Author: Eric Dumazet <edumazet@google.com>
+Date:   Thu Jul 26 12:18:11 2012 +0000
+
+    ipv6: Early TCP socket demux
+    
+    This is the IPv6 missing bits for infrastructure added in commit
+    41063e9dd1195 (ipv4: Early TCP socket demux.)
+    
+    Signed-off-by: Eric Dumazet <edumazet@google.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index 5ab923e51af3..47975e363fcd 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -47,9 +47,18 @@
+ 
+ 
+ 
+-inline int ip6_rcv_finish( struct sk_buff *skb)
++int ip6_rcv_finish(struct sk_buff *skb)
+ {
+-	if (skb_dst(skb) == NULL)
++	if (sysctl_ip_early_demux && !skb_dst(skb)) {
++		const struct inet6_protocol *ipprot;
++
++		rcu_read_lock();
++		ipprot = rcu_dereference(inet6_protos[ipv6_hdr(skb)->nexthdr]);
++		if (ipprot && ipprot->early_demux)
++			ipprot->early_demux(skb);
++		rcu_read_unlock();
++	}
++	if (!skb_dst(skb))
+ 		ip6_route_input(skb);
+ 
+ 	return dst_input(skb);
+
+commit f9242b6b28d61295f2bf7e8adfb1060b382e5381
+Author: David S. Miller <davem@davemloft.net>
+Date:   Tue Jun 19 18:56:21 2012 -0700
+
+    inet: Sanitize inet{,6} protocol demux.
+    
+    Don't pretend that inet_protos[] and inet6_protos[] are hashes, thay
+    are just a straight arrays.  Remove all unnecessary hash masking.
+    
+    Document MAX_INET_PROTOS.
+    
+    Use RAW_HTABLE_SIZE when appropriate.
+    
+    Reported-by: Ben Hutchings <bhutchings@solarflare.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index 21a15dfe4a9e..5ab923e51af3 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -168,13 +168,12 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+ 
+ static int ip6_input_finish(struct sk_buff *skb)
+ {
++	struct net *net = dev_net(skb_dst(skb)->dev);
+ 	const struct inet6_protocol *ipprot;
++	struct inet6_dev *idev;
+ 	unsigned int nhoff;
+ 	int nexthdr;
+ 	bool raw;
+-	u8 hash;
+-	struct inet6_dev *idev;
+-	struct net *net = dev_net(skb_dst(skb)->dev);
+ 
+ 	/*
+ 	 *	Parse extension headers
+@@ -189,9 +188,7 @@ static int ip6_input_finish(struct sk_buff *skb)
+ 	nexthdr = skb_network_header(skb)[nhoff];
+ 
+ 	raw = raw6_local_deliver(skb, nexthdr);
+-
+-	hash = nexthdr & (MAX_INET_PROTOS - 1);
+-	if ((ipprot = rcu_dereference(inet6_protos[hash])) != NULL) {
++	if ((ipprot = rcu_dereference(inet6_protos[nexthdr])) != NULL) {
+ 		int ret;
+ 
+ 		if (ipprot->flags & INET6_PROTO_FINAL) {
+
+commit a50feda546ac03415707a9bbcac8d6b20714db21
+Author: Eric Dumazet <edumazet@google.com>
+Date:   Fri May 18 18:57:34 2012 +0000
+
+    ipv6: bool/const conversions phase2
+    
+    Mostly bool conversions, some inline removals and const additions.
+    
+    Signed-off-by: Eric Dumazet <edumazet@google.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index 1ca5d45a12e8..21a15dfe4a9e 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -170,7 +170,8 @@ static int ip6_input_finish(struct sk_buff *skb)
+ {
+ 	const struct inet6_protocol *ipprot;
+ 	unsigned int nhoff;
+-	int nexthdr, raw;
++	int nexthdr;
++	bool raw;
+ 	u8 hash;
+ 	struct inet6_dev *idev;
+ 	struct net *net = dev_net(skb_dst(skb)->dev);
+@@ -251,7 +252,7 @@ int ip6_input(struct sk_buff *skb)
+ int ip6_mc_input(struct sk_buff *skb)
+ {
+ 	const struct ipv6hdr *hdr;
+-	int deliver;
++	bool deliver;
+ 
+ 	IP6_UPD_PO_STATS_BH(dev_net(skb_dst(skb)->dev),
+ 			 ip6_dst_idev(skb_dst(skb)), IPSTATS_MIB_INMCAST,
+@@ -287,7 +288,7 @@ int ip6_mc_input(struct sk_buff *skb)
+ 			 * is for MLD (0x0000).
+ 			 */
+ 			if ((ptr[2] | ptr[3]) == 0) {
+-				deliver = 0;
++				deliver = false;
+ 
+ 				if (!ipv6_ext_hdr(nexthdr)) {
+ 					/* BUG */
+@@ -312,7 +313,7 @@ int ip6_mc_input(struct sk_buff *skb)
+ 				case ICMPV6_MGM_REPORT:
+ 				case ICMPV6_MGM_REDUCTION:
+ 				case ICMPV6_MLD2_REPORT:
+-					deliver = 1;
++					deliver = true;
+ 					break;
+ 				}
+ 				goto out;
+
+commit 75f2811c6460ccc59d83c66059943ce9c9f81a18
+Author: Jesse Gross <jesse@nicira.com>
+Date:   Wed Nov 30 17:05:51 2011 -0800
+
+    ipv6: Add fragment reporting to ipv6_skip_exthdr().
+    
+    While parsing through IPv6 extension headers, fragment headers are
+    skipped making them invisible to the caller.  This reports the
+    fragment offset of the last header in order to make it possible to
+    determine whether the packet is fragmented and, if so whether it is
+    a first or last fragment.
+    
+    Signed-off-by: Jesse Gross <jesse@nicira.com>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index a46c64eb0a66..1ca5d45a12e8 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -280,6 +280,7 @@ int ip6_mc_input(struct sk_buff *skb)
+ 			u8 *ptr = skb_network_header(skb) + opt->ra;
+ 			struct icmp6hdr *icmp6;
+ 			u8 nexthdr = hdr->nexthdr;
++			__be16 frag_off;
+ 			int offset;
+ 
+ 			/* Check if the value of Router Alert
+@@ -293,7 +294,7 @@ int ip6_mc_input(struct sk_buff *skb)
+ 					goto out;
+ 				}
+ 				offset = ipv6_skip_exthdr(skb, sizeof(*hdr),
+-							  &nexthdr);
++							  &nexthdr, &frag_off);
+ 				if (offset < 0)
+ 					goto out;
+ 
+
+commit c457338d7acd3823e765b684a62294cfda9d2f55
+Author: Brian Haley <brian.haley@hp.com>
+Date:   Tue Nov 8 04:41:42 2011 +0000
+
+    ipv6: drop packets when source address is multicast
+    
+    RFC 4291 Section 2.7 says Multicast addresses must not be used as source
+    addresses in IPv6 packets - drop them on input so we don't process the
+    packet further.
+    
+    Signed-off-by: Brian Haley <brian.haley@hp.com>
+    Reported-and-Tested-by: Kumar Sanghvi <divinekumar@gmail.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index 027c7ff6f1e5..a46c64eb0a66 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -111,6 +111,14 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+ 	    ipv6_addr_loopback(&hdr->daddr))
+ 		goto err;
+ 
++	/*
++	 * RFC4291 2.7
++	 * Multicast addresses must not be used as source addresses in IPv6
++	 * packets or appear in any Routing header.
++	 */
++	if (ipv6_addr_is_multicast(&hdr->saddr))
++		goto err;
++
+ 	skb->transport_header = skb->network_header + sizeof(*hdr);
+ 	IP6CB(skb)->nhoff = offsetof(struct ipv6hdr, nexthdr);
+ 
+
+commit b71d1d426d263b0b6cb5760322efebbfc89d4463
+Author: Eric Dumazet <eric.dumazet@gmail.com>
+Date:   Fri Apr 22 04:53:02 2011 +0000
+
+    inet: constify ip headers and in6_addr
+    
+    Add const qualifiers to structs iphdr, ipv6hdr and in6_addr pointers
+    where possible, to make code intention more obvious.
+    
+    Signed-off-by: Eric Dumazet <eric.dumazet@gmail.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index a83e9209cecc..027c7ff6f1e5 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -57,7 +57,7 @@ inline int ip6_rcv_finish( struct sk_buff *skb)
+ 
+ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt, struct net_device *orig_dev)
+ {
+-	struct ipv6hdr *hdr;
++	const struct ipv6hdr *hdr;
+ 	u32 		pkt_len;
+ 	struct inet6_dev *idev;
+ 	struct net *net = dev_net(skb->dev);
+@@ -186,7 +186,7 @@ static int ip6_input_finish(struct sk_buff *skb)
+ 		int ret;
+ 
+ 		if (ipprot->flags & INET6_PROTO_FINAL) {
+-			struct ipv6hdr *hdr;
++			const struct ipv6hdr *hdr;
+ 
+ 			/* Free reference early: we don't need it any more,
+ 			   and it may hold ip_conntrack module loaded
+@@ -242,7 +242,7 @@ int ip6_input(struct sk_buff *skb)
+ 
+ int ip6_mc_input(struct sk_buff *skb)
+ {
+-	struct ipv6hdr *hdr;
++	const struct ipv6hdr *hdr;
+ 	int deliver;
+ 
+ 	IP6_UPD_PO_STATS_BH(dev_net(skb_dst(skb)->dev),
+
+commit 62910554656cdcd6b6f84a5154c4155aae4ca231
+Merge: 22265a5c3c10 ab9304717f76
+Author: Patrick McHardy <kaber@trash.net>
+Date:   Tue Apr 20 16:02:01 2010 +0200
+
+    Merge branch 'master' of /repos/git/net-next-2.6
+    
+    Conflicts:
+            Documentation/feature-removal-schedule.txt
+            net/ipv6/netfilter/ip6t_REJECT.c
+            net/netfilter/xt_limit.c
+    
+    Signed-off-by: Patrick McHardy <kaber@trash.net>
+
+commit 5a0e3ad6af8660be21ca98a971cd00f331318c05
+Author: Tejun Heo <tj@kernel.org>
+Date:   Wed Mar 24 17:04:11 2010 +0900
+
+    include cleanup: Update gfp.h and slab.h includes to prepare for breaking implicit slab.h inclusion from percpu.h
+    
+    percpu.h is included by sched.h and module.h and thus ends up being
+    included when building most .c files.  percpu.h includes slab.h which
+    in turn includes gfp.h making everything defined by the two files
+    universally available and complicating inclusion dependencies.
+    
+    percpu.h -> slab.h dependency is about to be removed.  Prepare for
+    this change by updating users of gfp and slab facilities include those
+    headers directly instead of assuming availability.  As this conversion
+    needs to touch large number of source files, the following script is
+    used as the basis of conversion.
+    
+      http://userweb.kernel.org/~tj/misc/slabh-sweep.py
+    
+    The script does the followings.
+    
+    * Scan files for gfp and slab usages and update includes such that
+      only the necessary includes are there.  ie. if only gfp is used,
+      gfp.h, if slab is used, slab.h.
+    
+    * When the script inserts a new include, it looks at the include
+      blocks and try to put the new include such that its order conforms
+      to its surrounding.  It's put in the include block which contains
+      core kernel includes, in the same order that the rest are ordered -
+      alphabetical, Christmas tree, rev-Xmas-tree or at the end if there
+      doesn't seem to be any matching order.
+    
+    * If the script can't find a place to put a new include (mostly
+      because the file doesn't have fitting include block), it prints out
+      an error message indicating which .h file needs to be added to the
+      file.
+    
+    The conversion was done in the following steps.
+    
+    1. The initial automatic conversion of all .c files updated slightly
+       over 4000 files, deleting around 700 includes and adding ~480 gfp.h
+       and ~3000 slab.h inclusions.  The script emitted errors for ~400
+       files.
+    
+    2. Each error was manually checked.  Some didn't need the inclusion,
+       some needed manual addition while adding it to implementation .h or
+       embedding .c file was more appropriate for others.  This step added
+       inclusions to around 150 files.
+    
+    3. The script was run again and the output was compared to the edits
+       from #2 to make sure no file was left behind.
+    
+    4. Several build tests were done and a couple of problems were fixed.
+       e.g. lib/decompress_*.c used malloc/free() wrappers around slab
+       APIs requiring slab.h to be added manually.
+    
+    5. The script was run on all .h files but without automatically
+       editing them as sprinkling gfp.h and slab.h inclusions around .h
+       files could easily lead to inclusion dependency hell.  Most gfp.h
+       inclusion directives were ignored as stuff from gfp.h was usually
+       wildly available and often used in preprocessor macros.  Each
+       slab.h inclusion directive was examined and added manually as
+       necessary.
+    
+    6. percpu.h was updated not to include slab.h.
+    
+    7. Build test were done on the following configurations and failures
+       were fixed.  CONFIG_GCOV_KERNEL was turned off for all tests (as my
+       distributed build env didn't work with gcov compiles) and a few
+       more options had to be turned off depending on archs to make things
+       build (like ipr on powerpc/64 which failed due to missing writeq).
+    
+       * x86 and x86_64 UP and SMP allmodconfig and a custom test config.
+       * powerpc and powerpc64 SMP allmodconfig
+       * sparc and sparc64 SMP allmodconfig
+       * ia64 SMP allmodconfig
+       * s390 SMP allmodconfig
+       * alpha SMP allmodconfig
+       * um on x86_64 SMP allmodconfig
+    
+    8. percpu.h modifications were reverted so that it could be applied as
+       a separate patch and serve as bisection point.
+    
+    Given the fact that I had only a couple of failures from tests on step
+    6, I'm fairly confident about the coverage of this conversion patch.
+    If there is a breakage, it's likely to be something in one of the arch
+    headers which should be easily discoverable easily on most builds of
+    the specific arch.
+    
+    Signed-off-by: Tejun Heo <tj@kernel.org>
+    Guess-its-ok-by: Christoph Lameter <cl@linux-foundation.org>
+    Cc: Ingo Molnar <mingo@redhat.com>
+    Cc: Lee Schermerhorn <Lee.Schermerhorn@hp.com>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index e28f9203deca..6aa7ee1295c2 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -28,6 +28,7 @@
+ #include <linux/in6.h>
+ #include <linux/icmpv6.h>
+ #include <linux/mroute6.h>
++#include <linux/slab.h>
+ 
+ #include <linux/netfilter.h>
+ #include <linux/netfilter_ipv6.h>
+
+commit b2e0b385d77069031edb957839aaaa8441b47287
+Author: Jan Engelhardt <jengelh@medozas.de>
+Date:   Tue Mar 23 04:09:07 2010 +0100
+
+    netfilter: ipv6: use NFPROTO values for NF_HOOK invocation
+    
+    The semantic patch that was used:
+    // <smpl>
+    @@
+    @@
+    (NF_HOOK
+    |NF_HOOK_THRESH
+    |nf_hook
+    )(
+    -PF_INET6,
+    +NFPROTO_IPV6,
+     ...)
+    // </smpl>
+    
+    Signed-off-by: Jan Engelhardt <jengelh@medozas.de>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index e28f9203deca..2c01dc65794d 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -142,7 +142,7 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+ 	/* Must drop socket now because of tproxy. */
+ 	skb_orphan(skb);
+ 
+-	return NF_HOOK(PF_INET6, NF_INET_PRE_ROUTING, skb, dev, NULL,
++	return NF_HOOK(NFPROTO_IPV6, NF_INET_PRE_ROUTING, skb, dev, NULL,
+ 		       ip6_rcv_finish);
+ err:
+ 	IP6_INC_STATS_BH(net, idev, IPSTATS_MIB_INHDRERRORS);
+@@ -235,7 +235,7 @@ static int ip6_input_finish(struct sk_buff *skb)
+ 
+ int ip6_input(struct sk_buff *skb)
+ {
+-	return NF_HOOK(PF_INET6, NF_INET_LOCAL_IN, skb, skb->dev, NULL,
++	return NF_HOOK(NFPROTO_IPV6, NF_INET_LOCAL_IN, skb, skb->dev, NULL,
+ 		       ip6_input_finish);
+ }
+ 
+
+commit 3ffe533c87281b68d469b279ff3a5056f9c75862
+Author: Alexey Dobriyan <adobriyan@gmail.com>
+Date:   Thu Feb 18 08:25:24 2010 +0000
+
+    ipv6: drop unused "dev" arg of icmpv6_send()
+    
+    Dunno, what was the idea, it wasn't used for a long time.
+    
+    Signed-off-by: Alexey Dobriyan <adobriyan@gmail.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index 237e2dba6e94..e28f9203deca 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -216,8 +216,7 @@ static int ip6_input_finish(struct sk_buff *skb)
+ 				IP6_INC_STATS_BH(net, idev,
+ 						 IPSTATS_MIB_INUNKNOWNPROTOS);
+ 				icmpv6_send(skb, ICMPV6_PARAMPROB,
+-					    ICMPV6_UNK_NEXTHDR, nhoff,
+-					    skb->dev);
++					    ICMPV6_UNK_NEXTHDR, nhoff);
+ 			}
+ 		} else
+ 			IP6_INC_STATS_BH(net, idev, IPSTATS_MIB_INDELIVERS);
+
+commit 41135cc836a1abeb12ca1416bdb29e87ad021153
+Author: Alexey Dobriyan <adobriyan@gmail.com>
+Date:   Mon Sep 14 12:22:28 2009 +0000
+
+    net: constify struct inet6_protocol
+    
+    Signed-off-by: Alexey Dobriyan <adobriyan@gmail.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index 2d9cbaa67edb..237e2dba6e94 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -159,7 +159,7 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+ 
+ static int ip6_input_finish(struct sk_buff *skb)
+ {
+-	struct inet6_protocol *ipprot;
++	const struct inet6_protocol *ipprot;
+ 	unsigned int nhoff;
+ 	int nexthdr, raw;
+ 	u8 hash;
+
+commit 5c91face51d29f553a444d16db4ac2c6162a3cd0
+Author: Mark Smith <lk-netdev@lk-netdev.nosense.org>
+Date:   Mon Jul 6 11:26:24 2009 +0000
+
+    ipv6: correct return on ipv6_rcv() packet drop
+    
+    The routine ipv6_rcv() uses magic number 0 for a return when it drops a
+    packet. This corresponds to NET_RX_SUCCESS, which is obviously
+    incorrect. Correct this by using NET_RX_DROP instead.
+    
+    ps. It isn't exactly clear who the IPv6 maintainers are, apologies if
+    I've missed any.
+    
+    Signed-off-by: Mark Smith <markzzzsmith@yahoo.com.au>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index 6d6a4277c677..2d9cbaa67edb 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -63,7 +63,7 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+ 
+ 	if (skb->pkt_type == PACKET_OTHERHOST) {
+ 		kfree_skb(skb);
+-		return 0;
++		return NET_RX_DROP;
+ 	}
+ 
+ 	rcu_read_lock();
+@@ -133,7 +133,7 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+ 		if (ipv6_parse_hopopts(skb) < 0) {
+ 			IP6_INC_STATS_BH(net, idev, IPSTATS_MIB_INHDRERRORS);
+ 			rcu_read_unlock();
+-			return 0;
++			return NET_RX_DROP;
+ 		}
+ 	}
+ 
+@@ -149,7 +149,7 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+ drop:
+ 	rcu_read_unlock();
+ 	kfree_skb(skb);
+-	return 0;
++	return NET_RX_DROP;
+ }
+ 
+ /*
+
+commit 71f9dacd2e4d233029e9e956ca3f79531f411827
+Author: Herbert Xu <herbert@gondor.apana.org.au>
+Date:   Fri Jun 26 19:22:37 2009 -0700
+
+    inet: Call skb_orphan before tproxy activates
+    
+    As transparent proxying looks up the socket early and assigns
+    it to the skb for later processing, we must drop any existing
+    socket ownership prior to that in order to distinguish between
+    the case where tproxy is active and where it is not.
+    
+    Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index c3a07d75b5f5..6d6a4277c677 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -139,6 +139,9 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+ 
+ 	rcu_read_unlock();
+ 
++	/* Must drop socket now because of tproxy. */
++	skb_orphan(skb);
++
+ 	return NF_HOOK(PF_INET6, NF_INET_PRE_ROUTING, skb, dev, NULL,
+ 		       ip6_rcv_finish);
+ err:
+
+commit adf30907d63893e4208dfe3f5c88ae12bc2f25d5
+Author: Eric Dumazet <eric.dumazet@gmail.com>
+Date:   Tue Jun 2 05:19:30 2009 +0000
+
+    net: skb->dst accessors
+    
+    Define three accessors to get/set dst attached to a skb
+    
+    struct dst_entry *skb_dst(const struct sk_buff *skb)
+    
+    void skb_dst_set(struct sk_buff *skb, struct dst_entry *dst)
+    
+    void skb_dst_drop(struct sk_buff *skb)
+    This one should replace occurrences of :
+    dst_release(skb->dst)
+    skb->dst = NULL;
+    
+    Delete skb->dst field
+    
+    Signed-off-by: Eric Dumazet <eric.dumazet@gmail.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index bc1a920c34a1..c3a07d75b5f5 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -48,7 +48,7 @@
+ 
+ inline int ip6_rcv_finish( struct sk_buff *skb)
+ {
+-	if (skb->dst == NULL)
++	if (skb_dst(skb) == NULL)
+ 		ip6_route_input(skb);
+ 
+ 	return dst_input(skb);
+@@ -91,7 +91,7 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+ 	 * arrived via the sending interface (ethX), because of the
+ 	 * nature of scoping architecture. --yoshfuji
+ 	 */
+-	IP6CB(skb)->iif = skb->dst ? ip6_dst_idev(skb->dst)->dev->ifindex : dev->ifindex;
++	IP6CB(skb)->iif = skb_dst(skb) ? ip6_dst_idev(skb_dst(skb))->dev->ifindex : dev->ifindex;
+ 
+ 	if (unlikely(!pskb_may_pull(skb, sizeof(*hdr))))
+ 		goto err;
+@@ -161,7 +161,7 @@ static int ip6_input_finish(struct sk_buff *skb)
+ 	int nexthdr, raw;
+ 	u8 hash;
+ 	struct inet6_dev *idev;
+-	struct net *net = dev_net(skb->dst->dev);
++	struct net *net = dev_net(skb_dst(skb)->dev);
+ 
+ 	/*
+ 	 *	Parse extension headers
+@@ -169,7 +169,7 @@ static int ip6_input_finish(struct sk_buff *skb)
+ 
+ 	rcu_read_lock();
+ resubmit:
+-	idev = ip6_dst_idev(skb->dst);
++	idev = ip6_dst_idev(skb_dst(skb));
+ 	if (!pskb_pull(skb, skb_transport_offset(skb)))
+ 		goto discard;
+ 	nhoff = IP6CB(skb)->nhoff;
+@@ -242,8 +242,8 @@ int ip6_mc_input(struct sk_buff *skb)
+ 	struct ipv6hdr *hdr;
+ 	int deliver;
+ 
+-	IP6_UPD_PO_STATS_BH(dev_net(skb->dst->dev),
+-			 ip6_dst_idev(skb->dst), IPSTATS_MIB_INMCAST,
++	IP6_UPD_PO_STATS_BH(dev_net(skb_dst(skb)->dev),
++			 ip6_dst_idev(skb_dst(skb)), IPSTATS_MIB_INMCAST,
+ 			 skb->len);
+ 
+ 	hdr = ipv6_hdr(skb);
+
+commit edf391ff17232f097d72441c9ad467bcb3b5db18
+Author: Neil Horman <nhorman@tuxdriver.com>
+Date:   Mon Apr 27 02:45:02 2009 -0700
+
+    snmp: add missing counters for RFC 4293
+    
+    The IP MIB (RFC 4293) defines stats for InOctets, OutOctets, InMcastOctets and
+    OutMcastOctets:
+    http://tools.ietf.org/html/rfc4293
+    But it seems we don't track those in any way that easy to separate from other
+    protocols.  This patch adds those missing counters to the stats file. Tested
+    successfully by me
+    
+    With help from Eric Dumazet.
+    
+    Signed-off-by: Neil Horman <nhorman@tuxdriver.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index 8f04bd9da274..bc1a920c34a1 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -70,7 +70,7 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+ 
+ 	idev = __in6_dev_get(skb->dev);
+ 
+-	IP6_INC_STATS_BH(net, idev, IPSTATS_MIB_INRECEIVES);
++	IP6_UPD_PO_STATS_BH(net, idev, IPSTATS_MIB_IN, skb->len);
+ 
+ 	if ((skb = skb_share_check(skb, GFP_ATOMIC)) == NULL ||
+ 	    !idev || unlikely(idev->cnf.disable_ipv6)) {
+@@ -242,8 +242,9 @@ int ip6_mc_input(struct sk_buff *skb)
+ 	struct ipv6hdr *hdr;
+ 	int deliver;
+ 
+-	IP6_INC_STATS_BH(dev_net(skb->dst->dev),
+-			 ip6_dst_idev(skb->dst), IPSTATS_MIB_INMCASTPKTS);
++	IP6_UPD_PO_STATS_BH(dev_net(skb->dst->dev),
++			 ip6_dst_idev(skb->dst), IPSTATS_MIB_INMCAST,
++			 skb->len);
+ 
+ 	hdr = ipv6_hdr(skb);
+ 	deliver = ipv6_chk_mcast_addr(skb->dev, &hdr->daddr, NULL);
+
+commit 71f6f6dfdf7c7a67462386d9ea05c1095a89c555
+Author: Jesper Nilsson <jesper.nilsson@axis.com>
+Date:   Fri Mar 27 00:17:45 2009 -0700
+
+    ipv6: Plug sk_buff leak in ipv6_rcv (net/ipv6/ip6_input.c)
+    
+    Commit 778d80be52699596bf70e0eb0761cf5e1e46088d
+    (ipv6: Add disable_ipv6 sysctl to disable IPv6 operaion on specific interface)
+    seems to have introduced a leak of sk_buff's for ipv6 traffic,
+    at least in some configurations where idev is NULL, or when ipv6
+    is disabled via sysctl.
+    
+    The problem is that if the first condition of the if-statement
+    returns non-NULL, it returns an skb with only one reference,
+    and when the other conditions apply, execution jumps to the "out"
+    label, which does not call kfree_skb for it.
+    
+    To plug this leak, change to use the "drop" label instead.
+    (this relies on it being ok to call kfree_skb on NULL)
+    This also allows us to avoid calling rcu_read_unlock here,
+    and removes the only user of the "out" label.
+    
+    Signed-off-by: Jesper Nilsson <jesper.nilsson@axis.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index f171e8dbac91..8f04bd9da274 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -75,8 +75,7 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+ 	if ((skb = skb_share_check(skb, GFP_ATOMIC)) == NULL ||
+ 	    !idev || unlikely(idev->cnf.disable_ipv6)) {
+ 		IP6_INC_STATS_BH(net, idev, IPSTATS_MIB_INDISCARDS);
+-		rcu_read_unlock();
+-		goto out;
++		goto drop;
+ 	}
+ 
+ 	memset(IP6CB(skb), 0, sizeof(struct inet6_skb_parm));
+@@ -147,7 +146,6 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+ drop:
+ 	rcu_read_unlock();
+ 	kfree_skb(skb);
+-out:
+ 	return 0;
+ }
+ 
+
+commit 1d6e55f195128813f96458203a9fa14204f9251e
+Author: Thomas Goff <thomas.goff@boeing.com>
+Date:   Tue Jan 27 22:39:59 2009 -0800
+
+    IPv6: Fix multicast routing bugs.
+    
+    This patch addresses the IPv6 multicast routing issues described
+    below.  It was tested with XORP 1.4/1.5 as the IPv6 PIM-SM routing
+    daemon against FreeBSD peers.
+    
+    net/ipv6/ip6_input.c:
+    
+      - Don't try to forward link-local multicast packets.
+    
+      - Don't reset skb2->dev before calling ip6_mr_input() so packets can
+        be identified as coming from the PIM register vif properly.
+    
+    net/ipv6/ip6mr.c:
+    
+      - Fix incoming PIM register messages processing:
+    
+        * The IPv6 pseudo-header should be included when checksumming PIM
+          messages (RFC 4601 section 4.9; RFC 3973 section 4.7.1).
+    
+        * Packets decapsulated from PIM register messages should have
+          skb->protocol ETH_P_IPV6.
+    
+      - Enable/disable IPv6 multicast forwarding on the corresponding
+        interface when a routing daemon adds/removes a multicast virtual
+        interface.
+    
+      - Remove incorrect skb_pull() to fix userspace signaling.
+    
+      - Enable/disable global IPv6 multicast forwarding when an IPv6
+        multicast routing socket is opened/closed.
+    
+    net/ipv6/route.c:
+    
+      - Don't use strict routing logic for packets decapsulated from PIM
+        register messages (similar to disabling rp_filter for the IPv4
+        case).
+    
+    Signed-off-by: Thomas Goff <thomas.goff@boeing.com>
+    Reviewed-by: Fred Templin <fred.l.templin@boeing.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index 936f48946e20..f171e8dbac91 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -255,6 +255,7 @@ int ip6_mc_input(struct sk_buff *skb)
+ 	 *      IPv6 multicast router mode is now supported ;)
+ 	 */
+ 	if (dev_net(skb->dev)->ipv6.devconf_all->mc_forwarding &&
++	    !(ipv6_addr_type(&hdr->daddr) & IPV6_ADDR_LINKLOCAL) &&
+ 	    likely(!(IP6CB(skb)->flags & IP6SKB_FORWARDED))) {
+ 		/*
+ 		 * Okay, we try to forward - split and duplicate
+@@ -316,7 +317,6 @@ int ip6_mc_input(struct sk_buff *skb)
+ 		}
+ 
+ 		if (skb2) {
+-			skb2->dev = skb2->dst->dev;
+ 			ip6_mr_input(skb2);
+ 		}
+ 	}
+
+commit 483a47d2fe794328d29950fe00ce26dd405d9437
+Author: Denis V. Lunev <den@openvz.org>
+Date:   Wed Oct 8 11:09:27 2008 -0700
+
+    ipv6: added net argument to IP6_INC_STATS_BH
+    
+    Signed-off-by: Denis V. Lunev <den@openvz.org>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index 7e14cccd0561..936f48946e20 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -59,6 +59,7 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+ 	struct ipv6hdr *hdr;
+ 	u32 		pkt_len;
+ 	struct inet6_dev *idev;
++	struct net *net = dev_net(skb->dev);
+ 
+ 	if (skb->pkt_type == PACKET_OTHERHOST) {
+ 		kfree_skb(skb);
+@@ -69,11 +70,11 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+ 
+ 	idev = __in6_dev_get(skb->dev);
+ 
+-	IP6_INC_STATS_BH(idev, IPSTATS_MIB_INRECEIVES);
++	IP6_INC_STATS_BH(net, idev, IPSTATS_MIB_INRECEIVES);
+ 
+ 	if ((skb = skb_share_check(skb, GFP_ATOMIC)) == NULL ||
+ 	    !idev || unlikely(idev->cnf.disable_ipv6)) {
+-		IP6_INC_STATS_BH(idev, IPSTATS_MIB_INDISCARDS);
++		IP6_INC_STATS_BH(net, idev, IPSTATS_MIB_INDISCARDS);
+ 		rcu_read_unlock();
+ 		goto out;
+ 	}
+@@ -118,11 +119,12 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+ 	/* pkt_len may be zero if Jumbo payload option is present */
+ 	if (pkt_len || hdr->nexthdr != NEXTHDR_HOP) {
+ 		if (pkt_len + sizeof(struct ipv6hdr) > skb->len) {
+-			IP6_INC_STATS_BH(idev, IPSTATS_MIB_INTRUNCATEDPKTS);
++			IP6_INC_STATS_BH(net,
++					 idev, IPSTATS_MIB_INTRUNCATEDPKTS);
+ 			goto drop;
+ 		}
+ 		if (pskb_trim_rcsum(skb, pkt_len + sizeof(struct ipv6hdr))) {
+-			IP6_INC_STATS_BH(idev, IPSTATS_MIB_INHDRERRORS);
++			IP6_INC_STATS_BH(net, idev, IPSTATS_MIB_INHDRERRORS);
+ 			goto drop;
+ 		}
+ 		hdr = ipv6_hdr(skb);
+@@ -130,7 +132,7 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+ 
+ 	if (hdr->nexthdr == NEXTHDR_HOP) {
+ 		if (ipv6_parse_hopopts(skb) < 0) {
+-			IP6_INC_STATS_BH(idev, IPSTATS_MIB_INHDRERRORS);
++			IP6_INC_STATS_BH(net, idev, IPSTATS_MIB_INHDRERRORS);
+ 			rcu_read_unlock();
+ 			return 0;
+ 		}
+@@ -141,7 +143,7 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+ 	return NF_HOOK(PF_INET6, NF_INET_PRE_ROUTING, skb, dev, NULL,
+ 		       ip6_rcv_finish);
+ err:
+-	IP6_INC_STATS_BH(idev, IPSTATS_MIB_INHDRERRORS);
++	IP6_INC_STATS_BH(net, idev, IPSTATS_MIB_INHDRERRORS);
+ drop:
+ 	rcu_read_unlock();
+ 	kfree_skb(skb);
+@@ -161,6 +163,7 @@ static int ip6_input_finish(struct sk_buff *skb)
+ 	int nexthdr, raw;
+ 	u8 hash;
+ 	struct inet6_dev *idev;
++	struct net *net = dev_net(skb->dst->dev);
+ 
+ 	/*
+ 	 *	Parse extension headers
+@@ -205,24 +208,25 @@ static int ip6_input_finish(struct sk_buff *skb)
+ 		if (ret > 0)
+ 			goto resubmit;
+ 		else if (ret == 0)
+-			IP6_INC_STATS_BH(idev, IPSTATS_MIB_INDELIVERS);
++			IP6_INC_STATS_BH(net, idev, IPSTATS_MIB_INDELIVERS);
+ 	} else {
+ 		if (!raw) {
+ 			if (xfrm6_policy_check(NULL, XFRM_POLICY_IN, skb)) {
+-				IP6_INC_STATS_BH(idev, IPSTATS_MIB_INUNKNOWNPROTOS);
++				IP6_INC_STATS_BH(net, idev,
++						 IPSTATS_MIB_INUNKNOWNPROTOS);
+ 				icmpv6_send(skb, ICMPV6_PARAMPROB,
+ 					    ICMPV6_UNK_NEXTHDR, nhoff,
+ 					    skb->dev);
+ 			}
+ 		} else
+-			IP6_INC_STATS_BH(idev, IPSTATS_MIB_INDELIVERS);
++			IP6_INC_STATS_BH(net, idev, IPSTATS_MIB_INDELIVERS);
+ 		kfree_skb(skb);
+ 	}
+ 	rcu_read_unlock();
+ 	return 0;
+ 
+ discard:
+-	IP6_INC_STATS_BH(idev, IPSTATS_MIB_INDISCARDS);
++	IP6_INC_STATS_BH(net, idev, IPSTATS_MIB_INDISCARDS);
+ 	rcu_read_unlock();
+ 	kfree_skb(skb);
+ 	return 0;
+@@ -240,7 +244,8 @@ int ip6_mc_input(struct sk_buff *skb)
+ 	struct ipv6hdr *hdr;
+ 	int deliver;
+ 
+-	IP6_INC_STATS_BH(ip6_dst_idev(skb->dst), IPSTATS_MIB_INMCASTPKTS);
++	IP6_INC_STATS_BH(dev_net(skb->dst->dev),
++			 ip6_dst_idev(skb->dst), IPSTATS_MIB_INMCASTPKTS);
+ 
+ 	hdr = ipv6_hdr(skb);
+ 	deliver = ipv6_chk_mcast_addr(skb->dev, &hdr->daddr, NULL);
+
+commit 53b7997fd5c62408d10b9aafb38974ce90fd2356
+Author: YOSHIFUJI Hideaki <yoshfuji@linux-ipv6.org>
+Date:   Sat Jul 19 22:35:03 2008 -0700
+
+    ipv6 netns: Make several "global" sysctl variables namespace aware.
+    
+    Signed-off-by: YOSHIFUJI Hideaki <yoshfuji@linux-ipv6.org>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index ea81c614dde2..7e14cccd0561 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -249,7 +249,7 @@ int ip6_mc_input(struct sk_buff *skb)
+ 	/*
+ 	 *      IPv6 multicast router mode is now supported ;)
+ 	 */
+-	if (ipv6_devconf.mc_forwarding &&
++	if (dev_net(skb->dev)->ipv6.devconf_all->mc_forwarding &&
+ 	    likely(!(IP6CB(skb)->flags & IP6SKB_FORWARDED))) {
+ 		/*
+ 		 * Okay, we try to forward - split and duplicate
+
+commit 778d80be52699596bf70e0eb0761cf5e1e46088d
+Author: YOSHIFUJI Hideaki <yoshfuji@linux-ipv6.org>
+Date:   Sat Jun 28 14:17:11 2008 +0900
+
+    ipv6: Add disable_ipv6 sysctl to disable IPv6 operaion on specific interface.
+    
+    Signed-off-by: YOSHIFUJI Hideaki <yoshfuji@linux-ipv6.org>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index 34e5a96623ae..ea81c614dde2 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -71,7 +71,8 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+ 
+ 	IP6_INC_STATS_BH(idev, IPSTATS_MIB_INRECEIVES);
+ 
+-	if ((skb = skb_share_check(skb, GFP_ATOMIC)) == NULL) {
++	if ((skb = skb_share_check(skb, GFP_ATOMIC)) == NULL ||
++	    !idev || unlikely(idev->cnf.disable_ipv6)) {
+ 		IP6_INC_STATS_BH(idev, IPSTATS_MIB_INDISCARDS);
+ 		rcu_read_unlock();
+ 		goto out;
+
+commit 1b63ba8a86c85524a8d7e5953b314ce71ebcb9c9
+Merge: e35c3269edba d420895efb25
+Author: David S. Miller <davem@davemloft.net>
+Date:   Sat Jun 28 01:19:40 2008 -0700
+
+    Merge branch 'master' of master.kernel.org:/pub/scm/linux/kernel/git/davem/net-2.6
+    
+    Conflicts:
+    
+            drivers/net/wireless/iwlwifi/iwl4965-base.c
+
+commit f630e43a215a3129d0c1173cae0bce6ea4855cf7
+Author: YOSHIFUJI Hideaki <yoshfuji@linux-ipv6.org>
+Date:   Thu Jun 19 16:33:57 2008 -0700
+
+    ipv6: Drop packets for loopback address from outside of the box.
+    
+    [ Based upon original report and patch by Karsten Keil.  Karsten
+      has verified that this fixes the TAHI test case "ICMPv6 test
+      v6LC.5.1.2 Part F". -DaveM ]
+    
+    Signed-off-by: YOSHIFUJI Hideaki <yoshfuji@linux-ipv6.org>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index 4e5c8615832c..17eb48b8e329 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -102,6 +102,15 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+ 	if (hdr->version != 6)
+ 		goto err;
+ 
++	/*
++	 * RFC4291 2.5.3
++	 * A packet received on an interface with a destination address
++	 * of loopback must be dropped.
++	 */
++	if (!(dev->flags & IFF_LOOPBACK) &&
++	    ipv6_addr_loopback(&hdr->daddr))
++		goto err;
++
+ 	skb->transport_header = skb->network_header + sizeof(*hdr);
+ 	IP6CB(skb)->nhoff = offsetof(struct ipv6hdr, nexthdr);
+ 
+
+commit 0b040829952d84bf2a62526f0e24b624e0699447
+Author: Adrian Bunk <bunk@kernel.org>
+Date:   Tue Jun 10 22:46:50 2008 -0700
+
+    net: remove CVS keywords
+    
+    This patch removes CVS keywords that weren't updated for a long time
+    from comments.
+    
+    Signed-off-by: Adrian Bunk <bunk@kernel.org>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index 4e5c8615832c..f77a6011c302 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -6,8 +6,6 @@
+  *	Pedro Roque		<roque@di.fc.ul.pt>
+  *	Ian P. Morris		<I.P.Morris@soton.ac.uk>
+  *
+- *	$Id: ip6_input.c,v 1.19 2000/12/13 18:31:50 davem Exp $
+- *
+  *	Based in linux/net/ipv4/ip_input.c
+  *
+  *	This program is free software; you can redistribute it and/or
+
+commit aba6096b21e151bc55da74605fe77b92cfcccb12
+Author: YOSHIFUJI Hideaki <yoshfuji@linux-ipv6.org>
+Date:   Thu Apr 10 15:41:26 2008 +0900
+
+    [IPV6]: Kill several warnings without CONFIG_IPV6_MROUTE.
+    
+    Pointed out by Andrew Morton <akpm@linux-foundation.org>.
+    
+    Signed-off-by: YOSHIFUJI Hideaki <yoshfuji@linux-ipv6.org>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index 09a3201e408a..4e5c8615832c 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -262,21 +262,23 @@ int ip6_mc_input(struct sk_buff *skb)
+ 			 * is for MLD (0x0000).
+ 			 */
+ 			if ((ptr[2] | ptr[3]) == 0) {
++				deliver = 0;
++
+ 				if (!ipv6_ext_hdr(nexthdr)) {
+ 					/* BUG */
+-					goto discard;
++					goto out;
+ 				}
+ 				offset = ipv6_skip_exthdr(skb, sizeof(*hdr),
+ 							  &nexthdr);
+ 				if (offset < 0)
+-					goto discard;
++					goto out;
+ 
+ 				if (nexthdr != IPPROTO_ICMPV6)
+-					goto discard;
++					goto out;
+ 
+ 				if (!pskb_may_pull(skb, (skb_network_header(skb) +
+ 						   offset + 1 - skb->data)))
+-					goto discard;
++					goto out;
+ 
+ 				icmp6 = (struct icmp6hdr *)(skb_network_header(skb) + offset);
+ 
+@@ -285,12 +287,9 @@ int ip6_mc_input(struct sk_buff *skb)
+ 				case ICMPV6_MGM_REPORT:
+ 				case ICMPV6_MGM_REDUCTION:
+ 				case ICMPV6_MLD2_REPORT:
++					deliver = 1;
+ 					break;
+-				default:
+-					/* Bogus */
+-					goto discard;
+ 				}
+-				deliver = 1;
+ 				goto out;
+ 			}
+ 			/* unknown RA - process it normally */
+@@ -308,15 +307,14 @@ int ip6_mc_input(struct sk_buff *skb)
+ 			ip6_mr_input(skb2);
+ 		}
+ 	}
+-#endif
+ out:
+-	if (likely(deliver)) {
++#endif
++	if (likely(deliver))
+ 		ip6_input(skb);
+-		return 0;
++	else {
++		/* discard */
++		kfree_skb(skb);
+ 	}
+-discard:
+-	/* discard */
+-	kfree_skb(skb);
+ 
+ 	return 0;
+ }
+
+commit 7bc570c8b4f75ddb3fd5dbeb38127cdc4acbcc9c
+Author: YOSHIFUJI Hideaki <yoshfuji@linux-ipv6.org>
+Date:   Thu Apr 3 09:22:53 2008 +0900
+
+    [IPV6] MROUTE: Support multicast forwarding.
+    
+    Based on ancient patch by Mickael Hoerdt
+    <hoerdt@clarinet.u-strasbg.fr>, which is available at
+    <http://www-r2.u-strasbg.fr/~hoerdt/dev/linux_ipv6_mforwarding/patch-linux-ipv6-mforwarding-0.1a>.
+    
+    Signed-off-by: YOSHIFUJI Hideaki <yoshfuji@linux-ipv6.org>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index 43a617e2268b..09a3201e408a 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -29,6 +29,7 @@
+ #include <linux/netdevice.h>
+ #include <linux/in6.h>
+ #include <linux/icmpv6.h>
++#include <linux/mroute6.h>
+ 
+ #include <linux/netfilter.h>
+ #include <linux/netfilter_ipv6.h>
+@@ -236,36 +237,84 @@ int ip6_mc_input(struct sk_buff *skb)
+ 	hdr = ipv6_hdr(skb);
+ 	deliver = ipv6_chk_mcast_addr(skb->dev, &hdr->daddr, NULL);
+ 
++#ifdef CONFIG_IPV6_MROUTE
+ 	/*
+-	 *	IPv6 multicast router mode isnt currently supported.
++	 *      IPv6 multicast router mode is now supported ;)
+ 	 */
+-#if 0
+-	if (ipv6_config.multicast_route) {
+-		int addr_type;
+-
+-		addr_type = ipv6_addr_type(&hdr->daddr);
+-
+-		if (!(addr_type & (IPV6_ADDR_LOOPBACK | IPV6_ADDR_LINKLOCAL))) {
+-			struct sk_buff *skb2;
+-			struct dst_entry *dst;
++	if (ipv6_devconf.mc_forwarding &&
++	    likely(!(IP6CB(skb)->flags & IP6SKB_FORWARDED))) {
++		/*
++		 * Okay, we try to forward - split and duplicate
++		 * packets.
++		 */
++		struct sk_buff *skb2;
++		struct inet6_skb_parm *opt = IP6CB(skb);
++
++		/* Check for MLD */
++		if (unlikely(opt->ra)) {
++			/* Check if this is a mld message */
++			u8 *ptr = skb_network_header(skb) + opt->ra;
++			struct icmp6hdr *icmp6;
++			u8 nexthdr = hdr->nexthdr;
++			int offset;
++
++			/* Check if the value of Router Alert
++			 * is for MLD (0x0000).
++			 */
++			if ((ptr[2] | ptr[3]) == 0) {
++				if (!ipv6_ext_hdr(nexthdr)) {
++					/* BUG */
++					goto discard;
++				}
++				offset = ipv6_skip_exthdr(skb, sizeof(*hdr),
++							  &nexthdr);
++				if (offset < 0)
++					goto discard;
++
++				if (nexthdr != IPPROTO_ICMPV6)
++					goto discard;
++
++				if (!pskb_may_pull(skb, (skb_network_header(skb) +
++						   offset + 1 - skb->data)))
++					goto discard;
++
++				icmp6 = (struct icmp6hdr *)(skb_network_header(skb) + offset);
++
++				switch (icmp6->icmp6_type) {
++				case ICMPV6_MGM_QUERY:
++				case ICMPV6_MGM_REPORT:
++				case ICMPV6_MGM_REDUCTION:
++				case ICMPV6_MLD2_REPORT:
++					break;
++				default:
++					/* Bogus */
++					goto discard;
++				}
++				deliver = 1;
++				goto out;
++			}
++			/* unknown RA - process it normally */
++		}
+ 
+-			dst = skb->dst;
++		if (deliver)
++			skb2 = skb_clone(skb, GFP_ATOMIC);
++		else {
++			skb2 = skb;
++			skb = NULL;
++		}
+ 
+-			if (deliver) {
+-				skb2 = skb_clone(skb, GFP_ATOMIC);
+-				dst_output(skb2);
+-			} else {
+-				dst_output(skb);
+-				return 0;
+-			}
++		if (skb2) {
++			skb2->dev = skb2->dst->dev;
++			ip6_mr_input(skb2);
+ 		}
+ 	}
+ #endif
+-
++out:
+ 	if (likely(deliver)) {
+ 		ip6_input(skb);
+ 		return 0;
+ 	}
++discard:
+ 	/* discard */
+ 	kfree_skb(skb);
+ 
+
+commit e1ec1b8ccdf0df6000faa8c2d985ca5f94157e5a
+Merge: c0f39322c335 802fb176d8c6
+Author: David S. Miller <davem@davemloft.net>
+Date:   Wed Apr 2 22:35:23 2008 -0700
+
+    Merge branch 'master' of git://git.kernel.org/pub/scm/linux/kernel/git/davem/net-2.6
+    
+    Conflicts:
+    
+            drivers/net/s2io.c
+
+commit 4c7966b86b910d6d4869aba1d7417d053ac9682c
+Author: YOSHIFUJI Hideaki <yoshfuji@linux-ipv6.org>
+Date:   Mon Mar 31 19:30:45 2008 -0700
+
+    [IPV6] MCAST: Ensure to check multicast listener(s).
+    
+    In ip6_mc_input(), we need to check whether we have listener(s) for
+    the packet.
+    
+    After commit ae7bf20a6316272acfcaef5d265b18aaa54b41e4, all packets
+    for multicast destinations are delivered to upper layer if
+    IFF_PROMISC or IFF_ALLMULTI is set.
+    
+    In fact, bug was rather ancient; the original (before the commit)
+    intent of the dev->flags check was to skip the ipv6_chk_mcast_addr()
+    call, assuming L2 filters packets appropriately, but it was even not
+    true.
+    
+    Let's explicitly check our multicast list.
+    
+    Signed-off-by: YOSHIFUJI Hideaki <yoshfuji@linux-ipv6.org>
+    Acked-by: David L Stevens <dlstevens@us.ibm.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index 178aebc0427a..98ab4f459905 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -239,8 +239,7 @@ int ip6_mc_input(struct sk_buff *skb)
+ 	IP6_INC_STATS_BH(ip6_dst_idev(skb->dst), IPSTATS_MIB_INMCASTPKTS);
+ 
+ 	hdr = ipv6_hdr(skb);
+-	deliver = unlikely(skb->dev->flags & (IFF_PROMISC|IFF_ALLMULTI)) ||
+-	    ipv6_chk_mcast_addr(skb->dev, &hdr->daddr, NULL);
++	deliver = ipv6_chk_mcast_addr(skb->dev, &hdr->daddr, NULL);
+ 
+ 	/*
+ 	 *	IPv6 multicast router mode isnt currently supported.
+
+commit da6bb5c0c5c22e8289aa555afadfb69487fafbc3
+Author: Daniel Lezcano <dlezcano@fr.ibm.com>
+Date:   Wed Mar 5 10:48:56 2008 -0800
+
+    [NETNS][IPV6] ip6_input - enable ipv6_rcv to handle several network namespace
+    
+    The different subsystem of ipv6 are ready for namespaces, so let's
+    activate it for ipv6_rcv.
+    
+    Signed-off-by: Daniel Lezcano <dlezcano@fr.ibm.com>
+    Signed-off-by: Benjamin Thery <benjamin.thery@bull.net>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index 178aebc0427a..7e36269826ba 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -61,11 +61,6 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+ 	u32 		pkt_len;
+ 	struct inet6_dev *idev;
+ 
+-	if (dev->nd_net != &init_net) {
+-		kfree_skb(skb);
+-		return 0;
+-	}
+-
+ 	if (skb->pkt_type == PACKET_OTHERHOST) {
+ 		kfree_skb(skb);
+ 		return 0;
+
+commit 69d6da0b0faa70249a243a14e6066c013e9294e5
+Author: Pavel Emelyanov <xemul@openvz.org>
+Date:   Mon Nov 19 22:35:57 2007 -0800
+
+    [IPv6] RAW: Compact the API for the kernel
+    
+    Same as in the previous patch for ipv4, compact the
+    API and hide hash table and rwlock inside the raw.c
+    file.
+    
+    Plus fix some "bad" places from checkpatch.pl point
+    of view (assignments inside if()).
+    
+    Signed-off-by: Pavel Emelyanov <xemul@openvz.org>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index 79610b4bad3e..178aebc0427a 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -153,9 +153,8 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+ static int ip6_input_finish(struct sk_buff *skb)
+ {
+ 	struct inet6_protocol *ipprot;
+-	struct sock *raw_sk;
+ 	unsigned int nhoff;
+-	int nexthdr;
++	int nexthdr, raw;
+ 	u8 hash;
+ 	struct inet6_dev *idev;
+ 
+@@ -171,9 +170,7 @@ static int ip6_input_finish(struct sk_buff *skb)
+ 	nhoff = IP6CB(skb)->nhoff;
+ 	nexthdr = skb_network_header(skb)[nhoff];
+ 
+-	raw_sk = sk_head(&raw_v6_htable[nexthdr & (MAX_INET_PROTOS - 1)]);
+-	if (raw_sk && !ipv6_raw_deliver(skb, nexthdr))
+-		raw_sk = NULL;
++	raw = raw6_local_deliver(skb, nexthdr);
+ 
+ 	hash = nexthdr & (MAX_INET_PROTOS - 1);
+ 	if ((ipprot = rcu_dereference(inet6_protos[hash])) != NULL) {
+@@ -206,7 +203,7 @@ static int ip6_input_finish(struct sk_buff *skb)
+ 		else if (ret == 0)
+ 			IP6_INC_STATS_BH(idev, IPSTATS_MIB_INDELIVERS);
+ 	} else {
+-		if (!raw_sk) {
++		if (!raw) {
+ 			if (xfrm6_policy_check(NULL, XFRM_POLICY_IN, skb)) {
+ 				IP6_INC_STATS_BH(idev, IPSTATS_MIB_INUNKNOWNPROTOS);
+ 				icmpv6_send(skb, ICMPV6_PARAMPROB,
+
+commit 6e23ae2a48750bda407a4a58f52a4865d7308bf5
+Author: Patrick McHardy <kaber@trash.net>
+Date:   Mon Nov 19 18:53:30 2007 -0800
+
+    [NETFILTER]: Introduce NF_INET_ hook values
+    
+    The IPv4 and IPv6 hook values are identical, yet some code tries to figure
+    out the "correct" value by looking at the address family. Introduce NF_INET_*
+    values for both IPv4 and IPv6. The old values are kept in a #ifndef __KERNEL__
+    section for userspace compatibility.
+    
+    Signed-off-by: Patrick McHardy <kaber@trash.net>
+    Acked-by: Herbert Xu <herbert@gondor.apana.org.au>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index fac6f7f9dd73..79610b4bad3e 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -134,7 +134,8 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+ 
+ 	rcu_read_unlock();
+ 
+-	return NF_HOOK(PF_INET6,NF_IP6_PRE_ROUTING, skb, dev, NULL, ip6_rcv_finish);
++	return NF_HOOK(PF_INET6, NF_INET_PRE_ROUTING, skb, dev, NULL,
++		       ip6_rcv_finish);
+ err:
+ 	IP6_INC_STATS_BH(idev, IPSTATS_MIB_INHDRERRORS);
+ drop:
+@@ -229,7 +230,8 @@ static int ip6_input_finish(struct sk_buff *skb)
+ 
+ int ip6_input(struct sk_buff *skb)
+ {
+-	return NF_HOOK(PF_INET6,NF_IP6_LOCAL_IN, skb, skb->dev, NULL, ip6_input_finish);
++	return NF_HOOK(PF_INET6, NF_INET_LOCAL_IN, skb, skb->dev, NULL,
++		       ip6_input_finish);
+ }
+ 
+ int ip6_mc_input(struct sk_buff *skb)
+
+commit e5bbef20e017efcb10700398cc048c49b98628e0
+Author: Herbert Xu <herbert@gondor.apana.org.au>
+Date:   Mon Oct 15 12:50:28 2007 -0700
+
+    [IPV6]: Replace sk_buff ** with sk_buff * in input handlers
+    
+    With all the users of the double pointers removed from the IPv6 input path,
+    this patch converts all occurances of sk_buff ** to sk_buff * in IPv6 input
+    handlers.
+    
+    Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index e7c85069a5db..fac6f7f9dd73 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -125,7 +125,7 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+ 	}
+ 
+ 	if (hdr->nexthdr == NEXTHDR_HOP) {
+-		if (ipv6_parse_hopopts(&skb) < 0) {
++		if (ipv6_parse_hopopts(skb) < 0) {
+ 			IP6_INC_STATS_BH(idev, IPSTATS_MIB_INHDRERRORS);
+ 			rcu_read_unlock();
+ 			return 0;
+@@ -199,7 +199,7 @@ static int ip6_input_finish(struct sk_buff *skb)
+ 		    !xfrm6_policy_check(NULL, XFRM_POLICY_IN, skb))
+ 			goto discard;
+ 
+-		ret = ipprot->handler(&skb);
++		ret = ipprot->handler(skb);
+ 		if (ret > 0)
+ 			goto resubmit;
+ 		else if (ret == 0)
+
+commit ad643a793bfb933e1b9e37ad4a5edf389ae160ea
+Author: Patrick McHardy <kaber@trash.net>
+Date:   Mon Oct 15 01:51:38 2007 -0700
+
+    [IPV6]: Uninline netfilter okfns
+    
+    Uninline netfilter okfns for those cases where gcc can generate tail-calls.
+    
+    Before:
+       text    data     bss     dec     hex filename
+    8994153 1016524  524652 10535329         a0c1a1 vmlinux
+    
+    After:
+       text    data     bss     dec     hex filename
+    8992761 1016524  524652 10533937         a0bc31 vmlinux
+    -------------------------------------------------------
+      -1392
+    
+    All cases have been verified to generate tail-calls with and without netfilter.
+    
+    Signed-off-by: Patrick McHardy <kaber@trash.net>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index 9149fc239759..e7c85069a5db 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -149,7 +149,7 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+  */
+ 
+ 
+-static inline int ip6_input_finish(struct sk_buff *skb)
++static int ip6_input_finish(struct sk_buff *skb)
+ {
+ 	struct inet6_protocol *ipprot;
+ 	struct sock *raw_sk;
+
+commit de3cb747ffac5f2a4a6bb156e7e2fd5229e688e5
+Author: Daniel Lezcano <dlezcano@fr.ibm.com>
+Date:   Tue Sep 25 19:16:28 2007 -0700
+
+    [NET]: Dynamically allocate the loopback device, part 1.
+    
+    This patch replaces all occurences to the static variable
+    loopback_dev to a pointer loopback_dev. That provides the
+    mindless, trivial, uninteressting change part for the dynamic
+    allocation for the loopback.
+    
+    Signed-off-by: Eric W. Biederman <ebiederm@xmission.com>
+    Signed-off-by: Daniel Lezcano <dlezcano@fr.ibm.com>
+    Acked-By: Kirill Korotaev <dev@sw.ru>
+    Acked-by: Benjamin Thery <benjamin.thery@bull.net>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index 7d18cac3f110..9149fc239759 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -91,7 +91,7 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+ 	 *
+ 	 * BTW, when we send a packet for our own local address on a
+ 	 * non-loopback interface (e.g. ethX), it is being delivered
+-	 * via the loopback interface (lo) here; skb->dev = &loopback_dev.
++	 * via the loopback interface (lo) here; skb->dev = loopback_dev.
+ 	 * It, however, should be considered as if it is being
+ 	 * arrived via the sending interface (ethX), because of the
+ 	 * nature of scoping architecture. --yoshfuji
+
+commit e730c15519d09ea528b4d2f1103681fa5937c0e6
+Author: Eric W. Biederman <ebiederm@xmission.com>
+Date:   Mon Sep 17 11:53:39 2007 -0700
+
+    [NET]: Make packet reception network namespace safe
+    
+    This patch modifies every packet receive function
+    registered with dev_add_pack() to drop packets if they
+    are not from the initial network namespace.
+    
+    This should ensure that the various network stacks do
+    not receive packets in a anything but the initial network
+    namespace until the code has been converted and is ready
+    for them.
+    
+    Signed-off-by: Eric W. Biederman <ebiederm@xmission.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index 30a5cb1b203e..7d18cac3f110 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -61,6 +61,11 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+ 	u32 		pkt_len;
+ 	struct inet6_dev *idev;
+ 
++	if (dev->nd_net != &init_net) {
++		kfree_skb(skb);
++		return 0;
++	}
++
+ 	if (skb->pkt_type == PACKET_OTHERHOST) {
+ 		kfree_skb(skb);
+ 		return 0;
+
+commit ae7bf20a6316272acfcaef5d265b18aaa54b41e4
+Author: Corey Mutter <crm-netdev@mutternet.com>
+Date:   Mon May 14 03:00:27 2007 -0700
+
+    [IPV6]: Reverse sense of promisc tests in ip6_mc_input
+    
+    Reverse the sense of the promiscuous-mode tests in ip6_mc_input().
+    
+    Signed-off-by: Corey Mutter <crm-netdev@mutternet.com>
+    Signed-off-by: David L Stevens <dlstevens@us.ibm.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index be0ee8a34f9b..30a5cb1b203e 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -235,7 +235,7 @@ int ip6_mc_input(struct sk_buff *skb)
+ 	IP6_INC_STATS_BH(ip6_dst_idev(skb->dst), IPSTATS_MIB_INMCASTPKTS);
+ 
+ 	hdr = ipv6_hdr(skb);
+-	deliver = likely(!(skb->dev->flags & (IFF_PROMISC|IFF_ALLMULTI))) ||
++	deliver = unlikely(skb->dev->flags & (IFF_PROMISC|IFF_ALLMULTI)) ||
+ 	    ipv6_chk_mcast_addr(skb->dev, &hdr->daddr, NULL);
+ 
+ 	/*
+
+commit b0e380b1d8a8e0aca215df97702f99815f05c094
+Author: Arnaldo Carvalho de Melo <acme@redhat.com>
+Date:   Tue Apr 10 21:21:55 2007 -0700
+
+    [SK_BUFF]: unions of just one member don't get anything done, kill them
+    
+    Renaming skb->h to skb->transport_header, skb->nh to skb->network_header and
+    skb->mac to skb->mac_header, to match the names of the associated helpers
+    (skb[_[re]set]_{transport,network,mac}_header).
+    
+    Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index cf0c4406b59e..be0ee8a34f9b 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -101,7 +101,7 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+ 	if (hdr->version != 6)
+ 		goto err;
+ 
+-	skb->h.raw = skb->nh.raw + sizeof(*hdr);
++	skb->transport_header = skb->network_header + sizeof(*hdr);
+ 	IP6CB(skb)->nhoff = offsetof(struct ipv6hdr, nexthdr);
+ 
+ 	pkt_len = ntohs(hdr->payload_len);
+
+commit cfe1fc7759fdacb0c650b575daed1692bf3eaece
+Author: Arnaldo Carvalho de Melo <acme@redhat.com>
+Date:   Fri Mar 16 17:26:39 2007 -0300
+
+    [SK_BUFF]: Introduce skb_network_header_len
+    
+    For the common sequence "skb->h.raw - skb->nh.raw", similar to skb->mac_len,
+    that is precalculated tho, don't think we need to bloat skb with one more
+    member, so just use this new helper, reducing the number of non-skbuff.h
+    references to the layer headers even more.
+    
+    Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index 44275411d1a8..cf0c4406b59e 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -182,7 +182,7 @@ static inline int ip6_input_finish(struct sk_buff *skb)
+ 			nf_reset(skb);
+ 
+ 			skb_postpull_rcsum(skb, skb_network_header(skb),
+-					   skb->h.raw - skb->nh.raw);
++					   skb_network_header_len(skb));
+ 			hdr = ipv6_hdr(skb);
+ 			if (ipv6_addr_is_multicast(&hdr->daddr) &&
+ 			    !ipv6_chk_mcast_addr(skb->dev, &hdr->daddr,
+
+commit ea2ae17d6443abddc79480dc9f7af8feacabddc4
+Author: Arnaldo Carvalho de Melo <acme@redhat.com>
+Date:   Wed Apr 25 17:55:53 2007 -0700
+
+    [SK_BUFF]: Introduce skb_transport_offset()
+    
+    For the quite common 'skb->h.raw - skb->data' sequence.
+    
+    Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index 2dd32a2ca056..44275411d1a8 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -160,7 +160,7 @@ static inline int ip6_input_finish(struct sk_buff *skb)
+ 	rcu_read_lock();
+ resubmit:
+ 	idev = ip6_dst_idev(skb->dst);
+-	if (!pskb_pull(skb, skb->h.raw - skb->data))
++	if (!pskb_pull(skb, skb_transport_offset(skb)))
+ 		goto discard;
+ 	nhoff = IP6CB(skb)->nhoff;
+ 	nexthdr = skb_network_header(skb)[nhoff];
+
+commit badff6d01a8589a1c828b0bf118903ca38627f4e
+Author: Arnaldo Carvalho de Melo <acme@redhat.com>
+Date:   Tue Mar 13 13:06:52 2007 -0300
+
+    [SK_BUFF]: Introduce skb_reset_transport_header(skb)
+    
+    For the common, open coded 'skb->h.raw = skb->data' operation, so that we can
+    later turn skb->h.raw into a offset, reducing the size of struct sk_buff in
+    64bit land while possibly keeping it as a pointer on 32bit.
+    
+    This one touches just the most simple cases:
+    
+    skb->h.raw = skb->data;
+    skb->h.raw = {skb_push|[__]skb_pull}()
+    
+    The next ones will handle the slightly more "complex" cases.
+    
+    Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index 9c3c787a21c1..2dd32a2ca056 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -101,7 +101,7 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+ 	if (hdr->version != 6)
+ 		goto err;
+ 
+-	skb->h.raw = (u8 *)(hdr + 1);
++	skb->h.raw = skb->nh.raw + sizeof(*hdr);
+ 	IP6CB(skb)->nhoff = offsetof(struct ipv6hdr, nexthdr);
+ 
+ 	pkt_len = ntohs(hdr->payload_len);
+
+commit 0660e03f6b18f19b6bbafe7583265a51b90daf36
+Author: Arnaldo Carvalho de Melo <acme@redhat.com>
+Date:   Wed Apr 25 17:54:47 2007 -0700
+
+    [SK_BUFF]: Introduce ipv6_hdr(), remove skb->nh.ipv6h
+    
+    Now the skb->nh union has just one member, .raw, i.e. it is just like the
+    skb->mac union, strange, no? I'm just leaving it like that till the transport
+    layer is done with, when we'll rename skb->mac.raw to skb->mac_header (or
+    ->mac_header_offset?), ditto for ->{h,nh}.
+    
+    Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index aecc74da0721..9c3c787a21c1 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -96,7 +96,7 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+ 	if (unlikely(!pskb_may_pull(skb, sizeof(*hdr))))
+ 		goto err;
+ 
+-	hdr = skb->nh.ipv6h;
++	hdr = ipv6_hdr(skb);
+ 
+ 	if (hdr->version != 6)
+ 		goto err;
+@@ -116,7 +116,7 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+ 			IP6_INC_STATS_BH(idev, IPSTATS_MIB_INHDRERRORS);
+ 			goto drop;
+ 		}
+-		hdr = skb->nh.ipv6h;
++		hdr = ipv6_hdr(skb);
+ 	}
+ 
+ 	if (hdr->nexthdr == NEXTHDR_HOP) {
+@@ -183,7 +183,7 @@ static inline int ip6_input_finish(struct sk_buff *skb)
+ 
+ 			skb_postpull_rcsum(skb, skb_network_header(skb),
+ 					   skb->h.raw - skb->nh.raw);
+-			hdr = skb->nh.ipv6h;
++			hdr = ipv6_hdr(skb);
+ 			if (ipv6_addr_is_multicast(&hdr->daddr) &&
+ 			    !ipv6_chk_mcast_addr(skb->dev, &hdr->daddr,
+ 			    &hdr->saddr) &&
+@@ -234,7 +234,7 @@ int ip6_mc_input(struct sk_buff *skb)
+ 
+ 	IP6_INC_STATS_BH(ip6_dst_idev(skb->dst), IPSTATS_MIB_INMCASTPKTS);
+ 
+-	hdr = skb->nh.ipv6h;
++	hdr = ipv6_hdr(skb);
+ 	deliver = likely(!(skb->dev->flags & (IFF_PROMISC|IFF_ALLMULTI))) ||
+ 	    ipv6_chk_mcast_addr(skb->dev, &hdr->daddr, NULL);
+ 
+
+commit d56f90a7c96da5187f0cdf07ee7434fe6aa78bbc
+Author: Arnaldo Carvalho de Melo <acme@redhat.com>
+Date:   Tue Apr 10 20:50:43 2007 -0700
+
+    [SK_BUFF]: Introduce skb_network_header()
+    
+    For the places where we need a pointer to the network header, it is still legal
+    to touch skb->nh.raw directly if just adding to, subtracting from or setting it
+    to another layer header.
+    
+    Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index 61e7a6c8141d..aecc74da0721 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -163,7 +163,7 @@ static inline int ip6_input_finish(struct sk_buff *skb)
+ 	if (!pskb_pull(skb, skb->h.raw - skb->data))
+ 		goto discard;
+ 	nhoff = IP6CB(skb)->nhoff;
+-	nexthdr = skb->nh.raw[nhoff];
++	nexthdr = skb_network_header(skb)[nhoff];
+ 
+ 	raw_sk = sk_head(&raw_v6_htable[nexthdr & (MAX_INET_PROTOS - 1)]);
+ 	if (raw_sk && !ipv6_raw_deliver(skb, nexthdr))
+@@ -181,7 +181,7 @@ static inline int ip6_input_finish(struct sk_buff *skb)
+ 			   indefinitely. */
+ 			nf_reset(skb);
+ 
+-			skb_postpull_rcsum(skb, skb->nh.raw,
++			skb_postpull_rcsum(skb, skb_network_header(skb),
+ 					   skb->h.raw - skb->nh.raw);
+ 			hdr = skb->nh.ipv6h;
+ 			if (ipv6_addr_is_multicast(&hdr->daddr) &&
+
+commit 60e5c166413f17d5ef00b4c1f398dbd44291309a
+Author: Mitsuru Chinen <mitch@linux.vnet.ibm.com>
+Date:   Wed Apr 4 23:54:59 2007 -0700
+
+    [IPv6]: Exclude truncated packets from InHdrErrors statistics
+    
+    Incoming trancated packets are counted as not only InTruncatedPkts but
+    also InHdrErrors. They should be counted as InTruncatedPkts only.
+    
+    Signed-off-by: Mitsuru Chinen <mitch@linux.vnet.ibm.com>
+    Acked-by: YOSHIFUJI Hideaki <yoshfuji@linux-ipv6.org>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index 11bfc7c43182..61e7a6c8141d 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -108,8 +108,10 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+ 
+ 	/* pkt_len may be zero if Jumbo payload option is present */
+ 	if (pkt_len || hdr->nexthdr != NEXTHDR_HOP) {
+-		if (pkt_len + sizeof(struct ipv6hdr) > skb->len)
+-			goto truncated;
++		if (pkt_len + sizeof(struct ipv6hdr) > skb->len) {
++			IP6_INC_STATS_BH(idev, IPSTATS_MIB_INTRUNCATEDPKTS);
++			goto drop;
++		}
+ 		if (pskb_trim_rcsum(skb, pkt_len + sizeof(struct ipv6hdr))) {
+ 			IP6_INC_STATS_BH(idev, IPSTATS_MIB_INHDRERRORS);
+ 			goto drop;
+@@ -128,8 +130,6 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+ 	rcu_read_unlock();
+ 
+ 	return NF_HOOK(PF_INET6,NF_IP6_PRE_ROUTING, skb, dev, NULL, ip6_rcv_finish);
+-truncated:
+-	IP6_INC_STATS_BH(idev, IPSTATS_MIB_INTRUNCATEDPKTS);
+ err:
+ 	IP6_INC_STATS_BH(idev, IPSTATS_MIB_INHDRERRORS);
+ drop:
+
+commit cd354f1ae75e6466a7e31b727faede57a1f89ca5
+Author: Tim Schmielau <tim@physik3.uni-rostock.de>
+Date:   Wed Feb 14 00:33:14 2007 -0800
+
+    [PATCH] remove many unneeded #includes of sched.h
+    
+    After Al Viro (finally) succeeded in removing the sched.h #include in module.h
+    recently, it makes sense again to remove other superfluous sched.h includes.
+    There are quite a lot of files which include it but don't actually need
+    anything defined in there.  Presumably these includes were once needed for
+    macros that used to live in sched.h, but moved to other header files in the
+    course of cleaning it up.
+    
+    To ease the pain, this time I did not fiddle with any header files and only
+    removed #includes from .c-files, which tend to cause less trouble.
+    
+    Compile tested against 2.6.20-rc2 and 2.6.20-rc2-mm2 (with offsets) on alpha,
+    arm, i386, ia64, mips, powerpc, and x86_64 with allnoconfig, defconfig,
+    allmodconfig, and allyesconfig as well as a few randconfigs on x86_64 and all
+    configs in arch/arm/configs on arm.  I also checked that no new warnings were
+    introduced by the patch (actually, some warnings are removed that were emitted
+    by unnecessarily included header files).
+    
+    Signed-off-by: Tim Schmielau <tim@physik3.uni-rostock.de>
+    Acked-by: Russell King <rmk+kernel@arm.linux.org.uk>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index 4fdded0e545a..11bfc7c43182 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -25,7 +25,6 @@
+ #include <linux/types.h>
+ #include <linux/socket.h>
+ #include <linux/sockios.h>
+-#include <linux/sched.h>
+ #include <linux/net.h>
+ #include <linux/netdevice.h>
+ #include <linux/in6.h>
+
+commit 1ab1457c42bc078e5a9becd82a7f9f940b55c53a
+Author: YOSHIFUJI Hideaki <yoshfuji@linux-ipv6.org>
+Date:   Fri Feb 9 23:24:49 2007 +0900
+
+    [NET] IPV6: Fix whitespace errors.
+    
+    Signed-off-by: YOSHIFUJI Hideaki <yoshfuji@linux-ipv6.org>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index ad0b8abcdf4b..4fdded0e545a 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -1,6 +1,6 @@
+ /*
+  *	IPv6 input
+- *	Linux INET6 implementation 
++ *	Linux INET6 implementation
+  *
+  *	Authors:
+  *	Pedro Roque		<roque@di.fc.ul.pt>
+@@ -48,7 +48,7 @@
+ 
+ 
+ 
+-inline int ip6_rcv_finish( struct sk_buff *skb) 
++inline int ip6_rcv_finish( struct sk_buff *skb)
+ {
+ 	if (skb->dst == NULL)
+ 		ip6_route_input(skb);
+@@ -173,9 +173,9 @@ static inline int ip6_input_finish(struct sk_buff *skb)
+ 	hash = nexthdr & (MAX_INET_PROTOS - 1);
+ 	if ((ipprot = rcu_dereference(inet6_protos[hash])) != NULL) {
+ 		int ret;
+-		
++
+ 		if (ipprot->flags & INET6_PROTO_FINAL) {
+-			struct ipv6hdr *hdr;	
++			struct ipv6hdr *hdr;
+ 
+ 			/* Free reference early: we don't need it any more,
+ 			   and it may hold ip_conntrack module loaded
+@@ -192,9 +192,9 @@ static inline int ip6_input_finish(struct sk_buff *skb)
+ 				goto discard;
+ 		}
+ 		if (!(ipprot->flags & INET6_PROTO_NOPOLICY) &&
+-		    !xfrm6_policy_check(NULL, XFRM_POLICY_IN, skb)) 
++		    !xfrm6_policy_check(NULL, XFRM_POLICY_IN, skb))
+ 			goto discard;
+-		
++
+ 		ret = ipprot->handler(&skb);
+ 		if (ret > 0)
+ 			goto resubmit;
+@@ -205,8 +205,8 @@ static inline int ip6_input_finish(struct sk_buff *skb)
+ 			if (xfrm6_policy_check(NULL, XFRM_POLICY_IN, skb)) {
+ 				IP6_INC_STATS_BH(idev, IPSTATS_MIB_INUNKNOWNPROTOS);
+ 				icmpv6_send(skb, ICMPV6_PARAMPROB,
+-				            ICMPV6_UNK_NEXTHDR, nhoff,
+-				            skb->dev);
++					    ICMPV6_UNK_NEXTHDR, nhoff,
++					    skb->dev);
+ 			}
+ 		} else
+ 			IP6_INC_STATS_BH(idev, IPSTATS_MIB_INDELIVERS);
+@@ -253,7 +253,7 @@ int ip6_mc_input(struct sk_buff *skb)
+ 			struct dst_entry *dst;
+ 
+ 			dst = skb->dst;
+-			
++
+ 			if (deliver) {
+ 				skb2 = skb_clone(skb, GFP_ATOMIC);
+ 				dst_output(skb2);
+
+commit a11d206d0f88e092419877c7f706cafb5e1c2e57
+Author: YOSHIFUJI Hideaki <yoshfuji@linux-ipv6.org>
+Date:   Sat Nov 4 20:11:37 2006 +0900
+
+    [IPV6]: Per-interface statistics support.
+    
+    For IP MIB (RFC4293).
+    
+    Signed-off-by: YOSHIFUJI Hideaki <yoshfuji@linux-ipv6.org>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index ebf54ae90a0c..ad0b8abcdf4b 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -60,14 +60,22 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+ {
+ 	struct ipv6hdr *hdr;
+ 	u32 		pkt_len;
++	struct inet6_dev *idev;
+ 
+-	if (skb->pkt_type == PACKET_OTHERHOST)
+-		goto drop;
++	if (skb->pkt_type == PACKET_OTHERHOST) {
++		kfree_skb(skb);
++		return 0;
++	}
++
++	rcu_read_lock();
+ 
+-	IP6_INC_STATS_BH(IPSTATS_MIB_INRECEIVES);
++	idev = __in6_dev_get(skb->dev);
++
++	IP6_INC_STATS_BH(idev, IPSTATS_MIB_INRECEIVES);
+ 
+ 	if ((skb = skb_share_check(skb, GFP_ATOMIC)) == NULL) {
+-		IP6_INC_STATS_BH(IPSTATS_MIB_INDISCARDS);
++		IP6_INC_STATS_BH(idev, IPSTATS_MIB_INDISCARDS);
++		rcu_read_unlock();
+ 		goto out;
+ 	}
+ 
+@@ -104,7 +112,7 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+ 		if (pkt_len + sizeof(struct ipv6hdr) > skb->len)
+ 			goto truncated;
+ 		if (pskb_trim_rcsum(skb, pkt_len + sizeof(struct ipv6hdr))) {
+-			IP6_INC_STATS_BH(IPSTATS_MIB_INHDRERRORS);
++			IP6_INC_STATS_BH(idev, IPSTATS_MIB_INHDRERRORS);
+ 			goto drop;
+ 		}
+ 		hdr = skb->nh.ipv6h;
+@@ -112,17 +120,21 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+ 
+ 	if (hdr->nexthdr == NEXTHDR_HOP) {
+ 		if (ipv6_parse_hopopts(&skb) < 0) {
+-			IP6_INC_STATS_BH(IPSTATS_MIB_INHDRERRORS);
++			IP6_INC_STATS_BH(idev, IPSTATS_MIB_INHDRERRORS);
++			rcu_read_unlock();
+ 			return 0;
+ 		}
+ 	}
+ 
++	rcu_read_unlock();
++
+ 	return NF_HOOK(PF_INET6,NF_IP6_PRE_ROUTING, skb, dev, NULL, ip6_rcv_finish);
+ truncated:
+-	IP6_INC_STATS_BH(IPSTATS_MIB_INTRUNCATEDPKTS);
++	IP6_INC_STATS_BH(idev, IPSTATS_MIB_INTRUNCATEDPKTS);
+ err:
+-	IP6_INC_STATS_BH(IPSTATS_MIB_INHDRERRORS);
++	IP6_INC_STATS_BH(idev, IPSTATS_MIB_INHDRERRORS);
+ drop:
++	rcu_read_unlock();
+ 	kfree_skb(skb);
+ out:
+ 	return 0;
+@@ -140,6 +152,7 @@ static inline int ip6_input_finish(struct sk_buff *skb)
+ 	unsigned int nhoff;
+ 	int nexthdr;
+ 	u8 hash;
++	struct inet6_dev *idev;
+ 
+ 	/*
+ 	 *	Parse extension headers
+@@ -147,6 +160,7 @@ static inline int ip6_input_finish(struct sk_buff *skb)
+ 
+ 	rcu_read_lock();
+ resubmit:
++	idev = ip6_dst_idev(skb->dst);
+ 	if (!pskb_pull(skb, skb->h.raw - skb->data))
+ 		goto discard;
+ 	nhoff = IP6CB(skb)->nhoff;
+@@ -185,24 +199,24 @@ static inline int ip6_input_finish(struct sk_buff *skb)
+ 		if (ret > 0)
+ 			goto resubmit;
+ 		else if (ret == 0)
+-			IP6_INC_STATS_BH(IPSTATS_MIB_INDELIVERS);
++			IP6_INC_STATS_BH(idev, IPSTATS_MIB_INDELIVERS);
+ 	} else {
+ 		if (!raw_sk) {
+ 			if (xfrm6_policy_check(NULL, XFRM_POLICY_IN, skb)) {
+-				IP6_INC_STATS_BH(IPSTATS_MIB_INUNKNOWNPROTOS);
++				IP6_INC_STATS_BH(idev, IPSTATS_MIB_INUNKNOWNPROTOS);
+ 				icmpv6_send(skb, ICMPV6_PARAMPROB,
+ 				            ICMPV6_UNK_NEXTHDR, nhoff,
+ 				            skb->dev);
+ 			}
+ 		} else
+-			IP6_INC_STATS_BH(IPSTATS_MIB_INDELIVERS);
++			IP6_INC_STATS_BH(idev, IPSTATS_MIB_INDELIVERS);
+ 		kfree_skb(skb);
+ 	}
+ 	rcu_read_unlock();
+ 	return 0;
+ 
+ discard:
+-	IP6_INC_STATS_BH(IPSTATS_MIB_INDISCARDS);
++	IP6_INC_STATS_BH(idev, IPSTATS_MIB_INDISCARDS);
+ 	rcu_read_unlock();
+ 	kfree_skb(skb);
+ 	return 0;
+@@ -219,7 +233,7 @@ int ip6_mc_input(struct sk_buff *skb)
+ 	struct ipv6hdr *hdr;
+ 	int deliver;
+ 
+-	IP6_INC_STATS_BH(IPSTATS_MIB_INMCASTPKTS);
++	IP6_INC_STATS_BH(ip6_dst_idev(skb->dst), IPSTATS_MIB_INMCASTPKTS);
+ 
+ 	hdr = skb->nh.ipv6h;
+ 	deliver = likely(!(skb->dev->flags & (IFF_PROMISC|IFF_ALLMULTI))) ||
+
+commit 7a3025b1b3a0173be5de6ced18754b909da27b38
+Author: YOSHIFUJI Hideaki <yoshfuji@linux-ipv6.org>
+Date:   Fri Oct 13 16:17:25 2006 +0900
+
+    [IPV6]: Introduce ip6_dst_idev() to get inet6_dev{} stored in dst_entry{}.
+    
+    Otherwise, we will see a lot of casts...
+    
+    Signed-off-by: YOSHIFUJI Hideaki <yoshfuji@linux-ipv6.org>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index 6b8e6d76a58b..ebf54ae90a0c 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -84,7 +84,7 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+ 	 * arrived via the sending interface (ethX), because of the
+ 	 * nature of scoping architecture. --yoshfuji
+ 	 */
+-	IP6CB(skb)->iif = skb->dst ? ((struct rt6_info *)skb->dst)->rt6i_idev->dev->ifindex : dev->ifindex;
++	IP6CB(skb)->iif = skb->dst ? ip6_dst_idev(skb->dst)->dev->ifindex : dev->ifindex;
+ 
+ 	if (unlikely(!pskb_may_pull(skb, sizeof(*hdr))))
+ 		goto err;
+
+commit a80ff03e05e4343d647780c116b02ec86078fd24
+Author: Masahide NAKAMURA <nakam@linux-ipv6.org>
+Date:   Wed Aug 23 19:19:50 2006 -0700
+
+    [IPV6]: Allow to replace skbuff by TLV parser.
+    
+    In receiving Mobile IPv6 home address option which is a TLV carried by
+    destination options header, kernel will try to mangle source adderss
+    of packet. Think of cloned skbuff it is required to replace it by the
+    parser just like routing header case.
+    
+    This is a framework to achieve that to allow TLV parser to replace
+    inbound skbuff pointer.
+    
+    Signed-off-by: Masahide NAKAMURA <nakam@linux-ipv6.org>
+    Signed-off-by: YOSHIFUJI Hideaki <yoshfuji@linux-ipv6.org>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index 25c2a9e03895..6b8e6d76a58b 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -111,7 +111,7 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+ 	}
+ 
+ 	if (hdr->nexthdr == NEXTHDR_HOP) {
+-		if (ipv6_parse_hopopts(skb) < 0) {
++		if (ipv6_parse_hopopts(&skb) < 0) {
+ 			IP6_INC_STATS_BH(IPSTATS_MIB_INHDRERRORS);
+ 			return 0;
+ 		}
+
+commit 6b7fdc3ae18a0598a999156b62d55ea55220e00f
+Author: Guillaume Chazarain <guichaz@yahoo.fr>
+Date:   Mon Jul 24 23:44:44 2006 -0700
+
+    [IPV6]: Clean skb cb on IPv6 input.
+    
+    Clear the accumulated junk in IP6CB when starting to handle an IPV6
+    packet.
+    
+    Signed-off-by: Guillaume Chazarain <guichaz@yahoo.fr>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index df8f051c0fce..25c2a9e03895 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -71,6 +71,8 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+ 		goto out;
+ 	}
+ 
++	memset(IP6CB(skb), 0, sizeof(struct inet6_skb_parm));
++
+ 	/*
+ 	 * Store incoming device index. When the packet will
+ 	 * be queued, we cannot refer to skb->dev anymore.
+
+commit 2889139a6acd2945f6143eb85f7dc2a22a352e1a
+Author: Herbert Xu <herbert@gondor.apana.org.au>
+Date:   Fri Jun 30 13:35:46 2006 -0700
+
+    [IPV6]: Remove redundant length check on input
+    
+    We don't need to check skb->len when we're just about to call
+    pskb_may_pull since that checks it for us.
+    
+    Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+    Acked-by: YOSHIFUJI Hideaki <yoshfuji@linux-ipv6.org>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index aceee252503d..df8f051c0fce 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -84,14 +84,9 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+ 	 */
+ 	IP6CB(skb)->iif = skb->dst ? ((struct rt6_info *)skb->dst)->rt6i_idev->dev->ifindex : dev->ifindex;
+ 
+-	if (skb->len < sizeof(struct ipv6hdr))
++	if (unlikely(!pskb_may_pull(skb, sizeof(*hdr))))
+ 		goto err;
+ 
+-	if (!pskb_may_pull(skb, sizeof(struct ipv6hdr))) {
+-		IP6_INC_STATS_BH(IPSTATS_MIB_INHDRERRORS);
+-		goto drop;
+-	}
+-
+ 	hdr = skb->nh.ipv6h;
+ 
+ 	if (hdr->version != 6)
+
+commit b809739a1b455396c21de13bcbf6669faf82f747
+Author: YOSHIFUJI Hideaki <yoshfuji@linux-ipv6.org>
+Date:   Tue Apr 18 14:48:45 2006 -0700
+
+    [IPV6]: Clean up hop-by-hop options handler.
+    
+    - Removed unused argument (nhoff) for ipv6_parse_hopopts().
+    - Make ipv6_parse_hopopts() to align with other extension header
+      handlers.
+    - Removed pointless assignment (hdr), which is not used afterwards.
+    
+    Signed-off-by: YOSHIFUJI Hideaki <yoshfuji@linux-ipv6.org>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index 29f73592e68e..aceee252503d 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -114,11 +114,10 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+ 	}
+ 
+ 	if (hdr->nexthdr == NEXTHDR_HOP) {
+-		if (ipv6_parse_hopopts(skb, IP6CB(skb)->nhoff) < 0) {
++		if (ipv6_parse_hopopts(skb) < 0) {
+ 			IP6_INC_STATS_BH(IPSTATS_MIB_INHDRERRORS);
+ 			return 0;
+ 		}
+-		hdr = skb->nh.ipv6h;
+ 	}
+ 
+ 	return NF_HOOK(PF_INET6,NF_IP6_PRE_ROUTING, skb, dev, NULL, ip6_rcv_finish);
+
+commit b05e106698d9966de524e78d9da1bf6407fe0c32
+Author: Patrick McHardy <kaber@trash.net>
+Date:   Fri Jan 6 23:03:34 2006 -0800
+
+    [IPV4/6]: Netfilter IPsec input hooks
+    
+    When the innermost transform uses transport mode the decapsulated packet
+    is not visible to netfilter. Pass the packet through the PRE_ROUTING and
+    LOCAL_IN hooks again before handing it to upper layer protocols to make
+    netfilter-visibility symetrical to the output path.
+    
+    Signed-off-by: Patrick McHardy <kaber@trash.net>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index 13d724150f33..29f73592e68e 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -48,7 +48,7 @@
+ 
+ 
+ 
+-static inline int ip6_rcv_finish( struct sk_buff *skb) 
++inline int ip6_rcv_finish( struct sk_buff *skb) 
+ {
+ 	if (skb->dst == NULL)
+ 		ip6_route_input(skb);
+
+commit 951dbc8ac714b04c36296b8b5c36c8e036ce433f
+Author: Patrick McHardy <kaber@trash.net>
+Date:   Fri Jan 6 23:02:34 2006 -0800
+
+    [IPV6]: Move nextheader offset to the IP6CB
+    
+    Move nextheader offset to the IP6CB to make it possible to pass a
+    packet to ip6_input_finish multiple times and have it skip already
+    parsed headers. As a nice side effect this gets rid of the manual
+    hopopts skipping in ip6_input_finish.
+    
+    Signed-off-by: Patrick McHardy <kaber@trash.net>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index a6026d2787d2..13d724150f33 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -97,6 +97,9 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+ 	if (hdr->version != 6)
+ 		goto err;
+ 
++	skb->h.raw = (u8 *)(hdr + 1);
++	IP6CB(skb)->nhoff = offsetof(struct ipv6hdr, nexthdr);
++
+ 	pkt_len = ntohs(hdr->payload_len);
+ 
+ 	/* pkt_len may be zero if Jumbo payload option is present */
+@@ -111,8 +114,7 @@ int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt
+ 	}
+ 
+ 	if (hdr->nexthdr == NEXTHDR_HOP) {
+-		skb->h.raw = (u8*)(hdr+1);
+-		if (ipv6_parse_hopopts(skb, offsetof(struct ipv6hdr, nexthdr)) < 0) {
++		if (ipv6_parse_hopopts(skb, IP6CB(skb)->nhoff) < 0) {
+ 			IP6_INC_STATS_BH(IPSTATS_MIB_INHDRERRORS);
+ 			return 0;
+ 		}
+@@ -143,26 +145,15 @@ static inline int ip6_input_finish(struct sk_buff *skb)
+ 	int nexthdr;
+ 	u8 hash;
+ 
+-	skb->h.raw = skb->nh.raw + sizeof(struct ipv6hdr);
+-
+ 	/*
+ 	 *	Parse extension headers
+ 	 */
+ 
+-	nexthdr = skb->nh.ipv6h->nexthdr;
+-	nhoff = offsetof(struct ipv6hdr, nexthdr);
+-
+-	/* Skip hop-by-hop options, they are already parsed. */
+-	if (nexthdr == NEXTHDR_HOP) {
+-		nhoff = sizeof(struct ipv6hdr);
+-		nexthdr = skb->h.raw[0];
+-		skb->h.raw += (skb->h.raw[1]+1)<<3;
+-	}
+-
+ 	rcu_read_lock();
+ resubmit:
+ 	if (!pskb_pull(skb, skb->h.raw - skb->data))
+ 		goto discard;
++	nhoff = IP6CB(skb)->nhoff;
+ 	nexthdr = skb->nh.raw[nhoff];
+ 
+ 	raw_sk = sk_head(&raw_v6_htable[nexthdr & (MAX_INET_PROTOS - 1)]);
+@@ -194,7 +185,7 @@ static inline int ip6_input_finish(struct sk_buff *skb)
+ 		    !xfrm6_policy_check(NULL, XFRM_POLICY_IN, skb)) 
+ 			goto discard;
+ 		
+-		ret = ipprot->handler(&skb, &nhoff);
++		ret = ipprot->handler(&skb);
+ 		if (ret > 0)
+ 			goto resubmit;
+ 		else if (ret == 0)
+
+commit 9fb9cbb1082d6b31fb45aa1a14432449a0df6cf1
+Author: Yasuyuki Kozakai <yasuyuki.kozakai@toshiba.co.jp>
+Date:   Wed Nov 9 16:38:16 2005 -0800
+
+    [NETFILTER]: Add nf_conntrack subsystem.
+    
+    The existing connection tracking subsystem in netfilter can only
+    handle ipv4.  There were basically two choices present to add
+    connection tracking support for ipv6.  We could either duplicate all
+    of the ipv4 connection tracking code into an ipv6 counterpart, or (the
+    choice taken by these patches) we could design a generic layer that
+    could handle both ipv4 and ipv6 and thus requiring only one sub-protocol
+    (TCP, UDP, etc.) connection tracking helper module to be written.
+    
+    In fact nf_conntrack is capable of working with any layer 3
+    protocol.
+    
+    The existing ipv4 specific conntrack code could also not deal
+    with the pecularities of doing connection tracking on ipv6,
+    which is also cured here.  For example, these issues include:
+    
+    1) ICMPv6 handling, which is used for neighbour discovery in
+       ipv6 thus some messages such as these should not participate
+       in connection tracking since effectively they are like ARP
+       messages
+    
+    2) fragmentation must be handled differently in ipv6, because
+       the simplistic "defrag, connection track and NAT, refrag"
+       (which the existing ipv4 connection tracking does) approach simply
+       isn't feasible in ipv6
+    
+    3) ipv6 extension header parsing must occur at the correct spots
+       before and after connection tracking decisions, and there were
+       no provisions for this in the existing connection tracking
+       design
+    
+    4) ipv6 has no need for stateful NAT
+    
+    The ipv4 specific conntrack layer is kept around, until all of
+    the ipv4 specific conntrack helpers are ported over to nf_conntrack
+    and it is feature complete.  Once that occurs, the old conntrack
+    stuff will get placed into the feature-removal-schedule and we will
+    fully kill it off 6 months later.
+    
+    Signed-off-by: Yasuyuki Kozakai <yasuyuki.kozakai@toshiba.co.jp>
+    Signed-off-by: Harald Welte <laforge@netfilter.org>
+    Signed-off-by: Arnaldo Carvalho de Melo <acme@mandriva.com>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index 6e3480426939..a6026d2787d2 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -176,6 +176,11 @@ static inline int ip6_input_finish(struct sk_buff *skb)
+ 		if (ipprot->flags & INET6_PROTO_FINAL) {
+ 			struct ipv6hdr *hdr;	
+ 
++			/* Free reference early: we don't need it any more,
++			   and it may hold ip_conntrack module loaded
++			   indefinitely. */
++			nf_reset(skb);
++
+ 			skb_postpull_rcsum(skb, skb->nh.raw,
+ 					   skb->h.raw - skb->nh.raw);
+ 			hdr = skb->nh.ipv6h;
+
+commit d13964f4490157b8a290903362bfbc54f750a6bc
+Author: Patrick McHardy <kaber@trash.net>
+Date:   Tue Aug 9 19:45:02 2005 -0700
+
+    [IPV4/6]: Check if packet was actually delivered to a raw socket to decide whether to send an ICMP unreachable
+    
+    Signed-off-by: Patrick McHardy <kaber@trash.net>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index ab51c0369e15..6e3480426939 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -166,8 +166,8 @@ static inline int ip6_input_finish(struct sk_buff *skb)
+ 	nexthdr = skb->nh.raw[nhoff];
+ 
+ 	raw_sk = sk_head(&raw_v6_htable[nexthdr & (MAX_INET_PROTOS - 1)]);
+-	if (raw_sk)
+-		ipv6_raw_deliver(skb, nexthdr);
++	if (raw_sk && !ipv6_raw_deliver(skb, nexthdr))
++		raw_sk = NULL;
+ 
+ 	hash = nexthdr & (MAX_INET_PROTOS - 1);
+ 	if ((ipprot = rcu_dereference(inet6_protos[hash])) != NULL) {
+
+commit f2ccd8fa06c8e302116e71df372f5c1f83432e03
+Author: David S. Miller <davem@davemloft.net>
+Date:   Tue Aug 9 19:34:12 2005 -0700
+
+    [NET]: Kill skb->real_dev
+    
+    Bonding just wants the device before the skb_bond()
+    decapsulation occurs, so simply pass that original
+    device into packet_type->func() as an argument.
+    
+    It remains to be seen whether we can use this same
+    exact thing to get rid of skb->input_dev as well.
+    
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index 10fbb50daea4..ab51c0369e15 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -56,7 +56,7 @@ static inline int ip6_rcv_finish( struct sk_buff *skb)
+ 	return dst_input(skb);
+ }
+ 
+-int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt)
++int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt, struct net_device *orig_dev)
+ {
+ 	struct ipv6hdr *hdr;
+ 	u32 		pkt_len;
+
+commit fad87acaea7b0965fe91f0351fdd688fc9761cbe
+Author: Patrick McHardy <kaber@trash.net>
+Date:   Tue Aug 16 21:03:41 2005 -0700
+
+    [IPV6]: Fix SKB leak in ip6_input_finish()
+    
+    Changing it to how ip_input handles should fix it.
+    
+    Signed-off-by: Patrick McHardy <kaber@trash.net>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+index 866f10726c58..10fbb50daea4 100644
+--- a/net/ipv6/ip6_input.c
++++ b/net/ipv6/ip6_input.c
+@@ -198,12 +198,13 @@ static inline int ip6_input_finish(struct sk_buff *skb)
+ 		if (!raw_sk) {
+ 			if (xfrm6_policy_check(NULL, XFRM_POLICY_IN, skb)) {
+ 				IP6_INC_STATS_BH(IPSTATS_MIB_INUNKNOWNPROTOS);
+-				icmpv6_param_prob(skb, ICMPV6_UNK_NEXTHDR, nhoff);
++				icmpv6_send(skb, ICMPV6_PARAMPROB,
++				            ICMPV6_UNK_NEXTHDR, nhoff,
++				            skb->dev);
+ 			}
+-		} else {
++		} else
+ 			IP6_INC_STATS_BH(IPSTATS_MIB_INDELIVERS);
+-			kfree_skb(skb);
+-		}
++		kfree_skb(skb);
+ 	}
+ 	rcu_read_unlock();
+ 	return 0;
+
+commit 1da177e4c3f41524e886b7f1b8a0c1fc7321cac2
+Author: Linus Torvalds <torvalds@ppc970.osdl.org>
+Date:   Sat Apr 16 15:20:36 2005 -0700
+
+    Linux-2.6.12-rc2
+    
+    Initial git repository build. I'm not bothering with the full history,
+    even though we have it. We can create a separate "historical" git
+    archive of that later if we want to, and in the meantime it's about
+    3.2GB when imported into git - space that would just make the early
+    git days unnecessarily complicated, when we don't have a lot of good
+    infrastructure for it.
+    
+    Let it rip!
+
+diff --git a/net/ipv6/ip6_input.c b/net/ipv6/ip6_input.c
+new file mode 100644
+index 000000000000..866f10726c58
+--- /dev/null
++++ b/net/ipv6/ip6_input.c
+@@ -0,0 +1,269 @@
++/*
++ *	IPv6 input
++ *	Linux INET6 implementation 
++ *
++ *	Authors:
++ *	Pedro Roque		<roque@di.fc.ul.pt>
++ *	Ian P. Morris		<I.P.Morris@soton.ac.uk>
++ *
++ *	$Id: ip6_input.c,v 1.19 2000/12/13 18:31:50 davem Exp $
++ *
++ *	Based in linux/net/ipv4/ip_input.c
++ *
++ *	This program is free software; you can redistribute it and/or
++ *      modify it under the terms of the GNU General Public License
++ *      as published by the Free Software Foundation; either version
++ *      2 of the License, or (at your option) any later version.
++ */
++/* Changes
++ *
++ * 	Mitsuru KANDA @USAGI and
++ * 	YOSHIFUJI Hideaki @USAGI: Remove ipv6_parse_exthdrs().
++ */
++
++#include <linux/errno.h>
++#include <linux/types.h>
++#include <linux/socket.h>
++#include <linux/sockios.h>
++#include <linux/sched.h>
++#include <linux/net.h>
++#include <linux/netdevice.h>
++#include <linux/in6.h>
++#include <linux/icmpv6.h>
++
++#include <linux/netfilter.h>
++#include <linux/netfilter_ipv6.h>
++
++#include <net/sock.h>
++#include <net/snmp.h>
++
++#include <net/ipv6.h>
++#include <net/protocol.h>
++#include <net/transp_v6.h>
++#include <net/rawv6.h>
++#include <net/ndisc.h>
++#include <net/ip6_route.h>
++#include <net/addrconf.h>
++#include <net/xfrm.h>
++
++
++
++static inline int ip6_rcv_finish( struct sk_buff *skb) 
++{
++	if (skb->dst == NULL)
++		ip6_route_input(skb);
++
++	return dst_input(skb);
++}
++
++int ipv6_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt)
++{
++	struct ipv6hdr *hdr;
++	u32 		pkt_len;
++
++	if (skb->pkt_type == PACKET_OTHERHOST)
++		goto drop;
++
++	IP6_INC_STATS_BH(IPSTATS_MIB_INRECEIVES);
++
++	if ((skb = skb_share_check(skb, GFP_ATOMIC)) == NULL) {
++		IP6_INC_STATS_BH(IPSTATS_MIB_INDISCARDS);
++		goto out;
++	}
++
++	/*
++	 * Store incoming device index. When the packet will
++	 * be queued, we cannot refer to skb->dev anymore.
++	 *
++	 * BTW, when we send a packet for our own local address on a
++	 * non-loopback interface (e.g. ethX), it is being delivered
++	 * via the loopback interface (lo) here; skb->dev = &loopback_dev.
++	 * It, however, should be considered as if it is being
++	 * arrived via the sending interface (ethX), because of the
++	 * nature of scoping architecture. --yoshfuji
++	 */
++	IP6CB(skb)->iif = skb->dst ? ((struct rt6_info *)skb->dst)->rt6i_idev->dev->ifindex : dev->ifindex;
++
++	if (skb->len < sizeof(struct ipv6hdr))
++		goto err;
++
++	if (!pskb_may_pull(skb, sizeof(struct ipv6hdr))) {
++		IP6_INC_STATS_BH(IPSTATS_MIB_INHDRERRORS);
++		goto drop;
++	}
++
++	hdr = skb->nh.ipv6h;
++
++	if (hdr->version != 6)
++		goto err;
++
++	pkt_len = ntohs(hdr->payload_len);
++
++	/* pkt_len may be zero if Jumbo payload option is present */
++	if (pkt_len || hdr->nexthdr != NEXTHDR_HOP) {
++		if (pkt_len + sizeof(struct ipv6hdr) > skb->len)
++			goto truncated;
++		if (pskb_trim_rcsum(skb, pkt_len + sizeof(struct ipv6hdr))) {
++			IP6_INC_STATS_BH(IPSTATS_MIB_INHDRERRORS);
++			goto drop;
++		}
++		hdr = skb->nh.ipv6h;
++	}
++
++	if (hdr->nexthdr == NEXTHDR_HOP) {
++		skb->h.raw = (u8*)(hdr+1);
++		if (ipv6_parse_hopopts(skb, offsetof(struct ipv6hdr, nexthdr)) < 0) {
++			IP6_INC_STATS_BH(IPSTATS_MIB_INHDRERRORS);
++			return 0;
++		}
++		hdr = skb->nh.ipv6h;
++	}
++
++	return NF_HOOK(PF_INET6,NF_IP6_PRE_ROUTING, skb, dev, NULL, ip6_rcv_finish);
++truncated:
++	IP6_INC_STATS_BH(IPSTATS_MIB_INTRUNCATEDPKTS);
++err:
++	IP6_INC_STATS_BH(IPSTATS_MIB_INHDRERRORS);
++drop:
++	kfree_skb(skb);
++out:
++	return 0;
++}
++
++/*
++ *	Deliver the packet to the host
++ */
++
++
++static inline int ip6_input_finish(struct sk_buff *skb)
++{
++	struct inet6_protocol *ipprot;
++	struct sock *raw_sk;
++	unsigned int nhoff;
++	int nexthdr;
++	u8 hash;
++
++	skb->h.raw = skb->nh.raw + sizeof(struct ipv6hdr);
++
++	/*
++	 *	Parse extension headers
++	 */
++
++	nexthdr = skb->nh.ipv6h->nexthdr;
++	nhoff = offsetof(struct ipv6hdr, nexthdr);
++
++	/* Skip hop-by-hop options, they are already parsed. */
++	if (nexthdr == NEXTHDR_HOP) {
++		nhoff = sizeof(struct ipv6hdr);
++		nexthdr = skb->h.raw[0];
++		skb->h.raw += (skb->h.raw[1]+1)<<3;
++	}
++
++	rcu_read_lock();
++resubmit:
++	if (!pskb_pull(skb, skb->h.raw - skb->data))
++		goto discard;
++	nexthdr = skb->nh.raw[nhoff];
++
++	raw_sk = sk_head(&raw_v6_htable[nexthdr & (MAX_INET_PROTOS - 1)]);
++	if (raw_sk)
++		ipv6_raw_deliver(skb, nexthdr);
++
++	hash = nexthdr & (MAX_INET_PROTOS - 1);
++	if ((ipprot = rcu_dereference(inet6_protos[hash])) != NULL) {
++		int ret;
++		
++		if (ipprot->flags & INET6_PROTO_FINAL) {
++			struct ipv6hdr *hdr;	
++
++			skb_postpull_rcsum(skb, skb->nh.raw,
++					   skb->h.raw - skb->nh.raw);
++			hdr = skb->nh.ipv6h;
++			if (ipv6_addr_is_multicast(&hdr->daddr) &&
++			    !ipv6_chk_mcast_addr(skb->dev, &hdr->daddr,
++			    &hdr->saddr) &&
++			    !ipv6_is_mld(skb, nexthdr))
++				goto discard;
++		}
++		if (!(ipprot->flags & INET6_PROTO_NOPOLICY) &&
++		    !xfrm6_policy_check(NULL, XFRM_POLICY_IN, skb)) 
++			goto discard;
++		
++		ret = ipprot->handler(&skb, &nhoff);
++		if (ret > 0)
++			goto resubmit;
++		else if (ret == 0)
++			IP6_INC_STATS_BH(IPSTATS_MIB_INDELIVERS);
++	} else {
++		if (!raw_sk) {
++			if (xfrm6_policy_check(NULL, XFRM_POLICY_IN, skb)) {
++				IP6_INC_STATS_BH(IPSTATS_MIB_INUNKNOWNPROTOS);
++				icmpv6_param_prob(skb, ICMPV6_UNK_NEXTHDR, nhoff);
++			}
++		} else {
++			IP6_INC_STATS_BH(IPSTATS_MIB_INDELIVERS);
++			kfree_skb(skb);
++		}
++	}
++	rcu_read_unlock();
++	return 0;
++
++discard:
++	IP6_INC_STATS_BH(IPSTATS_MIB_INDISCARDS);
++	rcu_read_unlock();
++	kfree_skb(skb);
++	return 0;
++}
++
++
++int ip6_input(struct sk_buff *skb)
++{
++	return NF_HOOK(PF_INET6,NF_IP6_LOCAL_IN, skb, skb->dev, NULL, ip6_input_finish);
++}
++
++int ip6_mc_input(struct sk_buff *skb)
++{
++	struct ipv6hdr *hdr;
++	int deliver;
++
++	IP6_INC_STATS_BH(IPSTATS_MIB_INMCASTPKTS);
++
++	hdr = skb->nh.ipv6h;
++	deliver = likely(!(skb->dev->flags & (IFF_PROMISC|IFF_ALLMULTI))) ||
++	    ipv6_chk_mcast_addr(skb->dev, &hdr->daddr, NULL);
++
++	/*
++	 *	IPv6 multicast router mode isnt currently supported.
++	 */
++#if 0
++	if (ipv6_config.multicast_route) {
++		int addr_type;
++
++		addr_type = ipv6_addr_type(&hdr->daddr);
++
++		if (!(addr_type & (IPV6_ADDR_LOOPBACK | IPV6_ADDR_LINKLOCAL))) {
++			struct sk_buff *skb2;
++			struct dst_entry *dst;
++
++			dst = skb->dst;
++			
++			if (deliver) {
++				skb2 = skb_clone(skb, GFP_ATOMIC);
++				dst_output(skb2);
++			} else {
++				dst_output(skb);
++				return 0;
++			}
++		}
++	}
++#endif
++
++	if (likely(deliver)) {
++		ip6_input(skb);
++		return 0;
++	}
++	/* discard */
++	kfree_skb(skb);
++
++	return 0;
++}

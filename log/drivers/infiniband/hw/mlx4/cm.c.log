@@ -1,0 +1,1495 @@
+commit ea660ad7c1c476fd6e5e3b17780d47159db71dea
+Author: Håkon Bugge <haakon.bugge@oracle.com>
+Date:   Thu Jan 23 16:55:21 2020 +0100
+
+    IB/mlx4: Fix leak in id_map_find_del
+    
+    Using CX-3 virtual functions, either from a bare-metal machine or
+    pass-through from a VM, MAD packets are proxied through the PF driver.
+    
+    Since the VF drivers have separate name spaces for MAD Transaction Ids
+    (TIDs), the PF driver has to re-map the TIDs and keep the book keeping in
+    a cache.
+    
+    Following the RDMA Connection Manager (CM) protocol, it is clear when an
+    entry has to evicted from the cache. When a DREP is sent from
+    mlx4_ib_multiplex_cm_handler(), id_map_find_del() is called. Similar when
+    a REJ is received by the mlx4_ib_demux_cm_handler(), id_map_find_del() is
+    called.
+    
+    This function wipes out the TID in use from the IDR or XArray and removes
+    the id_map_entry from the table.
+    
+    In short, it does everything except the topping of the cake, which is to
+    remove the entry from the list and free it. In other words, for the REJ
+    case enumerated above, one id_map_entry will be leaked.
+    
+    For the other case above, a DREQ has been received first. The reception of
+    the DREQ will trigger queuing of a delayed work to delete the
+    id_map_entry, for the case where the VM doesn't send back a DREP.
+    
+    In the normal case, the VM _will_ send back a DREP, and id_map_find_del()
+    will be called.
+    
+    But this scenario introduces a secondary leak. First, when the DREQ is
+    received, a delayed work is queued. The VM will then return a DREP, which
+    will call id_map_find_del(). As stated above, this will free the TID used
+    from the XArray or IDR. Now, there is window where that particular TID can
+    be re-allocated, lets say by an outgoing REQ. This TID will later be wiped
+    out by the delayed work, when the function id_map_ent_timeout() is
+    called. But the id_map_entry allocated by the outgoing REQ will not be
+    de-allocated, and we have a leak.
+    
+    Both leaks are fixed by removing the id_map_find_del() function and only
+    using schedule_delayed(). Of course, a check in schedule_delayed() to see
+    if the work already has been queued, has been added.
+    
+    Another benefit of always using the delayed version for deleting entries,
+    is that we do get a TimeWait effect; a TID no longer in use, will occupy
+    the XArray or IDR for CM_CLEANUP_CACHE_TIMEOUT time, without any ability
+    of being re-used for that time period.
+    
+    Fixes: 3cf69cc8dbeb ("IB/mlx4: Add CM paravirtualization")
+    Link: https://lore.kernel.org/r/20200123155521.1212288-1-haakon.bugge@oracle.com
+    Signed-off-by: Håkon Bugge <haakon.bugge@oracle.com>
+    Signed-off-by: Manjunath Patil <manjunath.b.patil@oracle.com>
+    Reviewed-by: Rama Nichanamatlu <rama.nichanamatlu@oracle.com>
+    Reviewed-by: Jack Morgenstein <jackm@dev.mellanox.co.il>
+    Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+
+diff --git a/drivers/infiniband/hw/mlx4/cm.c b/drivers/infiniband/hw/mlx4/cm.c
+index ecd6cadd529a..b591861934b3 100644
+--- a/drivers/infiniband/hw/mlx4/cm.c
++++ b/drivers/infiniband/hw/mlx4/cm.c
+@@ -186,23 +186,6 @@ static void id_map_ent_timeout(struct work_struct *work)
+ 	kfree(ent);
+ }
+ 
+-static void id_map_find_del(struct ib_device *ibdev, int pv_cm_id)
+-{
+-	struct mlx4_ib_sriov *sriov = &to_mdev(ibdev)->sriov;
+-	struct rb_root *sl_id_map = &sriov->sl_id_map;
+-	struct id_map_entry *ent, *found_ent;
+-
+-	spin_lock(&sriov->id_map_lock);
+-	ent = xa_erase(&sriov->pv_id_table, pv_cm_id);
+-	if (!ent)
+-		goto out;
+-	found_ent = id_map_find_by_sl_id(ibdev, ent->slave_id, ent->sl_cm_id);
+-	if (found_ent && found_ent == ent)
+-		rb_erase(&found_ent->node, sl_id_map);
+-out:
+-	spin_unlock(&sriov->id_map_lock);
+-}
+-
+ static void sl_id_map_add(struct ib_device *ibdev, struct id_map_entry *new)
+ {
+ 	struct rb_root *sl_id_map = &to_mdev(ibdev)->sriov.sl_id_map;
+@@ -294,7 +277,7 @@ static void schedule_delayed(struct ib_device *ibdev, struct id_map_entry *id)
+ 	spin_lock(&sriov->id_map_lock);
+ 	spin_lock_irqsave(&sriov->going_down_lock, flags);
+ 	/*make sure that there is no schedule inside the scheduled work.*/
+-	if (!sriov->is_going_down) {
++	if (!sriov->is_going_down && !id->scheduled_delete) {
+ 		id->scheduled_delete = 1;
+ 		schedule_delayed_work(&id->timeout, CM_CLEANUP_CACHE_TIMEOUT);
+ 	}
+@@ -341,9 +324,6 @@ int mlx4_ib_multiplex_cm_handler(struct ib_device *ibdev, int port, int slave_id
+ 
+ 	if (mad->mad_hdr.attr_id == CM_DREQ_ATTR_ID)
+ 		schedule_delayed(ibdev, id);
+-	else if (mad->mad_hdr.attr_id == CM_DREP_ATTR_ID)
+-		id_map_find_del(ibdev, pv_cm_id);
+-
+ 	return 0;
+ }
+ 
+@@ -382,12 +362,9 @@ int mlx4_ib_demux_cm_handler(struct ib_device *ibdev, int port, int *slave,
+ 		*slave = id->slave_id;
+ 	set_remote_comm_id(mad, id->sl_cm_id);
+ 
+-	if (mad->mad_hdr.attr_id == CM_DREQ_ATTR_ID)
++	if (mad->mad_hdr.attr_id == CM_DREQ_ATTR_ID ||
++	    mad->mad_hdr.attr_id == CM_REJ_ATTR_ID)
+ 		schedule_delayed(ibdev, id);
+-	else if (mad->mad_hdr.attr_id == CM_REJ_ATTR_ID ||
+-			mad->mad_hdr.attr_id == CM_DREP_ATTR_ID) {
+-		id_map_find_del(ibdev, (int) pv_cm_id);
+-	}
+ 
+ 	return 0;
+ }
+
+commit f1430536e008cd3b70794e12c414c20d54aabec2
+Author: Matthew Wilcox <willy@infradead.org>
+Date:   Wed Feb 20 16:20:44 2019 -0800
+
+    mlx4: Convert pv_id_table to XArray
+    
+    Signed-off-by: Matthew Wilcox <willy@infradead.org>
+    Acked-by: Leon Romanovsky <leonro@mellanox.com>
+    Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+
+diff --git a/drivers/infiniband/hw/mlx4/cm.c b/drivers/infiniband/hw/mlx4/cm.c
+index 8c79a480f2b7..ecd6cadd529a 100644
+--- a/drivers/infiniband/hw/mlx4/cm.c
++++ b/drivers/infiniband/hw/mlx4/cm.c
+@@ -168,20 +168,17 @@ static void id_map_ent_timeout(struct work_struct *work)
+ {
+ 	struct delayed_work *delay = to_delayed_work(work);
+ 	struct id_map_entry *ent = container_of(delay, struct id_map_entry, timeout);
+-	struct id_map_entry *db_ent, *found_ent;
++	struct id_map_entry *found_ent;
+ 	struct mlx4_ib_dev *dev = ent->dev;
+ 	struct mlx4_ib_sriov *sriov = &dev->sriov;
+ 	struct rb_root *sl_id_map = &sriov->sl_id_map;
+-	int pv_id = (int) ent->pv_cm_id;
+ 
+ 	spin_lock(&sriov->id_map_lock);
+-	db_ent = (struct id_map_entry *)idr_find(&sriov->pv_id_table, pv_id);
+-	if (!db_ent)
++	if (!xa_erase(&sriov->pv_id_table, ent->pv_cm_id))
+ 		goto out;
+ 	found_ent = id_map_find_by_sl_id(&dev->ib_dev, ent->slave_id, ent->sl_cm_id);
+ 	if (found_ent && found_ent == ent)
+ 		rb_erase(&found_ent->node, sl_id_map);
+-	idr_remove(&sriov->pv_id_table, pv_id);
+ 
+ out:
+ 	list_del(&ent->list);
+@@ -196,13 +193,12 @@ static void id_map_find_del(struct ib_device *ibdev, int pv_cm_id)
+ 	struct id_map_entry *ent, *found_ent;
+ 
+ 	spin_lock(&sriov->id_map_lock);
+-	ent = (struct id_map_entry *)idr_find(&sriov->pv_id_table, pv_cm_id);
++	ent = xa_erase(&sriov->pv_id_table, pv_cm_id);
+ 	if (!ent)
+ 		goto out;
+ 	found_ent = id_map_find_by_sl_id(ibdev, ent->slave_id, ent->sl_cm_id);
+ 	if (found_ent && found_ent == ent)
+ 		rb_erase(&found_ent->node, sl_id_map);
+-	idr_remove(&sriov->pv_id_table, pv_cm_id);
+ out:
+ 	spin_unlock(&sriov->id_map_lock);
+ }
+@@ -256,25 +252,19 @@ id_map_alloc(struct ib_device *ibdev, int slave_id, u32 sl_cm_id)
+ 	ent->dev = to_mdev(ibdev);
+ 	INIT_DELAYED_WORK(&ent->timeout, id_map_ent_timeout);
+ 
+-	idr_preload(GFP_KERNEL);
+-	spin_lock(&to_mdev(ibdev)->sriov.id_map_lock);
+-
+-	ret = idr_alloc_cyclic(&sriov->pv_id_table, ent, 0, 0, GFP_NOWAIT);
++	ret = xa_alloc_cyclic(&sriov->pv_id_table, &ent->pv_cm_id, ent,
++			xa_limit_32b, &sriov->pv_id_next, GFP_KERNEL);
+ 	if (ret >= 0) {
+-		ent->pv_cm_id = (u32)ret;
++		spin_lock(&sriov->id_map_lock);
+ 		sl_id_map_add(ibdev, ent);
+ 		list_add_tail(&ent->list, &sriov->cm_list);
+-	}
+-
+-	spin_unlock(&sriov->id_map_lock);
+-	idr_preload_end();
+-
+-	if (ret >= 0)
++		spin_unlock(&sriov->id_map_lock);
+ 		return ent;
++	}
+ 
+ 	/*error flow*/
+ 	kfree(ent);
+-	mlx4_ib_warn(ibdev, "No more space in the idr (err:0x%x)\n", ret);
++	mlx4_ib_warn(ibdev, "Allocation failed (err:0x%x)\n", ret);
+ 	return ERR_PTR(-ENOMEM);
+ }
+ 
+@@ -290,7 +280,7 @@ id_map_get(struct ib_device *ibdev, int *pv_cm_id, int slave_id, int sl_cm_id)
+ 		if (ent)
+ 			*pv_cm_id = (int) ent->pv_cm_id;
+ 	} else
+-		ent = (struct id_map_entry *)idr_find(&sriov->pv_id_table, *pv_cm_id);
++		ent = xa_load(&sriov->pv_id_table, *pv_cm_id);
+ 	spin_unlock(&sriov->id_map_lock);
+ 
+ 	return ent;
+@@ -407,7 +397,7 @@ void mlx4_ib_cm_paravirt_init(struct mlx4_ib_dev *dev)
+ 	spin_lock_init(&dev->sriov.id_map_lock);
+ 	INIT_LIST_HEAD(&dev->sriov.cm_list);
+ 	dev->sriov.sl_id_map = RB_ROOT;
+-	idr_init(&dev->sriov.pv_id_table);
++	xa_init_flags(&dev->sriov.pv_id_table, XA_FLAGS_ALLOC);
+ }
+ 
+ /* slave = -1 ==> all slaves */
+@@ -444,7 +434,7 @@ void mlx4_ib_cm_paravirt_clean(struct mlx4_ib_dev *dev, int slave)
+ 					 struct id_map_entry, node);
+ 
+ 			rb_erase(&ent->node, sl_id_map);
+-			idr_remove(&sriov->pv_id_table, (int) ent->pv_cm_id);
++			xa_erase(&sriov->pv_id_table, ent->pv_cm_id);
+ 		}
+ 		list_splice_init(&dev->sriov.cm_list, &lh);
+ 	} else {
+@@ -460,7 +450,7 @@ void mlx4_ib_cm_paravirt_clean(struct mlx4_ib_dev *dev, int slave)
+ 		/* remove those nodes from databases */
+ 		list_for_each_entry_safe(map, tmp_map, &lh, list) {
+ 			rb_erase(&map->node, sl_id_map);
+-			idr_remove(&sriov->pv_id_table, (int) map->pv_cm_id);
++			xa_erase(&sriov->pv_id_table, map->pv_cm_id);
+ 		}
+ 
+ 		/* add remaining nodes from cm_list */
+
+commit 2612d723aadcf8281f9bf8305657129bd9f3cd57
+Author: Håkon Bugge <haakon.bugge@oracle.com>
+Date:   Sun Feb 17 15:45:12 2019 +0100
+
+    IB/mlx4: Increase the timeout for CM cache
+    
+    Using CX-3 virtual functions, either from a bare-metal machine or
+    pass-through from a VM, MAD packets are proxied through the PF driver.
+    
+    Since the VF drivers have separate name spaces for MAD Transaction Ids
+    (TIDs), the PF driver has to re-map the TIDs and keep the book keeping
+    in a cache.
+    
+    Following the RDMA Connection Manager (CM) protocol, it is clear when
+    an entry has to evicted form the cache. But life is not perfect,
+    remote peers may die or be rebooted. Hence, it's a timeout to wipe out
+    a cache entry, when the PF driver assumes the remote peer has gone.
+    
+    During workloads where a high number of QPs are destroyed concurrently,
+    excessive amount of CM DREQ retries has been observed
+    
+    The problem can be demonstrated in a bare-metal environment, where two
+    nodes have instantiated 8 VFs each. This using dual ported HCAs, so we
+    have 16 vPorts per physical server.
+    
+    64 processes are associated with each vPort and creates and destroys
+    one QP for each of the remote 64 processes. That is, 1024 QPs per
+    vPort, all in all 16K QPs. The QPs are created/destroyed using the
+    CM.
+    
+    When tearing down these 16K QPs, excessive CM DREQ retries (and
+    duplicates) are observed. With some cat/paste/awk wizardry on the
+    infiniband_cm sysfs, we observe as sum of the 16 vPorts on one of the
+    nodes:
+    
+    cm_rx_duplicates:
+          dreq  2102
+    cm_rx_msgs:
+          drep  1989
+          dreq  6195
+           rep  3968
+           req  4224
+           rtu  4224
+    cm_tx_msgs:
+          drep  4093
+          dreq 27568
+           rep  4224
+           req  3968
+           rtu  3968
+    cm_tx_retries:
+          dreq 23469
+    
+    Note that the active/passive side is equally distributed between the
+    two nodes.
+    
+    Enabling pr_debug in cm.c gives tons of:
+    
+    [171778.814239] <mlx4_ib> mlx4_ib_multiplex_cm_handler: id{slave:
+    1,sl_cm_id: 0xd393089f} is NULL!
+    
+    By increasing the CM_CLEANUP_CACHE_TIMEOUT from 5 to 30 seconds, the
+    tear-down phase of the application is reduced from approximately 90 to
+    50 seconds. Retries/duplicates are also significantly reduced:
+    
+    cm_rx_duplicates:
+          dreq  2460
+    []
+    cm_tx_retries:
+          dreq  3010
+           req    47
+    
+    Increasing the timeout further didn't help, as these duplicates and
+    retries stems from a too short CMA timeout, which was 20 (~4 seconds)
+    on the systems. By increasing the CMA timeout to 22 (~17 seconds), the
+    numbers fell down to about 10 for both of them.
+    
+    Adjustment of the CMA timeout is not part of this commit.
+    
+    Signed-off-by: Håkon Bugge <haakon.bugge@oracle.com>
+    Acked-by: Jack Morgenstein <jackm@dev.mellanox.co.il>
+    Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+
+diff --git a/drivers/infiniband/hw/mlx4/cm.c b/drivers/infiniband/hw/mlx4/cm.c
+index fedaf8260105..8c79a480f2b7 100644
+--- a/drivers/infiniband/hw/mlx4/cm.c
++++ b/drivers/infiniband/hw/mlx4/cm.c
+@@ -39,7 +39,7 @@
+ 
+ #include "mlx4_ib.h"
+ 
+-#define CM_CLEANUP_CACHE_TIMEOUT  (5 * HZ)
++#define CM_CLEANUP_CACHE_TIMEOUT  (30 * HZ)
+ 
+ struct id_map_entry {
+ 	struct rb_node node;
+
+commit 4542e3c79a2c5a167cbeb4f4190d5f705d272002
+Author: Håkon Bugge <haakon.bugge@oracle.com>
+Date:   Tue Jun 20 14:07:50 2017 +0200
+
+    IB/mlx4: Fix CM REQ retries in paravirt mode
+    
+    CM REQs cannot be successfully retried, because a new pv_cm_id is
+    created for each request, without checking if one already exists.
+    
+    By checking if an id exists before creating one, the bug is fixed.
+    
+    This bug can be provoked by running an RDMA CM user-land application,
+    but inserting a five seconds delay before the rdma_accept() call on
+    the passive side. This delay is larger than the default CMA timeout,
+    and triggers a retry from the active side. The retried REQ will use
+    another pv_cm_id (the cm_id on the wire). This confuses the CM
+    protocol and two REJs are sent from the passive side.
+    
+    Here is an excerpt from ibdump running without the patch:
+    
+    3.285092       LID: 4 -> LID: 4       SDP 290 CM: ConnectRequest(SDP Hello)
+    7.382711       LID: 4 -> LID: 4       SDP 290 CM: ConnectRequest(SDP Hello)
+    7.382861       LID: 4 -> LID: 4       InfiniBand 290 CM: ConnectReject
+    7.387644       LID: 4 -> LID: 4       InfiniBand 290 CM: ConnectReject
+    
+    and here is the same with bug fix applied:
+    
+    3.251010       LID: 4 -> LID: 4       SDP 290 CM: ConnectRequest(SDP Hello)
+    7.349387       LID: 4 -> LID: 4       SDP 290 CM: ConnectRequest(SDP Hello)
+    8.258443       LID: 4 -> LID: 4       SDP 290 CM: ConnectReply(SDP Hello)
+    8.259890       LID: 4 -> LID: 4       InfiniBand 290 CM: ReadyToUse
+    
+    Suggested-by: Venkat Venkatsubra <venkat.x.venkatsubra@oracle.com>
+    Signed-off-by: Håkon Bugge <haakon.bugge@oracle.com>
+    Reported-by: Wei Lin Guay <wei.lin.guay@oracle.com>
+    Tested-by: Wei Lin Guay <wei.lin.guay@oracle.com>
+    Reviewed-by: Yuval Shaia <yuval.shaia@oracle.com>
+    Acked-by: Jack Morgenstein <jackm@dev.mellanox.co.il>
+    Signed-off-by: Doug Ledford <dledford@redhat.com>
+
+diff --git a/drivers/infiniband/hw/mlx4/cm.c b/drivers/infiniband/hw/mlx4/cm.c
+index 1e6c526450d9..fedaf8260105 100644
+--- a/drivers/infiniband/hw/mlx4/cm.c
++++ b/drivers/infiniband/hw/mlx4/cm.c
+@@ -323,6 +323,9 @@ int mlx4_ib_multiplex_cm_handler(struct ib_device *ibdev, int port, int slave_id
+ 			mad->mad_hdr.attr_id == CM_REP_ATTR_ID ||
+ 			mad->mad_hdr.attr_id == CM_SIDR_REQ_ATTR_ID) {
+ 		sl_cm_id = get_local_comm_id(mad);
++		id = id_map_get(ibdev, &pv_cm_id, slave_id, sl_cm_id);
++		if (id)
++			goto cont;
+ 		id = id_map_alloc(ibdev, slave_id, sl_cm_id);
+ 		if (IS_ERR(id)) {
+ 			mlx4_ib_warn(ibdev, "%s: id{slave: %d, sl_cm_id: 0x%x} Failed to id_map_alloc\n",
+@@ -343,6 +346,7 @@ int mlx4_ib_multiplex_cm_handler(struct ib_device *ibdev, int port, int slave_id
+ 		return -EINVAL;
+ 	}
+ 
++cont:
+ 	set_local_comm_id(mad, id->pv_cm_id);
+ 
+ 	if (mad->mad_hdr.attr_id == CM_DREQ_ATTR_ID)
+
+commit b03ee4ca0cec348c84dccf08aaec2454c4d236c2
+Author: Håkon Bugge <haakon.bugge@oracle.com>
+Date:   Fri Apr 28 13:06:54 2017 +0200
+
+    IB/mlx4: Fix incorrect order of formal and actual parameters
+    
+    The last two actual parameters when calling id_map_find_by_sl_id()
+    from id_map_get() are swapped. However, the same formal parameters to
+    id_map_get() have them swapped as well, inverting the effect of the
+    first error.
+    
+    This commit improves readability, but makes no functional change to
+    the code.
+    
+    Signed-off-by: Håkon Bugge <haakon.bugge@oracle.com>
+    Reviewed-by: Wengang Wang <wen.gang.wang@oracle.com>
+    Reviewed-by: Knut Omang <knut.omang@oracle.com>
+    Acked-by: Leon Romanovsky <leonro@mellanox.com>
+    Signed-off-by: Doug Ledford <dledford@redhat.com>
+
+diff --git a/drivers/infiniband/hw/mlx4/cm.c b/drivers/infiniband/hw/mlx4/cm.c
+index 61f63fe63c3c..1e6c526450d9 100644
+--- a/drivers/infiniband/hw/mlx4/cm.c
++++ b/drivers/infiniband/hw/mlx4/cm.c
+@@ -279,14 +279,14 @@ id_map_alloc(struct ib_device *ibdev, int slave_id, u32 sl_cm_id)
+ }
+ 
+ static struct id_map_entry *
+-id_map_get(struct ib_device *ibdev, int *pv_cm_id, int sl_cm_id, int slave_id)
++id_map_get(struct ib_device *ibdev, int *pv_cm_id, int slave_id, int sl_cm_id)
+ {
+ 	struct id_map_entry *ent;
+ 	struct mlx4_ib_sriov *sriov = &to_mdev(ibdev)->sriov;
+ 
+ 	spin_lock(&sriov->id_map_lock);
+ 	if (*pv_cm_id == -1) {
+-		ent = id_map_find_by_sl_id(ibdev, sl_cm_id, slave_id);
++		ent = id_map_find_by_sl_id(ibdev, slave_id, sl_cm_id);
+ 		if (ent)
+ 			*pv_cm_id = (int) ent->pv_cm_id;
+ 	} else
+
+commit 898782883501798284a10d1467b11dd2a48270cf
+Author: Håkon Bugge <haakon.bugge@oracle.com>
+Date:   Fri Apr 28 13:06:53 2017 +0200
+
+    IB/mlx4: Change flush logic so it adheres to the variable name
+    
+    Change and simplify the code to match the variable name. This commit
+    improves readability but makes no functional change to the code.
+    
+    Signed-off-by: Håkon Bugge <haakon.bugge@oracle.com>
+    Suggested-by: Wengang Wang <wen.gang.wang@oracle.com>
+    Reviewed-by: Wengang Wang <wen.gang.wang@oracle.com>
+    Reviewed-by: Knut Omang <knut.omang@oracle.com>
+    Acked-by: Leon Romanovsky <leonro@mellanox.com>
+    Signed-off-by: Doug Ledford <dledford@redhat.com>
+
+diff --git a/drivers/infiniband/hw/mlx4/cm.c b/drivers/infiniband/hw/mlx4/cm.c
+index d64845335e87..61f63fe63c3c 100644
+--- a/drivers/infiniband/hw/mlx4/cm.c
++++ b/drivers/infiniband/hw/mlx4/cm.c
+@@ -414,7 +414,7 @@ void mlx4_ib_cm_paravirt_clean(struct mlx4_ib_dev *dev, int slave)
+ 	struct rb_root *sl_id_map = &sriov->sl_id_map;
+ 	struct list_head lh;
+ 	struct rb_node *nd;
+-	int need_flush = 1;
++	int need_flush = 0;
+ 	struct id_map_entry *map, *tmp_map;
+ 	/* cancel all delayed work queue entries */
+ 	INIT_LIST_HEAD(&lh);
+@@ -422,13 +422,13 @@ void mlx4_ib_cm_paravirt_clean(struct mlx4_ib_dev *dev, int slave)
+ 	list_for_each_entry_safe(map, tmp_map, &dev->sriov.cm_list, list) {
+ 		if (slave < 0 || slave == map->slave_id) {
+ 			if (map->scheduled_delete)
+-				need_flush &= !!cancel_delayed_work(&map->timeout);
++				need_flush |= !cancel_delayed_work(&map->timeout);
+ 		}
+ 	}
+ 
+ 	spin_unlock(&sriov->id_map_lock);
+ 
+-	if (!need_flush)
++	if (need_flush)
+ 		flush_scheduled_work(); /* make sure all timers were flushed */
+ 
+ 	/* now, remove all leftover entries from databases*/
+
+commit 15d4626e498c09b66c0f74a107a83bd95abb175c
+Author: Leon Romanovsky <leon@kernel.org>
+Date:   Thu Nov 3 16:44:12 2016 +0200
+
+    IB/mlx4: Remove debug prints after allocation failure
+    
+    The prints after [k|v][m|z|c]alloc() functions are not needed,
+    because in case of failure, allocator will print their internal
+    error prints anyway.
+    
+    Signed-off-by: Leon Romanovsky <leon@kernel.org>
+    Signed-off-by: Doug Ledford <dledford@redhat.com>
+
+diff --git a/drivers/infiniband/hw/mlx4/cm.c b/drivers/infiniband/hw/mlx4/cm.c
+index 39a488889fc7..d64845335e87 100644
+--- a/drivers/infiniband/hw/mlx4/cm.c
++++ b/drivers/infiniband/hw/mlx4/cm.c
+@@ -247,10 +247,8 @@ id_map_alloc(struct ib_device *ibdev, int slave_id, u32 sl_cm_id)
+ 	struct mlx4_ib_sriov *sriov = &to_mdev(ibdev)->sriov;
+ 
+ 	ent = kmalloc(sizeof (struct id_map_entry), GFP_KERNEL);
+-	if (!ent) {
+-		mlx4_ib_warn(ibdev, "Couldn't allocate id cache entry - out of memory\n");
++	if (!ent)
+ 		return ERR_PTR(-ENOMEM);
+-	}
+ 
+ 	ent->sl_cm_id = sl_cm_id;
+ 	ent->slave_id = slave_id;
+
+commit 98e8be869386eb01439d4ee95c821aa00bdf7f2a
+Author: Jack Morgenstein <jackm@dev.mellanox.co.il>
+Date:   Thu Jan 29 10:41:43 2015 +0200
+
+    IB/mlx4: In mlx4_ib_demux_cm, print out GUID in host-endian order
+    
+    If a GUID is not found, the 64-bit GUID printed in the message log
+    warning should converted to host-endian order for printing.
+    
+    Found by Doug Ledford and Hal Rosenstock. Fix suggested by Hal.
+    
+    Signed-off-by: Hal Rosenstock <hal@dev.mellanox.co.il>
+    Signed-off-by: Jack Morgenstein <jackm@dev.mellanox.co.il>
+    Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+    Signed-off-by: Roland Dreier <roland@purestorage.com>
+
+diff --git a/drivers/infiniband/hw/mlx4/cm.c b/drivers/infiniband/hw/mlx4/cm.c
+index 56a593e0ae5d..39a488889fc7 100644
+--- a/drivers/infiniband/hw/mlx4/cm.c
++++ b/drivers/infiniband/hw/mlx4/cm.c
+@@ -372,7 +372,7 @@ int mlx4_ib_demux_cm_handler(struct ib_device *ibdev, int port, int *slave,
+ 		*slave = mlx4_ib_find_real_gid(ibdev, port, gid.global.interface_id);
+ 		if (*slave < 0) {
+ 			mlx4_ib_warn(ibdev, "failed matching slave_id by gid (0x%llx)\n",
+-					gid.global.interface_id);
++				     be64_to_cpu(gid.global.interface_id));
+ 			return -ENOENT;
+ 		}
+ 		return 0;
+
+commit ceb5433b3a54979216d794e45147d25c24c94999
+Author: Shani Michaelli <shanim@mellanox.com>
+Date:   Wed Mar 12 12:00:42 2014 +0200
+
+    mlx4_ib: Fix SIDR support of for UD QPs under SRIOV/RoCE
+    
+    * Handle CM_SIDR_REQ_ATTR_ID and CM_SIDR_REP_ATTR_ID
+      in multiplex_cm_handler and demux_cm_handler.
+    
+    * Handle Service ID Resolution messages and REQ messages
+      separately, for their formats are different.
+    
+    Signed-off-by: Shani Michaeli <shanim@mellanox.com>
+    Signed-off-by: Matan Barak <matanb@mellanox.com>
+    Signed-off-by: Jack Morgenstein <jackm@dev.mellanox.co.il>
+    Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/infiniband/hw/mlx4/cm.c b/drivers/infiniband/hw/mlx4/cm.c
+index b8d911543783..56a593e0ae5d 100644
+--- a/drivers/infiniband/hw/mlx4/cm.c
++++ b/drivers/infiniband/hw/mlx4/cm.c
+@@ -61,6 +61,11 @@ struct cm_generic_msg {
+ 	__be32 remote_comm_id;
+ };
+ 
++struct cm_sidr_generic_msg {
++	struct ib_mad_hdr hdr;
++	__be32 request_id;
++};
++
+ struct cm_req_msg {
+ 	unsigned char unused[0x60];
+ 	union ib_gid primary_path_sgid;
+@@ -69,28 +74,62 @@ struct cm_req_msg {
+ 
+ static void set_local_comm_id(struct ib_mad *mad, u32 cm_id)
+ {
+-	struct cm_generic_msg *msg = (struct cm_generic_msg *)mad;
+-	msg->local_comm_id = cpu_to_be32(cm_id);
++	if (mad->mad_hdr.attr_id == CM_SIDR_REQ_ATTR_ID) {
++		struct cm_sidr_generic_msg *msg =
++			(struct cm_sidr_generic_msg *)mad;
++		msg->request_id = cpu_to_be32(cm_id);
++	} else if (mad->mad_hdr.attr_id == CM_SIDR_REP_ATTR_ID) {
++		pr_err("trying to set local_comm_id in SIDR_REP\n");
++		return;
++	} else {
++		struct cm_generic_msg *msg = (struct cm_generic_msg *)mad;
++		msg->local_comm_id = cpu_to_be32(cm_id);
++	}
+ }
+ 
+ static u32 get_local_comm_id(struct ib_mad *mad)
+ {
+-	struct cm_generic_msg *msg = (struct cm_generic_msg *)mad;
+-
+-	return be32_to_cpu(msg->local_comm_id);
++	if (mad->mad_hdr.attr_id == CM_SIDR_REQ_ATTR_ID) {
++		struct cm_sidr_generic_msg *msg =
++			(struct cm_sidr_generic_msg *)mad;
++		return be32_to_cpu(msg->request_id);
++	} else if (mad->mad_hdr.attr_id == CM_SIDR_REP_ATTR_ID) {
++		pr_err("trying to set local_comm_id in SIDR_REP\n");
++		return -1;
++	} else {
++		struct cm_generic_msg *msg = (struct cm_generic_msg *)mad;
++		return be32_to_cpu(msg->local_comm_id);
++	}
+ }
+ 
+ static void set_remote_comm_id(struct ib_mad *mad, u32 cm_id)
+ {
+-	struct cm_generic_msg *msg = (struct cm_generic_msg *)mad;
+-	msg->remote_comm_id = cpu_to_be32(cm_id);
++	if (mad->mad_hdr.attr_id == CM_SIDR_REP_ATTR_ID) {
++		struct cm_sidr_generic_msg *msg =
++			(struct cm_sidr_generic_msg *)mad;
++		msg->request_id = cpu_to_be32(cm_id);
++	} else if (mad->mad_hdr.attr_id == CM_SIDR_REQ_ATTR_ID) {
++		pr_err("trying to set remote_comm_id in SIDR_REQ\n");
++		return;
++	} else {
++		struct cm_generic_msg *msg = (struct cm_generic_msg *)mad;
++		msg->remote_comm_id = cpu_to_be32(cm_id);
++	}
+ }
+ 
+ static u32 get_remote_comm_id(struct ib_mad *mad)
+ {
+-	struct cm_generic_msg *msg = (struct cm_generic_msg *)mad;
+-
+-	return be32_to_cpu(msg->remote_comm_id);
++	if (mad->mad_hdr.attr_id == CM_SIDR_REP_ATTR_ID) {
++		struct cm_sidr_generic_msg *msg =
++			(struct cm_sidr_generic_msg *)mad;
++		return be32_to_cpu(msg->request_id);
++	} else if (mad->mad_hdr.attr_id == CM_SIDR_REQ_ATTR_ID) {
++		pr_err("trying to set remote_comm_id in SIDR_REQ\n");
++		return -1;
++	} else {
++		struct cm_generic_msg *msg = (struct cm_generic_msg *)mad;
++		return be32_to_cpu(msg->remote_comm_id);
++	}
+ }
+ 
+ static union ib_gid gid_from_req_msg(struct ib_device *ibdev, struct ib_mad *mad)
+@@ -282,19 +321,21 @@ int mlx4_ib_multiplex_cm_handler(struct ib_device *ibdev, int port, int slave_id
+ 	u32 sl_cm_id;
+ 	int pv_cm_id = -1;
+ 
+-	sl_cm_id = get_local_comm_id(mad);
+-
+ 	if (mad->mad_hdr.attr_id == CM_REQ_ATTR_ID ||
+-			mad->mad_hdr.attr_id == CM_REP_ATTR_ID) {
++			mad->mad_hdr.attr_id == CM_REP_ATTR_ID ||
++			mad->mad_hdr.attr_id == CM_SIDR_REQ_ATTR_ID) {
++		sl_cm_id = get_local_comm_id(mad);
+ 		id = id_map_alloc(ibdev, slave_id, sl_cm_id);
+ 		if (IS_ERR(id)) {
+ 			mlx4_ib_warn(ibdev, "%s: id{slave: %d, sl_cm_id: 0x%x} Failed to id_map_alloc\n",
+ 				__func__, slave_id, sl_cm_id);
+ 			return PTR_ERR(id);
+ 		}
+-	} else if (mad->mad_hdr.attr_id == CM_REJ_ATTR_ID) {
++	} else if (mad->mad_hdr.attr_id == CM_REJ_ATTR_ID ||
++		   mad->mad_hdr.attr_id == CM_SIDR_REP_ATTR_ID) {
+ 		return 0;
+ 	} else {
++		sl_cm_id = get_local_comm_id(mad);
+ 		id = id_map_get(ibdev, &pv_cm_id, slave_id, sl_cm_id);
+ 	}
+ 
+@@ -320,7 +361,8 @@ int mlx4_ib_demux_cm_handler(struct ib_device *ibdev, int port, int *slave,
+ 	u32 pv_cm_id;
+ 	struct id_map_entry *id;
+ 
+-	if (mad->mad_hdr.attr_id == CM_REQ_ATTR_ID) {
++	if (mad->mad_hdr.attr_id == CM_REQ_ATTR_ID ||
++	    mad->mad_hdr.attr_id == CM_SIDR_REQ_ATTR_ID) {
+ 		union ib_gid gid;
+ 
+ 		if (!slave)
+
+commit 6ee51a4e866bbb0921180b457ed16cd172859346
+Author: Jack Morgenstein <jackm@dev.mellanox.co.il>
+Date:   Wed Mar 12 12:00:37 2014 +0200
+
+    mlx4: Adjust QP1 multiplexing for RoCE/SRIOV
+    
+    This requires the following modifications:
+    1. Fix build_mlx4_header to properly fill in the ETH fields
+    2. Adjust mux and demux QP1 flow to support RoCE.
+    
+    This commit still assumes only one GID per slave for RoCE.
+    The commit enabling multiple GIDs is a subsequent commit, and
+    is done separately because of its complexity.
+    
+    Signed-off-by: Jack Morgenstein <jackm@dev.mellanox.co.il>
+    Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+    Signed-off-by: David S. Miller <davem@davemloft.net>
+
+diff --git a/drivers/infiniband/hw/mlx4/cm.c b/drivers/infiniband/hw/mlx4/cm.c
+index d1f5f1dd77b0..b8d911543783 100644
+--- a/drivers/infiniband/hw/mlx4/cm.c
++++ b/drivers/infiniband/hw/mlx4/cm.c
+@@ -315,7 +315,7 @@ int mlx4_ib_multiplex_cm_handler(struct ib_device *ibdev, int port, int slave_id
+ }
+ 
+ int mlx4_ib_demux_cm_handler(struct ib_device *ibdev, int port, int *slave,
+-							     struct ib_mad *mad)
++			     struct ib_mad *mad)
+ {
+ 	u32 pv_cm_id;
+ 	struct id_map_entry *id;
+@@ -323,6 +323,9 @@ int mlx4_ib_demux_cm_handler(struct ib_device *ibdev, int port, int *slave,
+ 	if (mad->mad_hdr.attr_id == CM_REQ_ATTR_ID) {
+ 		union ib_gid gid;
+ 
++		if (!slave)
++			return 0;
++
+ 		gid = gid_from_req_msg(ibdev, mad);
+ 		*slave = mlx4_ib_find_real_gid(ibdev, port, gid.global.interface_id);
+ 		if (*slave < 0) {
+@@ -341,7 +344,8 @@ int mlx4_ib_demux_cm_handler(struct ib_device *ibdev, int port, int *slave,
+ 		return -ENOENT;
+ 	}
+ 
+-	*slave = id->slave_id;
++	if (slave)
++		*slave = id->slave_id;
+ 	set_remote_comm_id(mad, id->sl_cm_id);
+ 
+ 	if (mad->mad_hdr.attr_id == CM_DREQ_ATTR_ID)
+
+commit f2d9db877fdfe37b54428880429cf01f68718aad
+Author: Jeff Layton <jlayton@redhat.com>
+Date:   Mon Apr 29 16:21:19 2013 -0700
+
+    drivers/infiniband/hw/mlx4: convert to using idr_alloc_cyclic()
+    
+    Signed-off-by: Jeff Layton <jlayton@redhat.com>
+    Cc: Tejun Heo <tj@kernel.org>
+    Cc: Jack Morgenstein <jackm@dev.mellanox.co.il>
+    Cc: Or Gerlitz <ogerlitz@mellanox.com>
+    Cc: Roland Dreier <roland@purestorage.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/drivers/infiniband/hw/mlx4/cm.c b/drivers/infiniband/hw/mlx4/cm.c
+index add98d01476c..d1f5f1dd77b0 100644
+--- a/drivers/infiniband/hw/mlx4/cm.c
++++ b/drivers/infiniband/hw/mlx4/cm.c
+@@ -204,7 +204,6 @@ static struct id_map_entry *
+ id_map_alloc(struct ib_device *ibdev, int slave_id, u32 sl_cm_id)
+ {
+ 	int ret;
+-	static int next_id;
+ 	struct id_map_entry *ent;
+ 	struct mlx4_ib_sriov *sriov = &to_mdev(ibdev)->sriov;
+ 
+@@ -223,9 +222,8 @@ id_map_alloc(struct ib_device *ibdev, int slave_id, u32 sl_cm_id)
+ 	idr_preload(GFP_KERNEL);
+ 	spin_lock(&to_mdev(ibdev)->sriov.id_map_lock);
+ 
+-	ret = idr_alloc(&sriov->pv_id_table, ent, next_id, 0, GFP_NOWAIT);
++	ret = idr_alloc_cyclic(&sriov->pv_id_table, ent, 0, 0, GFP_NOWAIT);
+ 	if (ret >= 0) {
+-		next_id = max(ret + 1, 0);
+ 		ent->pv_cm_id = (u32)ret;
+ 		sl_id_map_add(ibdev, ent);
+ 		list_add_tail(&ent->list, &sriov->cm_list);
+
+commit 95e1b7145ed220a2124f9566ad97f4ccecdba063
+Author: Tejun Heo <tj@kernel.org>
+Date:   Wed Mar 13 14:59:39 2013 -0700
+
+    mlx4: remove leftover idr_pre_get() call
+    
+    Commit 6a9200603d76 ("IB/mlx4: convert to idr_alloc()") forgot to remove
+    idr_pre_get() call in mlx4_ib_cm_paravirt_init().  It's unnecessary and
+    idr_pre_get() will soon be deprecated.  Remove it.
+    
+    Signed-off-by: Tejun Heo <tj@kernel.org>
+    Cc: Jack Morgenstein <jackm@dev.mellanox.co.il>
+    Cc: Or Gerlitz <ogerlitz@mellanox.com>
+    Cc: Roland Dreier <roland@purestorage.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/drivers/infiniband/hw/mlx4/cm.c b/drivers/infiniband/hw/mlx4/cm.c
+index e0d79b2395e4..add98d01476c 100644
+--- a/drivers/infiniband/hw/mlx4/cm.c
++++ b/drivers/infiniband/hw/mlx4/cm.c
+@@ -362,7 +362,6 @@ void mlx4_ib_cm_paravirt_init(struct mlx4_ib_dev *dev)
+ 	INIT_LIST_HEAD(&dev->sriov.cm_list);
+ 	dev->sriov.sl_id_map = RB_ROOT;
+ 	idr_init(&dev->sriov.pv_id_table);
+-	idr_pre_get(&dev->sriov.pv_id_table, GFP_KERNEL);
+ }
+ 
+ /* slave = -1 ==> all slaves */
+
+commit e8c8d1bc063bc88cfa1356266027b5075d3a82d7
+Author: Tejun Heo <tj@kernel.org>
+Date:   Wed Feb 27 17:05:04 2013 -0800
+
+    idr: remove MAX_IDR_MASK and move left MAX_IDR_* into idr.c
+    
+    MAX_IDR_MASK is another weirdness in the idr interface.  As idr covers
+    whole positive integer range, it's defined as 0x7fffffff or INT_MAX.
+    
+    Its usage in idr_find(), idr_replace() and idr_remove() is bizarre.
+    They basically mask off the sign bit and operate on the rest, so if
+    the caller, by accident, passes in a negative number, the sign bit
+    will be masked off and the remaining part will be used as if that was
+    the input, which is worse than crashing.
+    
+    The constant is visible in idr.h and there are several users in the
+    kernel.
+    
+    * drivers/i2c/i2c-core.c:i2c_add_numbered_adapter()
+    
+      Basically used to test if adap->nr is a negative number which isn't
+      -1 and returns -EINVAL if so.  idr_alloc() already has negative
+      @start checking (w/ WARN_ON_ONCE), so this can go away.
+    
+    * drivers/infiniband/core/cm.c:cm_alloc_id()
+      drivers/infiniband/hw/mlx4/cm.c:id_map_alloc()
+    
+      Used to wrap cyclic @start.  Can be replaced with max(next, 0).
+      Note that this type of cyclic allocation using idr is buggy.  These
+      are prone to spurious -ENOSPC failure after the first wraparound.
+    
+    * fs/super.c:get_anon_bdev()
+    
+      The ID allocated from ida is masked off before being tested whether
+      it's inside valid range.  ida allocated ID can never be a negative
+      number and the masking is unnecessary.
+    
+    Update idr_*() functions to fail with -EINVAL when negative @id is
+    specified and update other MAX_IDR_MASK users as described above.
+    
+    This leaves MAX_IDR_MASK without any user, remove it and relocate
+    other MAX_IDR_* constants to lib/idr.c.
+    
+    Signed-off-by: Tejun Heo <tj@kernel.org>
+    Cc: Jean Delvare <khali@linux-fr.org>
+    Cc: Roland Dreier <roland@kernel.org>
+    Cc: Sean Hefty <sean.hefty@intel.com>
+    Cc: Hal Rosenstock <hal.rosenstock@gmail.com>
+    Cc: "Marciniszyn, Mike" <mike.marciniszyn@intel.com>
+    Cc: Jack Morgenstein <jackm@dev.mellanox.co.il>
+    Cc: Or Gerlitz <ogerlitz@mellanox.com>
+    Cc: Al Viro <viro@zeniv.linux.org.uk>
+    Acked-by: Wolfram Sang <wolfram@the-dreams.de>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/drivers/infiniband/hw/mlx4/cm.c b/drivers/infiniband/hw/mlx4/cm.c
+index 80e59ed864b3..e0d79b2395e4 100644
+--- a/drivers/infiniband/hw/mlx4/cm.c
++++ b/drivers/infiniband/hw/mlx4/cm.c
+@@ -225,7 +225,7 @@ id_map_alloc(struct ib_device *ibdev, int slave_id, u32 sl_cm_id)
+ 
+ 	ret = idr_alloc(&sriov->pv_id_table, ent, next_id, 0, GFP_NOWAIT);
+ 	if (ret >= 0) {
+-		next_id = ((unsigned)ret + 1) & MAX_IDR_MASK;
++		next_id = max(ret + 1, 0);
+ 		ent->pv_cm_id = (u32)ret;
+ 		sl_id_map_add(ibdev, ent);
+ 		list_add_tail(&ent->list, &sriov->cm_list);
+
+commit 6a9200603d76de1f8029b83c041f8eef99877a65
+Author: Tejun Heo <tj@kernel.org>
+Date:   Wed Feb 27 17:04:23 2013 -0800
+
+    IB/mlx4: convert to idr_alloc()
+    
+    Convert to the much saner new idr interface.
+    
+    Signed-off-by: Tejun Heo <tj@kernel.org>
+    Cc: Jack Morgenstein <jackm@dev.mellanox.co.il>
+    Cc: Or Gerlitz <ogerlitz@mellanox.com>
+    Cc: Roland Dreier <roland@purestorage.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/drivers/infiniband/hw/mlx4/cm.c b/drivers/infiniband/hw/mlx4/cm.c
+index dbc99d41605c..80e59ed864b3 100644
+--- a/drivers/infiniband/hw/mlx4/cm.c
++++ b/drivers/infiniband/hw/mlx4/cm.c
+@@ -203,7 +203,7 @@ static void sl_id_map_add(struct ib_device *ibdev, struct id_map_entry *new)
+ static struct id_map_entry *
+ id_map_alloc(struct ib_device *ibdev, int slave_id, u32 sl_cm_id)
+ {
+-	int ret, id;
++	int ret;
+ 	static int next_id;
+ 	struct id_map_entry *ent;
+ 	struct mlx4_ib_sriov *sriov = &to_mdev(ibdev)->sriov;
+@@ -220,25 +220,23 @@ id_map_alloc(struct ib_device *ibdev, int slave_id, u32 sl_cm_id)
+ 	ent->dev = to_mdev(ibdev);
+ 	INIT_DELAYED_WORK(&ent->timeout, id_map_ent_timeout);
+ 
+-	do {
+-		spin_lock(&to_mdev(ibdev)->sriov.id_map_lock);
+-		ret = idr_get_new_above(&sriov->pv_id_table, ent,
+-					next_id, &id);
+-		if (!ret) {
+-			next_id = ((unsigned) id + 1) & MAX_IDR_MASK;
+-			ent->pv_cm_id = (u32)id;
+-			sl_id_map_add(ibdev, ent);
+-		}
++	idr_preload(GFP_KERNEL);
++	spin_lock(&to_mdev(ibdev)->sriov.id_map_lock);
+ 
+-		spin_unlock(&sriov->id_map_lock);
+-	} while (ret == -EAGAIN && idr_pre_get(&sriov->pv_id_table, GFP_KERNEL));
+-	/*the function idr_get_new_above can return -ENOSPC, so don't insert in that case.*/
+-	if (!ret) {
+-		spin_lock(&sriov->id_map_lock);
++	ret = idr_alloc(&sriov->pv_id_table, ent, next_id, 0, GFP_NOWAIT);
++	if (ret >= 0) {
++		next_id = ((unsigned)ret + 1) & MAX_IDR_MASK;
++		ent->pv_cm_id = (u32)ret;
++		sl_id_map_add(ibdev, ent);
+ 		list_add_tail(&ent->list, &sriov->cm_list);
+-		spin_unlock(&sriov->id_map_lock);
+-		return ent;
+ 	}
++
++	spin_unlock(&sriov->id_map_lock);
++	idr_preload_end();
++
++	if (ret >= 0)
++		return ent;
++
+ 	/*error flow*/
+ 	kfree(ent);
+ 	mlx4_ib_warn(ibdev, "No more space in the idr (err:0x%x)\n", ret);
+
+commit ceb7decb366591e9b67d70832e07f5d240572a3d
+Author: Jack Morgenstein <jackm@dev.mellanox.co.il>
+Date:   Tue Nov 27 16:24:29 2012 +0000
+
+    IB/mlx4: Fix spinlock order to avoid lockdep warnings
+    
+    lockdep warns about taking a hard-irq-unsafe lock (sriov->id_map_lock)
+    inside a hard-irq-safe lock (sriov->going_down_lock).
+    
+    Since id_map_lock is never taken in the interrupt context, we can
+    simply reverse the order of taking the two spinlocks, thus avoiding
+    the warning and the depencency.
+    
+    Signed-off-by: Jack Morgenstein <jackm@dev.mellanox.co.il>
+    Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+    Cc: <stable@vger.kernel.org>
+    Signed-off-by: Roland Dreier <roland@purestorage.com>
+
+diff --git a/drivers/infiniband/hw/mlx4/cm.c b/drivers/infiniband/hw/mlx4/cm.c
+index 80079e5a2e30..dbc99d41605c 100644
+--- a/drivers/infiniband/hw/mlx4/cm.c
++++ b/drivers/infiniband/hw/mlx4/cm.c
+@@ -268,15 +268,15 @@ static void schedule_delayed(struct ib_device *ibdev, struct id_map_entry *id)
+ 	struct mlx4_ib_sriov *sriov = &to_mdev(ibdev)->sriov;
+ 	unsigned long flags;
+ 
+-	spin_lock_irqsave(&sriov->going_down_lock, flags);
+ 	spin_lock(&sriov->id_map_lock);
++	spin_lock_irqsave(&sriov->going_down_lock, flags);
+ 	/*make sure that there is no schedule inside the scheduled work.*/
+ 	if (!sriov->is_going_down) {
+ 		id->scheduled_delete = 1;
+ 		schedule_delayed_work(&id->timeout, CM_CLEANUP_CACHE_TIMEOUT);
+ 	}
+-	spin_unlock(&sriov->id_map_lock);
+ 	spin_unlock_irqrestore(&sriov->going_down_lock, flags);
++	spin_unlock(&sriov->id_map_lock);
+ }
+ 
+ int mlx4_ib_multiplex_cm_handler(struct ib_device *ibdev, int port, int slave_id,
+
+commit 125c4c706b680c7831f0966ff873c1ad0354ec25
+Author: Fengguang Wu <fengguang.wu@intel.com>
+Date:   Thu Oct 4 17:13:15 2012 -0700
+
+    idr: rename MAX_LEVEL to MAX_IDR_LEVEL
+    
+    To avoid name conflicts:
+    
+      drivers/video/riva/fbdev.c:281:9: sparse: preprocessor token MAX_LEVEL redefined
+    
+    While at it, also make the other names more consistent and add
+    parentheses.
+    
+    [akpm@linux-foundation.org: repair fallout]
+    [sfr@canb.auug.org.au: IB/mlx4: fix for MAX_ID_MASK to MAX_IDR_MASK name change]
+    Signed-off-by: Fengguang Wu <fengguang.wu@intel.com>
+    Cc: Bernd Petrovitsch <bernd@petrovitsch.priv.at>
+    Cc: walter harms <wharms@bfs.de>
+    Cc: Glauber Costa <glommer@parallels.com>
+    Signed-off-by: Stephen Rothwell <sfr@canb.auug.org.au>
+    Cc: Roland Dreier <roland@purestorage.com>
+    Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+    Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+
+diff --git a/drivers/infiniband/hw/mlx4/cm.c b/drivers/infiniband/hw/mlx4/cm.c
+index e25e4dafb8a8..80079e5a2e30 100644
+--- a/drivers/infiniband/hw/mlx4/cm.c
++++ b/drivers/infiniband/hw/mlx4/cm.c
+@@ -225,7 +225,7 @@ id_map_alloc(struct ib_device *ibdev, int slave_id, u32 sl_cm_id)
+ 		ret = idr_get_new_above(&sriov->pv_id_table, ent,
+ 					next_id, &id);
+ 		if (!ret) {
+-			next_id = ((unsigned) id + 1) & MAX_ID_MASK;
++			next_id = ((unsigned) id + 1) & MAX_IDR_MASK;
+ 			ent->pv_cm_id = (u32)id;
+ 			sl_id_map_add(ibdev, ent);
+ 		}
+
+commit 3cf69cc8dbebf15b99deb342ea422105ae9c2774
+Author: Amir Vadai <amirv@mellanox.co.il>
+Date:   Fri Aug 3 08:40:47 2012 +0000
+
+    IB/mlx4: Add CM paravirtualization
+    
+    In CM para-virtualization:
+    
+    1. Incoming requests are steered to the correct vHCA according to the
+       embedded GID.
+    2. Communication IDs on outgoing requests are replaced by a globally
+       unique ID, generated by the PPF, since there is no synchronization
+       of ID generation between guests (and so these IDs are not
+       guaranteed to be globally unique).  The guest's comm ID is stored,
+       and is returned to the response MAD when it arrives.
+    
+    Signed-off-by: Amir Vadai <amirv@mellanox.co.il>
+    Signed-off-by: Jack Morgenstein <jackm@dev.mellanox.co.il>
+    Signed-off-by: Roland Dreier <roland@purestorage.com>
+
+diff --git a/drivers/infiniband/hw/mlx4/cm.c b/drivers/infiniband/hw/mlx4/cm.c
+new file mode 100644
+index 000000000000..e25e4dafb8a8
+--- /dev/null
++++ b/drivers/infiniband/hw/mlx4/cm.c
+@@ -0,0 +1,437 @@
++/*
++ * Copyright (c) 2012 Mellanox Technologies. All rights reserved.
++ *
++ * This software is available to you under a choice of one of two
++ * licenses.  You may choose to be licensed under the terms of the GNU
++ * General Public License (GPL) Version 2, available from the file
++ * COPYING in the main directory of this source tree, or the
++ * OpenIB.org BSD license below:
++ *
++ *     Redistribution and use in source and binary forms, with or
++ *     without modification, are permitted provided that the following
++ *     conditions are met:
++ *
++ *      - Redistributions of source code must retain the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer.
++ *
++ *      - Redistributions in binary form must reproduce the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer in the documentation and/or other materials
++ *        provided with the distribution.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
++ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
++ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++#include <rdma/ib_mad.h>
++
++#include <linux/mlx4/cmd.h>
++#include <linux/rbtree.h>
++#include <linux/idr.h>
++#include <rdma/ib_cm.h>
++
++#include "mlx4_ib.h"
++
++#define CM_CLEANUP_CACHE_TIMEOUT  (5 * HZ)
++
++struct id_map_entry {
++	struct rb_node node;
++
++	u32 sl_cm_id;
++	u32 pv_cm_id;
++	int slave_id;
++	int scheduled_delete;
++	struct mlx4_ib_dev *dev;
++
++	struct list_head list;
++	struct delayed_work timeout;
++};
++
++struct cm_generic_msg {
++	struct ib_mad_hdr hdr;
++
++	__be32 local_comm_id;
++	__be32 remote_comm_id;
++};
++
++struct cm_req_msg {
++	unsigned char unused[0x60];
++	union ib_gid primary_path_sgid;
++};
++
++
++static void set_local_comm_id(struct ib_mad *mad, u32 cm_id)
++{
++	struct cm_generic_msg *msg = (struct cm_generic_msg *)mad;
++	msg->local_comm_id = cpu_to_be32(cm_id);
++}
++
++static u32 get_local_comm_id(struct ib_mad *mad)
++{
++	struct cm_generic_msg *msg = (struct cm_generic_msg *)mad;
++
++	return be32_to_cpu(msg->local_comm_id);
++}
++
++static void set_remote_comm_id(struct ib_mad *mad, u32 cm_id)
++{
++	struct cm_generic_msg *msg = (struct cm_generic_msg *)mad;
++	msg->remote_comm_id = cpu_to_be32(cm_id);
++}
++
++static u32 get_remote_comm_id(struct ib_mad *mad)
++{
++	struct cm_generic_msg *msg = (struct cm_generic_msg *)mad;
++
++	return be32_to_cpu(msg->remote_comm_id);
++}
++
++static union ib_gid gid_from_req_msg(struct ib_device *ibdev, struct ib_mad *mad)
++{
++	struct cm_req_msg *msg = (struct cm_req_msg *)mad;
++
++	return msg->primary_path_sgid;
++}
++
++/* Lock should be taken before called */
++static struct id_map_entry *
++id_map_find_by_sl_id(struct ib_device *ibdev, u32 slave_id, u32 sl_cm_id)
++{
++	struct rb_root *sl_id_map = &to_mdev(ibdev)->sriov.sl_id_map;
++	struct rb_node *node = sl_id_map->rb_node;
++
++	while (node) {
++		struct id_map_entry *id_map_entry =
++			rb_entry(node, struct id_map_entry, node);
++
++		if (id_map_entry->sl_cm_id > sl_cm_id)
++			node = node->rb_left;
++		else if (id_map_entry->sl_cm_id < sl_cm_id)
++			node = node->rb_right;
++		else if (id_map_entry->slave_id > slave_id)
++			node = node->rb_left;
++		else if (id_map_entry->slave_id < slave_id)
++			node = node->rb_right;
++		else
++			return id_map_entry;
++	}
++	return NULL;
++}
++
++static void id_map_ent_timeout(struct work_struct *work)
++{
++	struct delayed_work *delay = to_delayed_work(work);
++	struct id_map_entry *ent = container_of(delay, struct id_map_entry, timeout);
++	struct id_map_entry *db_ent, *found_ent;
++	struct mlx4_ib_dev *dev = ent->dev;
++	struct mlx4_ib_sriov *sriov = &dev->sriov;
++	struct rb_root *sl_id_map = &sriov->sl_id_map;
++	int pv_id = (int) ent->pv_cm_id;
++
++	spin_lock(&sriov->id_map_lock);
++	db_ent = (struct id_map_entry *)idr_find(&sriov->pv_id_table, pv_id);
++	if (!db_ent)
++		goto out;
++	found_ent = id_map_find_by_sl_id(&dev->ib_dev, ent->slave_id, ent->sl_cm_id);
++	if (found_ent && found_ent == ent)
++		rb_erase(&found_ent->node, sl_id_map);
++	idr_remove(&sriov->pv_id_table, pv_id);
++
++out:
++	list_del(&ent->list);
++	spin_unlock(&sriov->id_map_lock);
++	kfree(ent);
++}
++
++static void id_map_find_del(struct ib_device *ibdev, int pv_cm_id)
++{
++	struct mlx4_ib_sriov *sriov = &to_mdev(ibdev)->sriov;
++	struct rb_root *sl_id_map = &sriov->sl_id_map;
++	struct id_map_entry *ent, *found_ent;
++
++	spin_lock(&sriov->id_map_lock);
++	ent = (struct id_map_entry *)idr_find(&sriov->pv_id_table, pv_cm_id);
++	if (!ent)
++		goto out;
++	found_ent = id_map_find_by_sl_id(ibdev, ent->slave_id, ent->sl_cm_id);
++	if (found_ent && found_ent == ent)
++		rb_erase(&found_ent->node, sl_id_map);
++	idr_remove(&sriov->pv_id_table, pv_cm_id);
++out:
++	spin_unlock(&sriov->id_map_lock);
++}
++
++static void sl_id_map_add(struct ib_device *ibdev, struct id_map_entry *new)
++{
++	struct rb_root *sl_id_map = &to_mdev(ibdev)->sriov.sl_id_map;
++	struct rb_node **link = &sl_id_map->rb_node, *parent = NULL;
++	struct id_map_entry *ent;
++	int slave_id = new->slave_id;
++	int sl_cm_id = new->sl_cm_id;
++
++	ent = id_map_find_by_sl_id(ibdev, slave_id, sl_cm_id);
++	if (ent) {
++		pr_debug("overriding existing sl_id_map entry (cm_id = %x)\n",
++			 sl_cm_id);
++
++		rb_replace_node(&ent->node, &new->node, sl_id_map);
++		return;
++	}
++
++	/* Go to the bottom of the tree */
++	while (*link) {
++		parent = *link;
++		ent = rb_entry(parent, struct id_map_entry, node);
++
++		if (ent->sl_cm_id > sl_cm_id || (ent->sl_cm_id == sl_cm_id && ent->slave_id > slave_id))
++			link = &(*link)->rb_left;
++		else
++			link = &(*link)->rb_right;
++	}
++
++	rb_link_node(&new->node, parent, link);
++	rb_insert_color(&new->node, sl_id_map);
++}
++
++static struct id_map_entry *
++id_map_alloc(struct ib_device *ibdev, int slave_id, u32 sl_cm_id)
++{
++	int ret, id;
++	static int next_id;
++	struct id_map_entry *ent;
++	struct mlx4_ib_sriov *sriov = &to_mdev(ibdev)->sriov;
++
++	ent = kmalloc(sizeof (struct id_map_entry), GFP_KERNEL);
++	if (!ent) {
++		mlx4_ib_warn(ibdev, "Couldn't allocate id cache entry - out of memory\n");
++		return ERR_PTR(-ENOMEM);
++	}
++
++	ent->sl_cm_id = sl_cm_id;
++	ent->slave_id = slave_id;
++	ent->scheduled_delete = 0;
++	ent->dev = to_mdev(ibdev);
++	INIT_DELAYED_WORK(&ent->timeout, id_map_ent_timeout);
++
++	do {
++		spin_lock(&to_mdev(ibdev)->sriov.id_map_lock);
++		ret = idr_get_new_above(&sriov->pv_id_table, ent,
++					next_id, &id);
++		if (!ret) {
++			next_id = ((unsigned) id + 1) & MAX_ID_MASK;
++			ent->pv_cm_id = (u32)id;
++			sl_id_map_add(ibdev, ent);
++		}
++
++		spin_unlock(&sriov->id_map_lock);
++	} while (ret == -EAGAIN && idr_pre_get(&sriov->pv_id_table, GFP_KERNEL));
++	/*the function idr_get_new_above can return -ENOSPC, so don't insert in that case.*/
++	if (!ret) {
++		spin_lock(&sriov->id_map_lock);
++		list_add_tail(&ent->list, &sriov->cm_list);
++		spin_unlock(&sriov->id_map_lock);
++		return ent;
++	}
++	/*error flow*/
++	kfree(ent);
++	mlx4_ib_warn(ibdev, "No more space in the idr (err:0x%x)\n", ret);
++	return ERR_PTR(-ENOMEM);
++}
++
++static struct id_map_entry *
++id_map_get(struct ib_device *ibdev, int *pv_cm_id, int sl_cm_id, int slave_id)
++{
++	struct id_map_entry *ent;
++	struct mlx4_ib_sriov *sriov = &to_mdev(ibdev)->sriov;
++
++	spin_lock(&sriov->id_map_lock);
++	if (*pv_cm_id == -1) {
++		ent = id_map_find_by_sl_id(ibdev, sl_cm_id, slave_id);
++		if (ent)
++			*pv_cm_id = (int) ent->pv_cm_id;
++	} else
++		ent = (struct id_map_entry *)idr_find(&sriov->pv_id_table, *pv_cm_id);
++	spin_unlock(&sriov->id_map_lock);
++
++	return ent;
++}
++
++static void schedule_delayed(struct ib_device *ibdev, struct id_map_entry *id)
++{
++	struct mlx4_ib_sriov *sriov = &to_mdev(ibdev)->sriov;
++	unsigned long flags;
++
++	spin_lock_irqsave(&sriov->going_down_lock, flags);
++	spin_lock(&sriov->id_map_lock);
++	/*make sure that there is no schedule inside the scheduled work.*/
++	if (!sriov->is_going_down) {
++		id->scheduled_delete = 1;
++		schedule_delayed_work(&id->timeout, CM_CLEANUP_CACHE_TIMEOUT);
++	}
++	spin_unlock(&sriov->id_map_lock);
++	spin_unlock_irqrestore(&sriov->going_down_lock, flags);
++}
++
++int mlx4_ib_multiplex_cm_handler(struct ib_device *ibdev, int port, int slave_id,
++		struct ib_mad *mad)
++{
++	struct id_map_entry *id;
++	u32 sl_cm_id;
++	int pv_cm_id = -1;
++
++	sl_cm_id = get_local_comm_id(mad);
++
++	if (mad->mad_hdr.attr_id == CM_REQ_ATTR_ID ||
++			mad->mad_hdr.attr_id == CM_REP_ATTR_ID) {
++		id = id_map_alloc(ibdev, slave_id, sl_cm_id);
++		if (IS_ERR(id)) {
++			mlx4_ib_warn(ibdev, "%s: id{slave: %d, sl_cm_id: 0x%x} Failed to id_map_alloc\n",
++				__func__, slave_id, sl_cm_id);
++			return PTR_ERR(id);
++		}
++	} else if (mad->mad_hdr.attr_id == CM_REJ_ATTR_ID) {
++		return 0;
++	} else {
++		id = id_map_get(ibdev, &pv_cm_id, slave_id, sl_cm_id);
++	}
++
++	if (!id) {
++		pr_debug("id{slave: %d, sl_cm_id: 0x%x} is NULL!\n",
++			 slave_id, sl_cm_id);
++		return -EINVAL;
++	}
++
++	set_local_comm_id(mad, id->pv_cm_id);
++
++	if (mad->mad_hdr.attr_id == CM_DREQ_ATTR_ID)
++		schedule_delayed(ibdev, id);
++	else if (mad->mad_hdr.attr_id == CM_DREP_ATTR_ID)
++		id_map_find_del(ibdev, pv_cm_id);
++
++	return 0;
++}
++
++int mlx4_ib_demux_cm_handler(struct ib_device *ibdev, int port, int *slave,
++							     struct ib_mad *mad)
++{
++	u32 pv_cm_id;
++	struct id_map_entry *id;
++
++	if (mad->mad_hdr.attr_id == CM_REQ_ATTR_ID) {
++		union ib_gid gid;
++
++		gid = gid_from_req_msg(ibdev, mad);
++		*slave = mlx4_ib_find_real_gid(ibdev, port, gid.global.interface_id);
++		if (*slave < 0) {
++			mlx4_ib_warn(ibdev, "failed matching slave_id by gid (0x%llx)\n",
++					gid.global.interface_id);
++			return -ENOENT;
++		}
++		return 0;
++	}
++
++	pv_cm_id = get_remote_comm_id(mad);
++	id = id_map_get(ibdev, (int *)&pv_cm_id, -1, -1);
++
++	if (!id) {
++		pr_debug("Couldn't find an entry for pv_cm_id 0x%x\n", pv_cm_id);
++		return -ENOENT;
++	}
++
++	*slave = id->slave_id;
++	set_remote_comm_id(mad, id->sl_cm_id);
++
++	if (mad->mad_hdr.attr_id == CM_DREQ_ATTR_ID)
++		schedule_delayed(ibdev, id);
++	else if (mad->mad_hdr.attr_id == CM_REJ_ATTR_ID ||
++			mad->mad_hdr.attr_id == CM_DREP_ATTR_ID) {
++		id_map_find_del(ibdev, (int) pv_cm_id);
++	}
++
++	return 0;
++}
++
++void mlx4_ib_cm_paravirt_init(struct mlx4_ib_dev *dev)
++{
++	spin_lock_init(&dev->sriov.id_map_lock);
++	INIT_LIST_HEAD(&dev->sriov.cm_list);
++	dev->sriov.sl_id_map = RB_ROOT;
++	idr_init(&dev->sriov.pv_id_table);
++	idr_pre_get(&dev->sriov.pv_id_table, GFP_KERNEL);
++}
++
++/* slave = -1 ==> all slaves */
++/* TBD -- call paravirt clean for single slave.  Need for slave RESET event */
++void mlx4_ib_cm_paravirt_clean(struct mlx4_ib_dev *dev, int slave)
++{
++	struct mlx4_ib_sriov *sriov = &dev->sriov;
++	struct rb_root *sl_id_map = &sriov->sl_id_map;
++	struct list_head lh;
++	struct rb_node *nd;
++	int need_flush = 1;
++	struct id_map_entry *map, *tmp_map;
++	/* cancel all delayed work queue entries */
++	INIT_LIST_HEAD(&lh);
++	spin_lock(&sriov->id_map_lock);
++	list_for_each_entry_safe(map, tmp_map, &dev->sriov.cm_list, list) {
++		if (slave < 0 || slave == map->slave_id) {
++			if (map->scheduled_delete)
++				need_flush &= !!cancel_delayed_work(&map->timeout);
++		}
++	}
++
++	spin_unlock(&sriov->id_map_lock);
++
++	if (!need_flush)
++		flush_scheduled_work(); /* make sure all timers were flushed */
++
++	/* now, remove all leftover entries from databases*/
++	spin_lock(&sriov->id_map_lock);
++	if (slave < 0) {
++		while (rb_first(sl_id_map)) {
++			struct id_map_entry *ent =
++				rb_entry(rb_first(sl_id_map),
++					 struct id_map_entry, node);
++
++			rb_erase(&ent->node, sl_id_map);
++			idr_remove(&sriov->pv_id_table, (int) ent->pv_cm_id);
++		}
++		list_splice_init(&dev->sriov.cm_list, &lh);
++	} else {
++		/* first, move nodes belonging to slave to db remove list */
++		nd = rb_first(sl_id_map);
++		while (nd) {
++			struct id_map_entry *ent =
++				rb_entry(nd, struct id_map_entry, node);
++			nd = rb_next(nd);
++			if (ent->slave_id == slave)
++				list_move_tail(&ent->list, &lh);
++		}
++		/* remove those nodes from databases */
++		list_for_each_entry_safe(map, tmp_map, &lh, list) {
++			rb_erase(&map->node, sl_id_map);
++			idr_remove(&sriov->pv_id_table, (int) map->pv_cm_id);
++		}
++
++		/* add remaining nodes from cm_list */
++		list_for_each_entry_safe(map, tmp_map, &dev->sriov.cm_list, list) {
++			if (slave == map->slave_id)
++				list_move_tail(&map->list, &lh);
++		}
++	}
++
++	spin_unlock(&sriov->id_map_lock);
++
++	/* free any map entries left behind due to cancel_delayed_work above */
++	list_for_each_entry_safe(map, tmp_map, &lh, list) {
++		list_del(&map->list);
++		kfree(map);
++	}
++}

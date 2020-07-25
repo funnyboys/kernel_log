@@ -1,0 +1,651 @@
+commit df9f85d8582ebda052835c55ae940e4f866e1ef5
+Author: Chris Wilson <chris@chris-wilson.co.uk>
+Date:   Wed Nov 27 13:45:27 2019 +0000
+
+    drm/i915: Serialise i915_active_fence_set() with itself
+    
+    The expected downside to commit 58b4c1a07ada ("drm/i915: Reduce nested
+    prepare_remote_context() to a trylock") was that it would need to return
+    -EAGAIN to userspace in order to resolve potential mutex inversion. Such
+    an unsightly round trip is unnecessary if we could atomically insert a
+    barrier into the i915_active_fence, so make it happen.
+    
+    Currently, we use the timeline->mutex (or some other named outer lock)
+    to order insertion into the i915_active_fence (and so individual nodes
+    of i915_active). Inside __i915_active_fence_set, we only need then
+    serialise with the interrupt handler in order to claim the timeline for
+    ourselves.
+    
+    However, if we remove the outer lock, we need to ensure the order is
+    intact between not only multiple threads trying to insert themselves
+    into the timeline, but also with the interrupt handler completing the
+    previous occupant. We use xchg() on insert so that we have an ordered
+    sequence of insertions (and each caller knows the previous fence on
+    which to wait, preserving the chain of all fences in the timeline), but
+    we then have to cmpxchg() in the interrupt handler to avoid overwriting
+    the new occupant. The only nasty side-effect is having to temporarily
+    strip off the RCU-annotations to apply the atomic operations, otherwise
+    the rules are much more conventional!
+    
+    Bugzilla: https://bugs.freedesktop.org/show_bug.cgi?id=112402
+    Fixes: 58b4c1a07ada ("drm/i915: Reduce nested prepare_remote_context() to a trylock")
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+    Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20191127134527.3438410-1-chris@chris-wilson.co.uk
+
+diff --git a/drivers/gpu/drm/i915/i915_active_types.h b/drivers/gpu/drm/i915/i915_active_types.h
+index 96aed0ee700a..6360c3e4b765 100644
+--- a/drivers/gpu/drm/i915/i915_active_types.h
++++ b/drivers/gpu/drm/i915/i915_active_types.h
+@@ -20,21 +20,6 @@
+ struct i915_active_fence {
+ 	struct dma_fence __rcu *fence;
+ 	struct dma_fence_cb cb;
+-#if IS_ENABLED(CONFIG_DRM_I915_DEBUG_GEM)
+-	/*
+-	 * Incorporeal!
+-	 *
+-	 * Updates to the i915_active_request must be serialised under a lock
+-	 * to ensure that the timeline is ordered. Normally, this is the
+-	 * timeline->mutex, but another mutex may be used so long as it is
+-	 * done so consistently.
+-	 *
+-	 * For lockdep tracking of the above, we store the lock we intend
+-	 * to always use for updates of this i915_active_request during
+-	 * construction and assert that is held on every update.
+-	 */
+-	struct mutex *lock;
+-#endif
+ };
+ 
+ struct active_node;
+
+commit c9ad602feabe4271d2adf1bdae5d8b20c2dc84f1
+Author: Chris Wilson <chris@chris-wilson.co.uk>
+Date:   Thu Nov 14 17:25:35 2019 +0000
+
+    drm/i915: Split i915_active.mutex into an irq-safe spinlock for the rbtree
+    
+    As we want to be able to run inside atomic context for retiring the
+    i915_active, and we are no longer allowed to abuse mutex_trylock, split
+    the tree management portion of i915_active.mutex into an irq-safe
+    spinlock.
+    
+    References: a0855d24fc22d ("locking/mutex: Complain upon mutex API misuse in IRQ contexts")
+    References: https://bugs.freedesktop.org/show_bug.cgi?id=111626
+    Fixes: 274cbf20fd10 ("drm/i915: Push the i915_active.retire into a worker")
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Cc: Tvrtko Ursulin <tvrtko.ursulin@linux.intel.com>
+    Cc: Matthew Auld <matthew.auld@intel.com>
+    Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@linux.intel.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20191114172535.1116-1-chris@chris-wilson.co.uk
+
+diff --git a/drivers/gpu/drm/i915/i915_active_types.h b/drivers/gpu/drm/i915/i915_active_types.h
+index d89a74c142c6..96aed0ee700a 100644
+--- a/drivers/gpu/drm/i915/i915_active_types.h
++++ b/drivers/gpu/drm/i915/i915_active_types.h
+@@ -48,6 +48,7 @@ struct i915_active {
+ 	atomic_t count;
+ 	struct mutex mutex;
+ 
++	spinlock_t tree_lock;
+ 	struct active_node *cache;
+ 	struct rb_root tree;
+ 
+
+commit b1e3177bd1d8f41e2a9cc847e56a96cdc0eefe62
+Author: Chris Wilson <chris@chris-wilson.co.uk>
+Date:   Fri Oct 4 14:40:00 2019 +0100
+
+    drm/i915: Coordinate i915_active with its own mutex
+    
+    Forgo the struct_mutex serialisation for i915_active, and interpose its
+    own mutex handling for active/retire.
+    
+    This is a multi-layered sleight-of-hand. First, we had to ensure that no
+    active/retire callbacks accidentally inverted the mutex ordering rules,
+    nor assumed that they were themselves serialised by struct_mutex. More
+    challenging though, is the rule over updating elements of the active
+    rbtree. Instead of the whole i915_active now being serialised by
+    struct_mutex, allocations/rotations of the tree are serialised by the
+    i915_active.mutex and individual nodes are serialised by the caller
+    using the i915_timeline.mutex (we need to use nested spinlocks to
+    interact with the dma_fence callback lists).
+    
+    The pain point here is that instead of a single mutex around execbuf, we
+    now have to take a mutex for active tracker (one for each vma, context,
+    etc) and a couple of spinlocks for each fence update. The improvement in
+    fine grained locking allowing for multiple concurrent clients
+    (eventually!) should be worth it in typical loads.
+    
+    v2: Add some comments that barely elucidate anything :(
+    
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20191004134015.13204-6-chris@chris-wilson.co.uk
+
+diff --git a/drivers/gpu/drm/i915/i915_active_types.h b/drivers/gpu/drm/i915/i915_active_types.h
+index 021167f0004d..d89a74c142c6 100644
+--- a/drivers/gpu/drm/i915/i915_active_types.h
++++ b/drivers/gpu/drm/i915/i915_active_types.h
+@@ -17,17 +17,9 @@
+ 
+ #include "i915_utils.h"
+ 
+-struct drm_i915_private;
+-struct i915_active_request;
+-struct i915_request;
+-
+-typedef void (*i915_active_retire_fn)(struct i915_active_request *,
+-				      struct i915_request *);
+-
+-struct i915_active_request {
+-	struct i915_request __rcu *request;
+-	struct list_head link;
+-	i915_active_retire_fn retire;
++struct i915_active_fence {
++	struct dma_fence __rcu *fence;
++	struct dma_fence_cb cb;
+ #if IS_ENABLED(CONFIG_DRM_I915_DEBUG_GEM)
+ 	/*
+ 	 * Incorporeal!
+@@ -53,20 +45,17 @@ struct active_node;
+ #define i915_active_may_sleep(fn) ptr_pack_bits(&(fn), I915_ACTIVE_MAY_SLEEP, 2)
+ 
+ struct i915_active {
+-	struct drm_i915_private *i915;
++	atomic_t count;
++	struct mutex mutex;
+ 
+ 	struct active_node *cache;
+ 	struct rb_root tree;
+-	struct mutex mutex;
+-	atomic_t count;
+ 
+ 	/* Preallocated "exclusive" node */
+-	struct dma_fence __rcu *excl;
+-	struct dma_fence_cb excl_cb;
++	struct i915_active_fence excl;
+ 
+ 	unsigned long flags;
+ #define I915_ACTIVE_RETIRE_SLEEPS BIT(0)
+-#define I915_ACTIVE_GRAB_BIT 1
+ 
+ 	int (*active)(struct i915_active *ref);
+ 	void (*retire)(struct i915_active *ref);
+
+commit 274cbf20fd108fa26d0497282b102e00371210fd
+Author: Chris Wilson <chris@chris-wilson.co.uk>
+Date:   Fri Oct 4 14:39:59 2019 +0100
+
+    drm/i915: Push the i915_active.retire into a worker
+    
+    As we need to use a mutex to serialise i915_active activation
+    (because we want to allow the callback to sleep), we need to push the
+    i915_active.retire into a worker callback in case we get need to retire
+    from an atomic context.
+    
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Reviewed-by: Matthew Auld <matthew.auld@intel.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20191004134015.13204-5-chris@chris-wilson.co.uk
+
+diff --git a/drivers/gpu/drm/i915/i915_active_types.h b/drivers/gpu/drm/i915/i915_active_types.h
+index 86e7a232ea3c..021167f0004d 100644
+--- a/drivers/gpu/drm/i915/i915_active_types.h
++++ b/drivers/gpu/drm/i915/i915_active_types.h
+@@ -13,6 +13,9 @@
+ #include <linux/mutex.h>
+ #include <linux/rbtree.h>
+ #include <linux/rcupdate.h>
++#include <linux/workqueue.h>
++
++#include "i915_utils.h"
+ 
+ struct drm_i915_private;
+ struct i915_active_request;
+@@ -44,6 +47,11 @@ struct i915_active_request {
+ 
+ struct active_node;
+ 
++#define I915_ACTIVE_MAY_SLEEP BIT(0)
++
++#define __i915_active_call __aligned(4)
++#define i915_active_may_sleep(fn) ptr_pack_bits(&(fn), I915_ACTIVE_MAY_SLEEP, 2)
++
+ struct i915_active {
+ 	struct drm_i915_private *i915;
+ 
+@@ -57,11 +65,14 @@ struct i915_active {
+ 	struct dma_fence_cb excl_cb;
+ 
+ 	unsigned long flags;
+-#define I915_ACTIVE_GRAB_BIT 0
++#define I915_ACTIVE_RETIRE_SLEEPS BIT(0)
++#define I915_ACTIVE_GRAB_BIT 1
+ 
+ 	int (*active)(struct i915_active *ref);
+ 	void (*retire)(struct i915_active *ref);
+ 
++	struct work_struct work;
++
+ 	struct llist_head preallocated_barriers;
+ };
+ 
+
+commit 2850748ef8763ab46958e43a4d1c445f29eeb37d
+Author: Chris Wilson <chris@chris-wilson.co.uk>
+Date:   Fri Oct 4 14:39:58 2019 +0100
+
+    drm/i915: Pull i915_vma_pin under the vm->mutex
+    
+    Replace the struct_mutex requirement for pinning the i915_vma with the
+    local vm->mutex instead. Note that the vm->mutex is tainted by the
+    shrinker (we require unbinding from inside fs-reclaim) and so we cannot
+    allocate while holding that mutex. Instead we have to preallocate
+    workers to do allocate and apply the PTE updates after we have we
+    reserved their slot in the drm_mm (using fences to order the PTE writes
+    with the GPU work and with later unbind).
+    
+    In adding the asynchronous vma binding, one subtle requirement is to
+    avoid coupling the binding fence into the backing object->resv. That is
+    the asynchronous binding only applies to the vma timeline itself and not
+    to the pages as that is a more global timeline (the binding of one vma
+    does not need to be ordered with another vma, nor does the implicit GEM
+    fencing depend on a vma, only on writes to the backing store). Keeping
+    the vma binding distinct from the backing store timelines is verified by
+    a number of async gem_exec_fence and gem_exec_schedule tests. The way we
+    do this is quite simple, we keep the fence for the vma binding separate
+    and only wait on it as required, and never add it to the obj->resv
+    itself.
+    
+    Another consequence in reducing the locking around the vma is the
+    destruction of the vma is no longer globally serialised by struct_mutex.
+    A natural solution would be to add a kref to i915_vma, but that requires
+    decoupling the reference cycles, possibly by introducing a new
+    i915_mm_pages object that is own by both obj->mm and vma->pages.
+    However, we have not taken that route due to the overshadowing lmem/ttm
+    discussions, and instead play a series of complicated games with
+    trylocks to (hopefully) ensure that only one destruction path is called!
+    
+    v2: Add some commentary, and some helpers to reduce patch churn.
+    
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+    Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20191004134015.13204-4-chris@chris-wilson.co.uk
+
+diff --git a/drivers/gpu/drm/i915/i915_active_types.h b/drivers/gpu/drm/i915/i915_active_types.h
+index 1854e7d168c1..86e7a232ea3c 100644
+--- a/drivers/gpu/drm/i915/i915_active_types.h
++++ b/drivers/gpu/drm/i915/i915_active_types.h
+@@ -8,6 +8,7 @@
+ #define _I915_ACTIVE_TYPES_H_
+ 
+ #include <linux/atomic.h>
++#include <linux/dma-fence.h>
+ #include <linux/llist.h>
+ #include <linux/mutex.h>
+ #include <linux/rbtree.h>
+@@ -51,6 +52,10 @@ struct i915_active {
+ 	struct mutex mutex;
+ 	atomic_t count;
+ 
++	/* Preallocated "exclusive" node */
++	struct dma_fence __rcu *excl;
++	struct dma_fence_cb excl_cb;
++
+ 	unsigned long flags;
+ #define I915_ACTIVE_GRAB_BIT 0
+ 
+
+commit 25ffd4b11d069300f018f7b04c3c6b8814a128d6
+Author: Chris Wilson <chris@chris-wilson.co.uk>
+Date:   Fri Aug 16 13:10:00 2019 +0100
+
+    drm/i915: Markup expected timeline locks for i915_active
+    
+    As every i915_active_request should be serialised by a dedicated lock,
+    i915_active consists of a tree of locks; one for each node. Markup up
+    the i915_active_request with what lock is supposed to be guarding it so
+    that we can verify that the serialised updated are indeed serialised.
+    
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Reviewed-by: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20190816121000.8507-2-chris@chris-wilson.co.uk
+
+diff --git a/drivers/gpu/drm/i915/i915_active_types.h b/drivers/gpu/drm/i915/i915_active_types.h
+index ae3ee441c114..1854e7d168c1 100644
+--- a/drivers/gpu/drm/i915/i915_active_types.h
++++ b/drivers/gpu/drm/i915/i915_active_types.h
+@@ -24,6 +24,21 @@ struct i915_active_request {
+ 	struct i915_request __rcu *request;
+ 	struct list_head link;
+ 	i915_active_retire_fn retire;
++#if IS_ENABLED(CONFIG_DRM_I915_DEBUG_GEM)
++	/*
++	 * Incorporeal!
++	 *
++	 * Updates to the i915_active_request must be serialised under a lock
++	 * to ensure that the timeline is ordered. Normally, this is the
++	 * timeline->mutex, but another mutex may be used so long as it is
++	 * done so consistently.
++	 *
++	 * For lockdep tracking of the above, we store the lock we intend
++	 * to always use for updates of this i915_active_request during
++	 * construction and assert that is held on every update.
++	 */
++	struct mutex *lock;
++#endif
+ };
+ 
+ struct active_node;
+
+commit d8af05ff38ae7a42819b285ffef314942414ef8b
+Author: Chris Wilson <chris@chris-wilson.co.uk>
+Date:   Fri Aug 2 11:00:15 2019 +0100
+
+    drm/i915: Allow sharing the idle-barrier from other kernel requests
+    
+    By placing our idle-barriers in the i915_active fence tree, we expose
+    those for reuse by other components that are issuing requests along the
+    kernel_context. Reusing the proto-barrier active_node is perfectly fine
+    as the new request implies a context-switch, and so an opportune point
+    to run the idle-barrier. However, the proto-barrier is not equivalent
+    to a normal active_node and care must be taken to avoid dereferencing the
+    ERR_PTR used as its request marker.
+    
+    v2: Comment the more egregious cheek
+    v3: A glossary!
+    
+    Reported-by: Lionel Landwerlin <lionel.g.landwerlin@intel.com>
+    Fixes: ce476c80b8bf ("drm/i915: Keep contexts pinned until after the next kernel context switch")
+    Fixes: a9877da2d629 ("drm/i915/oa: Reconfigure contexts on the fly")
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Cc: Lionel Landwerlin <lionel.g.landwerlin@intel.com>
+    Cc: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+    Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20190802100015.1281-1-chris@chris-wilson.co.uk
+
+diff --git a/drivers/gpu/drm/i915/i915_active_types.h b/drivers/gpu/drm/i915/i915_active_types.h
+index 74743dd0d5f0..ae3ee441c114 100644
+--- a/drivers/gpu/drm/i915/i915_active_types.h
++++ b/drivers/gpu/drm/i915/i915_active_types.h
+@@ -42,7 +42,7 @@ struct i915_active {
+ 	int (*active)(struct i915_active *ref);
+ 	void (*retire)(struct i915_active *ref);
+ 
+-	struct llist_head barriers;
++	struct llist_head preallocated_barriers;
+ };
+ 
+ #endif /* _I915_ACTIVE_TYPES_H_ */
+
+commit 79c7a28e1f3a74b95ae2eae36ed0046fc8e6c7fd
+Author: Chris Wilson <chris@chris-wilson.co.uk>
+Date:   Thu Jul 25 23:38:43 2019 +0100
+
+    drm/i915: Capture vma contents outside of spinlock
+    
+    Currently we use the engine->active.lock to ensure that the request is
+    not retired as we capture the data. However, we only need to ensure that
+    the vma are not removed prior to use acquiring their contents, and
+    since we have already relinquished our stop-machine protection, we
+    assume that the user will not be overwriting the contents before we are
+    able to record them.
+    
+    In order to capture the vma outside of the spinlock, we acquire a
+    reference and mark the vma as active to prevent it from being unbound.
+    However, since it is tricky allocate an entry in the fence tree (doing
+    so would require taking a mutex) while inside the engine spinlock, we
+    use an atomic bit and special case the handling for i915_active_wait.
+    
+    The core benefit is that we can use some non-atomic methods for mapping
+    the device pages, we can remove the slow compression phase out of atomic
+    context (i.e. stop antagonising the nmi-watchdog), and no we longer need
+    large reserves of atomic pages.
+    
+    Bugzilla: https://bugs.freedesktop.org/show_bug.cgi?id=111215
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Reviewed-by: Matthew Auld <matthew.william.auld@gmail.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20190725223843.8971-1-chris@chris-wilson.co.uk
+
+diff --git a/drivers/gpu/drm/i915/i915_active_types.h b/drivers/gpu/drm/i915/i915_active_types.h
+index 5b0a3024ce24..74743dd0d5f0 100644
+--- a/drivers/gpu/drm/i915/i915_active_types.h
++++ b/drivers/gpu/drm/i915/i915_active_types.h
+@@ -36,6 +36,9 @@ struct i915_active {
+ 	struct mutex mutex;
+ 	atomic_t count;
+ 
++	unsigned long flags;
++#define I915_ACTIVE_GRAB_BIT 0
++
+ 	int (*active)(struct i915_active *ref);
+ 	void (*retire)(struct i915_active *ref);
+ 
+
+commit 12c255b5dad115e87f81ea45708b5f82b9a55253
+Author: Chris Wilson <chris@chris-wilson.co.uk>
+Date:   Fri Jun 21 19:38:00 2019 +0100
+
+    drm/i915: Provide an i915_active.acquire callback
+    
+    If we introduce a callback for i915_active that is only called the first
+    time we use the i915_active and is symmetrically paired with the
+    i915_active.retire callback, we can replace the open-coded and
+    non-atomic implementations -- which will be very fragile (i.e. broken)
+    upon removing the struct_mutex serialisation.
+    
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Reviewed-by: Matthew Auld <matthew.auld@intel.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20190621183801.23252-4-chris@chris-wilson.co.uk
+
+diff --git a/drivers/gpu/drm/i915/i915_active_types.h b/drivers/gpu/drm/i915/i915_active_types.h
+index c025991b9233..5b0a3024ce24 100644
+--- a/drivers/gpu/drm/i915/i915_active_types.h
++++ b/drivers/gpu/drm/i915/i915_active_types.h
+@@ -7,7 +7,9 @@
+ #ifndef _I915_ACTIVE_TYPES_H_
+ #define _I915_ACTIVE_TYPES_H_
+ 
++#include <linux/atomic.h>
+ #include <linux/llist.h>
++#include <linux/mutex.h>
+ #include <linux/rbtree.h>
+ #include <linux/rcupdate.h>
+ 
+@@ -24,13 +26,17 @@ struct i915_active_request {
+ 	i915_active_retire_fn retire;
+ };
+ 
++struct active_node;
++
+ struct i915_active {
+ 	struct drm_i915_private *i915;
+ 
++	struct active_node *cache;
+ 	struct rb_root tree;
+-	struct i915_active_request last;
+-	unsigned int count;
++	struct mutex mutex;
++	atomic_t count;
+ 
++	int (*active)(struct i915_active *ref);
+ 	void (*retire)(struct i915_active *ref);
+ 
+ 	struct llist_head barriers;
+
+commit ce476c80b8bfa8a8e4c9182cdb686c5aea2431a6
+Author: Chris Wilson <chris@chris-wilson.co.uk>
+Date:   Fri Jun 14 17:46:04 2019 +0100
+
+    drm/i915: Keep contexts pinned until after the next kernel context switch
+    
+    We need to keep the context image pinned in memory until after the GPU
+    has finished writing into it. Since it continues to write as we signal
+    the final breadcrumb, we need to keep it pinned until the request after
+    it is complete. Currently we know the order in which requests execute on
+    each engine, and so to remove that presumption we need to identify a
+    request/context-switch we know must occur after our completion. Any
+    request queued after the signal must imply a context switch, for
+    simplicity we use a fresh request from the kernel context.
+    
+    The sequence of operations for keeping the context pinned until saved is:
+    
+     - On context activation, we preallocate a node for each physical engine
+       the context may operate on. This is to avoid allocations during
+       unpinning, which may be from inside FS_RECLAIM context (aka the
+       shrinker)
+    
+     - On context deactivation on retirement of the last active request (which
+       is before we know the context has been saved), we add the
+       preallocated node onto a barrier list on each engine
+    
+     - On engine idling, we emit a switch to kernel context. When this
+       switch completes, we know that all previous contexts must have been
+       saved, and so on retiring this request we can finally unpin all the
+       contexts that were marked as deactivated prior to the switch.
+    
+    We can enhance this in future by flushing all the idle contexts on a
+    regular heartbeat pulse of a switch to kernel context, which will also
+    be used to check for hung engines.
+    
+    v2: intel_context_active_acquire/_release
+    
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Cc: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+    Reviewed-by: Mika Kuoppala <mika.kuoppala@linux.intel.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20190614164606.15633-1-chris@chris-wilson.co.uk
+
+diff --git a/drivers/gpu/drm/i915/i915_active_types.h b/drivers/gpu/drm/i915/i915_active_types.h
+index b679253b53a5..c025991b9233 100644
+--- a/drivers/gpu/drm/i915/i915_active_types.h
++++ b/drivers/gpu/drm/i915/i915_active_types.h
+@@ -7,6 +7,7 @@
+ #ifndef _I915_ACTIVE_TYPES_H_
+ #define _I915_ACTIVE_TYPES_H_
+ 
++#include <linux/llist.h>
+ #include <linux/rbtree.h>
+ #include <linux/rcupdate.h>
+ 
+@@ -31,6 +32,8 @@ struct i915_active {
+ 	unsigned int count;
+ 
+ 	void (*retire)(struct i915_active *ref);
++
++	struct llist_head barriers;
+ };
+ 
+ #endif /* _I915_ACTIVE_TYPES_H_ */
+
+commit 21950ee7cc8f13c5350bda0cae22cdb7ac7e3058
+Author: Chris Wilson <chris@chris-wilson.co.uk>
+Date:   Tue Feb 5 13:00:05 2019 +0000
+
+    drm/i915: Pull i915_gem_active into the i915_active family
+    
+    Looking forward, we need to break the struct_mutex dependency on
+    i915_gem_active. In the meantime, external use of i915_gem_active is
+    quite beguiling, little do new users suspect that it implies a barrier
+    as each request it tracks must be ordered wrt the previous one. As one
+    of many, it can be used to track activity across multiple timelines, a
+    shared fence, which fits our unordered request submission much better. We
+    need to steer external users away from the singular, exclusive fence
+    imposed by i915_gem_active to i915_active instead. As part of that
+    process, we move i915_gem_active out of i915_request.c into
+    i915_active.c to start separating the two concepts, and rename it to
+    i915_active_request (both to tie it to the concept of tracking just one
+    request, and to give it a longer, less appealing name).
+    
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20190205130005.2807-5-chris@chris-wilson.co.uk
+
+diff --git a/drivers/gpu/drm/i915/i915_active_types.h b/drivers/gpu/drm/i915/i915_active_types.h
+index 411e502ed8dd..b679253b53a5 100644
+--- a/drivers/gpu/drm/i915/i915_active_types.h
++++ b/drivers/gpu/drm/i915/i915_active_types.h
+@@ -8,16 +8,26 @@
+ #define _I915_ACTIVE_TYPES_H_
+ 
+ #include <linux/rbtree.h>
+-
+-#include "i915_request.h"
++#include <linux/rcupdate.h>
+ 
+ struct drm_i915_private;
++struct i915_active_request;
++struct i915_request;
++
++typedef void (*i915_active_retire_fn)(struct i915_active_request *,
++				      struct i915_request *);
++
++struct i915_active_request {
++	struct i915_request __rcu *request;
++	struct list_head link;
++	i915_active_retire_fn retire;
++};
+ 
+ struct i915_active {
+ 	struct drm_i915_private *i915;
+ 
+ 	struct rb_root tree;
+-	struct i915_gem_active last;
++	struct i915_active_request last;
+ 	unsigned int count;
+ 
+ 	void (*retire)(struct i915_active *ref);
+
+commit 64d6c500a3843408559164223d69fb31e1a00e52
+Author: Chris Wilson <chris@chris-wilson.co.uk>
+Date:   Tue Feb 5 13:00:02 2019 +0000
+
+    drm/i915: Generalise GPU activity tracking
+    
+    We currently track GPU memory usage inside VMA, such that we never
+    release memory used by the GPU until after it has finished accessing it.
+    However, we may want to track other resources aside from VMA, or we may
+    want to split a VMA into multiple independent regions and track each
+    separately. For this purpose, generalise our request tracking (akin to
+    struct reservation_object) so that we can embed it into other objects.
+    
+    v2: Tweak error handling during selftest setup.
+    
+    Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+    Reviewed-by: Tvrtko Ursulin <tvrtko.ursulin@intel.com>
+    Link: https://patchwork.freedesktop.org/patch/msgid/20190205130005.2807-2-chris@chris-wilson.co.uk
+
+diff --git a/drivers/gpu/drm/i915/i915_active_types.h b/drivers/gpu/drm/i915/i915_active_types.h
+new file mode 100644
+index 000000000000..411e502ed8dd
+--- /dev/null
++++ b/drivers/gpu/drm/i915/i915_active_types.h
+@@ -0,0 +1,26 @@
++/*
++ * SPDX-License-Identifier: MIT
++ *
++ * Copyright © 2019 Intel Corporation
++ */
++
++#ifndef _I915_ACTIVE_TYPES_H_
++#define _I915_ACTIVE_TYPES_H_
++
++#include <linux/rbtree.h>
++
++#include "i915_request.h"
++
++struct drm_i915_private;
++
++struct i915_active {
++	struct drm_i915_private *i915;
++
++	struct rb_root tree;
++	struct i915_gem_active last;
++	unsigned int count;
++
++	void (*retire)(struct i915_active *ref);
++};
++
++#endif /* _I915_ACTIVE_TYPES_H_ */
